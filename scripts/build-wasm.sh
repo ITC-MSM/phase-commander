@@ -30,7 +30,7 @@ build_wasm_crate() {
 
   if [ "$PROFILE" = "release" ] && command -v wasm-opt &> /dev/null; then
     echo "Optimizing $OUT_NAME..."
-    wasm-opt -Oz --strip-debug --enable-bulk-memory --enable-nontrapping-float-to-int \
+    wasm-opt -Oz --strip-debug --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext \
       "$WASM_OUT/${OUT_NAME}_bg.wasm" \
       -o "$WASM_OUT/${OUT_NAME}_bg.wasm"
   fi
