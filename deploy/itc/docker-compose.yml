@@ -1,3 +1,5 @@
+name: phase
+
 services:
   server:
     image: ghcr.io/itc-msm/phase-commander/server:platform
@@ -20,4 +22,3 @@ services:
 
 volumes:
   server_data:
-
