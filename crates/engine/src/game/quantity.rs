@@ -995,6 +995,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::AttachmentsOnLeavingObject { .. }
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::EventContextSourceKickerCount
         | QuantityRef::SpellsCastThisTurn { .. }
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
@@ -1325,6 +1326,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::AttachmentsOnLeavingObject { .. }
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::EventContextSourceKickerCount
         | QuantityRef::SpellsCastThisTurn { .. }
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
@@ -1627,6 +1629,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::EventContextAmount
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::EventContextSourceKickerCount
         // CR 117.1: spell-cast journals store each spell's cast-time
         // characteristics.
         | QuantityRef::SpellsCastThisTurn { .. }
@@ -1893,6 +1896,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::AttachmentsOnLeavingObject { .. }
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::EventContextSourceKickerCount
         | QuantityRef::SpellsCastThisTurn { .. }
         | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
@@ -5015,6 +5019,15 @@ fn resolve_ref(
                     .get(&ctx.self_object())
                     .map(|object| usize_to_i32_saturating(object.kickers_paid.len()))
             })
+            .unwrap_or(0),
+        // CR 603.2 + CR 702.33d: "that spell" is the source object carried by
+        // the current SpellCast event, not the permanent whose ability triggered.
+        QuantityRef::EventContextSourceKickerCount => state
+            .current_trigger_event
+            .as_ref()
+            .and_then(crate::game::targeting::extract_source_from_event)
+            .and_then(|id| state.objects.get(&id))
+            .map(|object| usize_to_i32_saturating(object.kickers_paid.len()))
             .unwrap_or(0),
         QuantityRef::AdditionalCostPaymentCount => ctx
             .trigger_source

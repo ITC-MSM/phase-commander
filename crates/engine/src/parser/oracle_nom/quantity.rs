@@ -960,6 +960,9 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // scry-context "number of cards looked at …" reading wins over a
         // plain object-count reading.
         parse_scry_look_count_ref,
+        // CR 702.33d: must precede the generic `parse_the_number_of` so kicker
+        // counts retain whether Oracle names this object or the triggering spell.
+        parse_kicker_count_expression,
         parse_the_number_of,
         parse_object_property_aggregate_ref,
         // Group mana-value aggregate parsers to reduce alt arity
@@ -4329,6 +4332,20 @@ pub fn parse_kicker_count_where_x_expression(input: &str) -> OracleResult<'_, Qu
     Ok(("", quantity))
 }
 
+/// Parse a complete kicker-count quantity, preserving whether Oracle refers to
+/// this object or to the spell that caused the current spell-cast trigger.
+fn parse_kicker_count_expression(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("the number of times ").parse(input)?;
+    alt((
+        parse_kicker_count_subject_was_kicked,
+        value(
+            QuantityRef::EventContextSourceKickerCount,
+            all_consuming(tag("that spell was kicked")),
+        ),
+    ))
+    .parse(rest)
+}
+
 /// Parse the inner content after "for each ".
 pub fn parse_for_each_clause_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     parse_for_each_clause_ref_with_they_controller(input, ControllerRef::ScopedPlayer)
@@ -6352,6 +6369,26 @@ mod tests {
         SharedQuality, SharedQualityRelation, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::mana::ManaColor;
+
+    /// CR 702.33d: Deathforge Shaman's "it" reads the source creature's own
+    /// multikicker payments.
+    #[test]
+    fn kicker_count_it_was_kicked_uses_source_object() {
+        let (rest, qty) = parse_quantity_ref("the number of times it was kicked")
+            .expect("self-referential kicker count should parse");
+        assert_eq!(rest, "");
+        assert_eq!(qty, QuantityRef::KickerCount);
+    }
+
+    /// CR 603.2 + CR 702.33d: Rumbling Aftershocks' "that spell" names the
+    /// spell-cast event source, not the enchantment whose ability triggered.
+    #[test]
+    fn kicker_count_that_spell_was_kicked_uses_trigger_event() {
+        let (rest, qty) = parse_quantity_ref("the number of times that spell was kicked")
+            .expect("triggering-spell kicker count should parse");
+        assert_eq!(rest, "");
+        assert_eq!(qty, QuantityRef::EventContextSourceKickerCount);
+    }
 
     fn assert_pt_difference(parsed: QuantityExpr, scope: ObjectScope, left: PtStat, right: PtStat) {
         assert_eq!(

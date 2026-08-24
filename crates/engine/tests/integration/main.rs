@@ -1127,6 +1127,7 @@ mod wise_mothman_milled_trigger;
 mod wise_mothman_target_distinctness;
 mod wolverine_best_there_is_dealt_damage_counter;
 mod wolverine_fierce_fighter_heal;
+mod worldwake_kicker_damage;
 mod wrenn_and_six_up_to_one_optout;
 mod yare_extra_blockers;
 mod yavimaya_enchantress_dynamic_pump;
