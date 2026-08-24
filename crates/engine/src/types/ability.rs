@@ -7522,6 +7522,10 @@ pub enum QuantityRef {
     /// CR 702.33b + CR 702.33c: Number of kicker costs paid for the source
     /// spell. For multikicker, each repeated payment contributes one entry.
     KickerCount,
+    /// CR 603.2 + CR 702.33d: Number of kicker costs paid for the spell that
+    /// caused the current spell-cast trigger. Unlike `KickerCount`, this reads
+    /// the object named by the preserved `SpellCast` event ("that spell").
+    EventContextSourceKickerCount,
     /// CR 601.2b/f/h + CR 702.157a: Number of non-kicker additional-cost
     /// payments made for the source spell. Used by Squad so its payment count
     /// remains distinct from Kicker's CR 702.33 payment model.
@@ -7728,6 +7732,7 @@ impl QuantityRef {
             | QuantityRef::DungeonsCompleted
             | QuantityRef::CostXPaid
             | QuantityRef::KickerCount
+            | QuantityRef::EventContextSourceKickerCount
             | QuantityRef::AdditionalCostPaymentCount
             | QuantityRef::AdditionalCostPaymentCountFor { .. }
             | QuantityRef::ConvokedCreatureCount

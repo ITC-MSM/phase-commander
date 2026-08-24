@@ -2541,6 +2541,11 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
         QuantityRef::DungeonsCompleted => Axes::NONE,
         QuantityRef::CostXPaid => Axes::NONE,
         QuantityRef::KickerCount => Axes::NONE,
+        QuantityRef::EventContextSourceKickerCount => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
         QuantityRef::AdditionalCostPaymentCount => Axes::NONE,
         QuantityRef::AdditionalCostPaymentCountFor {
             origin: _,

@@ -3424,6 +3424,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::DungeonsCompleted
         | QuantityRef::CostXPaid
         | QuantityRef::KickerCount
+        | QuantityRef::EventContextSourceKickerCount
         | QuantityRef::AdditionalCostPaymentCount
         | QuantityRef::AdditionalCostPaymentCountFor { .. }
         | QuantityRef::ConvokedCreatureCount

@@ -2243,6 +2243,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         // above → true); classified with the newer event-live
         // TimesCostPaidThisResolution twin → false.
         | QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::EventContextSourceKickerCount
         | QuantityRef::TimesCostPaidThisResolution => false,
     }
 }
@@ -6361,7 +6362,8 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         // CR 700.2: reads the live triggering-spell object like the
         // TimesCostPaidThisResolution twin — event-live, NOT a frozen D5 carrier,
         // so no `legacy_batch_prompt` (that would be `legacy_ref()`).
-        QuantityRef::EventContextSourceModesChosen => reads_event_live(),
+        QuantityRef::EventContextSourceModesChosen
+        | QuantityRef::EventContextSourceKickerCount => reads_event_live(),
         // D5 carriers.
         QuantityRef::EventContextAmount
         | QuantityRef::EventContextSourceCostX

@@ -1794,6 +1794,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::TargetZoneCardCount { .. } => "target zone card count".into(),
         QuantityRef::CostXPaid => "X paid for this spell".into(),
         QuantityRef::KickerCount => "kicker payments for this spell".into(),
+        QuantityRef::EventContextSourceKickerCount => {
+            "kicker payments for the triggering spell".into()
+        }
         QuantityRef::AdditionalCostPaymentCount => "additional cost payments for this spell".into(),
         QuantityRef::AdditionalCostPaymentCountFor {
             origin,
@@ -8434,6 +8437,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::TargetZoneCardCount { .. } => ("TargetZoneCardCount", Handled),
         QuantityRef::CostXPaid => ("CostXPaid", Handled),
         QuantityRef::KickerCount => ("KickerCount", Handled),
+        QuantityRef::EventContextSourceKickerCount => ("EventContextSourceKickerCount", Handled),
         QuantityRef::AdditionalCostPaymentCount => ("AdditionalCostPaymentCount", Handled),
         QuantityRef::AdditionalCostPaymentCountFor { .. } => {
             ("AdditionalCostPaymentCountFor", Handled)
