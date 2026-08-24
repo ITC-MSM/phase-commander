@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -28,3 +29,7 @@ jobs:
           gh api --method POST "repos/${GITHUB_REPOSITORY}/merges"
           -f base=platform -f head=main
           -f commit_message="Merge synchronized upstream main into platform"
+      - name: Rebuild platform images
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run platform-images.yml --ref platform
