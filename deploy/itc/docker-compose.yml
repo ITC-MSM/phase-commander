@@ -1,0 +1,23 @@
+services:
+  server:
+    image: ghcr.io/itc-msm/phase-commander/server:platform
+    restart: unless-stopped
+    environment:
+      PHASE_CORS_ORIGIN: https://172.16.50.234:8443
+      RUST_LOG: info
+    ports:
+      - "127.0.0.1:9374:9374"
+    volumes:
+      - server_data:/var/lib/phase-server
+
+  frontend:
+    image: ghcr.io/itc-msm/phase-commander/frontend:platform
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "127.0.0.1:3101:80"
+
+volumes:
+  server_data:
+

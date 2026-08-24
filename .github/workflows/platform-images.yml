@@ -1,0 +1,75 @@
+name: Build platform images
+
+on:
+  push:
+    branches: [platform]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: platform-images
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          rustflags: ""
+          cache-shared-key: itc-platform
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-bindgen-cli@0.2.121
+      - run: sudo apt-get update && sudo apt-get install -y binaryen
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+      - name: Generate card data
+        run: ./scripts/gen-card-data.sh
+      - name: Supply current draft pools
+        run: curl -fsSL https://data.phase-rs.dev/draft-pools.json -o client/public/draft-pools.json
+      - name: Build WASM
+        run: ./scripts/build-wasm.sh release
+      - name: Build frontend
+        env:
+          DATA_BASE_URL: https://data.phase-rs.dev
+          CARD_DATA_URL: /card-data.json
+          DEFAULT_MULTIPLAYER_SERVER_URL: wss://172.16.50.234:8443/ws
+          OFFICIAL_MULTIPLAYER_SERVER_URL: wss://172.16.50.234:8443/ws
+        run: cd client && pnpm install --frozen-lockfile && pnpm build
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push server
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/itc/server.Dockerfile
+          push: true
+          tags: ghcr.io/itc-msm/phase-commander/server:platform
+          cache-from: type=gha,scope=phase-server
+          cache-to: type=gha,mode=max,scope=phase-server
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/itc/frontend.Dockerfile
+          push: true
+          tags: ghcr.io/itc-msm/phase-commander/frontend:platform
+          cache-from: type=gha,scope=phase-frontend
+          cache-to: type=gha,mode=max,scope=phase-frontend
