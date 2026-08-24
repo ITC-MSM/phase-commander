@@ -32,4 +32,4 @@ jobs:
       - name: Rebuild platform images
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run platform-images.yml --ref platform
+        run: gh workflow run platform-images.yml --repo "$GITHUB_REPOSITORY" --ref platform
