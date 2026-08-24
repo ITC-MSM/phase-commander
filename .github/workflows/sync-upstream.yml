@@ -21,3 +21,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main
+      - name: Merge synchronized main into platform
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/merges"
+          -f base=platform -f head=main
+          -f commit_message="Merge synchronized upstream main into platform"
