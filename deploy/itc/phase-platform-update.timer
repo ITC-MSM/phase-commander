@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for Phase Commander updates every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=phase-platform-update.service
+
+[Install]
+WantedBy=timers.target
+
