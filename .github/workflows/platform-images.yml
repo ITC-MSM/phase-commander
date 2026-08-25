@@ -46,8 +46,8 @@ jobs:
         env:
           DATA_BASE_URL: https://data.phase-rs.dev
           CARD_DATA_URL: /card-data.json
-          DEFAULT_MULTIPLAYER_SERVER_URL: wss://172.16.50.234:8443/ws
-          OFFICIAL_MULTIPLAYER_SERVER_URL: wss://172.16.50.234:8443/ws
+          DEFAULT_MULTIPLAYER_SERVER_URL: wss://commanderonline.com/ws
+          OFFICIAL_MULTIPLAYER_SERVER_URL: wss://commanderonline.com/ws
         run: cd client && pnpm install --frozen-lockfile && pnpm build
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
