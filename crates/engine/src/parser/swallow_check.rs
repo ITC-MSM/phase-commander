@@ -779,6 +779,15 @@ fn effect_has_internal_optionality(effect: &Effect) -> bool {
         // Veil's "you may activate one of its loyalty abilities once this turn"
         // is the permission itself; the player still decides each activation.
         | Effect::GrantExtraLoyaltyActivations { .. } => true,
+        // CR 111.3 + CR 603.5: a token's quoted text is part of its
+        // characteristics, including optional triggered abilities. The
+        // optionality therefore lives inside the Token's static-ability grant,
+        // not on the token-creation definition itself (Mole Man / Moloid class).
+        // Walk the same StaticDefinition carrier as GenericEffect below so the
+        // audit follows the runtime shape instead of card-specific wording.
+        Effect::Token {
+            static_abilities, ..
+        } => static_abilities.iter().any(static_definition_has_optional),
         // CR 601.3b + CR 702.8a + CR 609.4: a `GenericEffect` whose statics
         // encode a "you may" opt-in accounts for the marker in two ways:
         //
@@ -974,7 +983,7 @@ fn static_mode_is_optional_permission(mode: &StaticMode) -> bool {
             // cast an instant" is an activation-timing permission, not an
             // optional effect to execute during resolution.
             | StaticMode::ActivateAsInstant { .. }
-            // CR 117.3a: "You may play lands from your graveyard"
+            // CR 305.1 + CR 611.3d: "You may play lands from your graveyard"
             // (Crucible, Ramunap Excavator, etc.) — graveyard-as-zone
             // cast permission, structurally opt-in.
             | StaticMode::GraveyardCastPermission { .. }
@@ -4672,7 +4681,7 @@ mod tests {
 
     use super::{
         any_ability_has_unimplemented, def_tree_has_optional, def_tree_has_unimplemented,
-        trigger_tree_has_optional, twice_is_activation_limit,
+        effect_has_internal_optionality, trigger_tree_has_optional, twice_is_activation_limit,
     };
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -5468,6 +5477,66 @@ mod tests {
             parsed.statics
         );
         assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn mole_man_token_trigger_accounts_for_optional_you_may() {
+        // CR 111.3: the quoted trigger is part of Moloid's token text.
+        // CR 603.5: its controller makes the "may mill" choice on resolution.
+        // Reverting the Effect::Token static-ability walk restores the exact
+        // Optional_YouMay coverage gap this production Oracle text exposed.
+        let parsed = parse_named(
+            "You may play lands from your graveyard.\n\
+             Landfall — Whenever a land you control enters, create a 1/1 green Minion creature token named Moloid with \"Whenever this token attacks, you may mill a card.\"",
+            "Mole Man, Moloid Master",
+            &["Creature"],
+        );
+
+        assert!(
+            !any_ability_has_unimplemented(&parsed),
+            "Mole Man reach guard: production parse must contain zero Unimplemented: {parsed:#?}"
+        );
+        assert!(
+            !has_swallowed_detector(&parsed, "Optional_YouMay"),
+            "Moloid's granted optional trigger must account for its printed 'you may'"
+        );
+    }
+
+    #[test]
+    fn token_granted_optional_trigger_is_a_general_building_block() {
+        let parsed = parse(
+            "Create a 1/1 green Minion creature token named Moloid with \"Whenever this token attacks, you may mill a card.\"",
+            &["Sorcery"],
+        );
+        let create = parsed.abilities.first().expect("token creation ability");
+
+        assert!(
+            !def_tree_has_unimplemented(create),
+            "synthetic token-grant reach guard: {create:#?}"
+        );
+        assert!(
+            def_tree_has_optional(create),
+            "Token.static_abilities -> GrantTrigger must expose nested optionality"
+        );
+        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn token_granted_mandatory_trigger_is_not_optional() {
+        let parsed = parse(
+            "Create a 1/1 green Minion creature token named Moloid with \"Whenever this token attacks, mill a card.\"",
+            &["Sorcery"],
+        );
+        let create = parsed.abilities.first().expect("token creation ability");
+
+        assert!(
+            !def_tree_has_unimplemented(create),
+            "mandatory token-grant reach guard: {create:#?}"
+        );
+        assert!(
+            !effect_has_internal_optionality(create.effect.as_ref()),
+            "a mandatory granted trigger must not become optional"
+        );
     }
 
     #[test]
