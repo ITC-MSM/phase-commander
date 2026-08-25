@@ -34,8 +34,12 @@ use crate::types::ability::{
     ContinuousModification, CopyRetargetPermission, DamageModification, DelayedTriggerCondition,
     DoubleTarget, Duration, Effect, FilterProp, ManaProduction, ModalSelectionConstraint,
     OpponentMayScope, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementCondition, ReplacementMode, RestrictionExpiry, StaticCondition, StaticDefinition,
-    TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition, UnlessPayScaling,
+    ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+    StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerConstraint,
+    TriggerDefinition, UnlessPayScaling,
+};
+use crate::types::ability_visit::{
+    visit_ability_def, visit_replacement, visit_static, visit_trigger,
 };
 use crate::types::game_state::RetargetScope;
 use crate::types::keywords::Keyword;
@@ -52,6 +56,7 @@ use nom::{
     combinator::{opt, value},
     Parser,
 };
+use std::ops::ControlFlow;
 
 /// Strip parenthesized reminder text. Reminder text is the parser's
 /// responsibility to ignore at the keyword level — keywords themselves are
@@ -1041,71 +1046,59 @@ fn any_static_has_granted_trigger_with_optional(parsed: &ParsedAbilities) -> boo
 /// original text — that is itself a coverage signal. Suppressing swallow
 /// detectors for these cards prevents double-reporting the same gap.
 fn def_tree_has_unimplemented(def: &AbilityDefinition) -> bool {
-    if matches!(*def.effect, Effect::Unimplemented { .. }) {
-        return true;
-    }
-    if let Effect::Token {
-        static_abilities, ..
-    } = &*def.effect
-    {
-        if static_abilities
-            .iter()
-            .any(static_definition_has_unimplemented)
-        {
-            return true;
+    visit_ability_def(def, &mut |effect| {
+        if matches!(effect, Effect::Unimplemented { .. }) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
         }
-    }
-    if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
-        if def_tree_has_unimplemented(effect) {
-            return true;
-        }
-    }
-    if let Some(ref sub) = def.sub_ability {
-        if def_tree_has_unimplemented(sub) {
-            return true;
-        }
-    }
-    if let Some(ref else_ab) = def.else_ability {
-        if def_tree_has_unimplemented(else_ab) {
-            return true;
-        }
-    }
-    def.mode_abilities.iter().any(def_tree_has_unimplemented)
-}
-
-fn trigger_tree_has_unimplemented(trigger: &TriggerDefinition) -> bool {
-    trigger
-        .execute
-        .as_deref()
-        .is_some_and(def_tree_has_unimplemented)
-}
-
-fn static_definition_has_unimplemented(s: &StaticDefinition) -> bool {
-    s.modifications.iter().any(|m| match m {
-        ContinuousModification::GrantTrigger { trigger } => trigger_tree_has_unimplemented(trigger),
-        ContinuousModification::GrantAbility { definition } => {
-            def_tree_has_unimplemented(definition)
-        }
-        // CR 113.3d + CR 613.1f: Parallel to static_carries_optional_modification —
-        // recurse into GrantStaticAbility so an Unimplemented-carrying granted static
-        // suppresses swallow detectors rather than double-reporting the parse gap.
-        ContinuousModification::GrantStaticAbility { definition } => {
-            static_definition_has_unimplemented(definition)
-        }
-        _ => false,
     })
+    .is_break()
+}
+
+/// Apply the authoritative nested-effect traversal to a trigger root.
+fn trigger_tree_has_unimplemented(trigger: &TriggerDefinition) -> bool {
+    visit_trigger(trigger, &mut |effect| {
+        if matches!(effect, Effect::Unimplemented { .. }) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+/// Apply the authoritative nested-effect traversal to a replacement root.
+fn replacement_tree_has_unimplemented(replacement: &ReplacementDefinition) -> bool {
+    visit_replacement(replacement, &mut |effect| {
+        if matches!(effect, Effect::Unimplemented { .. }) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
+/// Apply the authoritative nested-effect traversal to a static root.
+fn static_definition_has_unimplemented(s: &StaticDefinition) -> bool {
+    visit_static(s, &mut |effect| {
+        if matches!(effect, Effect::Unimplemented { .. }) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 fn any_ability_has_unimplemented(parsed: &ParsedAbilities) -> bool {
     parsed.abilities.iter().any(def_tree_has_unimplemented)
-        || parsed
-            .triggers
-            .iter()
-            .any(|t| t.execute.as_deref().is_some_and(def_tree_has_unimplemented))
+        || parsed.triggers.iter().any(trigger_tree_has_unimplemented)
         || parsed
             .replacements
             .iter()
-            .any(|r| r.execute.as_deref().is_some_and(def_tree_has_unimplemented))
+            .any(replacement_tree_has_unimplemented)
         || parsed.statics.iter().any(static_definition_has_unimplemented)
         // CR 603: A `TriggerMode::Unknown(_)` is the trigger-side equivalent
         // of `Effect::Unimplemented` — the parser preserved the original
@@ -4697,8 +4690,8 @@ mod tests {
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, DamageModification, Effect, OutsideGameSourcePool,
-        QuantityExpr, TargetFilter, TriggerCondition,
+        AbilityDefinition, AbilityKind, ContinuousModification, DamageModification, Effect,
+        OutsideGameSourcePool, PlayerFilter, QuantityExpr, TargetFilter, TriggerCondition,
     };
     use crate::types::identifiers::TrackedSetId;
     use crate::types::keywords::Keyword;
@@ -5561,6 +5554,53 @@ mod tests {
         assert!(
             def_tree_has_unimplemented(create),
             "Token.static_abilities -> GrantTrigger -> execute must expose nested Unimplemented: {create:#?}"
+        );
+    }
+
+    #[test]
+    fn choice_branch_token_granted_unimplemented_is_reached_by_def_tree_walker() {
+        let mut parsed = parse(
+            "Create a 1/1 green Minion creature token named Moloid with \"Whenever this token attacks, perform an impossible action.\"",
+            &["Sorcery"],
+        );
+        let create = parsed.abilities.remove(0);
+        let Effect::Token {
+            static_abilities, ..
+        } = create.effect.as_ref()
+        else {
+            panic!("reach guard: expected Token, got {create:#?}");
+        };
+        let trigger = static_abilities
+            .iter()
+            .flat_map(|definition| definition.modifications.iter())
+            .find_map(|modification| match modification {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger),
+                _ => None,
+            })
+            .expect("reach guard: expected Token.static_abilities -> GrantTrigger");
+        let execute = trigger.execute.as_deref().expect("granted trigger execute");
+        assert!(
+            matches!(execute.effect.as_ref(), Effect::Unimplemented { .. }),
+            "reach guard: granted trigger must contain Unimplemented"
+        );
+
+        let modal = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseOneOf {
+                chooser: PlayerFilter::Controller,
+                branches: vec![create],
+            },
+        );
+        let Effect::ChooseOneOf { branches, .. } = modal.effect.as_ref() else {
+            panic!("reach guard: expected outer ChooseOneOf, got {modal:#?}");
+        };
+        assert!(
+            matches!(branches[0].effect.as_ref(), Effect::Token { .. }),
+            "reach guard: choice branch must contain Token"
+        );
+        assert!(
+            def_tree_has_unimplemented(&modal),
+            "ChooseOneOf -> Token.static_abilities -> GrantTrigger -> Unimplemented must be visible: {modal:#?}"
         );
     }
 
