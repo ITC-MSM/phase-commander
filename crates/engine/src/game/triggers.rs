@@ -7429,7 +7429,6 @@ pub(crate) enum EventContextSeedTiming {
 }
 
 pub(crate) fn seed_event_context_parent_targets(
-    state: &GameState,
     ability: &mut ResolvedAbility,
     trigger_event: Option<&GameEvent>,
     timing: EventContextSeedTiming,
@@ -7440,21 +7439,23 @@ pub(crate) fn seed_event_context_parent_targets(
     if !effect_uses_parent_target(&ability.effect) || parent_target_seeding_blocked(ability) {
         return;
     }
-    let parent_id = match event {
+    let (parent_id, zone_change_pin) = match event {
         GameEvent::ZoneChanged { object_id, .. } => {
-            // CR 400.7: the exact post-change incarnation can be captured only
-            // when the trigger is put on the stack. A resolution fallback may
-            // run after the card left and returned with the same storage id, so
-            // it must never create or replace a zone-change referent.
+            // CR 400.7: the exact post-change incarnation must come from the
+            // event authority when the trigger is put on the stack. A live-state
+            // lookup or resolution fallback may see a later same-id object.
             if timing == EventContextSeedTiming::ResolutionFallback {
                 return;
             }
-            Some(*object_id)
+            let Some(pin) = zone_change_parent_target_pin(event) else {
+                return;
+            };
+            (Some(*object_id), Some(pin))
         }
-        GameEvent::Stationed { creature_id, .. } => Some(*creature_id),
-        GameEvent::VehicleCrewed { vehicle_id, .. } => Some(*vehicle_id),
-        GameEvent::Saddled { mount_id, .. } => Some(*mount_id),
-        _ => None,
+        GameEvent::Stationed { creature_id, .. } => (Some(*creature_id), None),
+        GameEvent::VehicleCrewed { vehicle_id, .. } => (Some(*vehicle_id), None),
+        GameEvent::Saddled { mount_id, .. } => (Some(*mount_id), None),
+        _ => (None, None),
     };
     if let Some(id) = parent_id {
         ability.targets = vec![TargetRef::Object(id)];
@@ -7462,16 +7463,45 @@ pub(crate) fn seed_event_context_parent_targets(
         // post-change object. Pin that incarnation so leaving the destination
         // zone and returning before resolution cannot retarget the ability to
         // the new object that reuses the same storage id.
-        if matches!(event, GameEvent::ZoneChanged { .. }) {
-            let pins = state
-                .objects
-                .get(&id)
-                .map(ObjectIncarnationRef::from_object)
-                .into_iter()
-                .collect();
-            ability.set_target_incarnations_recursive(pins);
+        if let Some(pin) = zone_change_pin {
+            ability.set_target_incarnations_recursive(vec![pin]);
         }
     }
+}
+
+/// Returns the destination incarnation recorded by the zone-change authority.
+/// Never consult live state here: trigger placement can be deferred until after
+/// the same storage id has already left and returned as a different object.
+fn zone_change_parent_target_pin(event: &GameEvent) -> Option<ObjectIncarnationRef> {
+    let GameEvent::ZoneChanged {
+        object_id,
+        from,
+        to,
+        record,
+    } = event
+    else {
+        return None;
+    };
+    if record.object_id != *object_id || record.from_zone != *from || record.to_zone != *to {
+        return None;
+    }
+
+    let incarnation = if *to == Zone::Battlefield {
+        record.entered_incarnation?
+    } else {
+        let source = record.trigger_source_context()?;
+        if source.identity.reference.object_id != *object_id
+            || from.is_some_and(|zone| source.identity.expected_zone != zone)
+        {
+            return None;
+        }
+        if from.is_some_and(|zone| zone != *to) {
+            source.identity.reference.incarnation.checked_add(1)?
+        } else {
+            source.identity.reference.incarnation
+        }
+    };
+    Some(ObjectIncarnationRef::of(*object_id, incarnation))
 }
 
 fn effect_uses_parent_target(effect: &Effect) -> bool {
@@ -7570,7 +7600,6 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
     ability.bind_force_block_attacker_recursive(event_attacker);
     seed_batched_attack_parent_targets(&mut ability, trigger_event.as_ref());
     seed_event_context_parent_targets(
-        state,
         &mut ability,
         trigger_event.as_ref(),
         EventContextSeedTiming::StackPush,
@@ -16386,9 +16415,7 @@ pub mod tests {
             creature_id: creature,
             counters_added: 1,
         };
-        let state = GameState::new_two_player(1);
         seed_event_context_parent_targets(
-            &state,
             &mut ability,
             Some(&event),
             EventContextSeedTiming::StackPush,
@@ -16400,7 +16427,26 @@ pub mod tests {
     fn seed_event_context_parent_targets_binds_zone_changed_object() {
         let source = ObjectId(999);
         let mut state = GameState::new_two_player(1);
-        let entered = make_creature(&mut state, PlayerId(0), "Entered", 2, 2);
+        let entered = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Entered".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&entered)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let mut entry_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, entered, Zone::Battlefield, &mut entry_events);
+        let event = entry_events
+            .iter()
+            .find(|event| matches!(event, GameEvent::ZoneChanged { .. }))
+            .expect("production entry emits a zone-change event");
         let entered_pin = ObjectIncarnationRef::from_object(&state.objects[&entered]);
         let mut ability = ResolvedAbility::new(
             Effect::TargetOnly {
@@ -16410,18 +16456,9 @@ pub mod tests {
             source,
             PlayerId(0),
         );
-        let event = zone_changed_event(
-            entered,
-            Zone::Hand,
-            Zone::Battlefield,
-            vec![CoreType::Creature],
-            vec![],
-        );
-
         seed_event_context_parent_targets(
-            &state,
             &mut ability,
-            Some(&event),
+            Some(event),
             EventContextSeedTiming::StackPush,
         );
 
@@ -16456,7 +16493,6 @@ pub mod tests {
             PlayerId(0),
         );
         seed_event_context_parent_targets(
-            &state,
             &mut ability,
             Some(&event),
             EventContextSeedTiming::ResolutionFallback,
@@ -16464,6 +16500,71 @@ pub mod tests {
 
         assert_eq!(ability.targets, vec![TargetRef::Object(source)]);
         assert!(ability.target_incarnations.is_empty());
+    }
+
+    #[test]
+    fn stack_push_uses_event_incarnation_after_zone_change_reentry() {
+        let source = ObjectId(999);
+        let mut state = GameState::new_two_player(1);
+        let entered = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Entered".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&entered)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let mut entry_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, entered, Zone::Battlefield, &mut entry_events);
+        let event = entry_events
+            .iter()
+            .find(|event| matches!(event, GameEvent::ZoneChanged { .. }))
+            .expect("production entry emits a zone-change event");
+        let GameEvent::ZoneChanged { record, .. } = event else {
+            unreachable!();
+        };
+        let event_pin = ObjectIncarnationRef::of(
+            entered,
+            record
+                .entered_incarnation
+                .expect("battlefield entry records its destination incarnation"),
+        );
+
+        let mut later_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, entered, Zone::Exile, &mut later_events);
+        crate::game::zones::move_to_zone(&mut state, entered, Zone::Battlefield, &mut later_events);
+        assert_ne!(
+            ObjectIncarnationRef::from_object(&state.objects[&entered]),
+            event_pin
+        );
+
+        let mut ability = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::ParentTarget,
+            },
+            vec![TargetRef::Object(source)],
+            source,
+            PlayerId(0),
+        );
+        seed_event_context_parent_targets(
+            &mut ability,
+            Some(event),
+            EventContextSeedTiming::StackPush,
+        );
+        assert_eq!(ability.target_incarnations, vec![event_pin]);
+
+        seed_event_context_parent_targets(
+            &mut ability,
+            Some(event),
+            EventContextSeedTiming::ResolutionFallback,
+        );
+        assert_eq!(ability.target_incarnations, vec![event_pin]);
     }
 
     fn zone_changed_event(
