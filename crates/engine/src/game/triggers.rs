@@ -16567,6 +16567,101 @@ pub mod tests {
         assert_eq!(ability.target_incarnations, vec![event_pin]);
     }
 
+    #[test]
+    fn production_ltb_stack_push_pins_recorded_destination_incarnation() {
+        let mut state = GameState::new_two_player(1);
+        let angel = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Avenging Angel".to_string(),
+            Zone::Battlefield,
+        );
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.origin = Some(Zone::Battlefield);
+        trigger.destination = Some(Zone::Graveyard);
+        trigger.valid_card = Some(TargetFilter::SelfRef);
+        trigger.trigger_zones = vec![Zone::Graveyard];
+        trigger.execute = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::TargetOnly {
+                target: TargetFilter::ParentTarget,
+            },
+        )));
+        state
+            .objects
+            .get_mut(&angel)
+            .unwrap()
+            .trigger_definitions
+            .push(trigger);
+
+        let mut death_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, angel, Zone::Graveyard, &mut death_events);
+        let destination_pin = ObjectIncarnationRef::from_object(&state.objects[&angel]);
+        process_triggers(&mut state, &death_events);
+
+        let Some(StackEntryKind::TriggeredAbility { ability, .. }) =
+            state.stack.back().map(|entry| &entry.kind)
+        else {
+            panic!("production LTB trigger must reach the stack");
+        };
+        assert_eq!(ability.targets, vec![TargetRef::Object(angel)]);
+        assert_eq!(ability.target_incarnations, vec![destination_pin]);
+        assert!(destination_pin.is_current(&state));
+    }
+
+    #[test]
+    fn non_battlefield_zone_change_pin_rejects_later_same_id_incarnation() {
+        let source = ObjectId(999);
+        let mut state = GameState::new_two_player(1);
+        let object = make_creature(&mut state, PlayerId(0), "Departing", 2, 2);
+        let mut death_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, object, Zone::Graveyard, &mut death_events);
+        let event = death_events
+            .iter()
+            .find(|event| matches!(event, GameEvent::ZoneChanged { .. }))
+            .expect("production departure emits a zone-change event");
+        let destination_pin = ObjectIncarnationRef::from_object(&state.objects[&object]);
+
+        let mut reentry_events = Vec::new();
+        crate::game::zones::move_to_zone(
+            &mut state,
+            object,
+            Zone::Battlefield,
+            &mut reentry_events,
+        );
+        assert_ne!(
+            ObjectIncarnationRef::from_object(&state.objects[&object]),
+            destination_pin
+        );
+
+        let mut ability = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::ParentTarget,
+            },
+            vec![TargetRef::Object(source)],
+            source,
+            PlayerId(0),
+        );
+        seed_event_context_parent_targets(
+            &mut ability,
+            Some(event),
+            EventContextSeedTiming::StackPush,
+        );
+
+        assert_eq!(ability.targets, vec![TargetRef::Object(object)]);
+        assert_eq!(ability.target_incarnations, vec![destination_pin]);
+        assert!(
+            crate::game::targeting::resolved_targets(
+                &ability,
+                &TargetFilter::ParentTarget,
+                &state,
+            )
+            .is_empty(),
+            "the recorded graveyard object must not resolve to its later battlefield incarnation"
+        );
+    }
+
     fn zone_changed_event(
         object_id: ObjectId,
         from: Zone,
