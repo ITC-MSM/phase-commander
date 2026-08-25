@@ -868,7 +868,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Blazing Bomb
 - Blitzwing, Cruel Tormentor
 - Bloodletter of Aclazotz
-- Bloodline Recollector
 - Boing!
 - Bonehoard Dracosaur
 - Boreal Outrider
