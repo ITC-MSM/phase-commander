@@ -18339,6 +18339,24 @@ fn harsh_mentor_ability_activation_trigger_accepts_oxford_type_list() {
 
 // --- CR 606.2: "Whenever you activate a loyalty ability of [pw]" ---
 
+/// CR 606.2: Ajani Unrelenting's unqualified form accepts every loyalty
+/// ability activated by the source controller, so it carries no card filter.
+#[test]
+fn loyalty_ability_trigger_without_planeswalker_qualifier() {
+    let def = parse_trigger_line(
+        "Whenever you activate a loyalty ability, create a 2/2 colorless Wizard Soldier creature token named Cadet.",
+        "Ajani Unrelenting",
+    );
+    assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_card, None);
+    let execute = def.execute.as_ref().expect("execute ability present");
+    assert!(
+        !matches!(*execute.effect, Effect::Unimplemented { .. }),
+        "Ajani's Cadet effect should parse, got {:?}",
+        execute.effect
+    );
+}
+
 /// CR 606.2 + CR 205.3j: Chandra's Regulator — "a Chandra planeswalker"
 /// parses to a typed Planeswalker + Subtype("Chandra") filter on
 /// `valid_card`, mode `LoyaltyAbilityActivated`, and the effect is not
