@@ -30,6 +30,10 @@ fn rev_reveals_and_casts_the_opponents_facedown_exiled_card() {
         .add_spell_to_library_top(P1, "Opponent Zero-Cost Instant", true)
         .with_mana_cost(ManaCost::zero())
         .id();
+    let removal = scenario
+        .add_spell_to_hand_from_oracle(P0, "Rev Test Removal", true, "Destroy target creature.")
+        .with_mana_cost(ManaCost::zero())
+        .id();
     let expected_name = "Opponent Zero-Cost Instant";
 
     let mut runner = scenario.build();
@@ -96,7 +100,9 @@ fn rev_reveals_and_casts_the_opponents_facedown_exiled_card() {
         "Hidden Card"
     );
 
-    engine::game::zones::move_to_zone(runner.state_mut(), rev, Zone::Graveyard, &mut Vec::new());
+    runner.cast(removal).target_object(rev).resolve();
+    runner.advance_until_stack_empty();
+    assert_eq!(runner.state().objects[&rev].zone, Zone::Graveyard);
     assert_eq!(
         filter_state_for_viewer(runner.state(), P0).objects[&exiled].name,
         expected_name,

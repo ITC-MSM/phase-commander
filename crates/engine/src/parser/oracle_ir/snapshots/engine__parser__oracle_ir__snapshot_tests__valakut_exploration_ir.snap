@@ -149,7 +149,14 @@ expression: "&ir"
                           "id": 0
                         }
                       },
-                      "duration": null,
+                      "duration": {
+                        "ForAsLongAs": {
+                          "condition": {
+                            "type": "Unrecognized",
+                            "text": "it remains exiled"
+                          }
+                        }
+                      },
                       "sub_ability": null,
                       "distribute": null,
                       "multi_target": null,

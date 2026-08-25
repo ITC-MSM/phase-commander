@@ -40,7 +40,14 @@ expression: "&lowered"
           },
           "cost": null,
           "sub_ability": null,
-          "duration": null,
+          "duration": {
+            "ForAsLongAs": {
+              "condition": {
+                "type": "Unrecognized",
+                "text": "it remains exiled"
+              }
+            }
+          },
           "description": null,
           "target_prompt": null,
           "condition": null,
