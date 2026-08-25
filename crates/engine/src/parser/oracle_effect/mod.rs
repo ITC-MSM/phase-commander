@@ -13207,7 +13207,9 @@ fn parse_per_owner_exiled_this_way(i: &str) -> OracleResult<'_, ()> {
 ///   → [`PermissionGrantee::ParentTargetController`] (Expedited Inheritance).
 ///   The pronoun "they" refers to the parent effect's player target.
 fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
-    let lower = tp.lower;
+    let (permission_text, explicit_duration) = strip_trailing_duration(tp.original);
+    let permission_lower = permission_text.to_lowercase();
+    let lower = permission_lower.as_str();
 
     let grantee = if alt((
         tag::<_, _, OracleError<'_>>("for each of those cards, its owner may play it"),
@@ -13265,18 +13267,15 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
         return None;
     };
 
-    // CR 400.7i + CR 611.2a: "for as long as it remains exiled" persists until
+    // CR 611.2a: "for as long as it remains exiled" persists until
     // the exile-scoped permission is cleared on zone exit
     // (`zones::apply_zone_exit_cleanup`) — the same Permanent encoding the
     // impulse `try_parse_play_from_exile` path uses (Lightstall Inquisitor).
     // Otherwise default to UntilEndOfTurn (matches impulse-draw default).
-    let duration = if scan_contains_phrase(tp.lower, "remain exiled")
-        || scan_contains_phrase(tp.lower, "remains exiled")
-    {
-        Duration::Permanent
-    } else {
-        let (_, dur) = strip_trailing_duration(tp.original);
-        dur.unwrap_or(Duration::UntilEndOfTurn)
+    let duration = match explicit_duration {
+        Some(duration) if is_play_from_exile_lifetime_duration(&duration) => Duration::Permanent,
+        Some(duration) => duration,
+        None => Duration::UntilEndOfTurn,
     };
 
     Some(parsed_clause(Effect::GrantCastingPermission {

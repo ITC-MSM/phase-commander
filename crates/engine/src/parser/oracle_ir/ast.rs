@@ -1,6 +1,11 @@
+use nom::branch::alt;
+use nom::bytes::complete::tag;
+use nom::combinator::{all_consuming, value};
+use nom::Parser;
 use serde::Serialize;
 
 use crate::parser::oracle_nom::enters_under::ControlClausePossessor;
+use crate::parser::oracle_nom::error::OracleError;
 use crate::types::ability::MultiTargetSpec;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, BounceSelection,
@@ -1981,25 +1986,29 @@ pub(crate) fn with_clause_duration(
     clause
 }
 
+/// CR 611.2a: recognizes the complete duration conditions whose casting
+/// permission lasts exactly while the referenced object remains in exile.
 pub(crate) fn is_play_from_exile_lifetime_duration(duration: &Duration) -> bool {
-    matches!(
-        duration,
-        Duration::ForAsLongAs {
-            condition: StaticCondition::Unrecognized { text },
-        } if matches!(
-            text.as_str(),
-            "it remains exiled"
-                | "that card remains exiled"
-                | "those cards remain exiled"
-                | "they remain exiled"
-        )
-    )
+    let Duration::ForAsLongAs {
+        condition: StaticCondition::Unrecognized { text },
+    } = duration
+    else {
+        return false;
+    };
+    let parsed: nom::IResult<&str, (), OracleError<'_>> = all_consuming(alt((
+        value((), tag("it remains exiled")),
+        value((), tag("that card remains exiled")),
+        value((), tag("those cards remain exiled")),
+        value((), tag("they remain exiled")),
+    )))
+    .parse(text);
+    parsed.is_ok()
 }
 
 fn normalize_play_from_exile_duration(duration: Duration) -> Duration {
     match duration {
         duration if is_play_from_exile_lifetime_duration(&duration) => {
-            // CR 400.7i + CR 611.2a: exile-play permissions persist until the
+            // CR 611.2a: exile-play permissions persist until the
             // referenced object leaves exile; zone-exit cleanup removes the
             // object-tagged permission.
             Duration::Permanent

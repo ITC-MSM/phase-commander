@@ -45707,6 +45707,67 @@ fn unrelated_remains_exiled_text_cannot_extend_permission_duration() {
     ));
 }
 
+#[test]
+fn exile_lifetime_duration_requires_the_complete_supported_condition() {
+    for text in [
+        "it remains exiled",
+        "that card remains exiled",
+        "those cards remain exiled",
+        "they remain exiled",
+    ] {
+        let duration = Duration::ForAsLongAs {
+            condition: StaticCondition::Unrecognized {
+                text: text.to_string(),
+            },
+        };
+        assert!(
+            is_play_from_exile_lifetime_duration(&duration),
+            "expected supported exile-lifetime subject: {text}"
+        );
+    }
+
+    let unrelated_tail = Duration::ForAsLongAs {
+        condition: StaticCondition::Unrecognized {
+            text: "it remains exiled and another card remains exiled".to_string(),
+        },
+    };
+    assert!(
+        !is_play_from_exile_lifetime_duration(&unrelated_tail),
+        "unrelated trailing text must not be absorbed into the permission duration"
+    );
+}
+
+#[test]
+fn per_grantee_permission_owns_only_its_trailing_exile_duration() {
+    let valid = "may play that card for as long as it remains exiled";
+    let valid_clause = try_parse_per_grantee_play_grant(TextPair::new(valid, valid))
+        .expect("expected per-owner casting permission");
+    assert!(matches!(
+        valid_clause.effect,
+        Effect::GrantCastingPermission {
+            permission: CastingPermission::PlayFromExile {
+                duration: Duration::Permanent,
+                ..
+            },
+            ..
+        }
+    ));
+
+    let unrelated = "may play that card this turn, then another card remains exiled";
+    let unrelated_clause = try_parse_per_grantee_play_grant(TextPair::new(unrelated, unrelated))
+        .expect("expected existing per-owner permission classification");
+    assert!(matches!(
+        unrelated_clause.effect,
+        Effect::GrantCastingPermission {
+            permission: CastingPermission::PlayFromExile {
+                duration: Duration::UntilEndOfTurn,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
 /// Discriminating: the "for as long as it remains exiled, and mana of any
 /// type..." form (Blightwing Bandit class) must keep dispatching to
 /// `try_parse_exile_play_grant_with_any_mana` (duration `Permanent`), NOT be
