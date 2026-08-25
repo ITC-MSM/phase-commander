@@ -28537,6 +28537,36 @@ fn elder_brain_they_draw_binds_to_defending_player() {
         }
         other => panic!("expected Draw, got {other:?}"),
     }
+
+    use crate::types::identifiers::TrackedSetId;
+
+    let mut cursor = draw.sub_ability.as_deref();
+    let mut grant = None;
+    while let Some(link) = cursor {
+        if matches!(link.effect.as_ref(), Effect::GrantCastingPermission { .. }) {
+            grant = Some(link);
+            break;
+        }
+        cursor = link.sub_ability.as_deref();
+    }
+    let grant = grant.expect("the plural exile-play permission must remain in the effect chain");
+    assert!(
+        matches!(
+            grant.effect.as_ref(),
+            Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile {
+                    duration: Duration::Permanent,
+                    ..
+                },
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+                ..
+            }
+        ),
+        "expected a permanent plural PlayFromExile grant on the tracked cards, got {:?}",
+        grant.effect
+    );
 }
 
 #[test]
