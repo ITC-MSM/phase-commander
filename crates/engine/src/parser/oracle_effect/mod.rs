@@ -13634,10 +13634,13 @@ fn try_parse_play_from_exile(tp: TextPair, ctx: &ParseContext) -> Option<ParsedE
         if look_at_play_anaphor_form || mass_anaphor_form {
             // fall through to the grant builder.
         } else {
-            // Only match when temporal context exists ("this turn", "until"),
-            // otherwise it's a CastFromZone, not impulse draw permission.
+            // Only match when temporal context exists ("this turn", "until",
+            // or a remains-exiled lifetime), otherwise it's a CastFromZone,
+            // not impulse draw permission.
             let has_temporal = scan_contains_phrase(tp.lower, "this turn")
-                || scan_contains_phrase(tp.lower, "until ");
+                || scan_contains_phrase(tp.lower, "until ")
+                || scan_contains_phrase(tp.lower, "remain exiled")
+                || scan_contains_phrase(tp.lower, "remains exiled");
             if !has_temporal {
                 return None;
             }
