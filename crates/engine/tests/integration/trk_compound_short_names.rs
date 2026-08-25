@@ -13,7 +13,6 @@ use engine::types::ability::{
     TypeFilter,
 };
 use engine::types::actions::GameAction;
-use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
@@ -204,27 +203,42 @@ fn kirk_attacks_branch_offers_the_same_live_modal_choice() {
 fn janeway_other_creature_entry_explores_that_creature() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_library_top(P0, &["Forest", "Library Bottom"]);
-    scenario.add_creature_from_oracle(P0, "Captain Kathryn Janeway", 2, 3, JANEWAY_ORACLE);
+    let nonland = scenario
+        .add_spell_to_library_top(P0, "Explore Probe", true)
+        .id();
+    let janeway = scenario
+        .add_creature_from_oracle(P0, "Captain Kathryn Janeway", 2, 3, JANEWAY_ORACLE)
+        .id();
     let explorer = scenario.add_creature_to_hand(P0, "Away Team", 2, 2).id();
     let mut runner = scenario.build();
-    let forest = runner.state().players[P0.0 as usize].library[0];
-    {
-        let top = runner.state_mut().objects.get_mut(&forest).expect("Forest");
-        top.card_types.core_types.push(CoreType::Land);
-        top.base_card_types = top.card_types.clone();
-    }
 
     runner.cast(explorer).resolve();
 
-    assert_eq!(runner.state().objects[&forest].zone, Zone::Hand);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::DigChoice { ref cards, .. } if cards == &vec![nonland]
+    ));
+    runner
+        .act(GameAction::SelectCards { cards: vec![] })
+        .expect("put the explored nonland into the graveyard");
+
+    assert_eq!(runner.state().objects[&nonland].zone, Zone::Graveyard);
     assert_eq!(
         runner.state().objects[&explorer]
             .counters
             .values()
             .copied()
             .sum::<u32>(),
+        1,
+        "the entering Away Team must receive the explore counter"
+    );
+    assert_eq!(
+        runner.state().objects[&janeway]
+            .counters
+            .values()
+            .copied()
+            .sum::<u32>(),
         0,
-        "a land reveal moves to hand without adding an explore counter"
+        "Janeway must not receive Away Team's explore counter"
     );
 }

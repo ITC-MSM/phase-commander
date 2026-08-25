@@ -7402,12 +7402,14 @@ pub(crate) fn seed_batched_attack_parent_targets(
         .collect();
 }
 
-/// CR 608.2c + CR 702.184a/702.122/702.171: Stationed/VehicleCrewed/Saddled
+/// CR 603.6 + CR 608.2c + CR 702.184a/702.122/702.171: Zone-change and
+/// Stationed/VehicleCrewed/Saddled
 /// triggers whose effect anaphorically binds `ParentTarget` ("that creature",
 /// "that Vehicle", "that Mount") inherit the event referent as propagated
 /// targets at stack-push time — mirroring `seed_batched_attack_parent_targets`
 /// for attack batches — so resolution does not depend on a live
-/// `current_trigger_event`.
+/// `current_trigger_event`. CR 603.6 specifically authorizes zone-change
+/// abilities to find and affect the object after it changes zones.
 fn parent_target_seeding_blocked(ability: &ResolvedAbility) -> bool {
     if ability.targets.is_empty() {
         return false;
@@ -7421,6 +7423,7 @@ fn parent_target_seeding_blocked(ability: &ResolvedAbility) -> bool {
 }
 
 pub(crate) fn seed_event_context_parent_targets(
+    state: &GameState,
     ability: &mut ResolvedAbility,
     trigger_event: Option<&GameEvent>,
 ) {
@@ -7430,14 +7433,28 @@ pub(crate) fn seed_event_context_parent_targets(
     if !effect_uses_parent_target(&ability.effect) || parent_target_seeding_blocked(ability) {
         return;
     }
-    let parent_id = match event {
-        GameEvent::Stationed { creature_id, .. } => Some(*creature_id),
-        GameEvent::VehicleCrewed { vehicle_id, .. } => Some(*vehicle_id),
-        GameEvent::Saddled { mount_id, .. } => Some(*mount_id),
-        _ => None,
+    let (parent_id, pin_zone_change_referent) = match event {
+        GameEvent::ZoneChanged { object_id, .. } => (Some(*object_id), true),
+        GameEvent::Stationed { creature_id, .. } => (Some(*creature_id), false),
+        GameEvent::VehicleCrewed { vehicle_id, .. } => (Some(*vehicle_id), false),
+        GameEvent::Saddled { mount_id, .. } => (Some(*mount_id), false),
+        _ => (None, false),
     };
     if let Some(id) = parent_id {
         ability.targets = vec![TargetRef::Object(id)];
+        // CR 400.7 + CR 603.6: a zone-change trigger refers to the exact
+        // post-change object. Pin that incarnation so leaving the destination
+        // zone and returning before resolution cannot retarget the ability to
+        // the new object that reuses the same storage id.
+        if pin_zone_change_referent && ability.target_incarnations.is_empty() {
+            let pins = state
+                .objects
+                .get(&id)
+                .map(ObjectIncarnationRef::from_object)
+                .into_iter()
+                .collect();
+            ability.set_target_incarnations_recursive(pins);
+        }
     }
 }
 
@@ -7536,7 +7553,7 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
     let event_attacker = event_attacker_from_trigger_event(state, trigger_event.as_ref());
     ability.bind_force_block_attacker_recursive(event_attacker);
     seed_batched_attack_parent_targets(&mut ability, trigger_event.as_ref());
-    seed_event_context_parent_targets(&mut ability, trigger_event.as_ref());
+    seed_event_context_parent_targets(state, &mut ability, trigger_event.as_ref());
 
     let entry_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;
@@ -16348,8 +16365,37 @@ pub mod tests {
             creature_id: creature,
             counters_added: 1,
         };
-        seed_event_context_parent_targets(&mut ability, Some(&event));
+        let state = GameState::new_two_player(1);
+        seed_event_context_parent_targets(&state, &mut ability, Some(&event));
         assert_eq!(ability.targets, vec![TargetRef::Object(creature)]);
+    }
+
+    #[test]
+    fn seed_event_context_parent_targets_binds_zone_changed_object() {
+        let source = ObjectId(999);
+        let mut state = GameState::new_two_player(1);
+        let entered = make_creature(&mut state, PlayerId(0), "Entered", 2, 2);
+        let entered_pin = ObjectIncarnationRef::from_object(&state.objects[&entered]);
+        let mut ability = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::ParentTarget,
+            },
+            vec![TargetRef::Object(source)],
+            source,
+            PlayerId(0),
+        );
+        let event = zone_changed_event(
+            entered,
+            Zone::Hand,
+            Zone::Battlefield,
+            vec![CoreType::Creature],
+            vec![],
+        );
+
+        seed_event_context_parent_targets(&state, &mut ability, Some(&event));
+
+        assert_eq!(ability.targets, vec![TargetRef::Object(entered)]);
+        assert_eq!(ability.target_incarnations, vec![entered_pin]);
     }
 
     fn zone_changed_event(

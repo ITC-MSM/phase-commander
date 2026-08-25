@@ -1415,17 +1415,22 @@ pub fn has_unconsumed_conditional(text: &str) -> bool {
 /// For comma-form names, the short self-reference is the span before the comma
 /// after removing MTGJSON's structural Alchemy `A-` prefix.
 pub(crate) fn comma_short_self_name(card_name: &str) -> Option<&str> {
-    let effective_name = if card_name.as_bytes().get(0..2) == Some(b"A-") {
-        &card_name[2..]
-    } else {
-        card_name
-    };
+    let effective_name = alchemy_effective_name(card_name);
     let (_, (short_name, _)) = nom_primitives::split_once_on(effective_name, ", ").ok()?;
     if short_name.len() >= 2 {
         Some(short_name)
     } else {
         None
     }
+}
+
+/// Remove MTGJSON's structural Alchemy prefix while accepting either casing.
+fn alchemy_effective_name(card_name: &str) -> &str {
+    card_name
+        .get(..2)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("A-"))
+        .and_then(|_| card_name.get(2..))
+        .unwrap_or(card_name)
 }
 
 /// CR 201.5c: derive the printed first-and-last-word short name used by some
@@ -1437,11 +1442,7 @@ pub(crate) fn comma_short_self_name(card_name: &str) -> Option<&str> {
 /// labels such as "The Minstrel's Ballad" for "The Wandering Minstrel"
 /// (CR 207.2c–d) while keeping the rule independent of any individual card.
 fn compound_short_self_name(card_name: &str) -> Option<String> {
-    let effective_name = if card_name.as_bytes().get(0..2) == Some(b"A-") {
-        &card_name[2..]
-    } else {
-        card_name
-    };
+    let effective_name = alchemy_effective_name(card_name);
     let words: Vec<&str> = effective_name.split_whitespace().collect();
     if comma_short_self_name(card_name).is_some() || words.contains(&"//") || words.len() < 3 {
         return None;
@@ -2176,7 +2177,7 @@ fn mask_granting_self_reference_in_quotes(text: &str, card_name: &str) -> String
     // before `~` normalization (mirrors `mask_card_name_keyword_action`), not
     // parsing dispatch.
     // allow-noncombinator: strip MTGJSON A- prefix (structural, mirrors normalize_card_name_refs)
-    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    let effective_name = alchemy_effective_name(card_name);
     // (name, case_sensitive). Multi-word / comma-short are case-insensitive
     // (proper nouns); a single-word name is matched case-sensitively so it only
     // hits the capitalized card-name occurrence — mirroring
@@ -2305,7 +2306,7 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     };
     let (text, card_named_originals) = mask_card_named_literal_spans(&text);
     // Strip A- prefix (Alchemy rebalanced cards in MTGJSON)
-    let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
+    let effective_name = alchemy_effective_name(card_name);
 
     // Alchemy rebalanced cards (CR n/a — MTGJSON convention): the Oracle
     // text often references the prefixed name literally ("Return A-~ from

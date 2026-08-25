@@ -15154,6 +15154,17 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_for_matching_strips_lowercase_alchemy_prefix() {
+        assert_eq!(
+            normalize_for_matching(
+                "whenever sprouting goblin attacks, create a token.",
+                "a-sprouting goblin",
+            ),
+            "whenever ~ attacks, create a token."
+        );
+    }
+
+    #[test]
     fn test_audit_treats_firebending_as_keyword_line() {
         assert!(is_keyword_line(
             "firebending x, where x is this creature's power."
