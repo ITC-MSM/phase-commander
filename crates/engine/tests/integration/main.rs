@@ -1083,6 +1083,7 @@ mod total_war_attacking_player_scope;
 mod tracked_set_anaphor_quantity_binds;
 mod treasured_find_regression;
 mod trespassers_curse_enchanted_player_trigger;
+mod trk_compound_short_names;
 mod true_conviction_double_keyword_grant;
 mod turn_based_draw_step_miracle_offer;
 mod turn_control_priority_softlock;
