@@ -66,6 +66,7 @@ mod bbfu10_entered_this_turn_snapshot;
 mod bbfu7_attacks_if_able_not_goad;
 mod belbe_thornbow_life_loss;
 mod betor_lifelink_counters_repro;
+mod bilbo_fellow_conspirator_token_replacement;
 mod birgi;
 mod bishop_of_binding_where_x_exiled_card_power;
 mod black_bolt_lethal_voice_destroys_triggering_opponents_permanent;
