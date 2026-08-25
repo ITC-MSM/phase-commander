@@ -1044,6 +1044,17 @@ fn def_tree_has_unimplemented(def: &AbilityDefinition) -> bool {
     if matches!(*def.effect, Effect::Unimplemented { .. }) {
         return true;
     }
+    if let Effect::Token {
+        static_abilities, ..
+    } = &*def.effect
+    {
+        if static_abilities
+            .iter()
+            .any(static_definition_has_unimplemented)
+        {
+            return true;
+        }
+    }
     if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
         if def_tree_has_unimplemented(effect) {
             return true;
@@ -5536,6 +5547,20 @@ mod tests {
         assert!(
             !effect_has_internal_optionality(create.effect.as_ref()),
             "a mandatory granted trigger must not become optional"
+        );
+    }
+
+    #[test]
+    fn token_granted_unimplemented_trigger_is_reached_by_def_tree_walker() {
+        let parsed = parse(
+            "Create a 1/1 green Minion creature token named Moloid with \"Whenever this token attacks, perform an impossible action.\"",
+            &["Sorcery"],
+        );
+        let create = parsed.abilities.first().expect("token creation ability");
+
+        assert!(
+            def_tree_has_unimplemented(create),
+            "Token.static_abilities -> GrantTrigger -> execute must expose nested Unimplemented: {create:#?}"
         );
     }
 
