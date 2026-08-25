@@ -282,9 +282,9 @@ fn tallyman_instead_branch_preserves_draw_and_life_loss_chains() {
     ));
 }
 
-/// CR 614.6 + CR 608.2c: every instruction in the seven-death `instead`
-/// branch replaces the printed one-card/one-life chain. This drives the real
-/// trigger and resolution pipeline and asserts both instructions in the branch.
+/// CR 608.2c: the seven-death condition selects the printed `instead` branch
+/// while the ability resolves. This drives the real trigger and resolution
+/// pipeline and asserts both instructions in the selected branch.
 #[test]
 fn tallyman_seven_deaths_draws_seven_and_loses_seven_life() {
     let (mut runner, source) = setup_tallyman(7);
@@ -299,8 +299,8 @@ fn tallyman_seven_deaths_draws_seven_and_loses_seven_life() {
     assert_eq!(life_total(&runner, P0), life_before - 7);
 }
 
-/// CR 614.6: below seven deaths, no instruction from the `instead` branch may
-/// run. This is the negative discriminator for the seven-death runtime witness:
+/// CR 608.2c: below seven deaths, resolution follows the base instructions and
+/// does not select the printed `instead` branch. This is the negative witness:
 /// an `and` tail peeled into an unconditional sibling loses 7 life here.
 #[test]
 fn tallyman_one_death_keeps_the_one_card_one_life_base_branch() {
