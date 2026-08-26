@@ -217,6 +217,10 @@ fn full_card_can_decline_without_exiling_either_alternative() {
     assert_eq!(zone_of(&runner, cloak), Zone::Battlefield);
     assert_eq!(zone_of(&runner, prey), Zone::Battlefield);
     assert_eq!(zone_of(&runner, hand_card), Zone::Hand);
+    assert!(
+        runner.state().public_revealed_cards.contains(&hand_card),
+        "the chosen opponent's hand must be revealed through ParentTargetSlot 0"
+    );
     assert!(runner.state().exile_links.is_empty());
 }
 

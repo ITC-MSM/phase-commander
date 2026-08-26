@@ -11889,7 +11889,7 @@ mod tests {
             })
             .and_then(|trigger| trigger.execute.as_deref())
             .expect("Great Aerie chaos trigger");
-        let ability = build_resolved_from_def(definition, source, PlayerId(0));
+        let mut ability = build_resolved_from_def(definition, source, PlayerId(0));
         let slots = build_target_slots(&state, &ability).expect("two optional target slots");
 
         assert_eq!(slots.len(), 2);
@@ -11914,13 +11914,18 @@ mod tests {
         };
 
         assert_eq!(selected, vec![None, None]);
+        assign_selected_slots_in_chain(&state, &mut ability, &selected)
+            .expect("both omitted slots must assign without inventing targets");
+        let mut events = Vec::new();
+        crate::game::effects::resolve_ability_chain(&mut state, &ability, &mut events, 0)
+            .expect("Great Aerie must resolve after both optional targets are skipped");
         assert_eq!(
             [
                 state.objects[&yours].damage_marked,
                 state.objects[&opponents].damage_marked,
             ],
             damage_before,
-            "target announcement must not mutate either creature"
+            "zero-target resolution must not mutate either creature"
         );
     }
 

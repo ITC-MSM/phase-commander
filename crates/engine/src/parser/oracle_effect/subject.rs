@@ -3728,12 +3728,7 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     for (index, slot) in ctx.declared_target_slots.iter().enumerate() {
         let is_player = match slot {
             TargetFilter::Player | TargetFilter::Opponent => true,
-            TargetFilter::Typed(TypedFilter {
-                type_filters,
-                properties,
-                ..
-            }) => type_filters.is_empty() && properties.is_empty(),
-            _ => false,
+            filter => filter.is_player_scope(),
         };
         if is_player {
             if declared_player_slot.is_some() {
@@ -7006,6 +7001,32 @@ mod tests {
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::statics::BlockExceptionKind;
+
+    #[test]
+    fn they_ignores_controllerless_empty_typed_target_slot() {
+        let mut only_empty = ParseContext {
+            declared_target_slots: vec![TargetFilter::Typed(TypedFilter::default())],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_they_pronoun(&mut only_empty),
+            TargetFilter::ParentTarget,
+            "an empty object filter must not masquerade as a player slot"
+        );
+
+        let mut with_opponent = ParseContext {
+            declared_target_slots: vec![
+                TargetFilter::Typed(TypedFilter::default()),
+                TargetFilter::Opponent,
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_they_pronoun(&mut with_opponent),
+            TargetFilter::ParentTargetSlot { index: 1 },
+            "the sole genuine player slot must remain unambiguous"
+        );
+    }
 
     /// CR 105.3 + CR 106.1a: "becomes that color" (Foraging Wickermaw) maps to the
     /// same `AddChosenColor` reader as "the chosen color" (Puca's Eye) — only the
