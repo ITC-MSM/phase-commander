@@ -2008,7 +2008,7 @@ pub(crate) fn is_play_from_exile_lifetime_duration(duration: &Duration) -> bool 
 fn normalize_play_from_exile_duration(duration: Duration) -> Duration {
     match duration {
         duration if is_play_from_exile_lifetime_duration(&duration) => {
-            // CR 611.2a: exile-play permissions persist until the
+            // CR 400.7i + CR 611.2a: exile-play permissions persist until the
             // referenced object leaves exile; zone-exit cleanup removes the
             // object-tagged permission.
             Duration::Permanent
