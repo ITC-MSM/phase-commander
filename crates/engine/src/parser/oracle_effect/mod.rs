@@ -27663,22 +27663,24 @@ pub(super) fn classify_bare_card_aggregate_publisher(
 fn classify_latest_bare_card_publisher_in_ability(
     def: &AbilityDefinition,
 ) -> Option<BareCardAggregatePublisher> {
-    let sub = def
+    let primary = def
         .sub_ability
         .as_deref()
-        .and_then(classify_latest_bare_card_publisher_in_ability);
-    let branch = if let Some(else_def) = def.else_ability.as_deref() {
-        let alternate = classify_latest_bare_card_publisher_in_ability(else_def);
-        match (sub, alternate) {
-            (Some(a), Some(b)) if a == b => Some(a),
-            // A producer on only one branch, or different producers across
-            // branches, cannot establish one unambiguous antecedent.
-            _ => Some(BareCardAggregatePublisher::TerminalUnsupported),
-        }
-    } else {
-        sub
+        .and_then(classify_latest_bare_card_publisher_in_ability)
+        .or_else(|| classify_bare_card_aggregate_publisher(&def.effect));
+    let Some(alternate) = def.else_ability.as_deref() else {
+        return primary;
     };
-    branch.or_else(|| classify_bare_card_aggregate_publisher(&def.effect))
+    match (
+        primary,
+        classify_latest_bare_card_publisher_in_ability(alternate),
+    ) {
+        (None, None) => None,
+        (Some(a), Some(b)) if a == b => Some(a),
+        (Some(_), None) | (None, Some(_)) | (Some(_), Some(_)) => {
+            Some(BareCardAggregatePublisher::TerminalUnsupported)
+        }
+    }
 }
 
 fn classify_latest_bare_card_publisher_in_clause(
