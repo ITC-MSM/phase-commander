@@ -27627,6 +27627,70 @@ fn publishes_aggregate_set_from_resolution(effect: &Effect) -> bool {
     publishes_tracked_set_from_resolution(effect) || matches!(effect, Effect::Sacrifice { .. })
 }
 
+/// CR 608.2c: Classification used only for the bare card-set surface "those
+/// cards". Mill and discard establish the cards that surface names. Any nearer
+/// producer from the existing aggregate-set authority blocks an older mill or
+/// discard without changing the broad binding rules for other anaphora.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BareCardAggregatePublisher {
+    ChainSetCompatible,
+    EventFallbackBarrier,
+    TerminalUnsupported,
+}
+
+pub(super) fn classify_bare_card_aggregate_publisher(
+    effect: &Effect,
+) -> Option<BareCardAggregatePublisher> {
+    if matches!(
+        effect,
+        Effect::Mill { .. } | Effect::Discard { .. } | Effect::DiscardCard { .. }
+    ) {
+        Some(BareCardAggregatePublisher::ChainSetCompatible)
+    } else if is_token_creating_effect(effect) {
+        Some(BareCardAggregatePublisher::EventFallbackBarrier)
+    } else if publishes_aggregate_set_from_resolution(effect)
+        || matches!(
+            effect,
+            Effect::TargetOnly { .. } | Effect::ChooseObjectsIntoTrackedSet { .. }
+        )
+    {
+        Some(BareCardAggregatePublisher::TerminalUnsupported)
+    } else {
+        None
+    }
+}
+
+fn classify_latest_bare_card_publisher_in_ability(
+    def: &AbilityDefinition,
+) -> Option<BareCardAggregatePublisher> {
+    let sub = def
+        .sub_ability
+        .as_deref()
+        .and_then(classify_latest_bare_card_publisher_in_ability);
+    let branch = if let Some(else_def) = def.else_ability.as_deref() {
+        let alternate = classify_latest_bare_card_publisher_in_ability(else_def);
+        match (sub, alternate) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            // A producer on only one branch, or different producers across
+            // branches, cannot establish one unambiguous antecedent.
+            _ => Some(BareCardAggregatePublisher::TerminalUnsupported),
+        }
+    } else {
+        sub
+    };
+    branch.or_else(|| classify_bare_card_aggregate_publisher(&def.effect))
+}
+
+fn classify_latest_bare_card_publisher_in_clause(
+    clause: &ParsedEffectClause,
+) -> Option<BareCardAggregatePublisher> {
+    clause
+        .sub_ability
+        .as_deref()
+        .and_then(classify_latest_bare_card_publisher_in_ability)
+        .or_else(|| classify_bare_card_aggregate_publisher(&clause.effect))
+}
+
 /// CR 608.2c: Re-anchor a batched set-anaphor aggregate to the CHAIN-published
 /// set.
 ///
@@ -28772,6 +28836,19 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
     }
 
     each_quantity_expr_mut(&mut def.effect, &mut rewrite_quantity_expr);
+    // CR 109.5 + CR 608.2c: The reflexive conditional parser represents "If
+    // that player doesn't" with the same typed Not(OptionalEffectPerformed)
+    // gate as the explicit per-opponent decline surfaces. Reuse their shared
+    // recipient authority here: inside the scoped iteration, "you" remains
+    // the printed ability controller while "that player" remains the scoped
+    // opponent. The structural gate keeps unrelated scoped effects untouched.
+    if def
+        .condition
+        .as_ref()
+        .is_some_and(AbilityCondition::is_not_optional_effect_performed)
+    {
+        rebind_decline_body_recipient(&mut def.effect);
+    }
     // CR 608.2 + CR 109.5: Rebind actor-default `You` controllers to
     // `ScopedPlayer` for each-*player* iterations only. Each-opponent scopes
     // keep `You` so optional opponent-choice sacrifices ("permanent of their
@@ -33372,6 +33449,19 @@ pub(crate) fn parse_effect_chain_ir(
                 sequence::parse_token_source_power_toughness_followup(next_text)
             })
             .map(|(power, toughness)| TokenPtFollowup::PowerToughness { power, toughness });
+        let nearest_bare_card_publisher = builder
+            .clauses()
+            .iter()
+            .rev()
+            .find_map(|clause| classify_latest_bare_card_publisher_in_clause(&clause.parsed));
+        let bare_card_aggregate_source = match nearest_bare_card_publisher {
+            Some(BareCardAggregatePublisher::ChainSetCompatible) => {
+                Some(TrackedAnaphorSource::ChainSet)
+            }
+            Some(BareCardAggregatePublisher::EventFallbackBarrier)
+            | Some(BareCardAggregatePublisher::TerminalUnsupported)
+            | None => None,
+        };
         let mut chunk_ctx = ParseContext {
             subject: chunk_subject,
             card_name: ctx.card_name.clone(),
@@ -33510,6 +33600,7 @@ pub(crate) fn parse_effect_chain_ir(
             // player" on Ghyrson) bind to the triggering event instead of being
             // reparsed as ordinary target phrases.
             in_trigger: ctx.in_trigger,
+            bare_card_aggregate_source,
             // CR 701.42a: propagate the staged meld partner so a reflexive
             // "exile them, then meld them into R" sub-clause parsed inside this
             // chunk (Vanille's "If you do, …" body, which chunks to a single

@@ -18,6 +18,224 @@ use crate::types::card_type::CoreType;
 use crate::types::mana::{ManaCost, ManaCostShard};
 use crate::types::statics::CostModifyMode;
 
+fn assert_tracked_mana_value_source(def: &AbilityDefinition, expected: TrackedAnaphorSource) {
+    let Effect::LoseLife { amount, .. } = def.effect.as_ref() else {
+        panic!("expected LoseLife, got {:?}", def.effect);
+    };
+    assert!(matches!(
+        amount,
+        QuantityExpr::Ref {
+            qty: QuantityRef::TrackedSetAggregate {
+                function: AggregateFunction::Sum,
+                property: ObjectProperty::ManaValue,
+                source,
+            }
+        } if *source == expected
+    ));
+}
+
+#[test]
+fn mill_and_discard_bind_bare_cards_aggregate_to_chain_set() {
+    for producer in ["mill three cards", "discard a card"] {
+        let def = parse_effect_chain(
+            &format!("{producer}, then lose life equal to the total mana value of those cards"),
+            AbilityKind::Spell,
+        );
+        let life_loss = def.sub_ability.as_deref().expect("life-loss continuation");
+        assert_tracked_mana_value_source(life_loss, TrackedAnaphorSource::ChainSet);
+    }
+}
+
+#[test]
+fn nearer_token_blocks_bare_cards_rebind_from_older_mill() {
+    let def = parse_effect_chain(
+        "mill three cards, then create a 1/1 green Insect creature token, then lose life equal to the total mana value of those cards",
+        AbilityKind::Spell,
+    );
+    let token = def.sub_ability.as_deref().expect("token continuation");
+    let aggregate = token
+        .sub_ability
+        .as_deref()
+        .expect("aggregate continuation");
+    assert!(matches!(
+        aggregate.effect.as_ref(),
+        Effect::Unimplemented { .. }
+    ));
+}
+
+#[test]
+fn nontrigger_bare_cards_without_publisher_stays_honest_gap() {
+    let def = parse_effect_chain(
+        "lose life equal to the total mana value of those cards",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(def.effect.as_ref(), Effect::Unimplemented { .. }));
+}
+
+#[test]
+fn scoped_reflexive_decline_preserves_controller_and_opponent_recipients() {
+    let decline_condition = || AbilityCondition::Not {
+        condition: Box::new(AbilityCondition::effect_performed()),
+    };
+    let lose = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: Some(TargetFilter::TriggeringPlayer),
+        },
+    )
+    .condition(decline_condition());
+    let mill = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Mill {
+            count: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::Controller,
+            destination: Zone::Graveyard,
+        },
+    )
+    .condition(decline_condition())
+    .sub_ability(lose);
+    let mut def = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::ScopedPlayer,
+        },
+    )
+    .player_scope(PlayerFilter::Opponent)
+    .sub_ability(mill);
+
+    apply_player_scope_rewrites(&mut def);
+
+    assert!(matches!(
+        def.effect.as_ref(),
+        Effect::Draw {
+            target: TargetFilter::ScopedPlayer,
+            ..
+        }
+    ));
+    let mill = def.sub_ability.as_deref().expect("decline mill");
+    assert!(matches!(
+        mill.effect.as_ref(),
+        Effect::Mill {
+            target: TargetFilter::OriginalController,
+            ..
+        }
+    ));
+    assert!(matches!(
+        mill.sub_ability
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::LoseLife {
+            target: Some(TargetFilter::ScopedPlayer),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scoped_decline_does_not_rebind_an_already_scoped_recipient() {
+    let decline = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Mill {
+            count: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::ScopedPlayer,
+            destination: Zone::Graveyard,
+        },
+    )
+    .condition(AbilityCondition::Not {
+        condition: Box::new(AbilityCondition::effect_performed()),
+    });
+    let mut def = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::ScopedPlayer,
+        },
+    )
+    .player_scope(PlayerFilter::Opponent)
+    .sub_ability(decline);
+
+    apply_player_scope_rewrites(&mut def);
+
+    assert!(matches!(
+        def.sub_ability
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::Mill {
+            target: TargetFilter::ScopedPlayer,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn scoped_decline_damage_rebinds_triggering_player_to_scoped_player() {
+    let damage = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: TargetFilter::TriggeringPlayer,
+            damage_source: None,
+            excess: None,
+        },
+    )
+    .condition(AbilityCondition::Not {
+        condition: Box::new(AbilityCondition::effect_performed()),
+    });
+    let mut def = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::ScopedPlayer,
+        },
+    )
+    .player_scope(PlayerFilter::Opponent)
+    .sub_ability(damage);
+
+    apply_player_scope_rewrites(&mut def);
+
+    assert!(matches!(
+        def.sub_ability
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::DealDamage {
+            target: TargetFilter::ScopedPlayer,
+            amount: QuantityExpr::Fixed { value: 3 },
+            damage_source: None,
+            excess: None,
+        })
+    ));
+}
+
+#[test]
+fn unscoped_decline_damage_keeps_triggering_player() {
+    let mut def = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: TargetFilter::TriggeringPlayer,
+            damage_source: None,
+            excess: None,
+        },
+    )
+    .condition(AbilityCondition::Not {
+        condition: Box::new(AbilityCondition::effect_performed()),
+    });
+
+    apply_player_scope_rewrites(&mut def);
+
+    assert!(matches!(
+        def.effect.as_ref(),
+        Effect::DealDamage {
+            target: TargetFilter::TriggeringPlayer,
+            amount: QuantityExpr::Fixed { value: 3 },
+            damage_source: None,
+            excess: None,
+        }
+    ));
+}
+
 /// CR 615.5: `each_target_filter_mut` must NEVER visit `Effect::Shuffle`.
 /// Several callers rewrite `TriggeringPlayer` / `ParentTargetController` /
 /// `ParentTarget` (exactly the refs a `Shuffle` carries); visiting `Shuffle`
