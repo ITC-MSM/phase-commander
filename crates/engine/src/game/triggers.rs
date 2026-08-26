@@ -16622,19 +16622,6 @@ pub mod tests {
             .find(|event| matches!(event, GameEvent::ZoneChanged { .. }))
             .expect("production departure emits a zone-change event");
         let destination_pin = ObjectIncarnationRef::from_object(&state.objects[&object]);
-
-        let mut reentry_events = Vec::new();
-        crate::game::zones::move_to_zone(
-            &mut state,
-            object,
-            Zone::Battlefield,
-            &mut reentry_events,
-        );
-        assert_ne!(
-            ObjectIncarnationRef::from_object(&state.objects[&object]),
-            destination_pin
-        );
-
         let mut ability = ResolvedAbility::new(
             Effect::TargetOnly {
                 target: TargetFilter::ParentTarget,
@@ -16651,6 +16638,23 @@ pub mod tests {
 
         assert_eq!(ability.targets, vec![TargetRef::Object(object)]);
         assert_eq!(ability.target_incarnations, vec![destination_pin]);
+        assert_eq!(
+            crate::game::targeting::resolved_targets(&ability, &TargetFilter::ParentTarget, &state,),
+            vec![TargetRef::Object(object)],
+            "the record-owned pre-change incarnation + 1 must name the graveyard object"
+        );
+
+        let mut reentry_events = Vec::new();
+        crate::game::zones::move_to_zone(
+            &mut state,
+            object,
+            Zone::Battlefield,
+            &mut reentry_events,
+        );
+        assert_ne!(
+            ObjectIncarnationRef::from_object(&state.objects[&object]),
+            destination_pin
+        );
         assert!(
             crate::game::targeting::resolved_targets(
                 &ability,
