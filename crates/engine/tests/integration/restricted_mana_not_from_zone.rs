@@ -15,11 +15,15 @@
 //! prohibition makes the corresponding hand/non-hand and non-cast assertions
 //! flip.
 
-use engine::types::identifiers::ObjectId;
+use engine::game::scenario::{GameScenario, P0};
+use engine::game::zones::create_object;
+use engine::types::card_type::{CoreType, Supertype};
+use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{
-    ActivationManaColorConstraint, ManaPool, ManaRestriction, ManaType, ManaUnit, PaymentContext,
-    SpecialAction, SpellMeta, ZoneSpend, ZoneSpendPolarity,
+    ActivationManaColorConstraint, ManaCost, ManaPool, ManaRestriction, ManaType, ManaUnit,
+    PaymentContext, SpecialAction, SpellMeta, ZoneSpend, ZoneSpendPolarity,
 };
+use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
 /// Mm'menon, the Right Hand: spend only to cast a spell from anywhere other than
@@ -194,6 +198,63 @@ fn karolina_restriction_is_a_narrow_cast_prohibition() {
             "Karolina's prohibition must not reject {action:?}"
         );
     }
+}
+
+#[test]
+fn karolina_restriction_drives_the_production_cast_payment_pipeline() {
+    let build_game = |zone, commander| {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let mut game = scenario.build();
+        let state = game.state_mut();
+        state.format_config.command_zone = commander;
+
+        let spell = create_object(
+            state,
+            CardId(if commander { 9_102 } else { 9_101 }),
+            P0,
+            "Restricted Mana Cast Probe".to_string(),
+            zone,
+        );
+        let object = state.objects.get_mut(&spell).unwrap();
+        object.card_types.core_types.push(CoreType::Creature);
+        object.mana_cost = ManaCost::generic(1);
+        if commander {
+            object.card_types.supertypes.push(Supertype::Legendary);
+            object.is_commander = true;
+        }
+
+        state
+            .players
+            .iter_mut()
+            .find(|player| player.id == P0)
+            .unwrap()
+            .mana_pool
+            .add(ManaUnit::new(
+                ManaType::White,
+                ObjectId(1),
+                false,
+                vec![cannot_cast_from_hand_restriction()],
+            ));
+        (game, spell)
+    };
+
+    let (mut hand_game, hand_spell) = build_game(Zone::Hand, false);
+    let error = match hand_game.cast(hand_spell).try_resolve() {
+        Ok(_) => panic!("Karolina's mana must not fund a spell cast from hand"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("Cannot pay mana cost"));
+    assert_eq!(hand_game.state().objects[&hand_spell].zone, Zone::Hand);
+    assert_eq!(hand_game.state().players[0].mana_pool.total(), 1);
+
+    // The command zone is a naturally castable non-hand origin, so this half
+    // reaches the same production payment path without granting a test-only
+    // graveyard or exile permission.
+    let (mut command_game, command_spell) = build_game(Zone::Command, true);
+    let outcome = command_game.cast(command_spell).resolve();
+    outcome.assert_zone(&[command_spell], Zone::Battlefield);
+    assert_eq!(outcome.mana_pool_total(P0), 0);
 }
 
 /// Guard against the inclusion polarity regressing: the positive `From` reading

@@ -614,7 +614,7 @@ pub enum ManaRestriction {
     /// accepts the legacy bare-`Zone` form (`{"OnlyForSpellFromZone":"Graveyard"}`)
     /// for backward compatibility, mapping it to the inclusion reading.
     OnlyForSpellFromZone(ZoneSpend),
-    /// CR 106.6 + CR 400.7: This mana cannot pay for a spell cast from the
+    /// CR 106.6 + CR 601.2g-h: This mana cannot pay for a spell cast from the
     /// named zone. It remains unrestricted for every non-cast payment context.
     /// A spell whose origin is unknown is rejected conservatively.
     CannotCastSpellFromZone(Zone),

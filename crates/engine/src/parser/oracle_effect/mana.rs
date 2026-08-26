@@ -1538,7 +1538,7 @@ fn parse_restricted_spell_type_phrase(spell_part: &str) -> Option<String> {
     )
 }
 
-/// CR 106.6 + CR 400.7: Parse "this mana can't be spent to cast ..." restrictions.
+/// CR 106.6 + CR 601.2g-h: Parse "this mana can't be spent to cast ..." restrictions.
 /// A spell-from-zone clause lowers to a prohibition of that cast class
 /// (`spells from your hand` -> `CannotCastSpellFromZone(Hand)`, Karolina Dean).
 /// An already-negative "from anywhere other than" clause is rejected rather

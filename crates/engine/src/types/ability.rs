@@ -3078,7 +3078,7 @@ pub enum ManaSpendRestriction {
     /// accepts the legacy bare-`Zone` serialized form for backward compatibility,
     /// mapping it to the inclusion reading.
     SpellFromZone(ZoneSpend),
-    /// CR 106.6 + CR 400.7: "This mana can't be spent to cast spells from
+    /// CR 106.6 + CR 601.2a: "This mana can't be spent to cast spells from
     /// [zone]." Unlike `SpellFromZone(NotFrom)`, this prohibits one class of
     /// spell cast without restricting ability, effect, or special-action costs.
     CannotCastSpellFromZone(Zone),
