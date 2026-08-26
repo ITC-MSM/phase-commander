@@ -20,7 +20,8 @@ jobs:
     steps:
       - name: Fast-forward fork from its upstream repository
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The fork sync may update workflow files, which GITHUB_TOKEN cannot do.
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN }}
         run: gh api --method POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main
       - name: Merge synchronized main into platform
         env:
