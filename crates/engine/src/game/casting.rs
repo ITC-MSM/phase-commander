@@ -20296,7 +20296,11 @@ pub fn handle_cancel_cast(
         // CR 601.2i + CR 712.11a / CR 709.3: backing out of a cast with an
         // alternative spell face before it completes restores the card's normal
         // front face in its origin zone.
-        super::stack::restore_alternative_spell_normal_face(state, pending.object_id);
+        super::stack::restore_alternative_spell_normal_face(
+            state,
+            pending.object_id,
+            pending.casting_variant,
+        );
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
             obj.modal_back_face = false;
         }
