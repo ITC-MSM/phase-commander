@@ -158,7 +158,7 @@ describe("ProliferateModal (via CardChoiceModal)", () => {
     });
   });
 
-  it("keeps a ChooseObjects selection at or above a required minimum", () => {
+  it("disables confirmation below a required minimum without locking reselection", () => {
     const eligible: TargetRef[] = [{ Object: 42 }, { Object: 43 }, { Object: 44 }];
     setUpWaitingFor({
       type: "ChooseObjectsSelection",
@@ -168,13 +168,37 @@ describe("ProliferateModal (via CardChoiceModal)", () => {
 
     expect(screen.queryByRole("button", { name: "None" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Triskelion" }));
-    expect(screen.getByRole("button", { name: "Walking Ballista" })).toBeDisabled();
     fireEvent.click(screen.getByRole("button", { name: "Walking Ballista" }));
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    expect(dispatchMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Triskelion" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
 
     expect(dispatchMock).toHaveBeenCalledWith({
       type: "SelectTargets",
-      data: { targets: eligible.slice(0, 2) },
+      data: { targets: eligible.slice(1) },
+    });
+  });
+
+  it("can replace a default target when the exact minimum equals the maximum", () => {
+    const eligible: TargetRef[] = [{ Object: 42 }, { Object: 43 }, { Object: 44 }];
+    setUpWaitingFor({
+      type: "ChooseObjectsSelection",
+      data: { player: 0, eligible, min: 2, max: 2 },
+    });
+    render(<CardChoiceModal />);
+
+    expect(screen.getByRole("button", { name: "Triskelion" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Walking Ballista" }));
+    expect(screen.getByRole("button", { name: "Confirm" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Triskelion" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Triskelion" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: "SelectTargets",
+      data: { targets: eligible.slice(1) },
     });
   });
 });

@@ -105,12 +105,12 @@ export function ProliferateModal({
       setSelected((prev) => {
         const selectedAlready = prev.some((t) => targetKey(t) === key);
         if (selectedAlready) {
-          return prev.length > min ? prev.filter((t) => targetKey(t) !== key) : prev;
+          return prev.filter((t) => targetKey(t) !== key);
         }
         return prev.length < max ? [...prev, target] : prev;
       });
     },
-    [max, min],
+    [max],
   );
 
   const handleConfirm = useCallback(() => {
@@ -166,7 +166,7 @@ export function ProliferateModal({
         {data.eligible.map((target) => {
           const key = targetKey(target);
           const isSelected = selected.some((t) => targetKey(t) === key);
-          const disabled = isSelected ? selected.length <= min : selected.length >= max;
+          const disabled = !isSelected && selected.length >= max;
           return (
             <button
               key={key}
