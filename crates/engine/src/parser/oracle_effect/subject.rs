@@ -6498,11 +6498,25 @@ pub(super) fn try_parse_each_source_deals_damage(
         )));
     }
 
-    // Require a usable non-player object-class source. Player-shaped subjects
-    // ("each player", "each opponent") and anaphoric "each of those …"
-    // (`ParentTarget`) fall through to their own handling.
+    // Require a usable non-player object-class source. The one context-set
+    // exception is an exact pairwise relation: "each of those ... to the
+    // other" reads the previously announced object pair through ParentTarget.
+    // Only `TwoTargets` publishes this two-slot registry; a single multi-target
+    // producer therefore fails closed without typed per-member provenance.
     let sources = parse_subject_application(subject, ctx)?.affected;
-    if !is_object_class_source(&sources) {
+    let pairwise_filters = match (&sources, ctx.declared_target_slots.as_slice()) {
+        (TargetFilter::ParentTarget, [first, second])
+            if has_pairwise_other_recipient(&predicate_lower)
+                && matches!(first, TargetFilter::Typed(typed)
+                    if !typed.type_filters.is_empty() || !typed.properties.is_empty())
+                && matches!(second, TargetFilter::Typed(typed)
+                    if !typed.type_filters.is_empty() || !typed.properties.is_empty()) =>
+        {
+            Some([Box::new(first.clone()), Box::new(second.clone())])
+        }
+        _ => None,
+    };
+    if !is_object_class_source(&sources) && pairwise_filters.is_none() {
         return None;
     }
 
@@ -6541,7 +6555,9 @@ pub(super) fn try_parse_each_source_deals_damage(
 
     // CR 109.4 + CR 120.3a: "its controller" is a per-source recipient. Every other
     // recipient is the shared announced/context target produced above.
-    let recipient = if recipient_phrase.is_some_and(is_its_controller_recipient) {
+    let recipient = if let Some(source_filters) = pairwise_filters {
+        EachDamageRecipient::OtherBatchSource { source_filters }
+    } else if recipient_phrase.is_some_and(is_its_controller_recipient) {
         EachDamageRecipient::EachController
     } else {
         EachDamageRecipient::Shared(target)
@@ -6584,6 +6600,29 @@ fn subject_sources_tapped_this_way(subject_lower: &str) -> bool {
 fn is_its_controller_recipient(recipient_phrase: &str) -> bool {
     all_consuming(tag::<_, _, OracleError<'_>>("its controller"))
         .parse(recipient_phrase)
+        .is_ok()
+}
+
+/// CR 120.3: exact pairwise recipient phrase used after a two-object anaphoric
+/// source set. Full consumption keeps "the other player/permanent" out.
+fn is_the_other_recipient(recipient_phrase: &str) -> bool {
+    all_consuming(tag::<_, _, OracleError<'_>>("the other"))
+        .parse(recipient_phrase)
+        .is_ok()
+}
+
+/// CR 120.3: recognize the pairwise recipient in both fixed damage
+/// ("deals N damage to the other") and characteristic damage ("deals damage
+/// equal to its toughness to the other"). The latter has no `" damage to "`
+/// delimiter, so Pattern 2 consumes the suffix last and requires EOF.
+fn has_pairwise_other_recipient(predicate_lower: &str) -> bool {
+    damage_recipient_phrase(predicate_lower).is_some_and(is_the_other_recipient)
+        || all_consuming((
+            take_until::<_, _, OracleError<'_>>(" to the other"),
+            tag(" to the other"),
+            opt(tag(".")),
+        ))
+        .parse(predicate_lower)
         .is_ok()
 }
 
@@ -7389,6 +7428,48 @@ mod tests {
         assert!(matches!(sources, TargetFilter::Typed(_)), "got {sources:?}");
         assert_eq!(amount, QuantityExpr::Fixed { value: 1 });
         assert_eq!(recipient, EachDamageRecipient::EachController);
+    }
+
+    #[test]
+    fn each_of_those_deals_to_the_other_is_pairwise_damage() {
+        let text = "each of those creatures deals damage equal to its toughness to the other";
+        let mut ctx = ParseContext {
+            declared_target_slots: vec![
+                TargetFilter::Typed(TypedFilter::creature()),
+                TargetFilter::Typed(TypedFilter::creature()),
+            ],
+            ..Default::default()
+        };
+        let effect = try_parse_each_source_deals_damage(text, &mut ctx)
+            .expect("declared object pair parses")
+            .effect;
+        let Effect::EachSourceDealsDamage {
+            sources,
+            amount,
+            recipient,
+        } = effect
+        else {
+            panic!("expected pairwise EachSourceDealsDamage, got {effect:?}");
+        };
+        assert_eq!(sources, TargetFilter::ParentTarget);
+        assert!(crate::game::quantity::quantity_expr_contains_scope(
+            &amount,
+            ObjectScope::BatchSource,
+        ));
+        assert!(matches!(
+            recipient,
+            EachDamageRecipient::OtherBatchSource { source_filters }
+                if source_filters.iter().all(|filter| matches!(
+                    filter.as_ref(),
+                    TargetFilter::Typed(typed)
+                        if typed.type_filters.contains(&TypeFilter::Creature)
+                ))
+        ));
+        assert!(!is_the_other_recipient("the other player"));
+        assert!(!has_pairwise_other_recipient(
+            "deals damage equal to its toughness to the other player"
+        ));
+        assert!(try_parse_each_source_deals_damage(text, &mut ParseContext::default()).is_none());
     }
 
     #[test]
