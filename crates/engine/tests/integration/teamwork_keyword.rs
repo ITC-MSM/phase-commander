@@ -978,9 +978,9 @@ fn helicarrier_strike_runtime_replaces_two_damage_with_four() {
     );
 }
 
-/// Cast We Say Thee Nay! in response to a creature spell and return the generic
-/// mana in the controller's first unless-payment prompt.
-fn we_say_thee_nay_unless_generic(pay_teamwork: bool) -> u32 {
+/// Cast We Say Thee Nay! in response to a creature spell and collect every
+/// generic unless-payment cost shown to the targeted spell's controller.
+fn we_say_thee_nay_unless_generics(pay_teamwork: bool) -> Vec<u32> {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let mut creature = scenario.add_creature_to_hand(P0, "Target Spell", 2, 2);
@@ -1028,7 +1028,12 @@ fn we_say_thee_nay_unless_generic(pay_teamwork: bool) -> u32 {
         })
         .expect("casting We Say Thee Nay! must succeed");
 
+    let mut unless_generics = Vec::new();
     for _ in 0..64 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+
         match runner.state().waiting_for.clone() {
             WaitingFor::OptionalCostChoice { .. } => runner
                 .act(GameAction::DecideOptionalCost { pay: pay_teamwork })
@@ -1054,29 +1059,37 @@ fn we_say_thee_nay_unless_generic(pay_teamwork: bool) -> u32 {
                     player, P0,
                     "the targeted spell's controller must be prompted"
                 );
-                return match cost {
+                let generic = match cost {
                     AbilityCost::Mana {
                         cost: ManaCost::Cost { generic, .. },
                     } => generic,
                     other => panic!("expected a fixed generic unless cost, got {other:?}"),
                 };
+                unless_generics.push(generic);
+                runner
+                    .act(GameAction::PayUnlessCost { pay: false })
+                    .expect("declining the unless payment must continue resolution");
             }
             other => panic!("unexpected We Say Thee Nay waiting state: {other:?}"),
         };
     }
-    panic!("We Say Thee Nay! never reached an unless-payment prompt")
+    assert!(
+        runner.state().stack.is_empty(),
+        "We Say Thee Nay! must finish resolving after every unless-payment prompt"
+    );
+    unless_generics
 }
 
 #[test]
 fn we_say_thee_nay_runtime_selects_exactly_one_unless_cost() {
     assert_eq!(
-        we_say_thee_nay_unless_generic(false),
-        2,
+        we_say_thee_nay_unless_generics(false),
+        vec![2],
         "declining Teamwork must retain the base {{2}} tax"
     );
     assert_eq!(
-        we_say_thee_nay_unless_generic(true),
-        4,
+        we_say_thee_nay_unless_generics(true),
+        vec![4],
         "paying Teamwork must replace the {{2}} tax with {{4}}"
     );
 }
