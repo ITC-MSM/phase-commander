@@ -1146,6 +1146,14 @@ pub struct SpellCastRecord {
     /// the underlying object (which may have left the stack).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_x_in_cost: bool,
+    /// CR 715.2a: Whether the spell's cast-time object has the alternative
+    /// characteristics of an Adventure spell, even when the creature face is
+    /// the face being cast. This is false when the Adventure face itself is
+    /// being cast: its alternative characteristics are then the normal face.
+    /// Captured so filtered cast-history queries do not need to inspect the
+    /// spell object after it leaves the stack.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub has_adventure: bool,
     /// CR 400.1 + CR 601.2a: Zone the spell was cast from, captured at cast-time
     /// so per-turn spell-history conditions can answer "from your hand" after
     /// the spell has moved on from the stack. Per CR 601.2a every cast spell
@@ -1215,6 +1223,7 @@ impl Default for SpellCastRecord {
             colors: Vec::new(),
             mana_value: 0,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Hand,
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
@@ -32997,6 +33006,7 @@ mod tests {
             colors: vec![],
             mana_value: 4,
             has_x_in_cost: false,
+            has_adventure: false,
             from_zone: Zone::Graveyard,
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
@@ -33006,6 +33016,25 @@ mod tests {
         let round_tripped: SpellCastRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped, original);
         assert_eq!(round_tripped.from_zone, Zone::Graveyard);
+    }
+
+    /// CR 715.2a + CR 715.2b: The Adventure snapshot field is backward
+    /// compatible, omitted when false, and preserved when true.
+    #[test]
+    fn spell_cast_record_adventure_field_serde_contract() {
+        let legacy_json = serde_json::to_string(&SpellCastRecord::default()).unwrap();
+        let legacy: SpellCastRecord = serde_json::from_str(&legacy_json).unwrap();
+        assert!(!legacy.has_adventure);
+        assert!(!legacy_json.contains("has_adventure"));
+
+        let adventure = SpellCastRecord {
+            has_adventure: true,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&adventure).unwrap();
+        assert!(json.contains("has_adventure"));
+        let round_tripped: SpellCastRecord = serde_json::from_str(&json).unwrap();
+        assert!(round_tripped.has_adventure);
     }
 
     // ---- CR 117.3d priority-yield accessors ----
