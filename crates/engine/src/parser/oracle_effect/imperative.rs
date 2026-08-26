@@ -4948,19 +4948,24 @@ fn try_parse_two_targets(rest: &str, ctx: &mut ParseContext) -> Option<ChooseImp
     // is part of the prefix.
     let prefix_orig = &rest[..lower_prefix.len()];
     let match_start_orig = &rest[rest.len() - lower_match_start.len()..];
+    let (_, target_b_multi_target) = parse_connector(match_start_orig).ok()?;
 
     // CR 115.1c slot A: the prefix must be a targeting phrase. `parse_target`
     // returning `Any` means "no recognized target" — we refuse to split.
-    let (target_a, _rem_a) = parse_target_with_ctx(prefix_orig.trim_end(), ctx);
+    let (target_a, rem_a) = parse_target_with_ctx(prefix_orig.trim_end(), ctx);
     if matches!(target_a, TargetFilter::Any) {
         return None;
+    }
+    if target_b_multi_target.is_some() {
+        all_consuming((space0::<_, E>, opt(alt((tag(","), tag(".")))), space0, eof))
+            .parse(rem_a)
+            .ok()?;
     }
 
     // CR 115.1c slot B: skip the leading "and " on the matched connector
     // and parse the second target. `tag("and ").parse(input)` returns
     // `(remainder, matched)` so we bind the first element.
     let (after_and_orig, _) = tag::<_, _, E>("and ").parse(match_start_orig).ok()?;
-    let (_, target_b_multi_target) = parse_connector(match_start_orig).ok()?;
     let target_b_text = if target_b_multi_target.is_some() {
         tag::<_, _, E>("up to one ").parse(after_and_orig).ok()?.0
     } else {
@@ -19420,6 +19425,65 @@ mod tests {
         assert!(!matches!(
             parse_choose_ast(text, &lower, &mut ParseContext::default()),
             Some(ChooseImperativeAst::TwoTargets { .. })
+        ));
+    }
+
+    #[test]
+    fn teferi_optional_second_slot_does_not_steal_a_three_target_list() {
+        let text =
+            "choose up to one target artifact, up to one target creature, and up to one target land";
+        let lower = text.to_lowercase();
+        assert!(!matches!(
+            parse_choose_ast(text, &lower, &mut ParseContext::default()),
+            Some(ChooseImperativeAst::TwoTargets { .. })
+        ));
+    }
+
+    #[test]
+    fn great_aerie_keeps_both_optional_creature_targets() {
+        let text = "choose up to one target creature you control and up to one target creature an opponent controls";
+        let lower = text.to_lowercase();
+        let Some(ChooseImperativeAst::TwoTargets {
+            target_a,
+            target_b,
+            target_b_multi_target,
+            ..
+        }) = parse_choose_ast(text, &lower, &mut ParseContext::default())
+        else {
+            panic!("expected the two-target Great Aerie head");
+        };
+        assert!(matches!(
+            target_a,
+            TargetFilter::Typed(ref tf)
+                if tf.type_filters.contains(&TypeFilter::Creature)
+                    && tf.controller == Some(ControllerRef::You)
+        ));
+        assert!(matches!(
+            target_b.as_ref(),
+            TargetFilter::Typed(tf)
+                if tf.type_filters.contains(&TypeFilter::Creature)
+                    && tf.controller == Some(ControllerRef::Opponent)
+        ));
+        assert_eq!(
+            target_b_multi_target,
+            Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }))
+        );
+    }
+
+    #[test]
+    fn mouth_to_mouth_binds_creature_to_target_opponent() {
+        let text = "choose target opponent and target creature they control";
+        let lower = text.to_lowercase();
+        let Some(ChooseImperativeAst::TwoTargets { target_b, .. }) =
+            parse_choose_ast(text, &lower, &mut ParseContext::default())
+        else {
+            panic!("expected the two-target Mouth to Mouth head");
+        };
+        assert!(matches!(
+            target_b.as_ref(),
+            TargetFilter::Typed(tf)
+                if tf.type_filters.contains(&TypeFilter::Creature)
+                    && tf.controller == Some(ControllerRef::TargetOpponent)
         ));
     }
 
