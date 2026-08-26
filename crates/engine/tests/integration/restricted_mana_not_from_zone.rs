@@ -15,8 +15,9 @@
 //! prohibition makes the corresponding hand/non-hand and non-cast assertions
 //! flip.
 
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::game::zones::create_object;
+use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{
@@ -202,9 +203,16 @@ fn karolina_restriction_is_a_narrow_cast_prohibition() {
 
 #[test]
 fn karolina_restriction_drives_the_production_cast_payment_pipeline() {
-    let build_game = |zone, commander| {
+    const KAROLINA_ORACLE: &str = "Flying\nAt the beginning of your first main phase, add {W}{U}{B}{R}{G}. This mana can't be spent to cast spells from your hand.";
+
+    let build_game = |zone, commander| -> (GameRunner, ObjectId) {
         let mut scenario = GameScenario::new();
-        scenario.at_phase(Phase::PreCombatMain);
+        scenario.at_phase(Phase::Upkeep);
+        scenario.with_library_top(P0, &["P0 Card"; 40]);
+        scenario.with_library_top(engine::types::player::PlayerId(1), &["P1 Card"; 40]);
+        scenario
+            .add_creature(P0, "Karolina Dean, Runaway", 4, 4)
+            .from_oracle_text(KAROLINA_ORACLE);
         let mut game = scenario.build();
         let state = game.state_mut();
         state.format_config.command_zone = commander;
@@ -224,18 +232,29 @@ fn karolina_restriction_drives_the_production_cast_payment_pipeline() {
             object.is_commander = true;
         }
 
-        state
-            .players
-            .iter_mut()
-            .find(|player| player.id == P0)
-            .unwrap()
-            .mana_pool
-            .add(ManaUnit::new(
-                ManaType::White,
-                ObjectId(1),
-                false,
-                vec![cannot_cast_from_hand_restriction()],
-            ));
+        game.advance_to_phase(Phase::PreCombatMain);
+        for _ in 0..4 {
+            if game.state().players[P0.0 as usize].mana_pool.total() == 5 {
+                break;
+            }
+            game.act(GameAction::PassPriority)
+                .expect("Karolina's first-main-phase trigger must resolve through priority");
+        }
+
+        let pool = &game.state().players[P0.0 as usize].mana_pool;
+        assert_eq!(pool.total(), 5, "Karolina's trigger must produce WUBRG");
+        for color in [
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Red,
+            ManaType::Green,
+        ] {
+            assert_eq!(pool.count_color(color), 1);
+        }
+        assert!(pool.mana.iter().all(|unit| {
+            unit.restrictions == vec![ManaRestriction::CannotCastSpellFromZone(Zone::Hand)]
+        }));
         (game, spell)
     };
 
@@ -246,7 +265,7 @@ fn karolina_restriction_drives_the_production_cast_payment_pipeline() {
     };
     assert!(error.to_string().contains("Cannot pay mana cost"));
     assert_eq!(hand_game.state().objects[&hand_spell].zone, Zone::Hand);
-    assert_eq!(hand_game.state().players[0].mana_pool.total(), 1);
+    assert_eq!(hand_game.state().players[0].mana_pool.total(), 5);
 
     // The command zone is a naturally castable non-hand origin, so this half
     // reaches the same production payment path without granting a test-only
@@ -254,7 +273,7 @@ fn karolina_restriction_drives_the_production_cast_payment_pipeline() {
     let (mut command_game, command_spell) = build_game(Zone::Command, true);
     let outcome = command_game.cast(command_spell).resolve();
     outcome.assert_zone(&[command_spell], Zone::Battlefield);
-    assert_eq!(outcome.mana_pool_total(P0), 0);
+    assert_eq!(outcome.mana_pool_total(P0), 4);
 }
 
 /// Guard against the inclusion polarity regressing: the positive `From` reading
