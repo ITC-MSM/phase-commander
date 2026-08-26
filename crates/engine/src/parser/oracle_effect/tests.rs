@@ -134,38 +134,27 @@ fn scoped_reflexive_decline_preserves_controller_and_opponent_recipients() {
 }
 
 #[test]
-fn scoped_decline_does_not_rebind_an_already_scoped_recipient() {
-    let decline = AbilityDefinition::new(
-        AbilityKind::Spell,
-        Effect::Mill {
-            count: QuantityExpr::Fixed { value: 2 },
-            target: TargetFilter::ScopedPlayer,
-            destination: Zone::Graveyard,
-        },
-    )
-    .condition(AbilityCondition::Not {
-        condition: Box::new(AbilityCondition::effect_performed()),
-    });
+fn all_player_decline_keeps_controller_for_the_all_scope_rewrite() {
     let mut def = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Draw {
             count: QuantityExpr::Fixed { value: 1 },
-            target: TargetFilter::ScopedPlayer,
+            target: TargetFilter::Controller,
         },
     )
-    .player_scope(PlayerFilter::Opponent)
-    .sub_ability(decline);
+    .condition(AbilityCondition::Not {
+        condition: Box::new(AbilityCondition::effect_performed()),
+    })
+    .player_scope(PlayerFilter::All);
 
     apply_player_scope_rewrites(&mut def);
 
     assert!(matches!(
-        def.sub_ability
-            .as_deref()
-            .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Mill {
-            target: TargetFilter::ScopedPlayer,
+        def.effect.as_ref(),
+        Effect::Draw {
+            target: TargetFilter::Controller,
             ..
-        })
+        }
     ));
 }
 

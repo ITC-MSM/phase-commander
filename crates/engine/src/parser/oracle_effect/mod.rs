@@ -28836,16 +28836,13 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
     }
 
     each_quantity_expr_mut(&mut def.effect, &mut rewrite_quantity_expr);
-    // CR 109.5 + CR 608.2c: The reflexive conditional parser represents "If
-    // that player doesn't" with the same typed Not(OptionalEffectPerformed)
-    // gate as the explicit per-opponent decline surfaces. Reuse their shared
-    // recipient authority here: inside the scoped iteration, "you" remains
-    // the printed ability controller while "that player" remains the scoped
-    // opponent. The structural gate keeps unrelated scoped effects untouched.
-    if def
-        .condition
-        .as_ref()
-        .is_some_and(AbilityCondition::is_not_optional_effect_performed)
+    // CR 109.5: Explicit All scopes retain Controller for their ScopedPlayer rewrite;
+    // inherited opponent-decline nodes have no local scope and still rebind here.
+    if !matches!(def.player_scope, Some(PlayerFilter::All))
+        && def
+            .condition
+            .as_ref()
+            .is_some_and(AbilityCondition::is_not_optional_effect_performed)
     {
         rebind_decline_body_recipient(&mut def.effect);
     }
