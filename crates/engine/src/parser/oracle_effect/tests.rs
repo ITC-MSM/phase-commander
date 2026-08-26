@@ -13232,6 +13232,20 @@ fn dark_deal_draw_uses_each_players_discard_count_minus_one() {
 }
 
 #[test]
+fn brass_tunnel_grinder_draw_uses_discard_count_plus_one() {
+    let def = parse_effect_chain(
+        "Discard any number of cards, then draw that many cards plus one.",
+        AbilityKind::Spell,
+    );
+    let draw = def
+        .sub_ability
+        .as_ref()
+        .expect("expected draw continuation");
+    assert!(matches!(&*draw.effect, Effect::Draw {
+        count: QuantityExpr::Offset { inner, offset: 1 }, ..
+    } if matches!(inner.as_ref(), QuantityExpr::Ref { qty: QuantityRef::EventContextAmount })));
+}
+#[test]
 fn effect_chain_then_conjugated_sacrifices() {
     // "then sacrifices the rest" — conjugated verb after ", then"
     let def = parse_effect_chain(

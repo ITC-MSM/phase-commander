@@ -10357,11 +10357,6 @@ pub(super) fn parse_imperative_family_ast(
         return Some(ImperativeFamilyAst::NoteManaSpent);
     }
 
-    if nom_on_lower(text, lower, |input| parse_word_bounded(input, "draw")).is_some() {
-        return parse_numeric_imperative_ast_with_context(text, lower, ctx)
-            .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::Numeric(ast)));
-    }
-
     // NOTE: when adding verbs here, also add them to IMPERATIVE_EXTRA_VERBS
     // in game/gap_analysis.rs so the parser gap analyzer can classify them.
     match first_word {
@@ -10627,6 +10622,10 @@ pub(super) fn parse_imperative_family_ast(
                 count,
                 target: TargetFilter::Controller,
             }))
+        }
+        _ if nom_on_lower(text, lower, |input| parse_word_bounded(input, "draw")).is_some() => {
+            parse_numeric_imperative_ast_with_context(text, lower, ctx)
+                .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::Numeric(ast)))
         }
         "scry" | "surveil" | "mill" => parse_numeric_imperative_ast_with_context(text, lower, ctx)
             .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::Numeric(ast))),
