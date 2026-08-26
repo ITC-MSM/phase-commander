@@ -2887,33 +2887,63 @@ pub fn candidate_actions_broad_with_probe(
             }
             actions
         }
-        // CR 608.2c: ChooseObjectsIntoTrackedSet — choose any subset of the
-        // eligible battlefield permanents (or decline with an empty selection).
+        // CR 608.2c: ChooseObjectsIntoTrackedSet — emit only distinct subsets
+        // within the resolution choice's printed cardinality.
         WaitingFor::ChooseObjectsSelection {
-            player, eligible, ..
+            player,
+            eligible,
+            min,
+            max,
+            ..
         } => {
-            let mut actions = vec![
-                // Pay for all affordable: select every eligible permanent.
-                candidate(
+            let mut unique = Vec::with_capacity(eligible.len());
+            for target in eligible {
+                if !unique.contains(target) {
+                    unique.push(target.clone());
+                }
+            }
+            let floor = *min as usize;
+            let ceiling = max
+                .map(|maximum| maximum as usize)
+                .unwrap_or(unique.len())
+                .min(unique.len());
+            if floor > ceiling {
+                return Vec::new();
+            }
+
+            let mut actions = Vec::new();
+            if ceiling > 1 || floor > 1 {
+                actions.push(candidate(
                     GameAction::SelectTargets {
-                        targets: eligible.clone(),
+                        targets: unique[..ceiling].to_vec(),
                     },
                     TacticalClass::Selection,
                     Some(*player),
-                ),
-                // Decline: empty selection.
-                candidate(
+                ));
+            }
+            if floor == 0 {
+                actions.push(candidate(
                     GameAction::SelectTargets {
                         targets: Vec::new(),
                     },
                     TacticalClass::Selection,
                     Some(*player),
-                ),
-            ];
-            for target in eligible {
+                ));
+            }
+            if floor <= 1 && ceiling >= 1 {
+                for target in &unique {
+                    actions.push(candidate(
+                        GameAction::SelectTargets {
+                            targets: vec![target.clone()],
+                        },
+                        TacticalClass::Selection,
+                        Some(*player),
+                    ));
+                }
+            } else if floor < ceiling {
                 actions.push(candidate(
                     GameAction::SelectTargets {
-                        targets: vec![target.clone()],
+                        targets: unique[..floor].to_vec(),
                     },
                     TacticalClass::Selection,
                     Some(*player),
@@ -5765,6 +5795,58 @@ mod tests {
     use crate::types::keywords::{Keyword, KeywordKind};
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
     use crate::types::zones::Zone;
+
+    #[test]
+    fn choose_objects_candidates_respect_bounds_and_distinctness() {
+        let mut state = GameState::new_two_player(42);
+        let eligible = vec![
+            TargetRef::Object(ObjectId(1)),
+            TargetRef::Object(ObjectId(2)),
+            TargetRef::Object(ObjectId(3)),
+        ];
+        state.waiting_for = WaitingFor::ChooseObjectsSelection {
+            player: PlayerId(0),
+            eligible,
+            min: 0,
+            max: Some(2),
+            trigger_event: None,
+        };
+
+        let actions = candidate_actions(&state);
+        let selections: Vec<&Vec<TargetRef>> = actions
+            .iter()
+            .filter_map(|candidate| match &candidate.action {
+                GameAction::SelectTargets { targets } => Some(targets),
+                _ => None,
+            })
+            .collect();
+        assert!(selections.iter().any(|targets| targets.is_empty()));
+        assert!(selections.iter().any(|targets| targets.len() == 2));
+        assert!(selections.iter().all(|targets| {
+            targets.len() <= 2
+                && targets
+                    .iter()
+                    .enumerate()
+                    .all(|(index, target)| !targets[..index].contains(target))
+        }));
+
+        state.waiting_for = WaitingFor::ChooseObjectsSelection {
+            player: PlayerId(0),
+            eligible: vec![
+                TargetRef::Object(ObjectId(1)),
+                TargetRef::Object(ObjectId(2)),
+                TargetRef::Object(ObjectId(3)),
+            ],
+            min: 2,
+            max: Some(2),
+            trigger_event: None,
+        };
+        let required_actions = candidate_actions(&state);
+        assert!(required_actions.iter().all(|candidate| matches!(
+            &candidate.action,
+            GameAction::SelectTargets { targets } if targets.len() == 2
+        )));
+    }
 
     /// CR 732.2a: an AI-controlled priority holder receives both legal shortcut choices.
     /// The `legal_actions` assertion reaches the simulation-filtered surface used by AI search;

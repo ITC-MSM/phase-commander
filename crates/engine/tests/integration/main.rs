@@ -887,6 +887,7 @@ mod mole_man_moloid_optional_mill;
 mod morbid_curiosity_cost_paid_mana_value_draw;
 mod morkrut_ashaya_self_sacrifice;
 mod morophon_chosen_type_1653;
+mod mount_doom_destroy_rest;
 mod mr_foxglove_defending_hand_minus_yours_draw;
 mod ms_marvel_power_exceeds_base;
 mod msh_wave5a_group1_classifier;

@@ -13081,14 +13081,20 @@ pub enum WaitingFor {
         phase: TimeTravelPhase,
     },
     /// CR 603.7e: The affected player of a `ChooseObjectsIntoTrackedSet` effect
-    /// selects any number of battlefield permanents from `eligible`. The
+    /// selects `min..=max` battlefield permanents from `eligible`. The
     /// chosen objects are written into a fresh tracked set so a downstream
     /// `PayCost { ScaledMana }` and `IfYouDo`/`Untap` reference the exact
-    /// selection. An empty selection is legal — the player declines.
+    /// selection. An empty selection is legal when `min == 0`.
     ChooseObjectsSelection {
         player: PlayerId,
         /// Eligible battlefield permanents matching the effect's filter.
         eligible: Vec<TargetRef>,
+        /// Minimum number of distinct eligible objects that must be selected.
+        #[serde(default)]
+        min: u32,
+        /// Maximum number selectable (`None` = all eligible objects).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
         /// CR 608.2: triggering event of the ability whose `ChooseObjectsIntoTrackedSet`
         /// raised this prompt. Restored around the continuation drain so the stashed
         /// `PayCost { payer: TriggeringPlayer }` resolves to the correct player.

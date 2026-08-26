@@ -21,10 +21,13 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (chooser_filter, filter) = match &ability.effect {
+    let (chooser_filter, filter, min, max) = match &ability.effect {
         Effect::ChooseObjectsIntoTrackedSet {
-            chooser, filter, ..
-        } => (chooser.clone(), filter.clone()),
+            chooser,
+            filter,
+            min,
+            max,
+        } => (chooser.clone(), filter.clone(), *min, *max),
         _ => {
             return Err(EffectError::MissingParam(
                 "ChooseObjectsIntoTrackedSet".to_string(),
@@ -70,6 +73,8 @@ pub fn resolve(
     state.waiting_for = WaitingFor::ChooseObjectsSelection {
         player: chooser,
         eligible,
+        min,
+        max,
         trigger_event: state.current_trigger_event.clone(),
     };
 
