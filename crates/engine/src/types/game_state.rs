@@ -13085,7 +13085,7 @@ pub enum WaitingFor {
         eligible: Vec<TargetRef>,
         phase: TimeTravelPhase,
     },
-    /// CR 603.7e: The affected player of a `ChooseObjectsIntoTrackedSet` effect
+    /// CR 608.2d: While applying `ChooseObjectsIntoTrackedSet`, the affected player
     /// selects `min..=max` battlefield permanents from `eligible`. The
     /// chosen objects are written into a fresh tracked set so a downstream
     /// `PayCost { ScaledMana }` and `IfYouDo`/`Untap` reference the exact

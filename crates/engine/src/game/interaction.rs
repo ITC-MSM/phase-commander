@@ -9930,13 +9930,13 @@ mod tests {
                 TargetRef::Object(ObjectId(3)),
             ],
             min: 1,
-            max: Some(2),
+            max: Some(4),
             trigger_event: None,
         };
         let projection = target_sequence_projection(&waiting)
             .expect("projection must succeed")
             .expect("choose-objects is a target sequence");
-        assert_eq!((projection.min, projection.max), (1, 2));
+        assert_eq!((projection.min, projection.max), (1, 3));
         assert!(projection.unique);
     }
 

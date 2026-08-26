@@ -52835,27 +52835,34 @@ fn mount_doom_lowers_choose_two_then_destroy_rest() {
         &mut ParseContext::default(),
     );
 
-    assert!(matches!(
-        def.effect.as_ref(),
-        Effect::ChooseObjectsIntoTrackedSet {
-            chooser: TargetFilter::Controller,
-            min: 0,
-            max: Some(2),
-            ..
-        }
-    ));
-    assert!(matches!(
-        def.sub_ability.as_deref().map(|sub| sub.effect.as_ref()),
-        Some(Effect::DestroyAll {
-            target: TargetFilter::Typed(tf),
-            ..
-        }) if tf.type_filters.contains(&TypeFilter::Creature)
-            && tf.properties.iter().any(|prop| matches!(
-                prop,
-                FilterProp::Not { prop }
-                    if matches!(**prop, FilterProp::InTrackedSet { .. })
-            ))
-    ));
+    let Effect::ChooseObjectsIntoTrackedSet {
+        chooser,
+        filter,
+        min,
+        max,
+    } = def.effect.as_ref()
+    else {
+        panic!("expected tracked-set survivor choice, got {:?}", def.effect);
+    };
+    assert_eq!(*chooser, TargetFilter::Controller);
+    assert_eq!((*min, *max), (0, Some(2)));
+    assert_eq!(*filter, TargetFilter::Typed(TypedFilter::creature()));
+
+    let destroy = def
+        .sub_ability
+        .as_deref()
+        .expect("survivor choice must be followed by destroy-rest");
+    let Effect::DestroyAll { target, .. } = destroy.effect.as_ref() else {
+        panic!("expected DestroyAll continuation, got {:?}", destroy.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Not {
+            prop: Box::new(FilterProp::InTrackedSet {
+                id: TrackedSetId(0),
+            }),
+        }]))
+    );
     assert!(!ability_chain_has_unimplemented(&def));
 }
 
