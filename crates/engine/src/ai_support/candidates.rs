@@ -2911,45 +2911,21 @@ pub fn candidate_actions_broad_with_probe(
                 return Vec::new();
             }
 
-            let mut actions = Vec::new();
-            if ceiling > 1 || floor > 1 {
-                actions.push(candidate(
-                    GameAction::SelectTargets {
-                        targets: unique[..ceiling].to_vec(),
-                    },
+            bounded_combinations_generic(
+                &unique,
+                floor..=ceiling,
+                SELECTION_POOL_CAP,
+                SELECTION_CANDIDATE_CAP,
+            )
+            .into_iter()
+            .map(|targets| {
+                candidate(
+                    GameAction::SelectTargets { targets },
                     TacticalClass::Selection,
                     Some(*player),
-                ));
-            }
-            if floor == 0 {
-                actions.push(candidate(
-                    GameAction::SelectTargets {
-                        targets: Vec::new(),
-                    },
-                    TacticalClass::Selection,
-                    Some(*player),
-                ));
-            }
-            if floor <= 1 && ceiling >= 1 {
-                for target in &unique {
-                    actions.push(candidate(
-                        GameAction::SelectTargets {
-                            targets: vec![target.clone()],
-                        },
-                        TacticalClass::Selection,
-                        Some(*player),
-                    ));
-                }
-            } else if floor < ceiling {
-                actions.push(candidate(
-                    GameAction::SelectTargets {
-                        targets: unique[..floor].to_vec(),
-                    },
-                    TacticalClass::Selection,
-                    Some(*player),
-                ));
-            }
-            actions
+                )
+            })
+            .collect()
         }
         // CR 701.36a: Populate — choose a creature token to copy.
         WaitingFor::PopulateChoice {
@@ -5822,6 +5798,13 @@ mod tests {
             .collect();
         assert!(selections.iter().any(|targets| targets.is_empty()));
         assert!(selections.iter().any(|targets| targets.len() == 2));
+        assert!(selections.iter().any(|targets| {
+            targets.as_slice()
+                == [
+                    TargetRef::Object(ObjectId(2)),
+                    TargetRef::Object(ObjectId(3)),
+                ]
+        }));
         assert!(selections.iter().all(|targets| {
             targets.len() <= 2
                 && targets

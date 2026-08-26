@@ -31522,6 +31522,39 @@ mod tests {
     }
 
     #[test]
+    fn choose_objects_selection_serializes_bounds_and_defaults_legacy_shape() {
+        use crate::types::ability::TargetRef;
+
+        let waiting = WaitingFor::ChooseObjectsSelection {
+            player: PlayerId(0),
+            eligible: vec![TargetRef::Object(ObjectId(1))],
+            min: 1,
+            max: Some(2),
+            trigger_event: None,
+        };
+        let json = serde_json::to_value(&waiting).expect("serialize bounded prompt");
+        assert_eq!(json["data"]["min"], 1);
+        assert_eq!(json["data"]["max"], 2);
+        assert_eq!(
+            serde_json::from_value::<WaitingFor>(json).expect("roundtrip bounded prompt"),
+            waiting
+        );
+
+        let legacy = r#"{
+            "type":"ChooseObjectsSelection",
+            "data":{"player":0,"eligible":[]}
+        }"#;
+        assert!(matches!(
+            serde_json::from_str::<WaitingFor>(legacy).expect("legacy prompt remains parseable"),
+            WaitingFor::ChooseObjectsSelection {
+                min: 0,
+                max: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn crew_vehicle_legacy_missing_contributions_deserializes() {
         let json = r#"{
             "type":"CrewVehicle",
