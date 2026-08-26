@@ -41,6 +41,57 @@
 
 A Rust-native MTG engine compiling to native and WASM, powering a Tauri desktop app, browser PWA, and WebSocket multiplayer. Implements comprehensive MTG rules using functional architecture — pure reducers, discriminated unions, and immutable state with structural sharing — with an Arena-quality React/TypeScript UI.
 
+## Commander Online fork workflow
+
+This fork powers [phase.commanderonline.com](https://phase.commanderonline.com). Card coverage is visible at [phase.commanderonline.com/coverage](https://phase.commanderonline.com/coverage), including completion by set.
+
+### Branches and updates
+
+- `upstream/main` is the original [`phase-rs/phase`](https://github.com/phase-rs/phase) repository.
+- `origin/main` is synchronized from upstream every six hours.
+- `origin/platform` contains the version built for Commander Online, including our own reviewed changes.
+- GitHub Actions merges synchronized `main` into `platform` and builds the `server:platform` and `frontend:platform` images.
+- The VPS pulls the images during the nightly maintenance window and recreates only services whose images changed. An active game can be interrupted when a game service is recreated, which is why deployment is scheduled at night.
+
+Upstream synchronization uses a normal Git merge. It does **not** overwrite our commits. If both projects change the same lines incompatibly, the sync stops with a merge conflict instead of silently discarding our work.
+
+### Add or fix cards
+
+1. Use the coverage dashboard's **By Set** or **Gap Analysis** view to choose an unsupported card or mechanic.
+2. Create a short-lived branch from the latest `platform`; never edit files directly on the VPS.
+3. Follow [the AI contributor procedure](docs/AI-CONTRIBUTOR.md) and the repository skill matching the mechanic. Reuse an existing engine primitive whenever possible; implement a card class rather than a one-card special case.
+4. Add focused parser tests and at least one runtime test that would fail without the implementation. Parser coverage alone does not prove that gameplay works.
+5. Run formatting, strict linting, engine tests, card-data generation, coverage, semantic audit, and the relevant end-to-end scenario as required by the contributor procedure.
+6. Open a PR against the original repository when the change is generally useful. After review, merge the same commits into this fork's `platform` branch so Commander Online can deploy them without waiting for the upstream release cycle.
+7. Confirm that [Build platform images](https://github.com/ITC-MSM/phase-commander/actions/workflows/platform-images.yml) is green. The change is built at this point, but is not necessarily live yet.
+
+If upstream later adds the same fix, Git normally recognizes identical or already-merged commits. If the implementations differ, resolve the conflict deliberately and keep the reviewed version; neither version is automatically allowed to overwrite the other.
+
+### Verify that a fix is live
+
+Check all four levels—the first green check alone is not enough:
+
+1. **Source:** the fork PR is merged into `platform` and the expected commit is present there.
+2. **Build:** the `Build platform images` run for that commit completed successfully.
+3. **Deployment:** after the maintenance window, both Phase containers are healthy and were started after the image build.
+4. **Gameplay:** reproduce the original bug in a fresh browser session. If the installed PWA still shows an older client, use its update action or close it completely and reopen it.
+
+For **Rev, Tithe Extractor**, the manual regression test is:
+
+1. Deal combat damage to a player with Rev and exile that player's top card face down.
+2. Confirm Rev's controller can identify the exiled card while the opponent cannot.
+3. Remove Rev from the battlefield.
+4. Confirm the card remains identifiable and offers a cast/play action to Rev's controller.
+5. Cast or play it and confirm the normal stack, timing, costs, and resolution are used.
+
+After connecting to the VPS, the scheduled deployment and its most recent result can be checked with:
+
+```bash
+systemctl status commanderonline-update.timer
+sudo journalctl -u commanderonline-update.service -n 100 --no-pager
+sudo docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+```
+
 ## Story
 
 I'm Matt — a millennial software engineer who loves Magic. My six-year-old son asks me to play with him all the time, but the real game is just too complicated for a kid his age.

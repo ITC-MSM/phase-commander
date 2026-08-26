@@ -2,10 +2,10 @@ use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, tag_no_case, take_until};
-use nom::character::complete::{char, multispace0, multispace1};
-use nom::combinator::{all_consuming, eof, map_opt, opt, peek, rest, value};
-use nom::multi::separated_list1;
+use nom::bytes::complete::{tag, tag_no_case, take_until, take_while1};
+use nom::character::complete::{anychar, char, multispace0, multispace1};
+use nom::combinator::{all_consuming, eof, map_opt, opt, peek, recognize, rest, value};
+use nom::multi::{many_till, separated_list1};
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
@@ -791,6 +791,9 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     if nom_primitives::scan_contains(&lower, "you would create a")
         && nom_primitives::scan_contains(&lower, "instead")
     {
+        if let Some(def) = parse_same_subtype_plus_additional_token_replacement(&lower, &text) {
+            return Some(def);
+        }
         if let Some(def) = parse_subtype_token_substitution(&lower, &text) {
             return Some(def);
         }
@@ -7418,8 +7421,11 @@ fn parse_continuous_redirect_recipient(input: &str) -> OracleResult<'_, DamageRe
 /// rather than a CR 614.5 one-opportunity shield: "all damage that would be dealt
 /// …" for a stated window applies to EVERY matching damage event in that window,
 /// unlike "the next time …"/"the next N damage …", which are spent by their first
-/// event. The window itself is end-of-turn cleanup (CR 514.2), which
-/// `ShieldKind::is_shield()` already enforces — the two spellings the corpus uses
+/// event. The window itself is end-of-turn cleanup (CR 611.2a + CR 514.2),
+/// stamped as `RestrictionExpiry::EndOfTurn` by
+/// `ReplacementDefinition::redirection_shield` at install and read by
+/// `turns::execute_cleanup`; `ShieldKind` classifies the effect and carries no
+/// lifetime meaning of its own — the two spellings the corpus uses
 /// are Heroic Sacrifice's leading "Until end of turn," (lifted to the ability's
 /// own `duration` by the chunker before this parser sees the clause) and Gideon's
 /// Sacrifice / Saving Grace's inline "this turn".
@@ -9744,6 +9750,60 @@ fn parse_xorn_subtype_token_replacement(
     )
 }
 
+/// CR 614.1a + CR 111.1: Parse subtype-gated replacements that preserve the
+/// original token batch and append an equal-sized batch of another subtype:
+///
+/// ```text
+/// If you would create a <S> token, instead create a <S> token and a <T> token.
+/// ```
+///
+/// The repeated primary subtype must match the antecedent. Keeping that check
+/// here prevents a substitution such as Food -> Clue plus Treasure from being
+/// misrepresented as an additional-token effect.
+fn parse_same_subtype_plus_additional_token_replacement(
+    lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let subtype = |input| {
+        take_while1::<_, _, OracleError<'_>>(|c: char| {
+            c.is_alphanumeric() || matches!(c, '-' | '\'')
+        })
+        .parse(input)
+    };
+    let article = || alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")));
+    let (_, (antecedent, _, repeated, _, additional, _, _)) = all_consuming((
+        preceded(tag("if you would create "), preceded(article(), subtype)),
+        tag(" token, instead create "),
+        preceded(article(), subtype),
+        tag(" token and "),
+        preceded(article(), subtype),
+        tag(" token."),
+        eof,
+    ))
+    .parse(lower)
+    .ok()?;
+
+    if !antecedent.eq_ignore_ascii_case(repeated) {
+        return None;
+    }
+
+    let descriptor = format!("a {additional} token");
+    let token = super::oracle_effect::parse_token_description(&descriptor)?;
+    let spec = token_description_to_spec(&token)?;
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::CreateToken)
+            .condition(ReplacementCondition::TokenSubtypeMatches {
+                subtypes: vec![canonicalize_subtype(antecedent)],
+            })
+            // CR 109.5 + CR 111.2: "you" is the source controller, and only
+            // token batches that player creates are affected.
+            .token_owner_scope(ControllerRef::You)
+            .additional_token_spec(spec)
+            .description(original_text.to_string()),
+    )
+}
+
 /// CR 614.1a + CR 111.1: Tippy-Toe class — generic additional token without subtype gate.
 fn parse_generic_additional_token_replacement(
     lower: &str,
@@ -10913,7 +10973,7 @@ pub(crate) fn parse_bidirectional_damage_prevention(
 
     let subject_raw = nom_primitives::scan_at_word_boundaries(norm_lower, |input| {
         preceded(
-            tag::<_, _, OracleError<'_>>("dealt to and dealt by "),
+            tag::<_, _, OracleError<'_>>(BIDIRECTIONAL_ELLIPSIS_ANCHOR),
             take_damage_source_subject_clause,
         )
         .parse(input)
@@ -10935,11 +10995,312 @@ pub(crate) fn parse_bidirectional_damage_prevention(
     if let Some(cs) = combat_scope {
         base = base.combat_scope(cs);
     }
+    // CR 611.2a + CR 514.2: Stamp the clause's own stated window through the SAME
+    // authority the single-definition path uses, on `base` — BEFORE the two halves
+    // are cloned, so the recipient half and the source half can never disagree
+    // about the lifetime of one physical sentence. Without this, the ellipsis form
+    // ("...dealt to and dealt by enchanted creature this turn.") produced two
+    // shields with `expiry: None`, i.e. an immortal, game-wide combat-damage
+    // lockout on any PERMANENT host — the exact defect this commit fixes for the
+    // single-definition shape. Not corpus-reachable today (all six cards this
+    // recognizer claims are windowless printed statics), but the class has
+    // permanent-hosted members one printing away: Deftblade Elite, Urborg Phantom
+    // and Moonlight Geist all carry this sentence as an ability body.
+    //
+    // The anchor passed here is this recognizer's OWN ellipsis phrase — the same
+    // `BIDIRECTIONAL_ELLIPSIS_ANCHOR` the subject extraction above matched — not
+    // the prevention verb. A multi-sentence line ("Prevent all damage that would
+    // be dealt to you this turn. Prevent all combat damage that would be dealt to
+    // and dealt by enchanted creature.") carries the verb in BOTH sentences, so a
+    // verb anchor would read sentence 1's window onto two halves built entirely
+    // from sentence 2 — pruning a correct printed static at the first cleanup
+    // step, which is the Solitary Confinement defect wearing a different hat.
+    // Anchoring on the ellipsis phrase makes the window come from the same
+    // sentence the subject did, by construction.
+    match stated_clause_expiry(norm_lower, BIDIRECTIONAL_ELLIPSIS_ANCHOR) {
+        StatedClauseExpiry::Explicit(expiry) => base = base.expiry(expiry),
+        StatedClauseExpiry::Durable => {}
+        StatedClauseExpiry::Unsupported => return None,
+    }
 
     let recipient_half = base.clone().valid_card(subject.clone());
     let source_half = base.damage_source_filter(subject);
 
     Some(vec![recipient_half, source_half])
+}
+
+/// The prevention verb the single-definition path anchors on, both to select the
+/// sentence whose window it may read and to locate the start of the clause whose
+/// gates are then checked. Carries its trailing space deliberately — see
+/// `sentence_carrying_anchor`.
+const PREVENTION_VERB_ANCHOR: &str = "prevent ";
+
+/// The ellipsis phrase `parse_bidirectional_damage_prevention` anchors on. Shared
+/// between that recognizer's subject extraction and its `stated_clause_expiry`
+/// call so the SUBJECT and the WINDOW are provably read from the same sentence of
+/// a multi-sentence line — the two cannot drift because there is only one phrase.
+const BIDIRECTIONAL_ELLIPSIS_ANCHOR: &str = "dealt to and dealt by ";
+
+/// CR 611.2a + CR 514.2: The window a prevention clause states FOR ITSELF,
+/// mapped to the `RestrictionExpiry` the runtime prunes read.
+///
+/// `window_anchor` names the phrase that identifies WHICH sentence of the line is
+/// the clause in question — `PREVENTION_VERB_ANCHOR` for the single-definition
+/// path, `BIDIRECTIONAL_ELLIPSIS_ANCHOR` for the two-definition ellipsis
+/// recognizer. This function is the ONE window authority both recognizers read
+/// through; parameterizing the anchor rather than forking the function is what
+/// keeps them from disagreeing about one physical line (see gate 1 in
+/// `prevention_clause_owns_trailing_window`).
+///
+/// `turns::execute_cleanup` reads `expiry` and only `expiry` — no prune infers a
+/// lifetime from `shield_kind` — so a stated window the parser drops produces a
+/// definition nothing can ever remove. That is not hypothetical: Urza's Science
+/// Fair Project's die-roll result row "Prevent all combat damage it would deal
+/// this turn." lowers to a printed, object-hosted `DamageDone` shield with
+/// neither `valid_card` nor `damage_target_filter`, on an Artifact Creature — a
+/// PERMANENT, so unlike the eight Instant/Sorcery hosts of the same shape it is
+/// not neutralized by `object_replacement_candidate_applies`' `[Battlefield,
+/// Command]` zone gate. Unstamped, it prevents ALL combat damage in the game, to
+/// or from either player, for the rest of the game.
+///
+/// POSITION IS THE WHOLE POINT. `oracle_effect::lower::strip_trailing_duration`
+/// is the phrase→`Duration` authority and owns the *per-turn-quantity* lookback
+/// guards ("where X is the number of tokens you created this turn"), but it does
+/// NOT own the judgement this function needs, and it is deliberately not extended
+/// to: it is a shared authority every effect line in the parser runs through, and
+/// its own relative-clause guard (`target_relative_clause_owns_suffix`) anchors on
+/// the FIRST `" that "` in its input, so a NESTED relative clause
+/// ("...dealt to creatures that attacked this turn") slips past it. This function
+/// therefore adds its own positional gates on top, scoped to the prevention class
+/// where a wrong answer is destructive (see `prevention_clause_owns_trailing_window`).
+/// The asymmetry is intentional: not stamping leaves a durable definition (the
+/// pre-existing, safe behaviour); stamping wrongly deletes a correct printed
+/// static off a format-legal permanent at the next cleanup step, which is exactly
+/// the Solitary Confinement bug this commit exists to fix.
+///
+/// CR 604.2: a printed static ability states no window at all, so the ordinary
+/// case returns `None` and the definition stays durable — exactly what Solitary
+/// Confinement, Fog Bank, Nine Lives and Pariah require.
+///
+/// SCOPE NOTE on "`expiry` is the single lifetime authority": that premise is
+/// true for definitions the runtime can ever consult, which is MODULO
+/// `object_replacement_candidate_applies`' `[Battlefield, Command]` zone gate.
+/// Five turn-windowed printed shield defs in the corpus (Head to Head, Sex
+/// Appeal, That's No Moonmist, Torrent of Lava, Winds of Qal Sisma) still emit
+/// `expiry: null` and are inert only because they are Instants/Sorceries that
+/// never reach the battlefield. The premise holds unconditionally only for
+/// PERMANENT hosts.
+enum StatedClauseExpiry {
+    Explicit(crate::types::ability::RestrictionExpiry),
+    Durable,
+    Unsupported,
+}
+
+fn stated_clause_expiry(clause_lower: &str, window_anchor: &str) -> StatedClauseExpiry {
+    use crate::types::ability::RestrictionExpiry;
+
+    let Some(sentence) = prevention_clause_owns_trailing_window(clause_lower, window_anchor) else {
+        return StatedClauseExpiry::Durable;
+    };
+    let (_, duration) = super::oracle_effect::lower::strip_trailing_duration(sentence);
+    match duration {
+        None => StatedClauseExpiry::Durable,
+        // CR 514.2: "this turn" / "until end of turn" ends at the cleanup step.
+        Some(Duration::UntilEndOfTurn) => {
+            StatedClauseExpiry::Explicit(RestrictionExpiry::EndOfTurn)
+        }
+        // CR 511.2: "this combat" / "until end of combat" expires at the end of
+        // the combat phase; `complete_end_combat_teardown` catches the live and
+        // pending surfaces and the cleanup prune catches the base surface.
+        Some(Duration::UntilEndOfCombat) => {
+            StatedClauseExpiry::Explicit(RestrictionExpiry::EndOfCombat)
+        }
+        // CR 611.2a + CR 500.4: a parsed static replacement has no installation
+        // context from which to bind these player/step-relative windows. Rejecting
+        // the definition keeps coverage honest; mapping them to EndOfTurn would
+        // silently shorten the card's stated duration.
+        Some(Duration::UntilNextTurnOf { .. })
+        | Some(Duration::UntilEndOfNextTurnOf { .. })
+        | Some(Duration::UntilNextStepOf { .. }) => StatedClauseExpiry::Unsupported,
+        // Not turn windows: these end on an event or a condition, so `None` is the
+        // CORRECT answer, not an unmapped one — the battlefield-exit prune in
+        // `layers.rs` and the CR 611.2b `ReplacementCondition` gate end them, and
+        // stamping any turn window here would cut them short.
+        Some(Duration::UntilHostLeavesPlay)
+        | Some(Duration::ForAsLongAs { .. })
+        | Some(Duration::UntilSourceExilesAnotherCard)
+        | Some(Duration::UntilOpponentBecomesMonarch) => StatedClauseExpiry::Durable,
+        // CR 604.2: an explicitly permanent window is the printed-static case —
+        // no expiry, and the definition must survive every cleanup step.
+        Some(Duration::Permanent) => StatedClauseExpiry::Durable,
+    }
+}
+
+/// CR 611.2a: Narrow `clause_lower` to the prevention clause whose OWN trailing
+/// window `stated_clause_expiry` may read, or `None` when no such window can be
+/// attributed.
+///
+/// Three positional gates, each closing a measured overreach of the bare
+/// `strip_trailing_duration` call this replaces. All three fail CLOSED (return
+/// `None` → no stamp → durable definition), which is the pre-existing behaviour.
+///
+/// 1. SENTENCE. A prevention line can span sentences — `extract_prevention_followup`
+///    exists precisely for the Vigor / Phyrexian Hydra / Stormwild Capridor /
+///    Hostility cohort — and the whole line reaches this parser as one string. A
+///    duration at the END of the line therefore need not belong to the prevention
+///    clause at all ("Prevent all damage that would be dealt to you. Target
+///    creature gets +1/+1 until end of turn." must NOT inherit that +1/+1's
+///    window). So the window is read from the sentence carrying `window_anchor`,
+///    never from the line. The CALLER supplies that anchor, because "which
+///    sentence is this definition's clause" is the caller's fact, not this
+///    function's: the single-definition path builds from the first `"prevent "`
+///    verb and passes `PREVENTION_VERB_ANCHOR`, while the ellipsis recognizer
+///    builds both halves from whichever sentence carries
+///    `BIDIRECTIONAL_ELLIPSIS_ANCHOR` and passes that instead. A line carrying
+///    the prevention verb in TWO sentences ("Prevent all damage that would be
+///    dealt to you this turn. Prevent all combat damage that would be dealt to
+///    and dealt by enchanted creature.") is exactly where a single hard-coded
+///    verb anchor makes the two recognizers disagree, and it is the Fog Bank /
+///    Gaseous Form printed-static shape, so the disagreement would prune a
+///    correct printed static.
+/// 2. SUBORDINATING CONJUNCTION. A subordinate clause after the prevention verb
+///    ("...dealt to you if you've gained 3 or more life this turn", "...as long as
+///    a permanent left the battlefield under your control this turn") owns its own
+///    "this turn"; the prevention grammar itself contains no subordinator, so the
+///    presence of one means the trailing window cannot be attributed.
+/// 3. NESTED RELATIVE CLAUSE. "...dealt to creatures that attacked this turn"
+///    binds "this turn" to the recipient filter — the parser proves it, emitting
+///    `FilterProp::AttackedThisTurn`. Delegates the judgement to
+///    `oracle_target::parse_that_clause_suffix`, the same authority
+///    `strip_trailing_duration`'s own guard uses, but scanned at EVERY word
+///    boundary rather than only the first `" that "`, so a relative clause nested
+///    inside the prevention clause's own "that would be dealt ..." is seen.
+///
+///    Gate 3 is deliberately EXACTLY as complete as `parse_that_clause_suffix`,
+///    and that coupling is the design, not an oversight: the gate declines iff
+///    the filter parser actually bound the relative clause, so it can never
+///    claim a binding the AST does not show. A relative clause the filter parser
+///    does not recognize therefore still lets the window through — but in every
+///    such case that same non-recognition already leaves the definition with
+///    `valid_card: null`, i.e. an over-broad shield. Bounding an over-broad
+///    shield to one turn is strictly the LESSER error, so the boundary is safe
+///    in the direction it fails. Widening gate 3 past the filter parser would
+///    mean guessing at bindings the parser cannot prove; the way to widen it is
+///    to teach `parse_that_clause_suffix` the missing relative clause, which
+///    fixes `valid_card` and this gate in one move.
+fn prevention_clause_owns_trailing_window<'a>(
+    clause_lower: &'a str,
+    window_anchor: &str,
+) -> Option<&'a str> {
+    let sentence = sentence_carrying_anchor(clause_lower, window_anchor)?;
+    // The prevention grammar (`parse_damage_prevention_replacement` step 1) anchors
+    // its amount at the "prevent " verb, so the segment after it is exactly the
+    // clause whose window is in question. This is the VERB anchor regardless of
+    // which anchor selected the sentence: gates 2 and 3 ask "what follows the
+    // prevention verb inside this sentence", a question the ellipsis phrase does
+    // not answer. A selected sentence that carries no prevention verb fails closed
+    // here (no stamp → durable definition), matching the other two gates.
+    let after_prevent = strip_after(sentence, PREVENTION_VERB_ANCHOR)?;
+
+    let subordinate_clause_intervenes =
+        nom_primitives::scan_at_word_boundaries(after_prevent, |input: &str| {
+            alt((
+                tag::<_, _, OracleError<'_>>("whenever "),
+                tag("when "),
+                tag("as long as "),
+                tag("if "),
+                tag("while "),
+                tag("unless "),
+            ))
+            .parse(input)
+        })
+        .is_some();
+    if subordinate_clause_intervenes {
+        return None;
+    }
+
+    let relative_clause_owns_suffix =
+        nom_primitives::scan_at_word_boundaries(after_prevent, |input: &str| {
+            let fail = || nom::Err::Error(OracleError::new(input, nom::error::ErrorKind::Fail));
+            let (_, consumed) =
+                super::oracle_target::parse_that_clause_suffix(input, None).ok_or_else(fail)?;
+            let remaining = input.get(consumed..).ok_or_else(fail)?;
+            // The relative clause owns the suffix only if it runs to the end of the
+            // clause; a genuine OUTER window after it ("... that attacked this turn
+            // until end of turn") leaves a remainder and is still readable.
+            (
+                multispace0,
+                opt(alt((tag::<_, _, OracleError<'_>>("."), tag(",")))),
+                multispace0,
+                eof,
+            )
+                .parse(remaining)
+        })
+        .is_some();
+    if relative_clause_owns_suffix {
+        return None;
+    }
+
+    Some(sentence)
+}
+
+/// The FIRST sentence of `clause_lower` that carries `anchor`, or `None` if no
+/// sentence does.
+///
+/// Sentence boundaries are walked with nom combinators rather than a string split,
+/// recognizing space and newline sentence separators. The anchor is matched at word
+/// boundaries only, so it cannot fire mid-word.
+///
+/// FIRST is the right answer for both callers because each caller passes the same
+/// phrase its own definition-building anchored on: `parse_damage_prevention_replacement`
+/// extracts its amount at the first `strip_after(.., "prevent ")`, and
+/// `parse_bidirectional_damage_prevention` extracts its subject at the first
+/// word-boundary `BIDIRECTIONAL_ELLIPSIS_ANCHOR`. Same phrase, same scan
+/// direction, therefore same sentence as the definition — which is precisely the
+/// property that keeps the two recognizers from disagreeing about one line.
+///
+/// `PREVENTION_VERB_ANCHOR` deliberately carries its trailing space: it must match
+/// the verb ("prevent all", "prevent the next 3", "prevent 2 of that damage") and
+/// NOT the past participle in a follow-up rider ("if damage is prevented this
+/// way", Stormwild Capridor), which states no window of its own.
+fn sentence_carrying_anchor<'a>(clause_lower: &'a str, anchor: &str) -> Option<&'a str> {
+    let mut remaining = clause_lower;
+    loop {
+        // `many_till(anychar, peek(sentence_boundary))` stops at the FIRST supported
+        // sentence separator, so a later ". " cannot swallow an earlier newline
+        // boundary. Pairing it with the same boundary parser consumes exactly that
+        // separator and preserves the traversal grammar.
+        let (sentence, tail) = match (
+            recognize(many_till(
+                anychar::<_, OracleError<'_>>,
+                peek(alt((
+                    tag::<_, _, OracleError<'_>>(". "),
+                    tag(".\r\n"),
+                    tag(".\n"),
+                ))),
+            )),
+            alt((tag::<_, _, OracleError<'_>>(". "), tag(".\r\n"), tag(".\n"))),
+        )
+            .parse(remaining)
+        {
+            Ok((tail, (sentence, _))) => (sentence, tail),
+            // No further sentence boundary: the rest of the line is one sentence.
+            Err(nom::Err::Error(_) | nom::Err::Failure(_) | nom::Err::Incomplete(_)) => {
+                (remaining, "")
+            }
+        };
+        let carries_anchor = nom_primitives::scan_at_word_boundaries(sentence, |input: &str| {
+            tag::<_, _, OracleError<'_>>(anchor).parse(input)
+        })
+        .is_some();
+        if carries_anchor {
+            return Some(sentence);
+        }
+        if tail.is_empty() {
+            return None;
+        }
+        remaining = tail;
+    }
 }
 
 /// CR 615: Parse damage prevention replacement effects.
@@ -11212,6 +11573,25 @@ fn parse_damage_prevention_replacement(
     }
     if let Some(sf) = damage_source_filter {
         def = def.damage_source_filter(sf);
+    }
+    // CR 611.2a + CR 514.2: record the window this clause states for ITSELF, so
+    // `expiry` — the single lifetime authority `turns::execute_cleanup` reads —
+    // carries what the card actually says instead of silently dropping it. A
+    // CR 604.2 printed static states no window, so `stated_clause_expiry`
+    // returns `None` for it and the definition stays durable.
+    //
+    // The `is_none()` guard is VACUOUSLY TRUE today and is kept only as a
+    // never-clobber assertion: nothing between `ReplacementDefinition::new` above
+    // and this line writes `expiry` (`prevention_shield` deliberately does not
+    // stamp one). It is not guarding a real prior write — if a future arm starts
+    // setting `expiry` earlier, that arm's answer is the more specific one and
+    // must win over this generic clause-window read.
+    if def.expiry.is_none() {
+        match stated_clause_expiry(working_lower, PREVENTION_VERB_ANCHOR) {
+            StatedClauseExpiry::Explicit(expiry) => def = def.expiry(expiry),
+            StatedClauseExpiry::Durable => {}
+            StatedClauseExpiry::Unsupported => return None,
+        }
     }
     // Capture whether the recipient filter was event-driven (typed
     // `valid_card`) before moving it onto `def` — the follow-up rewrite
@@ -12375,7 +12755,8 @@ mod tests {
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
         AbilityCondition, Comparator, ControllerRef, CountScope, QuantityExpr,
-        QuantityModification, QuantityRef, ReplacementCondition, ShieldKind, ZoneRef,
+        QuantityModification, QuantityRef, ReplacementCondition, RestrictionExpiry, ShieldKind,
+        ZoneRef,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
@@ -14309,6 +14690,279 @@ mod tests {
                 );
             }
             other => panic!("expected Typed opponent-controlled source filter, got {other:?}"),
+        }
+    }
+
+    /// CR 611.2a + CR 514.2 vs CR 604.2: `expiry` records the window a prevention
+    /// clause states FOR ITSELF, and nothing else. Shape-level companion to the
+    /// runtime pin in
+    /// `tests/integration/printed_damage_prevention_survives_turn.rs::turn_windowed_printed_shield_is_stamped_and_does_not_survive_cleanup`.
+    ///
+    /// The discriminating half is `TRAILING-POSITION` block: every one of those
+    /// four inputs ends in `"this turn"` / `"until end of turn"` at the very END of
+    /// the line, so a stamp that merely reads the last duration phrase passes them
+    /// all; only the positional gates in `prevention_clause_owns_trailing_window`
+    /// reject them. Each would otherwise delete a correct printed static off a
+    /// format-legal permanent at the next cleanup step — the reported Solitary
+    /// Confinement bug, reintroduced card by card.
+    ///
+    /// (A mid-sentence "this turn", e.g. Neriv, Heart of the Storm's "that entered
+    /// this turn would deal damage", does NOT discriminate here: the bare
+    /// `strip_trailing_duration` call these gates replaced already declined it,
+    /// because the phrase is not in trailing position at all.)
+    #[test]
+    fn prevention_expiry_records_only_a_clause_final_stated_window() {
+        // Verbatim Urza's Science Fair Project, result row 2. A trailing "this
+        // turn" IS this effect's own window.
+        let windowed = parse_replacement_line(
+            "Prevent all combat damage it would deal this turn.",
+            "Urza's Science Fair Project",
+        )
+        .expect("the prevention clause must still parse");
+        assert!(windowed.shield_kind.is_shield());
+        assert_eq!(
+            windowed.expiry,
+            Some(RestrictionExpiry::EndOfTurn),
+            "CR 611.2a: a clause-final 'this turn' is the effect's stated window"
+        );
+
+        // Verbatim Solitary Confinement, line 3. CR 604.2: a printed static
+        // states no window, so it must stay durable.
+        let durable = parse_replacement_line(
+            "Prevent all damage that would be dealt to you.",
+            "Solitary Confinement",
+        )
+        .expect("the printed static must still parse");
+        assert!(durable.shield_kind.is_shield());
+        assert_eq!(
+            durable.expiry, None,
+            "CR 604.2: a printed static's shield carries no window"
+        );
+
+        // TRAILING-POSITION discrimination. Every input below ends in a duration
+        // phrase at the very end of the line, so `strip_trailing_duration` alone
+        // reports `UntilEndOfTurn` for all four; the window nevertheless belongs to
+        // a subordinate clause or to a different sentence, never to the shield.
+        for (text, why) in [
+            (
+                // The parser itself proves the binding: it emits
+                // `FilterProp::AttackedThisTurn` on the recipient filter from this
+                // very phrase, then must not also read it as the shield's window.
+                "Prevent all damage that would be dealt to creatures that attacked this turn.",
+                "a nested relative clause owns its own 'this turn'",
+            ),
+            (
+                "Prevent all combat damage that would be dealt to you by creatures \
+                 that entered the battlefield this turn.",
+                "a nested relative clause on the SOURCE owns its own 'this turn'",
+            ),
+            (
+                "Prevent all damage that would be dealt to you if you've gained 3 \
+                 or more life this turn.",
+                "a trailing 'if' condition owns its own 'this turn'",
+            ),
+            (
+                // The SUFFIX form of the "as long as" condition; only the PREFIX
+                // form is lifted by `strip_as_long_as_condition_prefix`.
+                "Prevent all damage that would be dealt to you as long as a permanent \
+                 left the battlefield under your control this turn.",
+                "a trailing 'as long as' condition owns its own 'this turn'",
+            ),
+            (
+                "Prevent all damage that would be dealt to you. Target creature gets \
+                 +1/+1 until end of turn.",
+                "a DIFFERENT sentence's duration is not this shield's window",
+            ),
+        ] {
+            let def = parse_replacement_line(text, "Probe Card")
+                .unwrap_or_else(|| panic!("the prevention clause must still parse: {text}"));
+            // Reach-guard: the shield really was built, so `expiry: None` below is
+            // a decision this parser made and not an early bail-out.
+            assert!(
+                def.shield_kind.is_shield(),
+                "reach-guard: {text} must still produce a prevention shield"
+            );
+            assert_eq!(
+                def.expiry, None,
+                "CR 604.2 + CR 611.2a: {why} — a printed static must not acquire a \
+                 turn window from it ({text})"
+            );
+        }
+    }
+
+    /// CR 611.2a + CR 514.2: the bidirectional "dealt to and dealt by <subject>"
+    /// ellipsis recognizer emits TWO definitions from ONE physical sentence, so
+    /// both halves must agree about that sentence's stated window — and must apply
+    /// the same positional discipline as the single-definition path.
+    ///
+    /// `parse_bidirectional_damage_prevention` is a standalone dispatch arm that
+    /// bypasses `parse_damage_prevention_replacement` entirely (see `oracle.rs`
+    /// `dispatch`), so it is exercised directly here; `parse_replacement_line` can
+    /// only ever return one definition and cannot reach it.
+    #[test]
+    fn bidirectional_prevention_halves_share_the_clause_stated_window() {
+        let windowed = "prevent all combat damage that would be dealt to and dealt by \
+                        enchanted creature this turn.";
+        let halves = parse_bidirectional_damage_prevention(windowed, windowed)
+            .expect("the ellipsis form must still parse");
+        assert_eq!(halves.len(), 2, "recipient half + source half");
+        for half in &halves {
+            assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+            assert_eq!(
+                half.expiry,
+                Some(RestrictionExpiry::EndOfTurn),
+                "CR 514.2: both halves of one sentence carry that sentence's window"
+            );
+        }
+        // The two halves are distinguished only by which role they scope.
+        assert!(halves[0].valid_card.is_some() && halves[0].damage_source_filter.is_none());
+        assert!(halves[1].valid_card.is_none() && halves[1].damage_source_filter.is_some());
+
+        // CR 604.2: the windowless printed static (Fog Bank / Statecraft / Gaseous
+        // Form cohort) stays durable on both halves.
+        let durable = "prevent all combat damage that would be dealt to and dealt by \
+                       creatures you control.";
+        for half in parse_bidirectional_damage_prevention(durable, durable)
+            .expect("Statecraft's printed static must still parse")
+        {
+            assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+            assert_eq!(
+                half.expiry, None,
+                "CR 604.2: a printed static's shield carries no window"
+            );
+        }
+
+        // Same positional discipline as the single-definition path: a duration
+        // belonging to a DIFFERENT sentence must not be inherited by either half.
+        let other_sentence = "prevent all combat damage that would be dealt to and dealt by \
+                              enchanted creature. target creature gets +1/+1 until end of turn.";
+        for half in parse_bidirectional_damage_prevention(other_sentence, other_sentence)
+            .expect("the ellipsis form must still parse")
+        {
+            assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+            assert_eq!(
+                half.expiry, None,
+                "CR 611.2a: the two recognizers must agree on what a stated window is"
+            );
+        }
+
+        // ANCHOR DISCRIMINATION. Both lines below carry the prevention verb in
+        // BOTH sentences, so selecting the sentence by the prevention verb picks
+        // the FIRST one while the two halves are built entirely from the sentence
+        // carrying the ellipsis. Reading the window from the definition-bearing
+        // sentence is the only way to get both of these right, and getting the
+        // second one wrong prunes a correct Fog Bank / Gaseous Form printed static
+        // at the first cleanup step.
+        for (text, expected, why) in [
+            (
+                // The ellipsis sentence states the window; the earlier prevention
+                // sentence does not. A verb anchor reads sentence 1 and finds no
+                // duration, dropping a window the clause really did state.
+                "prevent all damage that would be dealt to you. prevent all combat damage \
+                 that would be dealt to and dealt by enchanted creature this turn.",
+                Some(RestrictionExpiry::EndOfTurn),
+                "the window stated BY the ellipsis sentence is the halves' own window",
+            ),
+            (
+                // The mirror: an earlier prevention sentence states a window the
+                // ellipsis sentence does not. A verb anchor reads sentence 1 and
+                // stamps a window belonging to a different definition entirely.
+                "prevent all damage that would be dealt to you this turn. prevent all combat \
+                 damage that would be dealt to and dealt by enchanted creature.",
+                None,
+                "a window stated by a DIFFERENT prevention sentence is not the halves' window",
+            ),
+        ] {
+            let halves = parse_bidirectional_damage_prevention(text, text)
+                .unwrap_or_else(|| panic!("the ellipsis form must still parse: {text}"));
+            assert_eq!(halves.len(), 2, "recipient half + source half: {text}");
+            // PROVENANCE REACH-GUARD: both halves are scoped by the ELLIPSIS
+            // sentence's subject ("enchanted creature" → `AttachedTo`), never by
+            // the other prevention sentence's recipient ("you" → a player filter).
+            // This is what makes the `expiry` assertions below a statement about
+            // sentence agreement rather than an early bail-out.
+            assert_eq!(
+                halves[0].valid_card,
+                Some(TargetFilter::AttachedTo),
+                "reach-guard: recipient half is built from the ellipsis sentence ({text})"
+            );
+            assert_eq!(
+                halves[1].damage_source_filter,
+                Some(TargetFilter::AttachedTo),
+                "reach-guard: source half is built from the ellipsis sentence ({text})"
+            );
+            for half in &halves {
+                assert!(half.shield_kind.is_shield(), "reach-guard: shield built");
+                assert_eq!(
+                    half.expiry, expected,
+                    "CR 611.2a: {why} — both recognizers read the window from the sentence \
+                     their definition was built from ({text})"
+                );
+            }
+        }
+    }
+
+    /// CR 611.2a + CR 500.4: a stated window that cannot be bound at the
+    /// replacement-installation seam must fail closed, never become a different
+    /// end-of-turn window or a durable shield.
+    #[test]
+    fn stated_but_unmappable_printed_window_fails_closed() {
+        for (text, why) in [
+            (
+                // "until your next turn" lowers to `Duration::UntilNextTurnOf`,
+                // whose `RestrictionExpiry` counterpart needs a `PlayerId` that
+                // does not exist at parse time.
+                "Prevent all damage that would be dealt to you until your next turn.",
+                "the player-relative turn window (`UntilNextTurnOf`)",
+            ),
+            (
+                // "until the end of your next turn" lowers to
+                // `Duration::UntilEndOfNextTurnOf`, a SECOND player-relative turn
+                // window that is a whole turn later than `UntilNextTurnOf` and
+                // likewise needs a `PlayerId` the parse seam cannot supply.
+                "Prevent all damage that would be dealt to you until the end of your next turn.",
+                "the end-of-next-turn window (`UntilEndOfNextTurnOf`)",
+            ),
+            (
+                // CR 500.4: "until your next upkeep" lowers to
+                // `Duration::UntilNextStepOf`, a STEP-keyed window with no
+                // replacement prune at all. It is the leg furthest from its stated
+                // window — an upkeep deadline is a whole opponent turn away — so
+                // approximating it to `EndOfTurn` is the most consequential of the
+                // three legs and the one most in need of a pin.
+                "Prevent all damage that would be dealt to you until your next upkeep.",
+                "the step-keyed window (`UntilNextStepOf`)",
+            ),
+        ] {
+            assert!(
+                parse_replacement_line(text, "Probe Card").is_none(),
+                "CR 611.2a: {why} cannot be represented at this seam, so the parser must \
+                 not install a replacement with an invented lifetime ({text})"
+            );
+        }
+
+        // CR 604.2: the contrast case — a clause that states NO window at all is
+        // durable by design and must NOT pick up the same fallback.
+        let durable = parse_replacement_line(
+            "Prevent all damage that would be dealt to you.",
+            "Solitary Confinement",
+        )
+        .expect("the printed static must still parse");
+        assert_eq!(durable.expiry, None);
+    }
+
+    #[test]
+    fn prevention_window_does_not_cross_newline_sentence_boundary() {
+        for separator in ["\n", "\r\n"] {
+            let text = format!(
+                "Prevent all damage that would be dealt to you.{separator}Target creature gets +1/+1 until end of turn."
+            );
+            let definition = parse_replacement_line(&text, "Boundary Probe")
+                .expect("the first prevention sentence must still parse");
+            assert_eq!(
+                definition.expiry, None,
+                "the later sentence's duration must not be attached across {separator:?}"
+            );
         }
     }
 
@@ -22297,6 +22951,59 @@ mod tests {
                 .any(|s| s.eq_ignore_ascii_case("Treasure")),
             "appended spec must be a Treasure token, got {:?}",
             spec.characteristics.subtypes
+        );
+    }
+
+    /// CR 614.1a + CR 111.10a-b: Bilbo preserves each Food token in the
+    /// proposed batch and appends one Treasure token for each of them.
+    #[test]
+    fn parses_same_subtype_plus_additional_token_replacement() {
+        let text =
+            "If you would create a Food token, instead create a Food token and a Treasure token.";
+        let def = parse_replacement_line(text, "Bilbo, Fellow Conspirator")
+            .expect("Bilbo replacement must parse");
+
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+        assert!(matches!(
+            def.condition,
+            Some(ReplacementCondition::TokenSubtypeMatches { ref subtypes })
+                if subtypes == &["Food".to_string()]
+        ));
+        let additional = def
+            .additional_token_spec
+            .expect("Bilbo must append a token spec");
+        assert_eq!(
+            additional.characteristics.subtypes,
+            vec!["Treasure".to_string()]
+        );
+    }
+
+    #[test]
+    fn same_subtype_plus_additional_rejects_changed_primary_subtype() {
+        let text =
+            "If you would create a Food token, instead create a Clue token and a Treasure token.";
+        assert!(
+            parse_same_subtype_plus_additional_token_replacement(text, text).is_none(),
+            "a changed primary token is substitution plus addition, not Bilbo's class"
+        );
+    }
+
+    #[test]
+    fn same_subtype_plus_additional_rejects_malformed_second_token() {
+        let text = "If you would create a Food token, instead create a Food and a Treasure token.";
+        assert!(
+            parse_same_subtype_plus_additional_token_replacement(text, text).is_none(),
+            "the repeated primary must be a complete token description"
+        );
+    }
+
+    #[test]
+    fn same_subtype_plus_additional_rejects_semantic_tail() {
+        let text = "If you would create a Food token, instead create a Food token and a Treasure token if it is your turn.";
+        assert!(
+            parse_same_subtype_plus_additional_token_replacement(text, text).is_none(),
+            "all-consuming grammar must not swallow a semantic tail"
         );
     }
 
