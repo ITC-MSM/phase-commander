@@ -3719,6 +3719,33 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     if let Some(filter) = chosen_player_anaphor_filter(ctx.relative_player_scope.as_ref()) {
         return filter;
     }
+    // CR 608.2c: after a multi-target declaration, a bare "They" can name the
+    // unique earlier player slot even when a later object slot intervenes.
+    // Bind by the declared slot's typed player shape, never by card text or
+    // position alone; zero or multiple player slots remain ambiguous and fall
+    // through to the established pronoun rules below.
+    let mut declared_player_slot = None;
+    for (index, slot) in ctx.declared_target_slots.iter().enumerate() {
+        let is_player = match slot {
+            TargetFilter::Player | TargetFilter::Opponent => true,
+            TargetFilter::Typed(TypedFilter {
+                type_filters,
+                properties,
+                ..
+            }) => type_filters.is_empty() && properties.is_empty(),
+            _ => false,
+        };
+        if is_player {
+            if declared_player_slot.is_some() {
+                declared_player_slot = None;
+                break;
+            }
+            declared_player_slot = Some(index);
+        }
+    }
+    if let Some(index) = declared_player_slot {
+        return TargetFilter::ParentTargetSlot { index };
+    }
     match &ctx.subject {
         // Player-type trigger subject: no type_filters, has controller ref
         Some(TargetFilter::Typed(tf)) if tf.type_filters.is_empty() && tf.controller.is_some() => {

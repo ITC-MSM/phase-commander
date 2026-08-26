@@ -4077,6 +4077,19 @@ pub(crate) fn collect_player_targets(
     ability: &ResolvedAbility,
     target: &TargetFilter,
 ) -> Vec<PlayerId> {
+    // CR 608.2c: a definite player anaphor may name one exact slot in the
+    // flattened resolving chain after an intervening object target. Resolve
+    // that slot before inspecting this node's propagated local targets, which
+    // may contain only the most-recent object slot.
+    if let TargetFilter::ParentTargetSlot { index } = target {
+        return crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
+            .and_then(|target| match target {
+                TargetRef::Player(player) => Some(player),
+                TargetRef::Object(_) => None,
+            })
+            .into_iter()
+            .collect();
+    }
     let from_targets: Vec<PlayerId> = ability
         .targets
         .iter()

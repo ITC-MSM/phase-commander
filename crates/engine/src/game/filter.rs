@@ -1465,13 +1465,12 @@ pub(crate) fn controller_ref_player(
         ControllerRef::ScopedPlayer => {
             scoped_player_or_controller(state, ability, source_controller, None)
         }
-        // CR 109.4: TargetOpponent reads identically to TargetPlayer (first player target).
-        ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => ability.and_then(|a| {
-            a.targets.iter().find_map(|t| match t {
-                TargetRef::Player(pid) => Some(*pid),
-                TargetRef::Object(_) => None,
-            })
-        }),
+        // CR 109.4: TargetOpponent reads identically to TargetPlayer (first
+        // declared player target), including an earlier slot in the resolving
+        // root after an intervening object-target node.
+        ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => {
+            target_player_from_ability_or_root(state, ability)
+        }
         ControllerRef::ParentTargetController => parent_target_controller_player(state, ability),
         ControllerRef::ParentTargetOwner => parent_target_owner_player(state, ability),
         ControllerRef::DefendingPlayer => {
@@ -1503,6 +1502,36 @@ pub(crate) fn controller_ref_player(
         // resolving ability (Gideon Jura's "+2").
         ControllerRef::SpecificPlayer { id } => Some(*id),
     }
+}
+
+/// CR 608.2c: resolve the first declared player target without letting a
+/// chained node's most-recent object-target propagation hide an earlier player
+/// slot. Local targets remain the fast path; the flattened resolving root is
+/// the exact fallback used by `ParentTargetSlot` anaphors elsewhere.
+fn target_player_from_ability_or_root(
+    state: &GameState,
+    ability: Option<&ResolvedAbility>,
+) -> Option<PlayerId> {
+    let ability = ability?;
+    ability
+        .targets
+        .iter()
+        .find_map(|target| match target {
+            TargetRef::Player(player) => Some(*player),
+            TargetRef::Object(_) => None,
+        })
+        .or_else(|| {
+            let root = crate::game::targeting::resolving_root_ability(state, ability);
+            if std::ptr::eq(root, ability) {
+                return None;
+            }
+            crate::game::ability_utils::flatten_targets_in_chain(root)
+                .into_iter()
+                .find_map(|target| match target {
+                    TargetRef::Player(player) => Some(player),
+                    TargetRef::Object(_) => None,
+                })
+        })
 }
 /// Whether `filter`, or any filter nested anywhere inside it, satisfies `leaf`.
 ///
@@ -3167,13 +3196,7 @@ fn filter_inner_for_object(
                     // whenever this variant appears). CR 109.4: TargetOpponent reads
                     // identically (the opponent constraint lives in the slot).
                     ControllerRef::TargetPlayer | ControllerRef::TargetOpponent => {
-                        let target_player = ability
-                            .and_then(|a| {
-                                a.targets.iter().find_map(|t| match t {
-                                    TargetRef::Player(pid) => Some(*pid),
-                                    TargetRef::Object(_) => None,
-                                })
-                            })
+                        let target_player = target_player_from_ability_or_root(state, ability)
                             // CR 603.2: When no player target was chosen, "that
                             // player" is the triggering event's player. Non-Phase
                             // triggers resolve their player anaphor from event
