@@ -11860,6 +11860,71 @@ mod tests {
     }
 
     #[test]
+    fn great_aerie_allows_skipping_both_optional_targets_without_mutation() {
+        let mut state = GameState::new(FormatConfig::standard(), 2, 42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "The Great Aerie".to_string(),
+            Zone::Battlefield,
+        );
+        let yours = create_creature(&mut state, PlayerId(0), CardId(2), "Your Creature");
+        let opponents = create_creature(&mut state, PlayerId(1), CardId(3), "Opponent Creature");
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "Whenever chaos ensues, choose up to one target creature you control and up to one target creature an opponent controls. Each of those creatures deals damage equal to its toughness to the other.",
+            "The Great Aerie",
+            &[],
+            &["Plane".to_string()],
+            &["Tarkir".to_string()],
+        );
+        let definition = parsed
+            .triggers
+            .iter()
+            .find(|trigger| {
+                matches!(
+                    trigger.mode,
+                    crate::types::triggers::TriggerMode::ChaosEnsues
+                )
+            })
+            .and_then(|trigger| trigger.execute.as_deref())
+            .expect("Great Aerie chaos trigger");
+        let ability = build_resolved_from_def(definition, source, PlayerId(0));
+        let slots = build_target_slots(&state, &ability).expect("two optional target slots");
+
+        assert_eq!(slots.len(), 2);
+        assert!(slots.iter().all(|slot| slot.optional));
+        let damage_before = [
+            state.objects[&yours].damage_marked,
+            state.objects[&opponents].damage_marked,
+        ];
+        let progress = begin_target_selection_for_ability(&state, &ability, &slots, &[])
+            .expect("selection starts");
+        let TargetSelectionAdvance::InProgress(progress) =
+            choose_target_for_ability(&state, &ability, &slots, &[], &progress, None)
+                .expect("skip first optional target")
+        else {
+            panic!("second optional slot remains");
+        };
+        let TargetSelectionAdvance::Complete(selected) =
+            choose_target_for_ability(&state, &ability, &slots, &[], &progress, None)
+                .expect("skip second optional target")
+        else {
+            panic!("both skipped targets complete selection");
+        };
+
+        assert_eq!(selected, vec![None, None]);
+        assert_eq!(
+            [
+                state.objects[&yours].damage_marked,
+                state.objects[&opponents].damage_marked,
+            ],
+            damage_before,
+            "target announcement must not mutate either creature"
+        );
+    }
+
+    #[test]
     fn choose_target_for_ability_skip_completes_optional_multi_target_tail() {
         let mut state = GameState::new(FormatConfig::standard(), 2, 42);
         let source = create_creature(&mut state, PlayerId(0), CardId(1), "Source");

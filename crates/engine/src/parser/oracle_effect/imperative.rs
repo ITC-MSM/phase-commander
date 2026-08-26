@@ -4952,7 +4952,9 @@ fn try_parse_two_targets(rest: &str, ctx: &mut ParseContext) -> Option<ChooseImp
 
     // CR 115.1c slot A: the prefix must be a targeting phrase. `parse_target`
     // returning `Any` means "no recognized target" — we refuse to split.
-    let (target_a, rem_a) = parse_target_with_ctx(prefix_orig.trim_end(), ctx);
+    let (target_a_text, explicit_target_a_multi_target) =
+        super::strip_optional_target_prefix(prefix_orig.trim_end());
+    let (target_a, rem_a) = parse_target_with_ctx(target_a_text, ctx);
     if matches!(target_a, TargetFilter::Any) {
         return None;
     }
@@ -5003,9 +5005,11 @@ fn try_parse_two_targets(rest: &str, ctx: &mut ParseContext) -> Option<ChooseImp
     // heads in one chain; the single-declaration form is the whole class.)
     ctx.declared_target_slots = vec![target_a.clone(), target_b.clone()];
 
-    let target_a_multi_target = target_b_multi_target
-        .as_ref()
-        .map(|_| MultiTargetSpec::exact(QuantityExpr::Fixed { value: 1 }));
+    let target_a_multi_target = explicit_target_a_multi_target.or_else(|| {
+        target_b_multi_target
+            .as_ref()
+            .map(|_| MultiTargetSpec::exact(QuantityExpr::Fixed { value: 1 }))
+    });
     Some(ChooseImperativeAst::TwoTargets {
         target_a,
         target_a_multi_target,
@@ -19445,9 +19449,9 @@ mod tests {
         let lower = text.to_lowercase();
         let Some(ChooseImperativeAst::TwoTargets {
             target_a,
+            target_a_multi_target,
             target_b,
             target_b_multi_target,
-            ..
         }) = parse_choose_ast(text, &lower, &mut ParseContext::default())
         else {
             panic!("expected the two-target Great Aerie head");
@@ -19464,6 +19468,10 @@ mod tests {
                 if tf.type_filters.contains(&TypeFilter::Creature)
                     && tf.controller == Some(ControllerRef::Opponent)
         ));
+        assert_eq!(
+            target_a_multi_target,
+            Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }))
+        );
         assert_eq!(
             target_b_multi_target,
             Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }))
