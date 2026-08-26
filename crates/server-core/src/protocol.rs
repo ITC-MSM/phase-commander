@@ -2398,8 +2398,8 @@ mod tests {
     }
 
     #[test]
-    fn protocol_version_is_38() {
-        assert_eq!(PROTOCOL_VERSION, 38);
+    fn protocol_version_is_39() {
+        assert_eq!(PROTOCOL_VERSION, 39);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no

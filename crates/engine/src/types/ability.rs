@@ -3078,6 +3078,10 @@ pub enum ManaSpendRestriction {
     /// accepts the legacy bare-`Zone` serialized form for backward compatibility,
     /// mapping it to the inclusion reading.
     SpellFromZone(ZoneSpend),
+    /// CR 106.6 + CR 400.7: "This mana can't be spent to cast spells from
+    /// [zone]." Unlike `SpellFromZone(NotFrom)`, this prohibits one class of
+    /// spell cast without restricting ability, effect, or special-action costs.
+    CannotCastSpellFromZone(Zone),
     /// CR 106.6 + CR 116.2m + CR 709.5e: "Spend this mana only to unlock
     /// [a ]door[s]" — the special-action half of a spend restriction. A leaf of
     /// the [`ManaSpendRestriction::Any`] disjunction (Smoky Lounge: "cast Room
@@ -3174,6 +3178,7 @@ impl ManaSpendRestriction {
             | ManaSpendRestriction::SpellWithColorCount { .. }
             | ManaSpendRestriction::SpellOfSourceChosenColor
             | ManaSpendRestriction::SpellFromZone(_)
+            | ManaSpendRestriction::CannotCastSpellFromZone(_)
             | ManaSpendRestriction::UnlockDoor => true,
             // CR 106.6: coverage for a disjunction requires every named branch to
             // be production-live (`.all()`). Partial absorption would drop
@@ -29019,6 +29024,7 @@ mod tests {
             polarity: ZoneSpendPolarity::From,
         })
         .is_coverage_supported());
+        assert!(ManaSpendRestriction::CannotCastSpellFromZone(Zone::Hand).is_coverage_supported());
         assert!(ManaSpendRestriction::UnlockDoor.is_coverage_supported());
         // CR 116.2b + CR 702.37e: the paid `GameAction::TurnFaceUp` handler makes
         // the turn-face-up special-action gate satisfiable.

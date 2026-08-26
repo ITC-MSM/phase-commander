@@ -1,5 +1,6 @@
-//! Mm'menon, the Right Hand — Artifacts you control have "{T}: Add {U}. Spend
-//! this mana only to cast a spell from anywhere other than your hand."
+//! Mm'menon, the Right Hand — positive spell-only `NotFrom(Hand)` restriction;
+//! and Karolina Dean, Runaway — a narrow prohibition on casts from hand that
+//! leaves every non-cast payment context unrestricted.
 //!
 //! CR 106.6 (restricted mana spend) + CR 400.7 (cast-from zone identity).
 //!
@@ -10,15 +11,14 @@
 //!      route, proving a `NotFrom`-restricted unit is CONSUMED for a spell cast
 //!      from a non-hand zone and WITHHELD for a spell cast from hand.
 //!
-//! Revert-proof: if the `ZoneSpendPolarity::NotFrom` arm of
-//! `OnlyForSpellFromZone` were reverted to the inclusion (`From`) reading, the
-//! "from hand" spell would become payable and the "from graveyard" spell would
-//! become unpayable — every assertion below flips.
+//! Revert-proof: reverting either the polarity axis or Karolina's dedicated
+//! prohibition makes the corresponding hand/non-hand and non-cast assertions
+//! flip.
 
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{
-    ManaPool, ManaRestriction, ManaType, ManaUnit, PaymentContext, SpellMeta, ZoneSpend,
-    ZoneSpendPolarity,
+    ActivationManaColorConstraint, ManaPool, ManaRestriction, ManaType, ManaUnit, PaymentContext,
+    SpecialAction, SpellMeta, ZoneSpend, ZoneSpendPolarity,
 };
 use engine::types::zones::Zone;
 
@@ -29,6 +29,12 @@ fn not_from_hand_restriction() -> ManaRestriction {
         zone: Zone::Hand,
         polarity: ZoneSpendPolarity::NotFrom,
     })
+}
+
+/// Karolina Dean: this mana cannot pay for the one forbidden cast class, but
+/// remains unrestricted for non-cast payments.
+fn cannot_cast_from_hand_restriction() -> ManaRestriction {
+    ManaRestriction::CannotCastSpellFromZone(Zone::Hand)
 }
 
 fn spell_cast_from(zone: Zone) -> SpellMeta {
@@ -103,6 +109,91 @@ fn spend_for_consumes_for_non_hand_and_withholds_for_hand() {
         "NotFrom-restricted mana must not pay a spell cast from hand"
     );
     assert_eq!(pool.total(), 1, "the unit must remain unspent");
+}
+
+#[test]
+fn karolina_restriction_is_a_narrow_cast_prohibition() {
+    let source = ObjectId(1);
+    let make_pool = || {
+        let mut pool = ManaPool::default();
+        pool.add(ManaUnit::new(
+            ManaType::White,
+            source,
+            false,
+            vec![cannot_cast_from_hand_restriction()],
+        ));
+        pool
+    };
+
+    let mut hand_pool = make_pool();
+    assert!(
+        hand_pool
+            .spend_for(
+                ManaType::White,
+                &PaymentContext::Spell(&spell_cast_from(Zone::Hand)),
+            )
+            .is_none(),
+        "Karolina's mana must be withheld from a spell cast from hand"
+    );
+    assert_eq!(hand_pool.total(), 1);
+
+    for origin in [Zone::Graveyard, Zone::Exile] {
+        let mut pool = make_pool();
+        assert!(
+            pool.spend_for(
+                ManaType::White,
+                &PaymentContext::Spell(&spell_cast_from(origin)),
+            )
+            .is_some(),
+            "Karolina's mana must pay for a spell cast from {origin:?}"
+        );
+        assert_eq!(pool.total(), 0, "eligible mana must be consumed");
+    }
+
+    let mut unknown_pool = make_pool();
+    assert!(
+        unknown_pool
+            .spend_for(
+                ManaType::White,
+                &PaymentContext::Spell(&SpellMeta::default()),
+            )
+            .is_none(),
+        "unknown spell origins must fail closed"
+    );
+
+    let source_types = ["Creature".to_string()];
+    let source_subtypes = ["Human".to_string()];
+    let activation = PaymentContext::Activation {
+        source_types: &source_types,
+        source_subtypes: &source_subtypes,
+        ability_tag: None,
+        mana_color_constraint: ActivationManaColorConstraint::Unrestricted,
+    };
+    let mut activation_pool = make_pool();
+    assert!(activation_pool
+        .spend_for(ManaType::White, &activation)
+        .is_some());
+
+    let mut effect_pool = make_pool();
+    assert!(effect_pool
+        .spend_for(ManaType::White, &PaymentContext::Effect)
+        .is_some());
+
+    for action in [
+        SpecialAction::CompanionToHand,
+        SpecialAction::UnlockDoor,
+        SpecialAction::Plot,
+        SpecialAction::TurnFaceUp,
+        SpecialAction::RollPlanarDie,
+        SpecialAction::EndContinuousEffect,
+    ] {
+        let mut pool = make_pool();
+        assert!(
+            pool.spend_for(ManaType::White, &PaymentContext::SpecialAction(action))
+                .is_some(),
+            "Karolina's prohibition must not reject {action:?}"
+        );
+    }
 }
 
 /// Guard against the inclusion polarity regressing: the positive `From` reading
