@@ -26,7 +26,7 @@ use engine::types::counter::CounterType;
 use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
-use engine::types::mana::ManaCost;
+use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 
@@ -978,11 +978,19 @@ fn helicarrier_strike_runtime_replaces_two_damage_with_four() {
     );
 }
 
-/// Cast We Say Thee Nay! in response to a creature spell and collect every
-/// generic unless-payment cost shown to the targeted spell's controller.
-fn we_say_thee_nay_unless_generics(pay_teamwork: bool) -> Vec<u32> {
+/// Cast We Say Thee Nay! in response to a creature spell, pay every surfaced
+/// unless cost, and return the complete prompt sequence. Paying (rather than
+/// declining) keeps the target spell live, so either possible duplicate order
+/// (`{2}` then `{4}` or `{4}` then `{2}`) remains observable.
+fn we_say_thee_nay_unless_costs(pay_teamwork: bool) -> Vec<u32> {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(
+        P0,
+        (0..8)
+            .map(|_| ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]))
+            .collect(),
+    );
     let mut creature = scenario.add_creature_to_hand(P0, "Target Spell", 2, 2);
     creature.with_mana_cost(ManaCost::Cost {
         shards: vec![],
@@ -1004,6 +1012,7 @@ fn we_say_thee_nay_unless_generics(pay_teamwork: bool) -> Vec<u32> {
     });
     let nay = nay.id();
     let mut runner = scenario.build();
+    let mut prompts = Vec::new();
 
     let creature_card = runner.state().objects[&creature].card_id;
     runner
@@ -1028,12 +1037,10 @@ fn we_say_thee_nay_unless_generics(pay_teamwork: bool) -> Vec<u32> {
         })
         .expect("casting We Say Thee Nay! must succeed");
 
-    let mut unless_generics = Vec::new();
     for _ in 0..64 {
         if runner.state().stack.is_empty() {
             break;
         }
-
         match runner.state().waiting_for.clone() {
             WaitingFor::OptionalCostChoice { .. } => runner
                 .act(GameAction::DecideOptionalCost { pay: pay_teamwork })
@@ -1059,38 +1066,38 @@ fn we_say_thee_nay_unless_generics(pay_teamwork: bool) -> Vec<u32> {
                     player, P0,
                     "the targeted spell's controller must be prompted"
                 );
-                let generic = match cost {
+                prompts.push(match cost {
                     AbilityCost::Mana {
                         cost: ManaCost::Cost { generic, .. },
                     } => generic,
                     other => panic!("expected a fixed generic unless cost, got {other:?}"),
-                };
-                unless_generics.push(generic);
+                });
                 runner
-                    .act(GameAction::PayUnlessCost { pay: false })
-                    .expect("declining the unless payment must continue resolution");
+                    .act(GameAction::PayUnlessCost { pay: true })
+                    .expect("paying the surfaced unless cost must succeed")
             }
             other => panic!("unexpected We Say Thee Nay waiting state: {other:?}"),
         };
     }
+    assert!(runner.state().stack.is_empty(), "both spells must resolve");
     assert!(
-        runner.state().stack.is_empty(),
-        "We Say Thee Nay! must finish resolving after every unless-payment prompt"
+        runner.state().battlefield.contains(&creature),
+        "paying every surfaced tax must let the target creature spell resolve"
     );
-    unless_generics
+    prompts
 }
 
 #[test]
 fn we_say_thee_nay_runtime_selects_exactly_one_unless_cost() {
     assert_eq!(
-        we_say_thee_nay_unless_generics(false),
+        we_say_thee_nay_unless_costs(false),
         vec![2],
-        "declining Teamwork must retain the base {{2}} tax"
+        "declining Teamwork must surface exactly the base {{2}} tax"
     );
     assert_eq!(
-        we_say_thee_nay_unless_generics(true),
+        we_say_thee_nay_unless_costs(true),
         vec![4],
-        "paying Teamwork must replace the {{2}} tax with {{4}}"
+        "paying Teamwork must replace the {{2}} tax with exactly one {{4}} tax"
     );
 }
 
