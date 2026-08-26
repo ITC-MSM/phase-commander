@@ -12097,6 +12097,8 @@ fn apply_action(
             WaitingFor::ChooseObjectsSelection {
                 player,
                 eligible,
+                min,
+                max,
                 trigger_event,
             },
             GameAction::SelectTargets { targets },
@@ -12104,21 +12106,39 @@ fn apply_action(
             let p = *player;
             let eligible_set = eligible.clone();
             let pending_event = trigger_event.clone();
-            // Validate all selected targets are in the eligible set.
+            let selected_count = targets.len();
+            if selected_count < *min as usize
+                || max.is_some_and(|maximum| selected_count > maximum as usize)
+            {
+                return Err(EngineError::InvalidAction(format!(
+                    "Object selection must choose at least {min}{} distinct objects, got {selected_count}",
+                    max.map_or(String::new(), |maximum| format!(" and at most {maximum}"))
+                )));
+            }
+            // Validate all selected targets are distinct objects in the eligible set.
+            let mut selected_objects = HashSet::with_capacity(selected_count);
             for t in &targets {
                 if !eligible_set.contains(t) {
                     return Err(EngineError::InvalidAction(
                         "Selected target not eligible for object selection".to_string(),
                     ));
                 }
+                let TargetRef::Object(id) = t else {
+                    return Err(EngineError::InvalidAction(
+                        "Object selection accepts battlefield objects only".to_string(),
+                    ));
+                };
+                if !selected_objects.insert(*id) {
+                    return Err(EngineError::InvalidAction(
+                        "Duplicate object in object selection".to_string(),
+                    ));
+                }
             }
-            // Map TargetRef → ObjectId. The eligible set is all battlefield
-            // permanents, so every selected target is an Object.
             let ids: Vec<ObjectId> = targets
                 .iter()
-                .filter_map(|t| match t {
-                    TargetRef::Object(id) => Some(*id),
-                    TargetRef::Player(_) => None,
+                .map(|target| match target {
+                    TargetRef::Object(id) => *id,
+                    TargetRef::Player(_) => unreachable!("validated as objects above"),
                 })
                 .collect();
             // CR 603.7: Always allocate a fresh tracked set — a player-chosen

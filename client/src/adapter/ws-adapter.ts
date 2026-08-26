@@ -203,6 +203,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 38 — WaitingFor.ChooseObjectsSelection publishes the resolving effect's
+ *      min and optional max bounds. Older clients silently ignore these
+ *      additive fields and offer selections outside the engine-authoritative
+ *      range, so the full-game handshake refuses that capability mismatch.
  * 37 — PayCostKind::TapCreatures changed from { aggregate:
  *      Option<TapCreaturesAggregate> } to a required { mode:
  *      TapCreaturesSelectionMode } (Fixed/VariableX/Aggregate) — the fix that
@@ -292,7 +296,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 37;
+export const PROTOCOL_VERSION = 38;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -13085,15 +13085,21 @@ pub enum WaitingFor {
         eligible: Vec<TargetRef>,
         phase: TimeTravelPhase,
     },
-    /// CR 603.7e: The affected player of a `ChooseObjectsIntoTrackedSet` effect
-    /// selects any number of battlefield permanents from `eligible`. The
+    /// CR 608.2d: While applying `ChooseObjectsIntoTrackedSet`, the affected player
+    /// selects `min..=max` battlefield permanents from `eligible`. The
     /// chosen objects are written into a fresh tracked set so a downstream
     /// `PayCost { ScaledMana }` and `IfYouDo`/`Untap` reference the exact
-    /// selection. An empty selection is legal — the player declines.
+    /// selection. An empty selection is legal when `min == 0`.
     ChooseObjectsSelection {
         player: PlayerId,
         /// Eligible battlefield permanents matching the effect's filter.
         eligible: Vec<TargetRef>,
+        /// Minimum number of distinct eligible objects that must be selected.
+        #[serde(default)]
+        min: u32,
+        /// Maximum number selectable (`None` = all eligible objects).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u32>,
         /// CR 608.2: triggering event of the ability whose `ChooseObjectsIntoTrackedSet`
         /// raised this prompt. Restored around the continuation drain so the stashed
         /// `PayCost { payer: TriggeringPlayer }` resolves to the correct player.
@@ -31588,6 +31594,39 @@ mod tests {
         assert_eq!(wf, deserialized);
         // Verify tag format
         assert!(json.contains("\"TriggerTargetSelection\""));
+    }
+
+    #[test]
+    fn choose_objects_selection_serializes_bounds_and_defaults_legacy_shape() {
+        use crate::types::ability::TargetRef;
+
+        let waiting = WaitingFor::ChooseObjectsSelection {
+            player: PlayerId(0),
+            eligible: vec![TargetRef::Object(ObjectId(1))],
+            min: 1,
+            max: Some(2),
+            trigger_event: None,
+        };
+        let json = serde_json::to_value(&waiting).expect("serialize bounded prompt");
+        assert_eq!(json["data"]["min"], 1);
+        assert_eq!(json["data"]["max"], 2);
+        assert_eq!(
+            serde_json::from_value::<WaitingFor>(json).expect("roundtrip bounded prompt"),
+            waiting
+        );
+
+        let legacy = r#"{
+            "type":"ChooseObjectsSelection",
+            "data":{"player":0,"eligible":[]}
+        }"#;
+        assert!(matches!(
+            serde_json::from_str::<WaitingFor>(legacy).expect("legacy prompt remains parseable"),
+            WaitingFor::ChooseObjectsSelection {
+                min: 0,
+                max: None,
+                ..
+            }
+        ));
     }
 
     #[test]

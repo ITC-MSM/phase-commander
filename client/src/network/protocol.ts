@@ -94,6 +94,10 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * admitted; see the gate for why.
  *
  * Bumps to date:
+ *  29 — WaitingFor.ChooseObjectsSelection publishes min and optional max
+ *       bounds. A v28 peer silently ignores the additive fields and offers
+ *       out-of-range selections, so refuse the capability mismatch during
+ *       host/guest first contact.
  *  28 — PayCostKind::TapCreatures changed from { aggregate } to a required
  *       { mode } (Fixed/VariableX/Aggregate) — the fix that also unlocks
  *       the u32::MAX X-sentinel tap-cost form (Glacian, Powerstone Engineer
@@ -168,7 +172,7 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *       sub-phase on WaitingFor::MulliganDecision; the MulliganBottomCards
  *       variant was removed
  */
-export const WIRE_PROTOCOL_VERSION = 28 as const;
+export const WIRE_PROTOCOL_VERSION = 29 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   // `wireProtocolVersion` is optional on both first-contact guest messages:
