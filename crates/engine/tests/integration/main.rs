@@ -91,6 +91,7 @@ mod captain_marvel_apex_avenger;
 mod cascade_intervening_if_pipeline;
 mod case_solve_condition;
 mod cast_during_resolution_pipeline;
+mod cavern_hoard_dragon_cost_reduction;
 mod cda_counted_quantities_pt;
 mod chain_of_smog_copy;
 mod chains_of_mephistopheles_discard_draw_or_mill;
