@@ -366,7 +366,7 @@ fn detect_replacement(
     // not enumerate these CR 614.1c carrier variants. Typed evidence reaches all
     // fields, including Yuna's `Effect::CreateDelayedTrigger` inner definition.
     //
-    // CR 614.1c + CR 607.1 + CR 122.1h: a graveyard/exile cast permission that
+    // CR 614.1c: a graveyard/exile cast permission that
     // carries an `enters_with_counter` rider ("You may cast this card from your
     // graveyard. If you do, it enters with a finality counter on it." — Hundred-
     // Battle Veteran and siblings Undead Sprinter, Intrepid Paleontologist,
@@ -3209,7 +3209,7 @@ fn conditional_enter_counters_if_is_only_if_marker(
     !has_other_if
 }
 
-/// CR 607.1 + CR 614.1c + CR 122.1: a cast-permission static with an
+/// CR 614.1c: a cast-permission static with an
 /// `enters_with_counter` rider represents "if you cast a spell this way, that
 /// permanent enters with a counter". Suppress only that represented sentence;
 /// a separate conditional in the same item must remain visible to the audit.
@@ -9108,7 +9108,7 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     /// when-you-next-cast trigger (Yuna) and the cast-this-way graveyard rider
     /// (Osteomancer Adept).
     ///
-    /// CR 614.1c + CR 607.1 + CR 122.1h: a THIRD grammar — a printed static
+    /// CR 614.1c: a THIRD grammar — a printed static
     /// `StaticMode::GraveyardCastPermission`/`ExileCastPermission` that carries
     /// `enters_with_counter: Some(_)` directly (no separate rider clause; the
     /// counter rides the permission static itself) — was ALSO a false positive
@@ -9155,6 +9155,19 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             "As long as there are three or more different kinds of counters among creatures you control, this creature gets +2/+4.\nYou may cast this card from your graveyard. If you do, it enters with a finality counter on it. (If a creature with a finality counter on it would die, exile it instead.)",
             "Hundred-Battle Veteran",
             &["Creature"],
+        );
+        assert!(
+            hundred_battle_veteran
+                .statics
+                .iter()
+                .any(|static_def| matches!(
+                    &static_def.mode,
+                    StaticMode::GraveyardCastPermission {
+                        enters_with_counter: Some(_),
+                        ..
+                    }
+                )),
+            "Hundred-Battle Veteran must parse to the graveyard-cast enters-with-counter carrier"
         );
         assert!(
             !has_swallowed_detector(&hundred_battle_veteran, "Replacement"),
