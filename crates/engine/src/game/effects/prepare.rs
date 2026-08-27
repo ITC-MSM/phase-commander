@@ -310,7 +310,12 @@ fn synthesize_prepared_copy_object(
     copy_obj.zone = Zone::Exile;
     copy_obj.controller = controller;
     copy_obj.owner = controller;
-    copy_obj.is_token = true;
+    // CR 722.3c + CR 707.12: this is a castable copy of a card in exile, not a
+    // token. A token outside the battlefield would cease to exist under CR
+    // 111.7; a permanent-spell copy instead becomes a token only as it resolves
+    // under CR 111.13 + CR 707.10f.
+    copy_obj.is_token = false;
+    copy_obj.is_copy = true;
     copy_obj.tapped = false;
     copy_obj.prepared = None;
     // Do not re-enter alternative-face casting logic for this synthetic copy.
@@ -407,7 +412,7 @@ fn mark_prepare_copy_cancel_rollback(
     }
 }
 
-/// CR 722.3c + CR 601.2: Build an ephemeral token copy of the prepare-spell
+/// CR 722.3c + CR 707.12 + CR 601.2: Build an ephemeral object copy of the prepare-spell
 /// face (face `b`) in exile, then cast it through the normal spell-casting
 /// pipeline so costs/targets/modes are handled by the same single authority as
 /// every other cast.
@@ -1106,6 +1111,48 @@ mod tests {
     }
 
     #[test]
+    fn synthesized_prepared_permanent_copy_becomes_token_only_on_resolution() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.phase = Phase::PreCombatMain;
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let source_id = setup_creature(&mut state);
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            source.prepared = Some(PreparedState);
+            source.back_face = Some(BackFaceForTest::prepare_permanent());
+        }
+
+        let waiting = cast_prepared_copy(&mut state, source_id, PlayerId(0), &mut Vec::new())
+            .expect("the zero-cost prepared permanent copy is cast");
+        assert!(matches!(waiting, WaitingFor::Priority { .. }));
+        let copy_id = state.stack.back().expect("prepared copy is on stack").id;
+        let stack_copy = &state.objects[&copy_id];
+        assert_eq!(stack_copy.zone, Zone::Stack);
+        assert!(stack_copy.is_copy, "the synthesized object is a card copy");
+        assert!(
+            !stack_copy.is_token,
+            "CR 722.3c + CR 707.12: the synthesized exile/stack copy is not yet a token"
+        );
+
+        crate::game::stack::resolve_top(&mut state, &mut Vec::new());
+
+        let permanent = &state.objects[&copy_id];
+        assert_eq!(permanent.zone, Zone::Battlefield);
+        assert!(
+            permanent.is_token,
+            "CR 111.13 + CR 707.10f: the resolving permanent copy becomes a token"
+        );
+        assert!(
+            !permanent.is_copy,
+            "CR 111.13 + CR 707.10f: the battlefield token is no longer a spell copy"
+        );
+    }
+
+    #[test]
     fn cancel_pending_prepare_copy_restores_prepared_source() {
         let mut state = GameState::new_two_player(42);
         let source_id = setup_creature(&mut state);
@@ -1267,6 +1314,13 @@ mod tests {
                 layout_kind: Some(LayoutKind::Prepare),
                 parse_warnings: vec![],
             }
+        }
+
+        fn prepare_permanent() -> crate::game::game_object::BackFaceData {
+            let mut back = Self::prepare_with_cost(ManaCost::zero());
+            back.card_types.core_types = vec![CoreType::Creature];
+            back.abilities.clear();
+            back
         }
     }
 }

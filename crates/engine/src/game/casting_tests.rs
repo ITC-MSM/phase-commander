@@ -1,5 +1,6 @@
 use super::super::engine::apply_as_current;
 use super::*;
+use crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell;
 use crate::game::zones;
 use crate::game::zones::create_object;
 use crate::parser::oracle_effect::parse_effect_chain;
@@ -41,6 +42,285 @@ fn setup_game_at_main_phase() -> GameState {
         player: PlayerId(0),
     };
     state
+}
+
+fn ability_graph_has_cast_occurrence(
+    ability: &ResolvedAbility,
+    expected: crate::types::game_state::CastOccurrence,
+) -> bool {
+    ability.cast_occurrence == Some(expected)
+        && ability
+            .sub_ability
+            .as_deref()
+            .is_none_or(|sub| ability_graph_has_cast_occurrence(sub, expected))
+        && ability
+            .else_ability
+            .as_deref()
+            .is_none_or(|branch| ability_graph_has_cast_occurrence(branch, expected))
+        && match &ability.effect {
+            Effect::EpicCopy { spell } => ability_graph_has_cast_occurrence(spell, expected),
+            _ => true,
+        }
+}
+
+fn graph_spell_definition(source_id: ObjectId) -> AbilityDefinition {
+    let mut definition = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::EpicCopy {
+            spell: Box::new(ResolvedAbility::new(
+                Effect::Investigate,
+                Vec::new(),
+                source_id,
+                PlayerId(0),
+            )),
+        },
+    );
+    definition.sub_ability = Some(Box::new(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Investigate,
+    )));
+    definition.else_ability = Some(Box::new(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Investigate,
+    )));
+    definition
+}
+
+fn spell_cast_ledger_entry_count(state: &GameState) -> usize {
+    use crate::types::resolved_commands::{ResolvedLedgerEdit, ResolvedRulesCommand};
+
+    state
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.command.as_ref(),
+                Some(ResolvedRulesCommand::LedgerEdit(command))
+                    if matches!(command.edit, ResolvedLedgerEdit::SpellCast { .. })
+            )
+        })
+        .count()
+}
+
+fn stack_entry_finalize_count(state: &GameState) -> usize {
+    use crate::types::resolved_commands::ResolvedRulesCommand;
+
+    state
+        .resolved_rules_journal
+        .entries()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.command.as_ref(),
+                Some(ResolvedRulesCommand::StackEntryFinalize(_))
+            )
+        })
+        .count()
+}
+
+#[test]
+fn standard_cast_stamps_one_occurrence_on_record_object_and_resolved_chain() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_object(
+        &mut state,
+        CardId(68_650),
+        PlayerId(0),
+        "Graph Spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let object = state.objects.get_mut(&spell).unwrap();
+        object.card_types.core_types.push(CoreType::Sorcery);
+        object.mana_cost = ManaCost::zero();
+        Arc::make_mut(&mut object.abilities).push(graph_spell_definition(spell));
+    }
+
+    assert_eq!(state.objects[&spell].cast_occurrence, None);
+    assert!(state.spells_cast_this_turn_by_player.is_empty());
+
+    let result = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id: CardId(68_650),
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect("the zero-cost spell finalizes through the real cast action");
+    assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+
+    let occurrence = state.objects[&spell]
+        .cast_occurrence
+        .expect("the real finalizer stamps the stack object");
+
+    assert!(ability_graph_has_cast_occurrence(
+        state.stack.back().and_then(StackEntry::ability).unwrap(),
+        occurrence
+    ));
+    assert_eq!(state.spells_cast_this_turn_by_player[&PlayerId(0)].len(), 1);
+    assert_eq!(spell_cast_ledger_entry_count(&state), 1);
+
+    let cancelled = create_object(
+        &mut state,
+        CardId(68_652),
+        PlayerId(0),
+        "Cancelled Graph Spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let object = state.objects.get_mut(&cancelled).unwrap();
+        object.card_types.core_types.push(CoreType::Instant);
+        object.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X],
+            generic: 0,
+        };
+        Arc::make_mut(&mut object.abilities).push(graph_spell_definition(cancelled));
+    }
+    apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: cancelled,
+            card_id: CardId(68_652),
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect("the cancellable cast reaches its X choice");
+    assert!(matches!(state.waiting_for, WaitingFor::ChooseXValue { .. }));
+    apply_as_current(&mut state, GameAction::CancelCast).expect("the cast cancels cleanly");
+    assert_eq!(state.objects[&cancelled].zone, Zone::Hand);
+    assert_eq!(state.objects[&cancelled].cast_occurrence, None);
+    assert!(state.stack.iter().all(|entry| entry.id != cancelled));
+    assert_eq!(state.spells_cast_this_turn_by_player[&PlayerId(0)].len(), 1);
+    assert_eq!(spell_cast_ledger_entry_count(&state), 1);
+}
+
+#[test]
+fn same_object_id_recast_receives_a_distinct_cast_occurrence() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_object(
+        &mut state,
+        CardId(68_651),
+        PlayerId(0),
+        "Recast Spell".to_string(),
+        Zone::Stack,
+    );
+    state.stack.push_back(StackEntry {
+        id: spell,
+        source_id: spell,
+        controller: PlayerId(0),
+        kind: StackEntryKind::Spell {
+            card_id: CardId(68_651),
+            ability: Some(Box::new(ResolvedAbility::new(
+                Effect::Investigate,
+                Vec::new(),
+                spell,
+                PlayerId(0),
+            ))),
+            casting_variant: CastingVariant::Normal,
+            actual_mana_spent: 0,
+        },
+    });
+    let object = state.objects[&spell].clone();
+    let first =
+        restrictions::record_spell_cast(&mut state, PlayerId(0), &object, CastingVariant::Normal)
+            .expect("first cast records");
+    stamp_cast_occurrence_on_stack_spell(&mut state, spell, first).unwrap();
+    let second =
+        restrictions::record_spell_cast(&mut state, PlayerId(0), &object, CastingVariant::Normal)
+            .expect("recast records");
+    stamp_cast_occurrence_on_stack_spell(&mut state, spell, second).unwrap();
+
+    assert_ne!(first, second);
+    assert_eq!(first.turn_journal_index, 0);
+    assert_eq!(second.turn_journal_index, 1);
+    assert!(state.spells_cast_this_turn_by_player[&PlayerId(0)]
+        .iter()
+        .all(|record| record.spell_object_id == Some(spell)));
+    assert_eq!(state.objects[&spell].cast_occurrence, Some(second));
+    assert_eq!(
+        state
+            .stack
+            .back()
+            .and_then(StackEntry::ability)
+            .unwrap()
+            .cast_occurrence,
+        Some(second)
+    );
+}
+
+#[test]
+fn spell_cast_writer_error_mappings_are_explicit_and_non_panicking() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_object(
+        &mut state,
+        CardId(68_653),
+        PlayerId(0),
+        "Overflow Spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let object = state.objects.get_mut(&spell).unwrap();
+        object.card_types.core_types.push(CoreType::Instant);
+        object.mana_cost = ManaCost::generic(1);
+        Arc::make_mut(&mut object.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Investigate,
+        ));
+    }
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Colorless, spell, false, vec![]));
+    state.spells_cast_this_game.insert(PlayerId(0), u32::MAX);
+    let mana_before = state.players[0].mana_pool.clone();
+    let history_before = state
+        .spells_cast_this_turn_by_player
+        .get(&PlayerId(0))
+        .map_or(0, |history| history.len());
+    let journal_before = spell_cast_ledger_entry_count(&state);
+    let finalizations_before = stack_entry_finalize_count(&state);
+    let state_before = state.clone();
+
+    let standard = apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id: CardId(68_653),
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect_err("the real standard-cast writer must propagate ledger overflow");
+    assert!(matches!(
+        standard,
+        EngineError::InvalidAction(ref message)
+            if message == "failed to record finalized spell cast: resolved ledger command overflows a counter"
+    ));
+    assert_eq!(state.objects[&spell].cast_occurrence, None);
+    assert_eq!(
+        state
+            .spells_cast_this_turn_by_player
+            .get(&PlayerId(0))
+            .map_or(0, |history| history.len()),
+        history_before
+    );
+    assert_eq!(spell_cast_ledger_entry_count(&state), journal_before);
+    assert_eq!(stack_entry_finalize_count(&state), finalizations_before);
+    assert_eq!(
+        state.players[0].mana_pool, mana_before,
+        "ledger rejection occurs before payment"
+    );
+    assert_eq!(state.objects[&spell].zone, Zone::Hand);
+    assert!(!state.stack_paid_facts.contains_key(&spell));
+    assert!(state.stack.iter().all(|entry| entry.id != spell));
+    assert!(state.pending_cast.is_none());
+    assert_eq!(state.waiting_for, state_before.waiting_for);
+    assert_eq!(
+        state, state_before,
+        "the action boundary rolls back exactly"
+    );
 }
 
 #[test]
@@ -28682,7 +28962,8 @@ fn per_turn_limit_all_players_blocks_after_one_cast() {
 
     // Record one spell cast (clone to avoid borrow conflict)
     let obj_clone = state.objects.get(&spell_id).unwrap().clone();
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
 
     // Now should be blocked
     let obj = state.objects.get(&spell_id).unwrap();
@@ -28702,8 +28983,10 @@ fn per_turn_limit_controller_scope_blocks_only_controller() {
     let spell_id = make_spell_obj(&mut state, PlayerId(0), false);
 
     let obj_clone = state.objects.get(&spell_id).unwrap().clone();
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal);
-    restrictions::record_spell_cast(&mut state, PlayerId(1), &obj_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
+    restrictions::record_spell_cast(&mut state, PlayerId(1), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
 
     let obj = state.objects.get(&spell_id).unwrap();
     // Controller (P0) should be blocked
@@ -28725,8 +29008,10 @@ fn per_turn_limit_opponents_scope_blocks_only_opponents() {
     let spell_id = make_spell_obj(&mut state, PlayerId(0), false);
 
     let obj_clone = state.objects.get(&spell_id).unwrap().clone();
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal);
-    restrictions::record_spell_cast(&mut state, PlayerId(1), &obj_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
+    restrictions::record_spell_cast(&mut state, PlayerId(1), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
 
     let obj = state.objects.get(&spell_id).unwrap();
     // Controller (P0) should NOT be blocked by their own "opponents" restriction
@@ -28753,7 +29038,8 @@ fn per_turn_limit_noncreature_filter_allows_creature_spells() {
     // Cast a noncreature spell first
     let nc_id = make_spell_obj(&mut state, PlayerId(0), false);
     let nc_clone = state.objects.get(&nc_id).unwrap().clone();
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &nc_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &nc_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
 
     // Trying to cast another noncreature → blocked
     let nc_obj = state.objects.get(&nc_id).unwrap();
@@ -28787,12 +29073,14 @@ fn per_turn_limit_max_two_allows_second_cast() {
 
     // First cast OK
     let obj_clone = state.objects.get(&spell_id).unwrap().clone();
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
     let obj = state.objects.get(&spell_id).unwrap();
     assert!(!is_blocked_by_per_turn_cast_limit(&state, PlayerId(0), obj));
 
     // Second cast OK
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
 
     // Third cast → blocked
     let obj = state.objects.get(&spell_id).unwrap();
@@ -28822,7 +29110,8 @@ fn per_turn_limit_multiple_sources_strictest_wins() {
 
     // Record one spell cast
     let obj_clone = state.objects.get(&spell_id).unwrap().clone();
-    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal);
+    restrictions::record_spell_cast(&mut state, PlayerId(0), &obj_clone, CastingVariant::Normal)
+        .expect("test spell-cast ledger is valid");
 
     // Blocked: B's limit of 1 applies
     let obj = state.objects.get(&spell_id).unwrap();

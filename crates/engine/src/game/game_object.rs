@@ -18,7 +18,7 @@ use crate::types::card_type::{CardType, CoreType};
 use crate::types::counter::{counter_map_serde, CounterType};
 use crate::types::definitions::Definitions;
 use crate::types::game_state::{
-    AttackDeclarationRecord, GameState, LKISnapshot, TriggerSourceContext,
+    AttackDeclarationRecord, CastOccurrence, GameState, LKISnapshot, TriggerSourceContext,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIdentityBinding, ObjectIncarnationRef};
 use crate::types::keywords::{Keyword, KeywordKind};
@@ -1206,6 +1206,11 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_from_zone: Option<Zone>,
 
+    /// CR 601.2i + CR 707.10: Exact turn-journal coordinate of this cast while
+    /// it remains a spell on the stack. Cleared on every Stack exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_occurrence: Option<CastOccurrence>,
+
     /// CR 601.2a + CR 603.4: Transient field tracking the player who cast the
     /// spell that became this permanent. Paired with `cast_from_zone` for
     /// intervening-if clauses such as "if you cast it from your graveyard".
@@ -1503,6 +1508,9 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         base_name_origin: _,
         class_level: _,
         cast_from_zone: _,
+        // COMPARED: finalized-cast provenance can affect resolution semantics while
+        // this object remains a spell on the stack (types/game_state.rs).
+        cast_occurrence: _,
         cast_controller: _,
         cast_spell_keywords: _,
         exile_from_stack_linked_source: _,
@@ -2431,6 +2439,7 @@ impl GameObject {
             base_name_origin: None,
             class_level: None,
             cast_from_zone: None,
+            cast_occurrence: None,
             cast_controller: None,
             cast_spell_keywords: Vec::new(),
             exile_from_stack_linked_source: None,

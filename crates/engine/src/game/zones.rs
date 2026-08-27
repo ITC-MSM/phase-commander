@@ -187,6 +187,11 @@ pub(crate) fn apply_zone_exit_cleanup(
     // discard pipeline re-stamps it after the move-to-graveyard completes.
     if let Some(obj) = state.objects.get_mut(&object_id) {
         obj.discarded_turn = None;
+        // CR 400.7 + CR 601.2i: A cast occurrence belongs to the spell object
+        // represented on the stack, never to the new object after it leaves.
+        if from == Zone::Stack && to != Zone::Stack {
+            obj.cast_occurrence = None;
+        }
     }
     // CR 400.7 + CR 403.4: Activation-use history belongs to the old
     // object. `ObjectId` is storage identity here, so clear per-object counts
@@ -955,6 +960,11 @@ pub fn apply_resolved_zone_change(
         .get_mut(&command.object.object_id)
         .expect("validated zone command object remains live");
     object.zone = command.to;
+    // CR 400.7 + CR 601.2i: replay bypasses `apply_zone_exit_cleanup`, so it
+    // must reproduce the live Stack-exit carrier clear from the recorded move.
+    if command.from == Zone::Stack && command.to != Zone::Stack {
+        object.cast_occurrence = None;
+    }
     if command.to == Zone::Battlefield {
         object.reset_for_battlefield_entry(
             turn_number,
@@ -4431,6 +4441,62 @@ mod tests {
         assert_eq!(
             replayed.objects[&id].cast_from_zone, None,
             "the replayed transition must clear the stamp exactly like the live one"
+        );
+    }
+
+    #[test]
+    fn cast_occurrence_is_cleared_on_stack_to_battlefield_and_nonbattlefield_moves() {
+        let occurrence = crate::types::game_state::CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 3,
+        };
+
+        for destination in [Zone::Battlefield, Zone::Graveyard] {
+            let mut live = setup();
+            let id = create_object(
+                &mut live,
+                CardId(6865),
+                PlayerId(0),
+                "Stamped Spell".to_string(),
+                Zone::Stack,
+            );
+            live.objects.get_mut(&id).unwrap().cast_occurrence = Some(occurrence);
+            let mut replayed = live.clone();
+            let record = crate::types::game_state::ZoneChangeRecord::test_minimal(
+                id,
+                Some(Zone::Stack),
+                destination,
+            );
+            let command = resolve_and_apply_zone_change(
+                &mut live,
+                id,
+                Zone::Stack,
+                destination,
+                PlayerId(0),
+                record,
+            )
+            .expect("live Stack exit resolves");
+            assert_eq!(live.objects[&id].cast_occurrence, None);
+
+            apply_resolved_zone_change(&mut replayed, &command)
+                .expect("recorded Stack exit replays");
+            assert_eq!(replayed.objects[&id].cast_occurrence, None);
+        }
+
+        let mut hostile = setup();
+        let id = create_object(
+            &mut hostile,
+            CardId(6866),
+            PlayerId(0),
+            "Not a Stack Exit".to_string(),
+            Zone::Hand,
+        );
+        hostile.objects.get_mut(&id).unwrap().cast_occurrence = Some(occurrence);
+        move_to_zone(&mut hostile, id, Zone::Exile, &mut Vec::new());
+        assert_eq!(
+            hostile.objects[&id].cast_occurrence,
+            Some(occurrence),
+            "only a Stack exit owns cast-occurrence cleanup"
         );
     }
 
