@@ -11567,6 +11567,71 @@ mod tests {
         }
     }
 
+    /// CR 122.1 + CR 611.3a: Hundred-Battle Veteran's "there are three or more
+    /// different kinds of counters among creatures you control" must type as a
+    /// `QuantityComparison` over `DistinctCounterKindsAmong`, not fall back to
+    /// `StaticCondition::Unrecognized` (which `game/layers.rs` evaluates as
+    /// unconditionally true, making the P/T boost silently always-on). Registers
+    /// `parse_distinct_counter_kinds_among_tail` in `parse_quantity_ref`'s bare-
+    /// suffix `alt()` — the same dual-registration treatment already given to
+    /// `parse_distinct_colors_among_tail` (Puca's Eye).
+    #[test]
+    fn parse_inner_condition_distinct_counter_kinds_among_ge_3() {
+        let text =
+            "there are three or more different kinds of counters among creatures you control";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctCounterKindsAmong { filter },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 3 },
+        } = cond
+        else {
+            panic!("expected DistinctCounterKindsAmong >= 3 comparison for {text:?}, got {cond:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for {text:?}, got {filter:?}");
+        };
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "population must be creatures for {text:?}, got {:?}",
+            tf.type_filters
+        );
+        assert_eq!(
+            tf.controller,
+            Some(ControllerRef::You),
+            "population must be scoped to creatures you control for {text:?}"
+        );
+    }
+
+    /// Sibling boundary test: "there are two or more ..." must produce a
+    /// distinct GE-2 comparison, proving the numeral is threaded through and
+    /// not hardcoded to 3 by the new bare-suffix registration.
+    #[test]
+    fn parse_inner_condition_distinct_counter_kinds_among_ge_2_boundary() {
+        let text = "there are two or more different kinds of counters among creatures you control";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "");
+        assert!(
+            matches!(
+                cond,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::DistinctCounterKindsAmong { .. }
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 2 },
+                }
+            ),
+            "expected DistinctCounterKindsAmong >= 2, got {cond:?}"
+        );
+    }
+
     /// Kavu Runner / Skittish Kavu: "... as long as no opponent controls a white
     /// or blue creature" must parse to a negated opponent presence (not the
     /// `Unrecognized` fallthrough it used to).

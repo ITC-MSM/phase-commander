@@ -1053,6 +1053,24 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // colors among ..." path; registering it here makes it reachable in the
         // bare-suffix context too.
         parse_distinct_colors_among_tail,
+        // CR 122.1: bare "different kind[s] of counters {on|among} <filter>" —
+        // reached after a parent has consumed "there are N [or more] " (Hundred-
+        // Battle Veteran: "as long as there are three or more different kinds of
+        // counters among creatures you control, ~ gets +2/+4"). CR 122.1 makes
+        // same-named counters interchangeable, which is the basis for
+        // de-duplicating counter *kinds* across the population before comparing
+        // against the threshold. Counter-side counterpart to
+        // `parse_distinct_colors_among_tail` immediately above: the tail
+        // combinator (`tag("different kind") + tag(" of counter") + "on"/"among"
+        // + parse_type_phrase`) is shared with the "the number of different kinds
+        // of counters among ..." path (`parse_number_of_inner`, used by Perrie,
+        // the Pulverizer); registering it here makes it reachable in the
+        // bare-suffix context too, so `parse_there_are_conditions` can build a
+        // `StaticCondition::QuantityComparison` instead of falling back to
+        // `StaticCondition::Unrecognized` (which `game/layers.rs` evaluates as
+        // unconditionally true — CR 611.3a requires the continuous effect to be
+        // re-evaluated live against the actual counter census, not locked in).
+        parse_distinct_counter_kinds_among_tail,
         // CR 402.1: "the player with the {most|fewest} cards in hand" — the
         // cross-player hand-size extremum, the hand-zone peer of the life
         // extremum. Distinctive "the player with the " prefix; no ordering

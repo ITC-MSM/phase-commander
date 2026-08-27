@@ -365,6 +365,32 @@ fn detect_replacement(
     // `effect_is_replacement_carrier` matcher: that deliberately finite matcher does
     // not enumerate these CR 614.1c carrier variants. Typed evidence reaches all
     // fields, including Yuna's `Effect::CreateDelayedTrigger` inner definition.
+    //
+    // CR 614.1c + CR 607.1 + CR 122.1h: a graveyard/exile cast permission that
+    // carries an `enters_with_counter` rider ("You may cast this card from your
+    // graveyard. If you do, it enters with a finality counter on it." — Hundred-
+    // Battle Veteran and siblings Undead Sprinter, Intrepid Paleontologist,
+    // Noctis Prince of Lucis, Leonardo, Sewer Samurai) IS the represented CR
+    // 614.1c replacement: the linked "it enters with ..." rider is folded onto
+    // the cast-permission static mode rather than emitted as a standalone
+    // `ReplacementDefinition`. Kept in sync with the sibling detector
+    // `enters_with_finality_this_way_is_only_if_marker` below, which already
+    // accepts this exact carrier shape — both detectors must agree on what
+    // counts as "represented" for the same AST shape.
+    if evidence.any_static_mode(|mode| {
+        matches!(
+            mode,
+            StaticMode::GraveyardCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            } | StaticMode::ExileCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            }
+        )
+    }) {
+        return;
+    }
     if evidence.any_static_mode(|m| {
         matches!(
             m,
@@ -9082,6 +9108,18 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     /// when-you-next-cast trigger (Yuna) and the cast-this-way graveyard rider
     /// (Osteomancer Adept).
     ///
+    /// CR 614.1c + CR 607.1 + CR 122.1h: a THIRD grammar — a printed static
+    /// `StaticMode::GraveyardCastPermission`/`ExileCastPermission` that carries
+    /// `enters_with_counter: Some(_)` directly (no separate rider clause; the
+    /// counter rides the permission static itself) — was ALSO a false positive
+    /// until `detect_replacement`'s carrier-acceptance closure was brought into
+    /// consistency with the sibling detector `enters_with_finality_this_way_is_only_if_marker`,
+    /// which already accepted this exact shape. This is the Hundred-Battle
+    /// Veteran class: "You may cast this card from your graveyard. If you do,
+    /// it enters with a finality counter on it." — and its confirmed siblings
+    /// Undead Sprinter, Intrepid Paleontologist, Noctis, Prince of Lucis,
+    /// Leonardo, Sewer Samurai.
+    ///
     /// The negative assertions cannot be vacuous: the detector only fires when the
     /// "enters with " marker is present AND no carrier is found, and the POSITIVE CONTROL
     /// below carries the same marker with no carrier — it must still fire. If the control
@@ -9109,20 +9147,77 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             "the cast-this-way graveyard rider is the same CR 614.1c carrier"
         );
 
+        // Hundred-Battle Veteran itself: `StaticMode::GraveyardCastPermission`
+        // carrying `enters_with_counter: Some(Finality)` directly on the
+        // printed static (no separate rider clause). This is the shape
+        // `detect_replacement`'s new match arm accepts.
+        let hundred_battle_veteran = parse_named(
+            "As long as there are three or more different kinds of counters among creatures you control, this creature gets +2/+4.\nYou may cast this card from your graveyard. If you do, it enters with a finality counter on it. (If a creature with a finality counter on it would die, exile it instead.)",
+            "Hundred-Battle Veteran",
+            &["Creature"],
+        );
+        assert!(
+            !has_swallowed_detector(&hundred_battle_veteran, "Replacement"),
+            "Hundred-Battle Veteran's printed GraveyardCastPermission{{enters_with_counter}} \
+             IS the CR 614.1c replacement — it must not be reported as swallowed"
+        );
+
         // POSITIVE CONTROL: the same "enters with" marker with NO carrier the parser can
-        // build. Undead Sprinter is a MEASURED true positive of this detector (its
-        // cast-permission is a STATIC, and the static path has no enters-with rider hook —
-        // see the CR 614.1c static-path gap). The detector MUST still fire on it, or the
-        // two assertions above prove nothing.
+        // build. `StaticMode::TopOfLibraryCastPermission` has no `enters_with_counter`
+        // field at all (unlike its Graveyard/Exile siblings), so a rider clause
+        // attached to it has nowhere to land and the whole sentence collapses into
+        // the static's `description` with no typed carrier — a MEASURED true
+        // positive, structurally guaranteed to remain unrepresented (not merely an
+        // arm this fix happened to skip). The detector MUST still fire on it, or the
+        // assertions above prove nothing.
         let uncarried = parse_named(
-            "Trample, haste\nYou may cast this card from your graveyard if a non-Zombie creature died this turn. If you do, this creature enters with a +1/+1 counter on it.",
-            "Undead Sprinter",
+            "You may cast creature spells from the top of your library. If you cast a spell this way, it enters with a +1/+1 counter on it.",
+            "Probe Prospector",
             &["Creature"],
         );
         assert!(
             has_swallowed_detector(&uncarried, "Replacement"),
             "positive control: an enters-with clause with NO carrier must still be reported \
              — if this goes quiet the detector is dead and the assertions above are vacuous"
+        );
+    }
+
+    /// Per-clause audit independence (CR 614.1c boundary): a synthetic card with
+    /// TWO enters-with-counter clauses on separate lines — one a REPRESENTED
+    /// `GraveyardCastPermission{enters_with_counter: Some(_)}` carrier (accepted
+    /// by this fix), the other the genuinely unrepresented
+    /// `TopOfLibraryCastPermission` shape from the positive control above — must
+    /// report the swallow for the second clause ONLY. A represented clause must
+    /// not suppress the audit of a sibling clause on the same card, and an
+    /// unrepresented clause must not retroactively flag the represented one.
+    #[test]
+    fn replacement_carrier_acceptance_is_per_clause_not_per_card() {
+        let text = "You may cast this card from your graveyard. If you do, it enters with a finality counter on it.\nYou may cast creature spells from the top of your library. If you cast a spell this way, it enters with a +1/+1 counter on it.";
+        let parsed = parse_named(text, "Split-Rider Chimera", &["Creature"]);
+
+        let replacement_swallows: Vec<_> = parsed
+            .parse_warnings
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replacement_swallows.len(),
+            1,
+            "expected exactly one Replacement swallow (the unrepresented top-of-library \
+             rider), got {replacement_swallows:?}"
+        );
+        assert!(
+            replacement_swallows[0].contains("top of your library"), // allow-noncombinator: test assertion on diagnostic output text, not Oracle-text parsing dispatch
+            "the swallow must be attributed to the unrepresented clause, not the \
+             represented graveyard-cast rider: got {replacement_swallows:?}"
         );
     }
 
