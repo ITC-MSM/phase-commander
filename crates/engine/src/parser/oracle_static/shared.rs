@@ -3666,10 +3666,12 @@ pub(crate) fn parse_dynamic_x_clause(input: &str) -> OracleResult<'_, QuantityRe
     use crate::parser::oracle_nom::error::OracleError;
 
     let (input, _) = tag_no_case::<_, _, OracleError<'_>>(", where x is ").parse(input)?;
+    let input = input.trim_end_matches('.');
 
     // CR 122.1: Untyped counter anaphor — only matches when it consumes the
-    // ENTIRE clause. A bare `Ok((_, _))` check here would discard whatever
-    // followed the anaphor instead of rejecting it, the same class of bug
+    // ENTIRE clause after terminal sentence punctuation is removed. A bare
+    // `Ok((_, _))` check here would discard whatever followed the anaphor
+    // instead of rejecting it, the same class of bug
     // fixed below for the general delegate — see that comment for the
     // concrete misparse this guards against.
     if let Ok(("", _)) = alt((

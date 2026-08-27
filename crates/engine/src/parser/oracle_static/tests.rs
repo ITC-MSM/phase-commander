@@ -26435,6 +26435,23 @@ fn dynamic_x_clause_damage_dealt_bare_binds_event_context_amount() {
     assert!(matches!(quantity, QuantityRef::EventContextAmount));
 }
 
+/// CR 122.1: the untyped-counter dynamic-X anaphor still accepts the ordinary
+/// terminal sentence period after the complete-consumption hardening.
+#[test]
+fn dynamic_x_clause_untyped_counter_anaphor_accepts_terminal_period() {
+    let (rest, quantity) =
+        parse_dynamic_x_clause(", where x is the number of counters on that creature.")
+            .expect("terminal punctuation must not reject the untyped-counter anaphor");
+    assert_eq!(rest, "");
+    assert!(matches!(
+        quantity,
+        QuantityRef::CountersOn {
+            scope: ObjectScope::Target,
+            counter_type: None,
+        }
+    ));
+}
+
 /// Regression for the false-green the maintainer flagged on PR #7969, through
 /// the exact code path they cited (`shared.rs`'s `parse_dynamic_x_clause`):
 /// that function used to call the non-complete `parse_quantity_ref` and
