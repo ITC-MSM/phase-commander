@@ -109,7 +109,8 @@ function workspaceVersion(): string {
 //
 // Resolution: at deploy time, set DATA_BASE_URL to the R2 prefix; defines
 // resolve to `${BASE}/<filename>`. Local dev with no env defaults to
-// site-root paths.
+// site-root paths. A matching `<NAME>_URL` variable overrides an individual
+// manifest entry, allowing self-hosts to own selected generated sidecars.
 //
 // `__CARD_DATA_URL__` is NOT manifest-driven — the WASM bundle is pinned to
 // a content-addressed `card-data-<hash>.json` URL via CARD_DATA_URL at build
@@ -206,7 +207,8 @@ function dataFileDefines(mode: string): Record<string, string> {
     // content-i18n code reads these via the {lng} template above, not the
     // per-file token, but every manifest entry still gets a valid token.
     const token = `__${filename.replace(/\.json$/, "").replace(/[.-]/g, "_").toUpperCase()}_URL__`;
-    defines[token] = JSON.stringify(`${base}/${filename}`);
+    const override = envVar(token.slice(2, -2));
+    defines[token] = JSON.stringify(override || `${base}/${filename}`);
   }
   return defines;
 }
