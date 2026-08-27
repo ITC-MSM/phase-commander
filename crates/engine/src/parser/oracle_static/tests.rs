@@ -26445,7 +26445,7 @@ fn combat_tax_nils_per_affected_with_ref() {
     }
 }
 
-/// CR 120.1 + CR 608.2h: bare "the amount of damage dealt" (no qualifier)
+/// CR 608.2h: bare "the amount of damage dealt" (no qualifier)
 /// through `parse_dynamic_x_clause` — the exact combat-tax dynamic-X entry
 /// point the maintainer cited on PR #7969 (`shared.rs`, reached via the
 /// `dynamic_qty` slot in `evasion.rs`'s combat-tax parser) — binds to

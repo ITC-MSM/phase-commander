@@ -77,7 +77,7 @@ fn drain_until_kotis_trigger_resolves(
 }
 
 /// CR 120.2a + CR 608.2h: Kotis deals 2 combat damage (each attacking
-/// creature deals combat damage equal to its printed power), so X = 2. The
+/// creature deals combat damage equal to its power), so X = 2. The
 /// top two library cards are exiled (one within budget, MV 1; one over
 /// budget, MV 5) and a third card stays in the library, proving the exile is
 /// bounded to exactly X cards from the DAMAGED player's library, not Kotis's

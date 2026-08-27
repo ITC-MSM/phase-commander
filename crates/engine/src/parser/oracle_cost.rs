@@ -3941,7 +3941,7 @@ mod tests {
         ));
     }
 
-    /// CR 120.2a + CR 608.2h: the bare "the amount of damage dealt" dynamic-X
+    /// CR 608.2h: the bare "the amount of damage dealt" dynamic-X
     /// phrase (no qualifier) binds to `QuantityRef::EventContextAmount`
     /// through the static dynamic-X path (`parse_dynamic_x_clause`), the same
     /// as it does through the where-X effect-quantity path used by Kotis, the

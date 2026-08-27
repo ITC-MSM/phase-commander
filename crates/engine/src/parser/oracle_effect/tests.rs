@@ -429,7 +429,7 @@ fn beseech_suffix_constraint_unchanged_after_refactor() {
     );
 }
 
-/// CR 608.2h + CR 120.1 (issue #5923): Kotis, the Fangkeeper's combat-damage
+/// CR 120.2a + CR 608.2h (issue #5923): Kotis, the Fangkeeper's combat-damage
 /// trigger — "exile the top X cards of their library, where X is the amount
 /// of damage dealt. You may cast any number of spells with mana value X or
 /// less from among them without paying their mana costs." Before the

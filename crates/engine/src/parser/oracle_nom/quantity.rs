@@ -4049,8 +4049,8 @@ pub fn parse_that_much_or_many(input: &str) -> OracleResult<'_, QuantityRef> {
 
 /// Parse event-context quantity references.
 ///
-/// CR 603.7c: "that {noun}" in a triggered ability refers to the object or
-/// value from the triggering event. The source-object variants resolve via
+/// "That {noun}" in a triggered ability refers to the object or value from
+/// the triggering event. The source-object variants resolve via
 /// `extract_source_from_event` → live object or LKI cache.
 fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
@@ -4059,9 +4059,9 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
         // counter-removal, and mana-production count-prefix slots).
         parse_that_much_or_many,
         value(QuantityRef::EventContextAmount, tag("that damage")),
-        // CR 120.2a + CR 608.2h: "the damage dealt" bare form in a triggered
-        // ability body — refers to the total from the triggering
-        // combat-damage event, an amount determined once when the effect is
+        // CR 608.2h: "the damage dealt" bare form in a triggered ability
+        // body — refers to the total from the triggering damage event, an
+        // amount determined once when the effect is
         // applied. Accepts an optional "the amount of " / "amount of " / bare
         // "the " determiner prefix ahead of the "damage dealt" phrase, so
         // both the original bare form ("the damage dealt" — Primo, the
