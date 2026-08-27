@@ -3667,10 +3667,12 @@ pub(crate) fn parse_dynamic_x_clause(input: &str) -> OracleResult<'_, QuantityRe
 
     let (input, _) = tag_no_case::<_, _, OracleError<'_>>(", where x is ").parse(input)?;
 
-    // CR 122.1: Untyped counter anaphor — consume the rest of the clause and
-    // emit `AnyCountersOnTarget`. Accepted variants mirror the counter-on-target
-    // anaphor family (no type prefix).
-    if let Ok((_, _)) = alt((
+    // CR 122.1: Untyped counter anaphor — only matches when it consumes the
+    // ENTIRE clause. A bare `Ok((_, _))` check here would discard whatever
+    // followed the anaphor instead of rejecting it, the same class of bug
+    // fixed below for the general delegate — see that comment for the
+    // concrete misparse this guards against.
+    if let Ok(("", _)) = alt((
         tag_no_case::<_, _, OracleError<'_>>("the number of counters on that creature"),
         tag_no_case::<_, _, OracleError<'_>>("the number of counters on that permanent"),
     ))
@@ -3688,16 +3690,36 @@ pub(crate) fn parse_dynamic_x_clause(input: &str) -> OracleResult<'_, QuantityRe
     // Delegate to the shared quantity-ref combinator which is case-sensitive on
     // lowercase patterns ("the number of"). Normalize to lowercase for the
     // remaining phrase so the upstream combinators match.
+    //
+    // Both callers of this function (`try_parse_dynamic_x_cost_reduction`'s
+    // "where X is <count>" cost-reduction tail, and the combat-tax
+    // `dynamic_qty` slot in `evasion.rs`) treat this function's returned
+    // remainder as authoritative: they resume parsing (or check
+    // full-consumption) from whatever `&str` comes back here, not from
+    // `input`. `parse_quantity_ref` (non-complete) matches a recognized
+    // phrase as a PREFIX and happily returns leftover text as its remainder
+    // — but unconditionally collapsing that remainder to `""` below would
+    // silently swallow a qualifier the phrase never actually matched. E.g.
+    // "the amount of damage dealt this way" only matches the bare
+    // "damage dealt" arm up to that point; the leftover " this way" would be
+    // discarded and the clause misread as `EventContextAmount` instead of
+    // the distinct `PreviousEffectAmount` meaning "this way" carries (CR
+    // 608.2h vs the "this way" family below it in quantity.rs), or instead
+    // of staying an honest unsupported gap when no arm actually spans the
+    // full qualified phrase. `parse_quantity_ref_complete` requires the
+    // entire (trimmed) phrase to be consumed and errors instead of
+    // truncating, so an unrecognized qualified phrase stays an honest gap.
     let lowered = input.to_lowercase();
-    let (_, quantity) =
-        super::oracle_nom::quantity::parse_quantity_ref(&lowered).map_err(|e| match e {
+    let (_, quantity) = super::oracle_nom::quantity::parse_quantity_ref_complete(&lowered)
+        .map_err(|e| match e {
             nom::Err::Error(_) | nom::Err::Failure(_) => {
                 nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail))
             }
             nom::Err::Incomplete(n) => nom::Err::Incomplete(n),
         })?;
-    // Don't try to keep a &str reference into the lowered string — accept that the
-    // dynamic-X clause consumes the rest of the phrase and return empty remainder.
+    // `parse_quantity_ref_complete` already required full consumption of
+    // `lowered`, so returning an empty remainder here is honest, not
+    // discarding — unlike the direct `parse_quantity_ref` call this replaced.
     Ok(("", quantity))
 }
 

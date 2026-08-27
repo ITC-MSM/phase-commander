@@ -26411,6 +26411,106 @@ fn combat_tax_nils_per_affected_with_ref() {
     }
 }
 
+/// CR 120.1 + CR 608.2h: bare "the amount of damage dealt" (no qualifier)
+/// through `parse_dynamic_x_clause` — the exact combat-tax dynamic-X entry
+/// point the maintainer cited on PR #7969 (`shared.rs`, reached via the
+/// `dynamic_qty` slot in `evasion.rs`'s combat-tax parser) — binds to
+/// `QuantityRef::EventContextAmount`. Positive control for the rejection
+/// tests below: proves the unqualified phrase still parses once that entry
+/// point requires full consumption.
+///
+/// Exercises `parse_dynamic_x_clause` directly rather than through
+/// `parse_static_line`: the full combat-tax dispatch chain has a deliberate,
+/// unrelated fallback (`parse_subject_combat_rule_static` →
+/// `parse_unless_static_condition`) that always succeeds with an honest
+/// `StaticCondition::Unrecognized` rider when the dedicated combat-tax
+/// combinator fails, so asserting `parse_static_line(..).is_none()` would
+/// not actually discriminate this fix from that pre-existing, correct
+/// fallback.
+#[test]
+fn dynamic_x_clause_damage_dealt_bare_binds_event_context_amount() {
+    let (rest, quantity) = parse_dynamic_x_clause(", where x is the amount of damage dealt")
+        .expect("bare damage-dealt dynamic-X clause should parse");
+    assert_eq!(rest, "");
+    assert!(matches!(quantity, QuantityRef::EventContextAmount));
+}
+
+/// Regression for the false-green the maintainer flagged on PR #7969, through
+/// the exact code path they cited (`shared.rs`'s `parse_dynamic_x_clause`):
+/// that function used to call the non-complete `parse_quantity_ref` and
+/// unconditionally discard its remainder, so "the amount of damage dealt
+/// this way" would match only the bare "damage dealt" prefix and silently
+/// lose the "this way" qualifier — misread as `EventContextAmount` instead
+/// of staying an honest unsupported gap (no arm spans the full qualified
+/// phrase). `parse_dynamic_x_clause` now requires full consumption via
+/// `parse_quantity_ref_complete`, so this must error rather than truncate.
+#[test]
+fn dynamic_x_clause_damage_dealt_this_way_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt this way").is_err(),
+        "qualified \"this way\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// Sibling of the "this way" regression above: a "to <object>" qualifier
+/// after "damage dealt" must not be dropped either.
+#[test]
+fn dynamic_x_clause_damage_dealt_to_continuation_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt to that player").is_err(),
+        "qualified \"to\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// Sibling of the "this way" regression above: a "by <object>" qualifier
+/// after "damage dealt" must not be dropped either.
+#[test]
+fn dynamic_x_clause_damage_dealt_by_continuation_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt by that creature").is_err(),
+        "qualified \"by\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// End-to-end companion to the direct `parse_dynamic_x_clause` tests above:
+/// through the full combat-tax dispatch (`parse_static_line`), a qualified
+/// "damage dealt this way" dynamic-X clause must not come back bound as
+/// `PerQuantityRef(EventContextAmount)` — the misparse the maintainer
+/// flagged. The dedicated combat-tax combinator honestly fails (proven
+/// directly above), so the unrelated `Unrecognized`-condition fallback in
+/// `parse_subject_combat_rule_static` takes over and preserves the raw
+/// unless-clause text instead of a wrong dynamic quantity binding.
+#[test]
+fn combat_tax_damage_dealt_this_way_does_not_bind_event_context_amount() {
+    let def = parse_static_line(
+        "Creatures can't attack you unless their controller pays {X}, where X is the amount of damage dealt this way.",
+    )
+    .expect("combat-tax line falls back to an Unrecognized unless-condition, not None");
+    assert_eq!(def.mode, StaticMode::CantAttack);
+    match def.condition {
+        // The dedicated combat-tax combinator honestly failed to bind {X}, so
+        // dispatch fell through to the generic unless-condition fallback,
+        // which preserves the raw clause text instead of a dynamic quantity.
+        Some(StaticCondition::Not { .. }) | None => {}
+        // If some other path DID produce a typed `UnlessPay`, it must not be
+        // the misparsed bare-`EventContextAmount` scaling — this is the
+        // concrete failure mode this regression guards against.
+        Some(ref cond) => {
+            if let Some((_, scaling)) = find_unless_pay(cond) {
+                assert!(
+                    !matches!(
+                        scaling,
+                        UnlessPayScaling::PerQuantityRef {
+                            quantity: QuantityRef::EventContextAmount
+                        }
+                    ),
+                    "qualified \"this way\" continuation must not truncate to EventContextAmount, got {scaling:?}"
+                );
+            }
+        }
+    }
+}
+
 /// CR 508.1d: Brainwash-class aura form — "Enchanted creature can't attack
 /// unless its controller pays {3}." Verifies the aura subject branch emits
 /// `FilterProp::EnchantedBy` and flat scaling.

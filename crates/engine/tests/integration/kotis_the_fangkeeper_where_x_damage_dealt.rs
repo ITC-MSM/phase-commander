@@ -76,11 +76,12 @@ fn drain_until_kotis_trigger_resolves(
     panic!("Kotis's trigger did not resolve");
 }
 
-/// CR 120.1 + CR 608.2h: Kotis deals 2 combat damage (its printed power), so
-/// X = 2. The top two library cards are exiled (one within budget, MV 1; one
-/// over budget, MV 5) and a third card stays in the library, proving the
-/// exile is bounded to exactly X cards from the DAMAGED player's library, not
-/// Kotis's controller's.
+/// CR 120.2a + CR 608.2h: Kotis deals 2 combat damage (each attacking
+/// creature deals combat damage equal to its printed power), so X = 2. The
+/// top two library cards are exiled (one within budget, MV 1; one over
+/// budget, MV 5) and a third card stays in the library, proving the exile is
+/// bounded to exactly X cards from the DAMAGED player's library, not Kotis's
+/// controller's.
 #[test]
 fn kotis_exiles_top_x_cards_and_offers_only_mana_value_x_or_less() {
     let mut scenario = GameScenario::new();
@@ -133,8 +134,12 @@ fn kotis_exiles_top_x_cards_and_offers_only_mana_value_x_or_less() {
     let state = runner.state();
 
     // Exactly the top two P1 library cards were exiled; the third stays put,
-    // and P0's own library is untouched (CR 608.2c: "their library" binds to
-    // the damaged player, not the source's controller).
+    // and P0's own library is untouched. "Their library" is an Oracle-text
+    // grammar interpretation — the pronoun binds to the nearest preceding
+    // player noun, the damaged player from "deals combat damage to a
+    // player," not Kotis's controller — not a claim covered by a specific CR
+    // number (CR 608.2c governs the ORDER effects apply their instructions,
+    // not pronoun antecedents).
     assert_eq!(state.objects[&cheap].zone, Zone::Exile);
     assert_eq!(state.objects[&expensive].zone, Zone::Exile);
     assert_eq!(

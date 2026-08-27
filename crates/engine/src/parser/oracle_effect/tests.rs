@@ -470,7 +470,10 @@ fn kotis_the_fangkeeper_full_trigger_binds_damage_dealt_where_x() {
     assert_eq!(
         *player,
         TargetFilter::TriggeringPlayer,
-        "CR 608.2c: \"their library\" in a DamageDone trigger refers to the damaged player"
+        "Oracle-text grammar: \"their library\" in a DamageDone trigger binds to the \
+         damaged player (\"deals combat damage to a player\"), not to Kotis's controller \
+         — a pronoun-antecedent reading, not a specific CR citation (CR 608.2c governs \
+         the ORDER effects apply their instructions, not pronoun antecedents)"
     );
     assert_eq!(
         *count,
