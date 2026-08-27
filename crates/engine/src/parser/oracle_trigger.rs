@@ -3469,11 +3469,32 @@ fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> b
                 .all(reflexive_optional_cost_payable_by_resolution_prompt)
                 && costs.iter().any(cost_contains_tap_creatures)
         }
-        // `OneOf` needs an interactive branch-choice prompt before a concrete
-        // branch can be paid. Do not let the generic reflexive splitter mark
-        // those cards supported until that flow exists.
-        AbilityCost::OneOf { .. } => false,
+        AbilityCost::OneOf { costs } => {
+            costs.len() >= 2 && costs.iter().all(reflexive_optional_direct_cost)
+        }
         AbilityCost::TapCreatures { .. } => true,
+        _ => false,
+    }
+}
+
+/// Phase-1 structural allowlist for immediate direct payment leaves. Sacrifice
+/// remains an honest strict gap until its replacement-safe resume exists.
+fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
+    use crate::types::ability::{CardSelectionMode, DiscardSelfScope};
+
+    match cost {
+        AbilityCost::Mana { cost } => !crate::game::casting_costs::cost_has_x(cost),
+        AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value },
+            filter,
+            selection: CardSelectionMode::Chosen,
+            self_scope: DiscardSelfScope::FromHand,
+        } => *value > 0 && matches!(filter, None | Some(TargetFilter::Typed(_))),
+        AbilityCost::Exile {
+            count,
+            zone: Some(_),
+            filter,
+        } => *count > 0 && matches!(filter, None | Some(TargetFilter::Typed(_))),
         _ => false,
     }
 }

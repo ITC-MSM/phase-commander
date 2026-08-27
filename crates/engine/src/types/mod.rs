@@ -41,7 +41,7 @@ pub use ability::{
     TargetRef, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
 };
 pub use action_rejection::{ActionRejection, ActionRejectionCode, ActionRejectionDisposition};
-pub use actions::GameAction;
+pub use actions::{GameAction, ResolutionOptionalPaymentChoice};
 pub use attribution::{EffectRef, ObjectAttribution};
 pub use card::{CardFace, CardLayout, CardRules, Rarity};
 pub use card_type::{is_land_subtype, CardType, CoreType, Supertype};
@@ -53,8 +53,8 @@ pub use game_state::{
     ActionResult, BattlefieldEntryRecord, CommanderDamageEntry, CostResume, GameState, LKISnapshot,
     LandPlayRecord, LoopDetectSample, NextSpellModifier, PayCostKind, PendingNextSpellModifier,
     PendingReplacement, PendingSpellCostReduction, PlayerDeckPool, PriorityPassingMode,
-    ScheduledTurnControl, SpellCastRecord, StackEntry, StackEntryKind, TransientContinuousEffect,
-    WaitingFor, ZoneChangeRecord,
+    ResolutionOptionalPaymentOption, ScheduledTurnControl, SpellCastRecord, StackEntry,
+    StackEntryKind, TransientContinuousEffect, WaitingFor, ZoneChangeRecord,
 };
 pub use identifiers::{
     CardId, ObjectId, ObjectIdentityBinding, ObjectIncarnationRef, ObjectProvenance,

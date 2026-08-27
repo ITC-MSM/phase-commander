@@ -114,7 +114,37 @@ type SerializedCost = {
   count?: QuantityExpr | number;
   costs?: SerializedCost[];
   cost?: { type: string; shards?: string[]; generic?: number };
+  filter?: { type: string; type_filters?: unknown[] } | null;
+  zone?: string | null;
 };
+
+function formatTypeFilter(filter: unknown): string {
+  if (typeof filter === "string") return filter.toLowerCase();
+  if (!filter || typeof filter !== "object") return "card";
+  if ("Non" in filter) return `non${formatTypeFilter((filter as { Non: unknown }).Non)}`;
+  if ("Subtype" in filter) return String((filter as { Subtype: unknown }).Subtype);
+  if ("AnyOf" in filter) {
+    const alternatives = (filter as { AnyOf: unknown[] }).AnyOf ?? [];
+    return alternatives.map(formatTypeFilter).join(" or ");
+  }
+  return "card";
+}
+
+function formatFilteredCard(filter: SerializedCost["filter"]): string {
+  const types = filter?.type === "Typed" ? filter.type_filters ?? [] : [];
+  const meaningful = types.filter((type) => type !== "Card" && type !== "Any");
+  return meaningful.length > 0 ? `${meaningful.map(formatTypeFilter).join(" ")} card` : "card";
+}
+
+function formatZone(zone: string | null | undefined): string {
+  switch (zone) {
+    case "Battlefield": return "the battlefield";
+    case "Graveyard": return "your graveyard";
+    case "Library": return "your library";
+    case "Exile": return "exile";
+    default: return "your hand";
+  }
+}
 
 /** Render a QuantityExpr (or legacy raw number) for display in cost labels. */
 function formatQuantity(q: QuantityExpr | number | undefined, fallback = 1): string {
@@ -288,7 +318,13 @@ export function formatCost(cost: SerializedCost): string {
     case "Sacrifice": return "Sacrifice";
     case "Discard": {
       const label = formatQuantity(cost.count, 1);
-      return `Discard ${label} card${quantityIsPlural(cost.count) ? "s" : ""}`;
+      const noun = formatFilteredCard(cost.filter);
+      return `Discard ${label} ${noun}${quantityIsPlural(cost.count) ? "s" : ""}`;
+    }
+    case "Exile": {
+      const count = typeof cost.count === "number" ? cost.count : 1;
+      const noun = formatFilteredCard(cost.filter);
+      return `Exile ${count} ${noun}${count === 1 ? "" : "s"} from ${formatZone(cost.zone)}`;
     }
     case "Blight": return `Blight ${cost.count ?? 1}`;
     case "CollectEvidence":

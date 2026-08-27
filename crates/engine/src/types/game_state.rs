@@ -11303,6 +11303,14 @@ impl PersistedGameState {
     }
 }
 
+/// A payable root branch advertised by the engine. `index` is its position in
+/// the original `AbilityCost::OneOf`, even when unpayable siblings are omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionOptionalPaymentOption {
+    pub index: usize,
+    pub cost: AbilityCost,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WaitingFor {
@@ -12442,6 +12450,13 @@ pub enum WaitingFor {
         /// private printed selector used to persist the answer.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         same_card_may_trigger_choice_available: bool,
+    },
+    /// CR 118.12 + CR 608.2d: the payer may decline or choose one currently
+    /// payable, server-authored branch of a root `PayCost(OneOf)` instruction.
+    ResolutionOptionalPaymentChoice {
+        player: PlayerId,
+        source_id: ObjectId,
+        costs: Vec<ResolutionOptionalPaymentOption>,
     },
     /// CR 702.95a + CR 608.2d: Soulbond partner choice made while the PairWith
     /// effect resolves. The listed objects are legal choices, not targets.
@@ -13898,6 +13913,7 @@ impl WaitingFor {
             WaitingFor::MultiTargetSelection { .. } => "MultiTargetSelection",
             WaitingFor::AbilityModeChoice { .. } => "AbilityModeChoice",
             WaitingFor::OptionalEffectChoice { .. } => "OptionalEffectChoice",
+            WaitingFor::ResolutionOptionalPaymentChoice { .. } => "ResolutionOptionalPaymentChoice",
             WaitingFor::PairChoice { .. } => "PairChoice",
             WaitingFor::TributeChoice { .. } => "TributeChoice",
             WaitingFor::MiracleReveal { .. } => "MiracleReveal",
@@ -14069,6 +14085,7 @@ impl WaitingFor {
             | WaitingFor::CollectEvidenceChoice { player, .. }
             | WaitingFor::HarmonizeTapChoice { player, .. }
             | WaitingFor::OptionalEffectChoice { player, .. }
+            | WaitingFor::ResolutionOptionalPaymentChoice { player, .. }
             | WaitingFor::PairChoice { player, .. }
             | WaitingFor::OpponentMayChoice { player, .. }
             | WaitingFor::RespondToShortcut { player, .. }
@@ -14424,6 +14441,7 @@ impl WaitingFor {
             WaitingFor::OrderTriggers { .. }
                 | WaitingFor::TriggerTargetSelection { .. }
                 | WaitingFor::OptionalEffectChoice { .. }
+                | WaitingFor::ResolutionOptionalPaymentChoice { .. }
                 | WaitingFor::CommanderZoneChoice { .. }
                 | WaitingFor::ChooseLegend { .. }
                 | WaitingFor::BattleProtectorChoice { .. }
@@ -25013,6 +25031,14 @@ mod forced_cascade_window_tests {
                     description: None,
                     may_trigger_key: None,
                     same_card_may_trigger_choice_available: false,
+                },
+            ),
+            (
+                "ResolutionOptionalPaymentChoice (CR 118.12 + CR 608.2d)",
+                WaitingFor::ResolutionOptionalPaymentChoice {
+                    player: PlayerId(0),
+                    source_id: ObjectId(1),
+                    costs: Vec::new(),
                 },
             ),
             (

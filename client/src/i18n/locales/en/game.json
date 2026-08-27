@@ -2187,6 +2187,11 @@
     "dontAskAgain": "Don't ask again this game",
     "dontAskAgainForSameCard": "Apply this to every copy of this card"
   },
+  "resolutionOptionalPayment": {
+    "title": "Choose an optional payment",
+    "pay": "Pay {{cost}}",
+    "decline": "Decline"
+  },
   "topOrBottom": {
     "cardFallback": "Card",
     "title": "Put {{name}} on top or bottom of library",

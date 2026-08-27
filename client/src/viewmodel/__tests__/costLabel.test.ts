@@ -490,6 +490,32 @@ describe("formatAbilityCost", () => {
       ],
     })).toBe("{1} or Pay 2 life");
   });
+
+  it("formats the external-tag mana wire shape", () => {
+    expect(formatAbilityCost({
+      type: "Mana",
+      cost: { type: "Cost", shards: ["Blue"], generic: 2 },
+    })).toBe("{2}{U}");
+  });
+
+  it("formats typed discard filters from the server wire shape", () => {
+    expect(formatAbilityCost({
+      type: "Discard",
+      count: { type: "Fixed", value: 1 },
+      filter: { type: "Typed", type_filters: [{ Non: "Land" }], controller: null, properties: [] },
+      random: "Chosen",
+      self_ref: "AnyCard",
+    })).toBe("Discard 1 nonland card");
+  });
+
+  it("formats exile filters and zones from the server wire shape", () => {
+    expect(formatAbilityCost({
+      type: "Exile",
+      count: 2,
+      zone: "Graveyard",
+      filter: { type: "Typed", type_filters: ["Creature"], controller: null, properties: [] },
+    })).toBe("Exile 2 creature cards from your graveyard");
+  });
 });
 
 describe("spellCostDisplay", () => {

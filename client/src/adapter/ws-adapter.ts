@@ -203,6 +203,8 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 43 — Resolution-time optional PayCost(OneOf) branch choice added a
+ *      serialized WaitingFor/GameAction pair.
  * 42 — FormatConfig.deck_size changed from a bare u16 to the adjacently
  *      tagged DeckSizeRule enum (Minimum(u16) / Exactly(u16)), because
  *      CR 903.13f(1) makes Commander Draft a command-zone format with a
@@ -324,7 +326,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 42;
+export const PROTOCOL_VERSION = 43;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
