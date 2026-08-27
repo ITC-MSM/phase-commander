@@ -4059,7 +4059,7 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
         // counter-removal, and mana-production count-prefix slots).
         parse_that_much_or_many,
         value(QuantityRef::EventContextAmount, tag("that damage")),
-        // CR 120.1 + CR 608.2h: "the damage dealt" bare form in a triggered
+        // CR 120.2a + CR 608.2h: "the damage dealt" bare form in a triggered
         // ability body — refers to the total from the triggering
         // combat-damage event, an amount determined once when the effect is
         // applied. Accepts an optional "the amount of " / "amount of " / bare
