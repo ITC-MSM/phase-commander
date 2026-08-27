@@ -7596,7 +7596,9 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 }
             }
 
-            // Auto-submit empty blockers only when there's nothing to choose.
+            // Auto-submit empty blockers when nothing can be chosen, and submit
+            // an empty declaration for a live turn-boundary preference just as
+            // Declare Attackers does above.
             // CR 509.1 says the turn-based action still runs when no legal blocks
             // are available, and CR 117.1c requires the active player to receive
             // priority during the step (instants and Ninjutsu-family activations
@@ -7610,7 +7612,8 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
                 ..
             } if !state.phase_stop_hit(*player)
                 && (valid_blocker_ids.is_empty()
-                    || !super::combat::has_attackers_in_play(state)) =>
+                    || !super::combat::has_attackers_in_play(state)
+                    || end_of_turn_active(state, *player)) =>
             {
                 let mut events = Vec::new();
                 match engine_combat::handle_empty_blockers(state, *player, &mut events) {
@@ -7629,6 +7632,41 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) -> bool 
         }
     }
     advanced
+}
+
+/// CR 117.3d + CR 117.4: continues a live auto-pass preference after Resolve
+/// All has discharged its one-run consent. Resolve All is not an ordinary
+/// action boundary, so it owns the aggregation while this seam owns the normal
+/// priority progression.
+pub(crate) fn resume_auto_pass_after_resolve_all(
+    state: &mut GameState,
+    batch: &mut super::engine_resolve_batch::ResolveAllFastForwardResult,
+) {
+    let before = state.clone();
+    let mut result = ActionResult {
+        events: Vec::new(),
+        waiting_for: state.waiting_for.clone(),
+        log_entries: Vec::new(),
+    };
+    // CR 704.3: mirror the ordinary action-boundary reconciliation on both
+    // sides of the internal auto-pass drive. The resume seam bypasses
+    // `finish_action_boundary`, so without this a loss created by its final
+    // resolution could remain at Priority instead of becoming GameOver.
+    reconcile_terminal_result(state, &mut result);
+    run_auto_pass_loop(state, &mut result);
+    reconcile_terminal_result(state, &mut result);
+
+    let log_entries = super::log::resolve_log_entries(&result.events, &before, state);
+    batch.items_resolved = batch.items_resolved.saturating_add(
+        result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::StackResolved { .. }))
+            .count() as u32,
+    );
+    batch.events.extend(result.events);
+    batch.log_entries.extend(log_entries);
+    batch.waiting_for = state.waiting_for.clone();
 }
 
 /// CR 732.2: settle a runaway mandatory cascade gracefully. Pauses resolution,
@@ -7746,10 +7784,6 @@ fn begin_resolve_all_consent(
     max_resolutions: u32,
 ) -> Result<WaitingFor, EngineError> {
     super::priority::pass_priority_legality(state, priority_player)?;
-    // Resolve All consent supersedes this representative's standing yield. A
-    // Ready run must be free of auto-pass state so its one-resolution proof
-    // cannot advance beyond the consented boundary.
-    state.auto_pass.remove(&priority_player);
     let current_representative =
         super::topology::priority_pass_representative(state, priority_player);
     let mut representatives = super::topology::priority_pass_participants(state);
@@ -7928,6 +7962,16 @@ fn decline_resolve_all_consent_with_auto_pass(
     // from this state. Install the captured Priority window before reusing the
     // normal SetAutoPass path, rather than passing from the consent prompt.
     state.waiting_for = WaitingFor::Priority { player };
+    // The outer action boundary drives an existing preference immediately.
+    // Replacing it here would turn a retained time-boundary request into a
+    // stack-bound fallback before that normal progression can observe it.
+    if state.auto_pass.contains_key(&player) {
+        return Ok(ActionResult {
+            events: std::mem::take(events),
+            waiting_for: state.waiting_for.clone(),
+            log_entries: vec![],
+        });
+    }
     install_until_stack_empty_auto_pass_and_pass_priority(state, player, events)
 }
 
@@ -7959,9 +8003,6 @@ fn respond_resolve_all_consent(
                 .find(|participant| participant.representative == representative)
                 .expect("pending Resolve All representative must be a participant");
             participant.granted = true;
-            // A grant replaces this representative's standing auto-pass with
-            // the consented, bounded Resolve All sequence.
-            state.auto_pass.remove(&representative);
         }
     }
     if matches!(decision, ResolveAllConsentDecision::Decline) {
@@ -8796,28 +8837,22 @@ fn apply_action(
             }
             if let Some(obj) = state.objects.get_mut(object_id) {
                 if back_face {
-                    // Swap to back face using existing primitives
-                    let back = obj.back_face.take().expect("dual-faced card has back face");
-                    let front_snapshot = super::printed_cards::snapshot_object_face(obj);
-                    super::printed_cards::apply_back_face_to_object(obj, back);
-                    obj.back_face = Some(front_snapshot);
+                    // Swap to back face — the shared swap preserves the stored
+                    // slot's layout_kind (#7565).
+                    super::printed_cards::swap_object_faces(obj);
                     // CR 712.8a (MDFC) / CR 709.3 (split): non-front face showing;
                     // `apply_zone_exit_cleanup` reverts when leaving the stack.
                     obj.modal_back_face = true;
-                } else {
-                    // Front face chosen — clear layout_kind so the intercept
-                    // won't re-fire on re-entry into handle_play_land / handle_cast_spell.
-                    if let Some(ref mut bf) = obj.back_face {
-                        bf.layout_kind = None;
-                    }
                 }
-                // After choosing either face, clear layout on the stashed other
-                // half so cast/play re-entry does not re-prompt.
-                if back_face {
-                    if let Some(ref mut bf) = obj.back_face {
-                        bf.layout_kind = None;
-                    }
-                }
+                // CR 601.2b (#7565): remember that THIS cast's face choice is
+                // made so the handle_play_land / handle_cast_spell re-entry
+                // does not re-prompt. A transient flag, NOT
+                // `back_face.layout_kind = None`: that erasure was permanent,
+                // so a recast from hand (Rescue, bounce) silently auto-picked
+                // the front face and every other layout_kind consumer went
+                // blind. Cleared on any zone change off the stack and on
+                // cancel.
+                obj.cast_face_committed = true;
             }
             // CR 712.12 / CR 712.11b: Route the re-entry by the now-active face's
             // type. A land face is put onto the battlefield via the play-land
@@ -11003,11 +11038,47 @@ fn apply_action(
             engine_combat::handle_declare_attackers(state, *player, &attacks, &bands, &mut events)?
         }
         (
+            WaitingFor::DeclareAttackers { player, .. },
+            GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilTurnBoundary { until },
+            },
+        ) => {
+            store_auto_pass_request(
+                state,
+                *player,
+                AutoPassRequest::UntilTurnBoundary { until },
+            );
+            state.waiting_for.clone()
+        }
+        (WaitingFor::DeclareAttackers { .. }, GameAction::SetAutoPass { .. }) => {
+            return Err(EngineError::ActionNotAllowed(
+                "UntilStackEmpty auto-pass is unavailable while declaring attackers".to_string(),
+            ));
+        }
+        (
             WaitingFor::DeclareBlockers { player, .. },
             GameAction::DeclareBlockers { assignments },
         ) => {
             triggers_processed_inline = true;
             engine_combat::handle_declare_blockers(state, *player, &assignments, &mut events)?
+        }
+        (
+            WaitingFor::DeclareBlockers { player, .. },
+            GameAction::SetAutoPass {
+                mode: AutoPassRequest::UntilTurnBoundary { until },
+            },
+        ) => {
+            store_auto_pass_request(
+                state,
+                *player,
+                AutoPassRequest::UntilTurnBoundary { until },
+            );
+            state.waiting_for.clone()
+        }
+        (WaitingFor::DeclareBlockers { .. }, GameAction::SetAutoPass { .. }) => {
+            return Err(EngineError::ActionNotAllowed(
+                "UntilStackEmpty auto-pass is unavailable while declaring blockers".to_string(),
+            ));
         }
         (
             WaitingFor::UntapChoice {
@@ -13788,10 +13859,14 @@ fn handle_play_land(
 
     // CR 712.12: MDFC land face selection
     if let Some(obj) = state.objects.get(&object_id) {
-        let is_modal = obj
-            .back_face
-            .as_ref()
-            .is_some_and(|bf| bf.layout_kind == Some(crate::types::card::LayoutKind::Modal));
+        // CR 712.12 + CR 601.2b (#7565): the face prompt is offered only while
+        // this cast's choice is still open — `cast_face_committed` suppresses
+        // the re-entry re-prompt (layout_kind itself stays untouched).
+        let is_modal = !obj.cast_face_committed
+            && obj
+                .back_face
+                .as_ref()
+                .is_some_and(|bf| bf.layout_kind == Some(crate::types::card::LayoutKind::Modal));
         let front_is_land = obj
             .card_types
             .core_types
@@ -13817,10 +13892,7 @@ fn handle_play_land(
         if is_modal && !front_is_land && back_is_land {
             // CR 712.12: Only back face is a land — auto-swap (player already chose "play as land")
             let obj = state.objects.get_mut(&object_id).unwrap();
-            let back = obj.back_face.take().expect("MDFC has back face");
-            let front_snapshot = super::printed_cards::snapshot_object_face(obj);
-            super::printed_cards::apply_back_face_to_object(obj, back);
-            obj.back_face = Some(front_snapshot);
+            super::printed_cards::swap_object_faces(obj);
             // CR 712.8a: Mark back-face so apply_zone_exit_cleanup reverts to front face
             // when this land leaves the battlefield. Do NOT set obj.transformed — MDFC
             // face selection is not transformation.
@@ -15806,6 +15878,7 @@ mod priority_principal_tests {
             .get_mut(&object_id)
             .unwrap()
             .back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
             name: "Blow Off Steam".to_string(),
             power: None,
             toughness: None,
