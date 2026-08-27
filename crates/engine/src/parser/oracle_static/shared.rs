@@ -578,6 +578,45 @@ pub(crate) fn try_parse_inverted_attached_combat_grant(
     defs
 }
 
+/// CR 506.5 + CR 509.1b + CR 611.3a: Inverted attached-subject evasion gated
+/// on the host creature's live combat state — "As long as enchanted/equipped
+/// creature is attacking alone, it can't be blocked." The restriction belongs
+/// to the attached host, not the Aura/Equipment source. Reuses the canonical
+/// evasion classifier and the same recipient gate as attached combat grants.
+pub(crate) fn try_parse_inverted_attached_combat_evasion(
+    split: &InvertedSplit,
+    description: &str,
+) -> Option<StaticDefinition> {
+    let condition_lower = split.condition_text.to_lowercase();
+    let (rest, (affected, combat_prop)) =
+        nom_condition::parse_attached_subject_combat_state(&condition_lower).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let effect_lower = split.effect_text.to_lowercase();
+    let effect_tp = TextPair::new(&split.effect_text, &effect_lower);
+    let predicate = nom_tag_tp(&effect_tp, "it ").or_else(|| nom_tag_tp(&effect_tp, "they "))?;
+    let (mode, evasion_condition) = super::evasion::cant_be_blocked_mode(predicate.lower.trim())?;
+
+    let recipient_gate = StaticCondition::RecipientMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![combat_prop])),
+    };
+    let condition = match evasion_condition {
+        Some(evasion_condition) => StaticCondition::And {
+            conditions: vec![recipient_gate, evasion_condition],
+        },
+        None => recipient_gate,
+    };
+
+    Some(
+        StaticDefinition::new(mode)
+            .affected(affected)
+            .condition(condition)
+            .description(description.to_string()),
+    )
+}
+
 fn parse_grant_conjunct_verb(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
@@ -2362,18 +2401,22 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
         return Vec::new();
     }
 
-    // CR 508.1a + CR 611.3a + CR 613.1f: Inverted attached-subject grant gated on
-    // the host creature's COMBAT STATE — "As long as equipped/enchanted creature
-    // is attacking|blocking, it has/gets <X> [and <unmodeled conjunct>]" (Ace's
-    // Baseball Bat). This must run on the multi-static path (and before the
-    // single-return fallback) for two reasons: (1) the generic inverted rewrite
-    // would gate the grant on `SourceIsAttacking` (the Equipment, never an
-    // attacker) with `affected = SelfRef` — both wrong; (2) the compound effect
-    // may carry an unmodeled conjunct (the "must be blocked by a Dalek if able"
-    // lure) that must surface as a sibling `Effect::Unimplemented` residual
-    // rather than being silently dropped. The single-return path can carry only
-    // one def, so the residual would have nowhere to live there.
+    // CR 508.1a + CR 509.1b + CR 611.3a + CR 613.1f: Inverted attached-subject
+    // grant/evasion gated on the host creature's COMBAT STATE — "As long as
+    // equipped/enchanted creature is attacking[ alone]|blocking, it has/gets
+    // <X>" or "it can't be blocked" (Ace's Baseball Bat, Security Bypass).
+    // This must run on the multi-static path (and before the single-return
+    // fallback) for two reasons: (1) the generic inverted rewrite would gate on
+    // the Aura/Equipment source and set `affected = SelfRef` — both wrong; (2)
+    // a compound grant may carry an unmodeled conjunct (the "must be blocked by
+    // a Dalek if able" lure) that must surface as a sibling
+    // `Effect::Unimplemented` residual rather than being silently dropped. The
+    // single-return path can carry only one def, so that residual would have
+    // nowhere to live there.
     if let Some(split) = try_split_inverted_as_long_as(&tp) {
+        if let Some(def) = try_parse_inverted_attached_combat_evasion(&split, &stripped) {
+            return vec![def];
+        }
         let defs = try_parse_inverted_attached_combat_grant(&split, &stripped);
         if !defs.is_empty() {
             return defs;
