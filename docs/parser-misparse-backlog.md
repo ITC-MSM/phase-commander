@@ -421,7 +421,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Knowledge Pool
 - Korlash, Heir to Blackblade
 - Korvold, Fae-Cursed King
-- Kotis, the Fangkeeper
 - Kotose, the Silent Spider
 - Krang, the All-Powerful
 - Krasis Incubation
