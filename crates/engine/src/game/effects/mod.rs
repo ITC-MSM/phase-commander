@@ -25,8 +25,8 @@ use crate::types::game_state::{
     AutoMayChoice, CastOfferKind, ClauseMinimumSnapshot, DayNight, DiscardBatchCursor, GameState,
     LKISnapshot, ManaAbilityResume, MayTriggerAutoChoiceKey, PendingContinuation,
     PendingCostMoveResume, PendingDiscardBatchCompletion, PendingPlayerScopeSacrificeChoice,
-    PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp, WaitingFor,
-    ZoneChangeRecord,
+    PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp,
+    ResolutionOptionalPaymentOption, WaitingFor, ZoneChangeRecord,
 };
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -7208,6 +7208,42 @@ pub(crate) struct UpfrontOptionalGate {
     pub key: Option<MayTriggerAutoChoiceKey>,
 }
 
+/// CR 118.12 + CR 608.2d: enumerate the payable immediate branches of an
+/// optional root `PayCost(OneOf)` without renumbering them. The chooser is only
+/// an adapter; affordability and execution remain owned by `game::costs`.
+pub(crate) fn resolution_optional_payment_options(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<(PlayerId, Vec<ResolutionOptionalPaymentOption>)> {
+    let Effect::PayCost {
+        cost: AbilityCost::OneOf { costs },
+        scale: None,
+        payer,
+    } = &ability.effect
+    else {
+        return None;
+    };
+    let payer = crate::game::targeting::resolve_effect_player_ref(state, ability, payer)?;
+    let scope = crate::game::costs::PaymentScope::Resolution {
+        ability,
+        cost_move_root: crate::game::costs::ResolutionCostMoveRoot::EffectPayCost,
+    };
+    let options = costs
+        .iter()
+        .enumerate()
+        .filter(|(_, cost)| {
+            crate::game::costs::is_direct_resolution_optional_payment_branch(cost)
+                && crate::game::costs::supported_at_resolution(cost)
+                && crate::game::costs::can_pay(state, payer, ability.source_id, cost, &scope)
+        })
+        .map(|(index, cost)| ResolutionOptionalPaymentOption {
+            index,
+            cost: cost.clone(),
+        })
+        .collect();
+    Some((payer, options))
+}
+
 pub(crate) fn upfront_optional_gate(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -11269,6 +11305,10 @@ fn resolve_chain_body(
         ability,
         OptionalFeasibility::Known(optional_is_infeasible),
     ) {
+        let UpfrontOptionalGate {
+            prompt_player,
+            key: may_trigger_key,
+        } = gate;
         // The executable half of the `optional_for` coupling note above: this branch is
         // reachable only because the CR 101.4 fan-out already returned, so the authority's
         // `optional_for.is_some() ⇒ None` conjunct can never be the thing that admits an
@@ -11279,11 +11319,53 @@ fn resolve_chain_body(
             "CR 608.2d + CR 101.4: the fan-out early return must have taken every \
              `optional_for` ability before the up-front gate"
         );
+        if let Some((payer, costs)) = resolution_optional_payment_options(state, ability) {
+            if may_trigger_key.as_ref().is_some_and(|key| {
+                matches!(
+                    state.may_trigger_auto_choice_for_live_prompt(key),
+                    Some(AutoMayChoice::Decline)
+                )
+            }) {
+                resolve_optional_effect_decision(
+                    state,
+                    ability.clone(),
+                    AutoMayChoice::Decline,
+                    events,
+                    depth + 1,
+                )?;
+                return Ok(());
+            }
+            if costs.is_empty() {
+                // CR 608.2d: an impossible optional payment is declined without
+                // opening a choice window.
+                resolve_optional_effect_decision(
+                    state,
+                    ability.clone(),
+                    AutoMayChoice::Decline,
+                    events,
+                    depth + 1,
+                )?;
+                return Ok(());
+            }
+            state
+                .install_direct_choice_frame(
+                    ResolutionFrame::OptionalEffect(OptionalEffectFrame {
+                        ability: Box::new(ability_with_event_context_targets(state, ability)),
+                        trigger_event: state.current_trigger_event.clone(),
+                        trigger_events: state.current_trigger_events.clone(),
+                        trigger_match_count: state.current_trigger_match_count,
+                    }),
+                    WaitingFor::ResolutionOptionalPaymentChoice {
+                        player: payer,
+                        source_id: ability.source_id,
+                        costs,
+                    },
+                )
+                .map_err(|error| EffectError::InvalidParam(error.to_string()))?;
+            return Ok(());
+        }
+
         let description = ability.description.clone();
-        let UpfrontOptionalGate {
-            prompt_player,
-            key: may_trigger_key,
-        } = gate;
         // Deliberately the DIRECT store read rather than `stored_may_answer`, and this is
         // not a duplicated authority: the KEY is what has to be built in one place, and it
         // was — by `upfront_optional_gate`, above. `stored_may_answer` would re-enter the

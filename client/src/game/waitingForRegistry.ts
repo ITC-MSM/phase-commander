@@ -166,6 +166,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "PairChoice",
     "OpponentMayChoice",
     "OptionalEffectChoice",
+    "ResolutionOptionalPaymentChoice",
     "UnlessPayment",
     "UnlessPaymentChooseCost",
     "WardDiscardChoice",

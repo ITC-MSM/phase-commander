@@ -2144,6 +2144,26 @@
     "dontAskAgain": "Nie pytaj ponownie w tej grze",
     "dontAskAgainForSameCard": "Zastosuj do każdej kopii tej karty"
   },
+  "resolutionOptionalPayment": {
+    "title": "Wybierz opcjonalną opłatę",
+    "pay": "Zapłać {{cost}}",
+    "decline": "Odmów",
+    "cost": {
+      "card": "kartę",
+      "cards": "karty",
+      "filteredCard": "kartę {{types}}",
+      "filteredCards": "karty {{types}}",
+      "nonType": "nie-{{type}}",
+      "orSeparator": " lub ",
+      "zoneBattlefield": "pola bitwy",
+      "zoneGraveyard": "twojego cmentarza",
+      "zoneLibrary": "twojej biblioteki",
+      "zoneExile": "wygnania",
+      "zoneHand": "twojej ręki",
+      "discard": "Odrzuć {{count}} {{cards}}",
+      "exile": "Wygnaj {{count}} {{cards}} z {{zone}}"
+    }
+  },
   "topOrBottom": {
     "cardFallback": "Karta",
     "title": "Umieść {{name}} na wierzchu lub spodzie biblioteki",
