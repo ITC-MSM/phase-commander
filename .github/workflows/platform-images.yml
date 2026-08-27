@@ -40,12 +40,20 @@ jobs:
         run: ./scripts/gen-card-data.sh
       - name: Supply current draft pools
         run: curl -fsSL https://data.phase-rs.dev/draft-pools.json -o client/public/draft-pools.json
+      - name: Validate self-hosted coverage data
+        run: |
+          test -s client/public/coverage-data.json
+          test -s client/public/coverage-summary.json
+          jq -e . client/public/coverage-data.json >/dev/null
+          jq -e . client/public/coverage-summary.json >/dev/null
       - name: Build WASM
         run: ./scripts/build-wasm.sh release
       - name: Build frontend
         env:
           DATA_BASE_URL: https://data.phase-rs.dev
           CARD_DATA_URL: /card-data.json
+          COVERAGE_DATA_URL: /coverage-data.json
+          COVERAGE_SUMMARY_URL: /coverage-summary.json
           DEFAULT_MULTIPLAYER_SERVER_URL: wss://commanderonline.com/ws
           OFFICIAL_MULTIPLAYER_SERVER_URL: wss://commanderonline.com/ws
         run: cd client && pnpm install --frozen-lockfile && pnpm build
