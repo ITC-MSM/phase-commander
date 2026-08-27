@@ -3374,11 +3374,10 @@ fn simulate_chosen_split_spell_back_face(obj: &mut crate::game::game_object::Gam
     swap_to_alternative_spell_face(obj);
     // Mirror `ChooseModalFace { back_face: true }` so affordability preview and
     // alt-cost resolution use the chosen face without re-prompting or swapping
-    // back to the front half (#3987).
+    // back to the front half (#3987). #7565: the mirror is the transient
+    // choice flag, not a layout_kind erasure.
     obj.modal_back_face = true;
-    if let Some(ref mut bf) = obj.back_face {
-        bf.layout_kind = None;
-    }
+    obj.cast_face_committed = true;
 }
 
 pub(super) fn exile_alt_cost_permission_supports_cast(
@@ -9327,13 +9326,22 @@ pub(super) fn consume_pending_spell_cost_reduction(
 /// spell face for casting. Saves the normal face in `back_face` for later
 /// restoration.
 fn swap_to_alternative_spell_face(obj: &mut crate::game::game_object::GameObject) {
-    let alternative = match obj.back_face.take() {
-        Some(b) => b,
-        None => return,
-    };
-    let normal_snapshot = super::printed_cards::snapshot_object_face(obj);
-    super::printed_cards::apply_back_face_to_object(obj, alternative);
-    obj.back_face = Some(normal_snapshot);
+    // #7565: the shared swap preserves the stored slot's layout_kind.
+    super::printed_cards::swap_object_faces(obj);
+    // CR 715.2a (#7714): while the Adventure/Omen face IS in use, the stored
+    // slot holds the NORMAL face — it must not read as "has an Adventure"
+    // (`SpellCastRecord.has_adventure`, Garenbrig Squire's qualifier).
+    // `restore_alternative_spell_normal_face` re-stamps the marker from the
+    // cast's variant when the normal face returns. Split/MDFC markers are a
+    // different semantic (card-level layout class) and stay preserved.
+    if let Some(back) = obj.back_face.as_mut() {
+        if matches!(
+            back.layout_kind,
+            Some(LayoutKind::Adventure) | Some(LayoutKind::Omen)
+        ) {
+            back.layout_kind = None;
+        }
+    }
 }
 
 /// CR 715 / CR 720: Returns the Adventure-family spell layout if this object
@@ -9423,7 +9431,11 @@ fn is_castable_split_face(types: &crate::types::card_type::CardType) -> bool {
 /// CR 712.11b + CR 709.3: Cast-time face choice for spell//spell MDFCs and
 /// spell//spell split cards.
 fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
-    modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj)
+    // CR 601.2b (#7565): a choice already made for the CURRENT cast is not
+    // offered again on pipeline re-entry; the transient flag clears once the
+    // cast conversation ends, so a later recast prompts afresh.
+    !obj.cast_face_committed
+        && (modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj))
 }
 
 /// CR 712.11b: Returns true if `obj` is a Modal double-faced card whose two
@@ -9439,9 +9451,11 @@ fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) 
 /// face normally and plays its land (back) face via PlayLand, so neither needs
 /// a cast-time choice here.
 ///
-/// The gate keys off `back_face.layout_kind == Modal`, which
-/// `snapshot_object_face` clears to `None` after a swap — so re-entry into the
-/// cast pipeline for the chosen face does not re-prompt.
+/// The gate keys off `back_face.layout_kind == Modal`. #7565: a swap now
+/// preserves that layout ([`crate::game::printed_cards::swap_object_faces`]), so
+/// re-entry into the cast pipeline for the chosen face is stopped one level up
+/// instead — [`cast_spell_face_choice_available`] returns `false` once
+/// `cast_face_committed` is set (CR 601.2b).
 fn modal_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
     use crate::types::card_type::CoreType;
     let Some(back) = obj.back_face.as_ref() else {
@@ -14460,8 +14474,10 @@ pub fn can_cast_modal_face_now(
     };
     if back_face {
         simulate_chosen_split_spell_back_face(obj);
-    } else if let Some(back) = obj.back_face.as_mut() {
-        back.layout_kind = None;
+    } else {
+        // #7565: mirror the front-face choice on the simulation clone the same
+        // way the real handler records it.
+        obj.cast_face_committed = true;
     }
     if obj
         .card_types
@@ -15075,9 +15091,11 @@ fn can_cast_prepared_now_with_probe(
     // (Esika, God of the Tree needs {1}{G}{G}) while the back face is castable
     // (The Prismatic Bridge needs {W}{U}{B}{R}{G}); the card is still legally
     // castable and will prompt ModalFaceChoice (CR 712.11b). Mirror the Adventure
-    // recursion: swap to the back face and re-test. `simulate_chosen_split_spell_back_face`
-    // clears the stashed face's `layout_kind`, so the recursive call does not
-    // re-enter this branch (no infinite recursion).
+    // recursion: swap to the back face and re-test. #7565: the recursion stops
+    // because `simulate_chosen_split_spell_back_face` sets `cast_face_committed`,
+    // which `cast_spell_face_choice_available` reads (CR 601.2b — a choice already
+    // made for the current cast is not offered again). The swap itself no longer
+    // erases the stashed `layout_kind`, so that erasure can no longer be the guard.
     if cast_spell_face_choice_available(obj) {
         let mut sim = state.clone();
         if let Some(sim_obj) = sim.objects.get_mut(&prepared.object_id) {
@@ -20518,6 +20536,12 @@ pub fn handle_cancel_cast(
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
             obj.modal_back_face = false;
         }
+    }
+    // #7565: a cancelled cast releases its face choice — the object may never
+    // move zones (it stays in hand), so the zone-change clear cannot cover
+    // this path. Unconditional: harmless when no choice was made.
+    if let Some(obj) = state.objects.get_mut(&pending.object_id) {
+        obj.cast_face_committed = false;
     }
 
     if pending.casting_variant == CastingVariant::Prototype {
