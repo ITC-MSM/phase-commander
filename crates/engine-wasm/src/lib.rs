@@ -3155,28 +3155,22 @@ pub fn resolve_all(
             Ok(result) => result,
             Err(rejection) => return Ok(rejected_action_outcome(rejection)),
         };
-        // A Resolve All burst applies real actions directly via
-        // `apply_action_boundary_with_stack_limit` (bypassing `submit_action`,
-        // which is the only other place REPLAY_LOG is appended to) — without
-        // this, an exported replay would silently omit every action a player
-        // fast-forwarded through, and playback would desync from the game
-        // they actually played. `recorded_actions` is `#[serde(skip)]`, so
-        // draining it here has no effect on the JS-visible result shape.
-        if !result.recorded_actions.is_empty() {
-            REPLAY_LOG.with(|cell| {
-                let mut log = cell.take();
-                if let Some(log) = log.as_mut() {
-                    for (actor, action) in result.recorded_actions.drain(..) {
-                        log.push_action(actor, action);
-                    }
-                }
-                cell.set(log);
-            });
-            // Resolve All advances the live state without travelling through
-            // `submit_action`, so it must invalidate proposal capabilities at
-            // the same authority boundary.
-            invalidate_ai_proposals();
-        }
+        // Resolve All consumes a transport-owned Ready latch, rather than one
+        // `GameAction` per internal priority pass. Record the entire consumer
+        // atomically after the last submitted consent action; playback invokes
+        // the same engine consumer at that exact boundary, so auto-pass cannot
+        // re-run between synthetic recorded passes.
+        REPLAY_LOG.with(|cell| {
+            let mut log = cell.take();
+            if let Some(log) = log.as_mut() {
+                log.push_resolve_all_boundary(requester);
+            }
+            cell.set(log);
+        });
+        // Resolve All advances the live state without travelling through
+        // `submit_action`, so it must invalidate proposal capabilities at the
+        // same authority boundary.
+        invalidate_ai_proposals();
         result.events.clear();
         result.log_entries.clear();
         Ok(action_outcome(Ok(result)))
@@ -4649,6 +4643,62 @@ mod tests {
         assert_eq!(result.items_resolved, 1);
         let restored: GameState = serde_wasm_bindgen::from_value(get_game_state()).unwrap();
         assert!(restored.stack.is_empty());
+        clear_game_state();
+    }
+
+    #[test]
+    fn resolve_all_exported_path_records_one_atomic_replay_boundary() {
+        clear_game_state();
+
+        let mut state = GameState::new_two_player(8);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        state.priority_player = PlayerId(0);
+        state.stack.push_back(no_op_stack_entry(1, PlayerId(0)));
+        let header = ReplayHeader {
+            format_config: state.format_config.clone(),
+            match_config: state.match_config,
+            player_count: state.players.len() as u8,
+            first_player: Some(0),
+            seed: state.rng_seed,
+            deck_data: None,
+        };
+        REPLAY_LOG.with(|cell| cell.set(Some(ReplayLog::new(header))));
+
+        let begin = GameAction::BeginResolveAll { max_resolutions: 0 };
+        apply(&mut state, PlayerId(0), begin.clone())
+            .expect("P0 begins the Resolve All consent run");
+        record_replay_action(false, PlayerId(0), begin);
+        let WaitingFor::ResolveAllConsent { epoch, .. } = state.waiting_for else {
+            panic!(
+                "P1 should be asked for consent, got {:?}",
+                state.waiting_for
+            );
+        };
+        let grant = GameAction::RespondResolveAllConsent {
+            epoch,
+            decision: ResolveAllConsentDecision::Grant,
+        };
+        apply(&mut state, PlayerId(1), grant.clone()).expect("P1 grants Resolve All consent");
+        record_replay_action(false, PlayerId(1), grant);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ResolveAllReady { .. }
+        ));
+        GAME_STATE.with(|cell| cell.set(Some(state)));
+
+        resolve_all(0, "[]", 0).expect("the Ready consumer resolves through the WASM bridge");
+
+        REPLAY_LOG.with(|cell| {
+            let log = cell.take().expect("the replay log remains installed");
+            assert_eq!(log.actions.len(), 2);
+            assert_eq!(log.resolve_all_boundaries.len(), 1);
+            let boundary = &log.resolve_all_boundaries[0];
+            assert_eq!(boundary.after_action_count, 2);
+            assert_eq!(boundary.requester, PlayerId(0));
+            cell.set(Some(log));
+        });
         clear_game_state();
     }
 
