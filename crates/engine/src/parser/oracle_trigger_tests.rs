@@ -20,7 +20,7 @@ use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::game_state::WaitingFor;
 use crate::types::keywords::Keyword;
-use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
+use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::{CastFrequency, StaticMode};
 
@@ -16517,26 +16517,101 @@ fn reflexive_optional_payment_does_not_rewrite_separate_you_control_target() {
     }
 }
 
-/// CR 118.12 + CR 603.12: the generic reflexive optional-cost splitter only
-/// supports straight-line resolution costs. Disjunctive `OneOf` costs require a
-/// branch-choice payment flow, so they must not be exported as a supported
-/// optional `PayCost` until that flow exists.
+/// CR 118.12 + CR 603.12: Phase 1 admits only direct disjunctive resolution
+/// costs. Sacrifice-bearing alternatives remain strict until the replacement-
+/// aware payment continuation exists.
 #[test]
-fn reflexive_optional_disjunctive_cost_remains_parser_gap() {
-    let def = parse_trigger_line(
-        "Whenever you discard a card, you may pay {1} or discard a card. When you do, draw a card.",
-        "Disjunctive Reflexive Test",
+fn anthropede_and_isu_unlock_without_sacrifice_leak() {
+    fn root_cost(def: &TriggerDefinition) -> (&Vec<AbilityCost>, &AbilityDefinition) {
+        let execute = def.execute.as_ref().expect("execute");
+        let Effect::PayCost {
+            payer: TargetFilter::Controller,
+            cost: AbilityCost::OneOf { costs },
+            ..
+        } = execute.effect.as_ref()
+        else {
+            panic!(
+                "expected optional root PayCost(OneOf), got {:?}",
+                execute.effect
+            );
+        };
+        assert!(execute.optional, "the printed may must remain optional");
+        (costs, execute)
+    }
+
+    fn mana_cost(cost: &AbilityCost) -> &ManaCost {
+        let AbilityCost::Mana { cost } = cost else {
+            panic!("expected Mana cost, got {cost:?}");
+        };
+        cost
+    }
+
+    let anthropede = parse_trigger_line(
+        "When this creature enters, you may discard a card or pay {2}. When you do, destroy target Room.",
+        "Anthropede",
     );
-    let execute = def.execute.as_ref().expect("execute");
-    assert!(
-        !matches!(execute.effect.as_ref(), Effect::PayCost { .. }),
-        "OneOf resolution costs must not be surfaced through the straight-line PayCost prompt"
+    let (costs, execute) = root_cost(&anthropede);
+    assert_eq!(costs.len(), 2);
+    assert!(matches!(costs[0], AbilityCost::Discard { .. }));
+    assert!(matches!(costs[1], AbilityCost::Mana { .. }));
+    assert_eq!(mana_cost(&costs[1]), &ManaCost::generic(2));
+    assert_eq!(
+        execute
+            .sub_ability
+            .as_ref()
+            .expect("When-you-do tail")
+            .condition,
+        Some(AbilityCondition::WhenYouDo)
     );
-    assert!(
-        matches!(execute.effect.as_ref(), Effect::Unimplemented { .. }),
-        "unsupported reflexive optional costs should remain honest parser gaps, got {:?}",
-        execute.effect
-    );
+
+    for text in [
+        "Whenever another snow permanent you control enters, you may pay {G}, {W}, or {U}. If you do, put a +1/+1 counter on Isu.",
+        "Whenever another snow permanent you control enters, you may pay {G}, {W} or {U}. If you do, put a +1/+1 counter on Isu.",
+    ] {
+        let isu = parse_trigger_line(text, "Isu the Abominable");
+        let (costs, execute) = root_cost(&isu);
+        assert_eq!(costs.len(), 3);
+        assert!(costs.iter().all(|cost| matches!(cost, AbilityCost::Mana { .. })));
+        assert_eq!(
+            costs.iter().map(mana_cost).cloned().collect::<Vec<_>>(),
+            vec![
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 0,
+                },
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::White],
+                    generic: 0,
+                },
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 0,
+                },
+            ],
+            "Isu must preserve the printed {{G}}/{{W}}/{{U}} branch order"
+        );
+        assert_eq!(
+            execute.sub_ability.as_ref().expect("If-you-do tail").condition,
+            Some(AbilityCondition::effect_performed())
+        );
+    }
+
+    for (name, text) in [
+        (
+            "K'un-Lun Warrior",
+            "When this creature enters, you may sacrifice an artifact or discard a card. If you do, draw a card.",
+        ),
+        (
+            "Bullseye, Death Dealer",
+            "When Bullseye enters, you may sacrifice an artifact or discard a nonland card. When you do, Bullseye deals 2 damage to any target.",
+        ),
+    ] {
+        let strict = parse_trigger_line(text, name);
+        assert!(matches!(
+            strict.execute.as_deref().map(|ability| ability.effect.as_ref()),
+            Some(Effect::Unimplemented { name, .. }) if name == "reflexive optional payment"
+        ), "sacrifice alternative must remain the exact Phase-1 strict gap for {name}");
+    }
 }
 
 /// Issue #1993: Halana and Alena, Partners — X in the counter clause must bind

@@ -2202,6 +2202,26 @@
     "dontAskAgain": "Don't ask again this game",
     "dontAskAgainForSameCard": "Apply this to every copy of this card"
   },
+  "resolutionOptionalPayment": {
+    "title": "Choose an optional payment",
+    "pay": "Pay {{cost}}",
+    "decline": "Decline",
+    "cost": {
+      "card": "card",
+      "cards": "cards",
+      "filteredCard": "{{types}} card",
+      "filteredCards": "{{types}} cards",
+      "nonType": "non{{type}}",
+      "orSeparator": " or ",
+      "zoneBattlefield": "the battlefield",
+      "zoneGraveyard": "your graveyard",
+      "zoneLibrary": "your library",
+      "zoneExile": "exile",
+      "zoneHand": "your hand",
+      "discard": "Discard {{count}} {{cards}}",
+      "exile": "Exile {{count}} {{cards}} from {{zone}}"
+    }
+  },
   "topOrBottom": {
     "cardFallback": "Card",
     "title": "Put {{name}} on top or bottom of library",

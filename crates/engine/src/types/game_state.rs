@@ -11545,6 +11545,14 @@ impl PersistedGameState {
     }
 }
 
+/// A payable root branch advertised by the engine. `index` is its position in
+/// the original `AbilityCost::OneOf`, even when unpayable siblings are omitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolutionOptionalPaymentOption {
+    pub index: usize,
+    pub cost: AbilityCost,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum WaitingFor {
@@ -12684,6 +12692,13 @@ pub enum WaitingFor {
         /// private printed selector used to persist the answer.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         same_card_may_trigger_choice_available: bool,
+    },
+    /// CR 118.12 + CR 608.2d: the payer may decline or choose one currently
+    /// payable, server-authored branch of a root `PayCost(OneOf)` instruction.
+    ResolutionOptionalPaymentChoice {
+        player: PlayerId,
+        source_id: ObjectId,
+        costs: Vec<ResolutionOptionalPaymentOption>,
     },
     /// CR 702.95a + CR 608.2d: Soulbond partner choice made while the PairWith
     /// effect resolves. The listed objects are legal choices, not targets.
@@ -14140,6 +14155,7 @@ impl WaitingFor {
             WaitingFor::MultiTargetSelection { .. } => "MultiTargetSelection",
             WaitingFor::AbilityModeChoice { .. } => "AbilityModeChoice",
             WaitingFor::OptionalEffectChoice { .. } => "OptionalEffectChoice",
+            WaitingFor::ResolutionOptionalPaymentChoice { .. } => "ResolutionOptionalPaymentChoice",
             WaitingFor::PairChoice { .. } => "PairChoice",
             WaitingFor::TributeChoice { .. } => "TributeChoice",
             WaitingFor::MiracleReveal { .. } => "MiracleReveal",
@@ -14311,6 +14327,7 @@ impl WaitingFor {
             | WaitingFor::CollectEvidenceChoice { player, .. }
             | WaitingFor::HarmonizeTapChoice { player, .. }
             | WaitingFor::OptionalEffectChoice { player, .. }
+            | WaitingFor::ResolutionOptionalPaymentChoice { player, .. }
             | WaitingFor::PairChoice { player, .. }
             | WaitingFor::OpponentMayChoice { player, .. }
             | WaitingFor::RespondToShortcut { player, .. }
@@ -14657,7 +14674,7 @@ impl WaitingFor {
     /// `engine_combat::handle_declare_attackers` tax pause are where the class boundary
     /// between "declaring" (a member) and "paying to declare" (not a member) is drawn.
     ///
-    /// FAIL-CLOSED: the other 114 variants fall through to `false`, and `false` keeps
+    /// FAIL-CLOSED: every other variant falls through to `false`, and `false` keeps
     /// the ring-clearing behaviour, so a newly added variant defaults to the safe side
     /// without anyone remembering to update this list.
     pub fn is_forced_cascade_window(&self) -> bool {
@@ -25476,7 +25493,7 @@ mod forced_cascade_window_tests {
     /// CR 603.3b / CR 603.3d / CR 603.5 + CR 608.2d / CR 903.9a / CR 704.5j /
     /// CR 310.11 / CR 703.1 + CR 117.3a: the membership matrix for
     /// [`WaitingFor::is_forced_cascade_window`], asserted in BOTH directions —
-    /// thirteen members and eight non-members, each named.
+    /// thirteen members and nine non-members, each named.
     ///
     /// The class is defined by "no player has priority here", and each half of the
     /// matrix pins a different consequence:
@@ -25656,6 +25673,14 @@ mod forced_cascade_window_tests {
         ];
 
         let not_forced: Vec<(&str, WaitingFor)> = vec![
+            (
+                "ResolutionOptionalPaymentChoice — a Phyrexian branch can MOVE LIFE",
+                WaitingFor::ResolutionOptionalPaymentChoice {
+                    player: PlayerId(0),
+                    source_id: ObjectId(1),
+                    costs: Vec::new(),
+                },
+            ),
             (
                 "Priority{active} — CR 704.3 SBA point, must sample or clear",
                 WaitingFor::Priority {

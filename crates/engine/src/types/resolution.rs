@@ -379,8 +379,8 @@ impl ResolutionFrame {
             Self::RepeatedOptionalPayment(RepeatedOptionalPaymentFrame {
                 pending: Some(_),
                 ..
-            })
-            | Self::OptionalEffect(_) => FrameGate::DirectChoice(DirectChoiceGate::OptionalEffect),
+            }) => FrameGate::DirectChoice(DirectChoiceGate::RepeatedOptionalPayment),
+            Self::OptionalEffect(_) => FrameGate::DirectChoice(DirectChoiceGate::OptionalEffect),
             Self::CoinFlip(_) => FrameGate::DirectChoice(DirectChoiceGate::CoinFlipKeep),
             Self::Proliferate(_) => FrameGate::DirectChoice(DirectChoiceGate::Proliferate),
             Self::MutateMerge(_) => FrameGate::DirectChoice(DirectChoiceGate::MutateMerge),
@@ -431,6 +431,7 @@ pub enum FrameGate {
 /// A concrete prompt that a direct-choice frame is permitted to consume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DirectChoiceGate {
+    RepeatedOptionalPayment,
     OptionalEffect,
     CoinFlipKeep,
     Proliferate,
@@ -443,9 +444,19 @@ impl DirectChoiceGate {
         matches!(
             (self, waiting_for),
             (
+                Self::RepeatedOptionalPayment,
+                WaitingFor::OptionalEffectChoice { .. }
+            ) | (
+                Self::RepeatedOptionalPayment,
+                WaitingFor::OpponentMayChoice { .. }
+            ) | (
                 Self::OptionalEffect,
                 WaitingFor::OptionalEffectChoice { .. }
             ) | (Self::OptionalEffect, WaitingFor::OpponentMayChoice { .. })
+                | (
+                    Self::OptionalEffect,
+                    WaitingFor::ResolutionOptionalPaymentChoice { .. }
+                )
                 | (Self::CoinFlipKeep, WaitingFor::CoinFlipKeepChoice { .. })
                 | (Self::Proliferate, WaitingFor::ProliferateChoice { .. })
                 | (Self::MutateMerge, WaitingFor::MutateMergeChoice { .. })
@@ -5491,6 +5502,54 @@ mod tests {
             }),
             Err(ResolutionStackError::MultipleDirectChoiceOwners)
         );
+    }
+
+    #[test]
+    fn v2_replayed_resolution_optional_payment_prompt_requires_optional_effect_frame() {
+        let waiting_for = WaitingFor::ResolutionOptionalPaymentChoice {
+            player: PlayerId(0),
+            source_id: ObjectId(8),
+            costs: Vec::new(),
+        };
+
+        let mut repeated_state = GameState::new_two_player(8);
+        repeated_state.waiting_for = waiting_for.clone();
+        let mut repeated_frames = ResolutionStack::default();
+        repeated_frames.push_inner(ResolutionFrame::RepeatedOptionalPayment(
+            RepeatedOptionalPaymentFrame {
+                pending: Some(Box::new(PendingRepeatedOptionalPayment {
+                    payment_unit: Box::new(resolved_draw(8)),
+                    reflexive: Box::new(resolved_draw(9)),
+                    remaining: 1,
+                })),
+                optional_cost_payments_this_resolution: 0,
+            },
+        ));
+        let repeated_payload = v2_fixture_with_frames(repeated_state, repeated_frames);
+        let error = serde_json::from_value::<ResolutionStateWire>(repeated_payload)
+            .expect_err("a replayed repeated-payment frame cannot own the Phase 1 prompt");
+        assert!(
+            error
+                .to_string()
+                .contains("ResolutionOptionalPaymentChoice"),
+            "the wire rejection must identify the mismatched prompt: {error}"
+        );
+
+        let mut optional_state = GameState::new_two_player(10);
+        optional_state.waiting_for = waiting_for;
+        let mut optional_frames = ResolutionStack::default();
+        optional_frames.push_inner(ResolutionFrame::OptionalEffect(OptionalEffectFrame {
+            ability: Box::new(resolved_draw(10)),
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            trigger_match_count: None,
+        }));
+        let optional_payload = v2_fixture_with_frames(optional_state, optional_frames);
+        let restored: ResolutionStateWire = serde_json::from_value(optional_payload)
+            .expect("an OptionalEffect frame owns the Phase 1 prompt after deserialize");
+        let replayed = serde_json::to_value(restored).expect("restored state reserializes");
+        serde_json::from_value::<ResolutionStateWire>(replayed)
+            .expect("the accepted OptionalEffect prompt remains valid on replay");
     }
 
     #[test]

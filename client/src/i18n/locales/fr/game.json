@@ -2144,6 +2144,26 @@
     "dontAskAgain": "Ne plus demander pendant cette partie",
     "dontAskAgainForSameCard": "Appliquer à chaque exemplaire de cette carte"
   },
+  "resolutionOptionalPayment": {
+    "title": "Choisissez un paiement optionnel",
+    "pay": "Payer {{cost}}",
+    "decline": "Refuser",
+    "cost": {
+      "card": "carte",
+      "cards": "cartes",
+      "filteredCard": "carte {{types}}",
+      "filteredCards": "cartes {{types}}",
+      "nonType": "non-{{type}}",
+      "orSeparator": " ou ",
+      "zoneBattlefield": "le champ de bataille",
+      "zoneGraveyard": "votre cimetière",
+      "zoneLibrary": "votre bibliothèque",
+      "zoneExile": "l’exil",
+      "zoneHand": "votre main",
+      "discard": "Défaussez-vous de {{count}} {{cards}}",
+      "exile": "Exilez {{count}} {{cards}} depuis {{zone}}"
+    }
+  },
   "topOrBottom": {
     "cardFallback": "Card",
     "title": "Put {{name}} on top or bottom of library",

@@ -3469,13 +3469,52 @@ fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> b
                 .all(reflexive_optional_cost_payable_by_resolution_prompt)
                 && costs.iter().any(cost_contains_tap_creatures)
         }
-        // `OneOf` needs an interactive branch-choice prompt before a concrete
-        // branch can be paid. Do not let the generic reflexive splitter mark
-        // those cards supported until that flow exists.
-        AbilityCost::OneOf { .. } => false,
+        AbilityCost::OneOf { costs } => {
+            // CR 608.2d: every offered branch must be a legal choice; CR 118.12:
+            // admission is limited to the exact immediate payment allowlist.
+            costs.len() >= 2 && costs.iter().all(reflexive_optional_direct_cost)
+        }
         AbilityCost::TapCreatures { .. } => true,
-        _ => false,
+        AbilityCost::Mana { .. }
+        | AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::Sacrifice(_)
+        | AbilityCost::PayLife { .. }
+        | AbilityCost::Discard { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::ExileMaterials { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::ExileWithAggregate { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::UnattachFrom { .. }
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::PerCounter { .. }
+        | AbilityCost::KeywordCostOfCastSpell { .. }
+        | AbilityCost::GetPlayerCounters { .. }
+        | AbilityCost::Unimplemented { .. } => false,
     }
+}
+
+/// CR 608.2d: every offered branch must be legal; CR 118.12: only exact
+/// resolution-time payment shapes enter this parser family.
+///
+/// Phase-1 structural allowlist for immediate direct payment leaves. Sacrifice
+/// remains an honest strict gap until its replacement-safe resume exists.
+fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
+    crate::game::costs::is_direct_resolution_optional_payment_branch(cost)
 }
 
 fn cost_contains_tap_creatures(cost: &AbilityCost) -> bool {

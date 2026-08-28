@@ -692,7 +692,8 @@ fn collect_search_observer_triggers(
 pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
     matches!(
         waiting_for,
-        WaitingFor::MeldPairChoice { .. }
+        WaitingFor::ResolutionOptionalPaymentChoice { .. }
+            | WaitingFor::MeldPairChoice { .. }
             | WaitingFor::MeldAttackTargetChoice { .. }
             | WaitingFor::EntryAttackTargetChoice { .. }
             | WaitingFor::ScryChoice { .. }
@@ -1564,6 +1565,19 @@ pub(super) fn handle_resolution_choice(
     events: &mut Vec<GameEvent>,
 ) -> Result<ResolutionChoiceOutcome, EngineError> {
     let outcome = match (waiting_for, action) {
+        // CR 608.2d: the resolving effect offers only its legal optional payment choices; CR 118.12: choosing a payable branch continues the payment whose success governs the reflexive "If you do" result.
+        (
+            WaitingFor::ResolutionOptionalPaymentChoice {
+                player,
+                source_id,
+                costs,
+            },
+            GameAction::ChooseResolutionOptionalPaymentBranch { choice },
+        ) => ResolutionChoiceOutcome::WaitingFor(
+            super::engine_payment_choices::handle_resolution_optional_payment_choice(
+                state, player, source_id, costs, choice, events,
+            )?,
+        ),
         (
             WaitingFor::MeldPairChoice { player, choices },
             GameAction::ChooseMeldPair {
