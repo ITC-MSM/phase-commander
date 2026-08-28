@@ -942,6 +942,7 @@ mod palace_jailer;
 mod palisade_giant_redirect;
 mod panther_habit_equipped_prevention_scope;
 mod pariah_attached_redirect;
+mod part_in_friendship_conditional_reveal;
 mod pass_priority_structural_legality;
 mod peer_into_the_abyss;
 mod peerless_recycling_gift_recipient;
