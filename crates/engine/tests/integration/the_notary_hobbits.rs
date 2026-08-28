@@ -39,7 +39,7 @@ use engine::types::mana::ManaType;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::triggers::TriggerMode;
-use engine::types::zone::Zone;
+use engine::types::zones::Zone;
 
 const NOTARY_HOBBITS_ORACLE: &str = "When The Notary Hobbits enter, if they're not a token, \
     create two tokens that are copies of them, except the tokens aren't legendary.\n\
@@ -130,9 +130,9 @@ fn the_notary_hobbits_etb_creates_two_nonlegendary_tokens_without_recursion() {
         // including the original ETB trigger. Its intervening-if condition is
         // what prevents that retained trigger from creating more tokens.
         assert!(
-            token.base_triggers.iter().any(|trigger| {
-                trigger.mode == TriggerMode::ChangesZone
-                    && trigger.destination == Some(Zone::Battlefield)
+            token.trigger_definitions.iter_unchecked().any(|trigger| {
+                trigger.definition.mode == TriggerMode::ChangesZone
+                    && trigger.definition.destination == Some(Zone::Battlefield)
             }),
             "token copy must retain The Notary Hobbits's enters-the-battlefield trigger"
         );
