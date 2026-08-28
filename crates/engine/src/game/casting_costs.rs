@@ -6602,6 +6602,17 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                         granted_to,
                         ..
                     } if granted_to.is_none() || *granted_to == Some(player) => Some(cost.clone()),
+                    // CR 118.9 + CR 119.4 + CR 305.1: Inside Information class —
+                    // the alt cost lives on the `PlayFromExile` grant itself (see
+                    // `types::ability::CastingPermission::PlayFromExile::alt_ability_cost`)
+                    // so the same grant can also authorize land plays, which
+                    // never reach this spell-cost pipeline and so stay unaffected.
+                    // Mirrors the `ExileWithAltAbilityCost` arm above.
+                    crate::types::ability::CastingPermission::PlayFromExile {
+                        alt_ability_cost: Some(cost),
+                        granted_to,
+                        ..
+                    } if *granted_to == player => Some(cost.clone()),
                     _ => None,
                 })
                 .or_else(|| {

@@ -1700,6 +1700,57 @@ fn any_ability_has_cast_from_zone_alt_ability_cost(parsed: &ParsedAbilities) -> 
         })
 }
 
+/// CR 118.9 + CR 119.4 + CR 305.1: Inside Information class — the "[if you
+/// cast a spell this way,] pay <cost> rather than pay its mana cost" rider
+/// folds onto a plain `PlayFromExile` grant's `alt_ability_cost` (not a
+/// `CastFromZone`) when the preceding grant is a "you may PLAY those cards"
+/// permission that must also authorize land plays. Mirrors
+/// `def_tree_has_cast_from_zone_alt_ability_cost` for that sibling shape.
+fn def_tree_has_play_from_exile_alt_ability_cost(def: &AbilityDefinition) -> bool {
+    if let Effect::GrantCastingPermission {
+        permission:
+            CastingPermission::PlayFromExile {
+                alt_ability_cost: Some(_),
+                ..
+            },
+        ..
+    } = &*def.effect
+    {
+        return true;
+    }
+    if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+        if def_tree_has_play_from_exile_alt_ability_cost(effect) {
+            return true;
+        }
+    }
+    if let Some(ref sub) = def.sub_ability {
+        if def_tree_has_play_from_exile_alt_ability_cost(sub) {
+            return true;
+        }
+    }
+    if let Some(ref else_ab) = def.else_ability {
+        if def_tree_has_play_from_exile_alt_ability_cost(else_ab) {
+            return true;
+        }
+    }
+    def.mode_abilities
+        .iter()
+        .any(def_tree_has_play_from_exile_alt_ability_cost)
+}
+
+fn any_ability_has_play_from_exile_alt_ability_cost(parsed: &ParsedAbilities) -> bool {
+    parsed
+        .abilities
+        .iter()
+        .any(def_tree_has_play_from_exile_alt_ability_cost)
+        || parsed.triggers.iter().any(|trigger| {
+            trigger
+                .execute
+                .as_deref()
+                .is_some_and(def_tree_has_play_from_exile_alt_ability_cost)
+        })
+}
+
 fn any_replacement_has_may_cost_decline(parsed: &ParsedAbilities) -> bool {
     parsed.replacements.iter().any(|repl| {
         matches!(
@@ -3304,6 +3355,9 @@ fn detect_condition_if(
         return;
     }
     if any_ability_has_cast_from_zone_alt_ability_cost(parsed) {
+        return;
+    }
+    if any_ability_has_play_from_exile_alt_ability_cost(parsed) {
         return;
     }
     if any_static_has_target_gated_cost_modification(parsed) {

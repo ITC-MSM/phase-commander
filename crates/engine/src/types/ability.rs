@@ -3794,6 +3794,22 @@ pub enum CastingPermission {
         /// ("Each spell cast this way costs {1} more to cast." — Lightstall Inquisitor).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cast_cost_raise: Option<ManaCost>,
+        /// CR 118.9 + CR 119.4: Optional non-mana alternative cost that REPLACES
+        /// the mana cost for a spell cast via this permission ("If you cast a
+        /// spell this way, pay life equal to its mana value rather than pay its
+        /// mana cost." — Inside Information). Unlike `ExileWithAltAbilityCost`
+        /// (a standalone permission built by `CastFromZone`'s spell-only "cast"
+        /// grammar), this field lives directly on a `PlayFromExile` grant so a
+        /// single permission can authorize BOTH a CR 305.1 land play (unaffected
+        /// — lands have no mana cost to replace) and a spell cast (mana cost
+        /// replaced by this cost) from the same exiled batch. `None` (the common
+        /// case) leaves every other `PlayFromExile` grant's spells payable at
+        /// their normal printed mana cost. Read by
+        /// `casting::alt_cost_from_exile`-style zeroing and
+        /// `casting_costs::check_additional_cost_or_pay`'s alt-cost payment,
+        /// mirroring the `ExileWithAltAbilityCost` consumption path exactly.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alt_ability_cost: Option<AbilityCost>,
         /// CR 614.1c: Lands played via this permission enter with this tap state
         /// ("Each land played this way enters tapped." — Lightstall Inquisitor).
         /// "enters tapped" is a CR 614.1c "[permanent] enters ..." replacement.

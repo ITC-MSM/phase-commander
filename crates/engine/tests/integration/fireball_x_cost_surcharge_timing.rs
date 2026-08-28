@@ -347,6 +347,7 @@ fn fireball_distribution_resume_preserves_elected_exile_permission() {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: EtbTapState::Unspecified,
         },
         CastingPermission::PlayFromExile {
@@ -362,6 +363,7 @@ fn fireball_distribution_resume_preserves_elected_exile_permission() {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: EtbTapState::Unspecified,
         },
     ];

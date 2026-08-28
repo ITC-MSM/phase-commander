@@ -1509,6 +1509,7 @@ fn record_lingering_permissions(
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: EtbTapState::Unspecified,
                 };
 
