@@ -9525,6 +9525,53 @@ impl StaticCondition {
             _ => false,
         }
     }
+
+    /// True when this condition (or a Boolean sub-condition of it, at ANY
+    /// nesting depth) is an [`StaticCondition::Unrecognized`] leaf.
+    ///
+    /// Single authority for "does this condition tree contain a parser gap,"
+    /// shared by every coverage-honesty gate in the codebase. Recursing through
+    /// `And`/`Or`/`Not` is load-bearing: a parser fallback that wraps an
+    /// unparsed clause as `Not(Unrecognized)` (the shape
+    /// `extract_cant_untap_condition` and `parse_unless_static_condition`
+    /// produce for an `unless <condition we can't decompose>` gate — see
+    /// `oracle_static/static_helpers.rs` and `oracle_static/shared.rs`) is a
+    /// TOP-LEVEL `Not`, not a top-level `Unrecognized`. A caller that only
+    /// checks `matches!(condition, StaticCondition::Unrecognized { .. })`
+    /// misses it entirely and reports the card as fully supported even though
+    /// the wrapped restriction is permanently inert at runtime (`Unrecognized`
+    /// evaluates `true`; the wrapping `Not` negates it to `false` forever).
+    /// Every coverage/support check MUST call this method instead of matching
+    /// `Unrecognized` directly. Exhaustive by design as new combinator
+    /// variants are added — extend the match arm below if a future variant
+    /// nests a `StaticCondition`.
+    pub(crate) fn contains_unrecognized(&self) -> bool {
+        match self {
+            StaticCondition::Unrecognized { .. } => true,
+            StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+                conditions.iter().any(StaticCondition::contains_unrecognized)
+            }
+            StaticCondition::Not { condition } => condition.contains_unrecognized(),
+            _ => false,
+        }
+    }
+
+    /// Returns the text of every [`StaticCondition::Unrecognized`] leaf found
+    /// anywhere in this condition tree (recursing through `And`/`Or`/`Not`),
+    /// for use in coverage gap labels. Delegates to the same recursion as
+    /// [`Self::contains_unrecognized`] so the two can never disagree about
+    /// what counts as "unrecognized."
+    pub(crate) fn unrecognized_texts(&self) -> Vec<&str> {
+        match self {
+            StaticCondition::Unrecognized { text } => vec![text.as_str()],
+            StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+                .iter()
+                .flat_map(StaticCondition::unrecognized_texts)
+                .collect(),
+            StaticCondition::Not { condition } => condition.unrecognized_texts(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -6423,7 +6423,13 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
 }
 
 fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
-    matches!(def.condition, Some(StaticCondition::Unrecognized { .. }))
+    // CR 611.3a: recurse through And/Or/Not — a parser fallback that wraps an
+    // unparsed `unless` clause as `Not(Unrecognized)` is a top-level `Not`, not
+    // a top-level `Unrecognized`, and must still be flagged (`contains_unrecognized`
+    // is the single authority; see its doc comment in `types/ability.rs`).
+    def.condition
+        .as_ref()
+        .is_some_and(StaticCondition::contains_unrecognized)
         || def
             .modifications
             .iter()
@@ -6518,10 +6524,16 @@ fn check_statics(
         }
         // Flag unrecognized conditions — these represent parser gaps where
         // the condition text wasn't decomposed into typed building blocks.
-        if let Some(StaticCondition::Unrecognized { ref text }) = def.condition {
-            let label = format!("Static:Unrecognized({})", truncate_label(text, 60));
-            if !missing.contains(&label) {
-                missing.push(label);
+        // Recurse through And/Or/Not (`contains_unrecognized`/`unrecognized_texts`)
+        // so a nested `Not(Unrecognized)` fallback (e.g. an unbindable
+        // recipient-scoped `unless` gate) is labeled instead of silently
+        // passing as supported.
+        if let Some(condition) = &def.condition {
+            for text in condition.unrecognized_texts() {
+                let label = format!("Static:Unrecognized({})", truncate_label(text, 60));
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
             }
         }
         for modification in &def.modifications {
@@ -7797,7 +7809,10 @@ fn is_static_supported(
     static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
 ) -> bool {
     (static_registry.contains_key(&stat.mode) || is_data_carrying_static(&stat.mode))
-        && !matches!(stat.condition, Some(StaticCondition::Unrecognized { .. }))
+        && !stat
+            .condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized)
         && stat
             .modifications
             .iter()
