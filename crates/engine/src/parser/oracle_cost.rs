@@ -2855,6 +2855,54 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn binary_sacrifice_alternatives_preserve_typed_sibling_filters() {
+        use crate::types::ability::{CardSelectionMode, DiscardSelfScope, TypeFilter};
+
+        for text in [
+            "Sacrifice an artifact or discard a nonland card",
+            "Discard a nonland card or sacrifice an artifact",
+        ] {
+            let AbilityCost::OneOf { costs } = parse_oracle_cost(text) else {
+                panic!("binary payment must produce OneOf: {text}");
+            };
+            assert_eq!(costs.len(), 2);
+            let sacrifice = costs
+                .iter()
+                .find_map(|cost| match cost {
+                    AbilityCost::Sacrifice(cost) => Some(cost),
+                    _ => None,
+                })
+                .expect("artifact sacrifice branch");
+            assert!(matches!(
+                sacrifice.target,
+                TargetFilter::Typed(ref typed)
+                    if typed.type_filters.contains(&TypeFilter::Artifact)
+            ));
+            assert_eq!(sacrifice.requirement.fixed_count(), Some(1));
+            assert!(costs.iter().any(|cost| matches!(
+                cost,
+                AbilityCost::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: Some(TargetFilter::Typed(typed)),
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand,
+                } if typed.type_filters.iter().any(|filter| matches!(
+                    filter,
+                    TypeFilter::Non(inner) if **inner == TypeFilter::Land
+                ))
+            )));
+        }
+
+        assert!(
+            !matches!(
+                parse_oracle_cost("Sacrifice an artifact or creature"),
+                AbilityCost::OneOf { .. }
+            ),
+            "noun-level 'or' must remain one sacrifice filter"
+        );
+    }
     #[test]
     fn cost_pay_life_equal_to_commanders_color_identity() {
         // CR 903.4: War Room — "Pay life equal to the number of colors in your

@@ -3477,10 +3477,12 @@ fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> b
     }
 }
 
-/// Phase-1 structural allowlist for immediate direct payment leaves. Sacrifice
-/// remains an honest strict gap until its replacement-safe resume exists.
+/// Structural allowlist for immediate resolution-time optional-payment leaves.
+/// Sacrifice is deliberately limited to a positive, finite fixed count of a
+/// typed permanent population. This excludes self/granting-object/any targets,
+/// aggregate requirements, and the `u32::MAX` X/any-number sentinel.
 fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
-    use crate::types::ability::{CardSelectionMode, DiscardSelfScope};
+    use crate::types::ability::{CardSelectionMode, DiscardSelfScope, SacrificeRequirement};
 
     match cost {
         AbilityCost::Mana { cost } => !crate::game::casting_costs::cost_has_x(cost),
@@ -3495,6 +3497,14 @@ fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
             zone: Some(_),
             filter,
         } => *count > 0 && matches!(filter, None | Some(TargetFilter::Typed(_))),
+        AbilityCost::Sacrifice(cost) => {
+            matches!(cost.target, TargetFilter::Typed(_))
+                && matches!(
+                    cost.requirement,
+                    SacrificeRequirement::Count { count }
+                        if count > 0 && count != u32::MAX
+                )
+        }
         _ => false,
     }
 }
