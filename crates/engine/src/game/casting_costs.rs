@@ -9411,7 +9411,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
         .map_err(finalized_spell_cast_ledger_error)?;
     if !state.objects.contains_key(&object_id) {
         return Err(EngineError::InvalidAction(format!(
-            "cannot stamp cast occurrence on non-spell stack carrier {object_id:?}"
+            "spell object {object_id:?} no longer exists before finalization records cast occurrence"
         )));
     }
 
@@ -10150,9 +10150,9 @@ fn finalize_cast_with_phyrexian_choices_inner(
     .map_err(finalized_spell_cast_ledger_error)?;
     stamp_cast_occurrence_on_stack_spell(state, object_id, occurrence)?;
 
-    // CR 733: the cast-occurrence carrier settles with the CR 601.2i retag.
-    // Record only after the ledger has minted and the shared authority has
-    // stamped it, so replay reproduces both the object and complete stack graph.
+    // Record the resolved-command finalization only after the ledger has minted
+    // and the shared authority has stamped the occurrence, so replay reproduces
+    // both the object and complete stack graph.
     let resulting_kind = state
         .stack
         .get(entry_position)

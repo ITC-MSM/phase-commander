@@ -74,7 +74,9 @@ pub fn record_spell_cast(
 
 /// Validate every fallible spell-cast ledger precondition without mutation.
 ///
-/// Cast finalization calls this before paying costs or changing the announced
+/// CR 601.2g provides the mana-ability window before payment, CR 601.2h pays
+/// the total cost, and CR 601.2i makes the spell cast. Cast finalization calls
+/// this before those payment/finalization steps or changing the announced
 /// object's zone. Mana payment cannot mutate these cast-history axes, so a
 /// later [`record_spell_cast`] cannot discover an overflow after the cast has
 /// partially committed.
