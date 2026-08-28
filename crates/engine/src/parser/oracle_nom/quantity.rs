@@ -4067,8 +4067,8 @@ pub fn parse_that_much_or_many(input: &str) -> OracleResult<'_, QuantityRef> {
 
 /// Parse event-context quantity references.
 ///
-/// CR 603.7c: "that {noun}" in a triggered ability refers to the object or
-/// value from the triggering event. The source-object variants resolve via
+/// "That {noun}" in a triggered ability refers to the object or value from
+/// the triggering event. The source-object variants resolve via
 /// `extract_source_from_event` → live object or LKI cache.
 fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
@@ -4077,11 +4077,36 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
         // counter-removal, and mana-production count-prefix slots).
         parse_that_much_or_many,
         value(QuantityRef::EventContextAmount, tag("that damage")),
-        // CR 120.1 + CR 603.7c: "the damage dealt" bare form in a triggered
-        // ability body — refers to the total from the triggering combat-damage
-        // event. Distinct from "that damage" (different article+verb) and
-        // "damage dealt this way" (PreviousEffectAmount).
-        value(QuantityRef::EventContextAmount, tag("the damage dealt")),
+        // CR 608.2h: "the damage dealt" bare form in a triggered ability
+        // body — refers to the total from the triggering damage event, an
+        // amount determined once when the effect is
+        // applied. Accepts an optional "the amount of " / "amount of " / bare
+        // "the " determiner prefix ahead of the "damage dealt" phrase, so
+        // both the original bare form ("the damage dealt" — Primo, the
+        // Unbounded) and the paraphrase "the amount of damage dealt" (Kotis,
+        // the Fangkeeper: "exile the top X cards of their library, where X
+        // is the amount of damage dealt") parse uniformly — the prefix is
+        // factored once ahead of the phrase via `preceded` + `opt(alt(...))`,
+        // mirroring `parse_life_lost_ref` / `parse_life_gained_ref`'s
+        // "(the) amount of " prefix handling for the analogous life-change
+        // quantities (the bare "the " arm has no counterpart there because
+        // those functions spell "the " into each downstream full-phrase tag
+        // instead of a single bare-phrase tag). Distinct from "that damage"
+        // (different article+verb) and "damage dealt this way"
+        // (PreviousEffectAmount). The longer qualified forms ("the amount of
+        // damage dealt to/by <object> this turn [by <source>]" — Blazing
+        // Effigy, Grothama, All-Devouring, Impact Resonance, Tangled Colony)
+        // are not swallowed here: `parse_quantity_ref_complete`
+        // (`oracle_effect/lower.rs`) requires the where-X expression to be
+        // fully consumed, and this arm only matches when nothing follows
+        // "damage dealt".
+        value(
+            QuantityRef::EventContextAmount,
+            preceded(
+                opt(alt((tag("the amount of "), tag("amount of "), tag("the ")))),
+                tag("damage dealt"),
+            ),
+        ),
         // CR 701.47c: amass-specific definite phrases name the Army chosen by
         // the current amass instruction, not the generic demonstrative referent.
         parse_amassed_army_property_ref,
