@@ -25,11 +25,11 @@ use crate::parser::oracle_target::{
 };
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
-    AbilityCondition, AggregateFunction, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel, DamageGroupKey,
-    DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SharedQuality, StaticCondition,
-    TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    AbilityCondition, AggregateFunction, CardTypeSetSource, CastManaObjectScope,
+    CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel,
+    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
+    PlayerRelation, PlayerScope, PropertyAggregate, PtStat, PtValueScope, QuantityExpr,
+    QuantityRef, SharedQuality, StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -3140,11 +3140,16 @@ fn parse_you_control_superlative_object_condition(
             scope: PtValueScope::Current,
             comparator,
             value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: aggregate,
-                    property,
-                    filter: population_filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        aggregate,
+                        property,
+                        CardTypeSetSource::Objects {
+                            filter: population_filter,
+                        },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
         },
     );
@@ -3192,11 +3197,16 @@ fn build_superlative_comparison(
         lhs: QuantityExpr::Ref { qty: lhs_qty },
         comparator,
         rhs: QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: aggregate,
-                property,
-                filter: aggregate_filter,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    aggregate,
+                    property,
+                    CardTypeSetSource::Objects {
+                        filter: aggregate_filter,
+                    },
+                )
+                .expect("object property aggregate is valid"),
+            ),
         },
     }
 }
@@ -3253,11 +3263,14 @@ pub(crate) fn parse_spell_target_has_superlative(
             lhs: QuantityExpr::Ref { qty: lhs_qty },
             comparator,
             rhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: aggregate,
-                    property,
-                    filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        aggregate,
+                        property,
+                        CardTypeSetSource::Objects { filter },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
         },
     ))
@@ -4843,11 +4856,14 @@ fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondi
         rest,
         StaticCondition::QuantityComparison {
             lhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property,
-                    filter,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        property,
+                        CardTypeSetSource::Objects { filter },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
             },
             comparator,
             rhs: QuantityExpr::Fixed { value: n as i32 },
@@ -19610,15 +19626,13 @@ mod tests {
                 );
                 match lhs {
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function,
-                                property,
-                                filter,
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     } => {
-                        assert_eq!(function, AggregateFunction::Sum);
-                        assert_eq!(property, expected_property.0);
+                        assert_eq!(aggregate.function(), AggregateFunction::Sum);
+                        assert_eq!(aggregate.property(), expected_property.0);
+                        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                            panic!("expected object source, got {:?}", aggregate.source());
+                        };
                         match filter {
                             TargetFilter::Typed(t) => {
                                 assert_eq!(t.controller, Some(ControllerRef::You));
@@ -19784,15 +19798,13 @@ mod tests {
                 );
                 match rhs {
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function,
-                                property,
-                                filter,
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     } => {
-                        assert_eq!(function, AggregateFunction::Max);
-                        assert_eq!(property, ObjectProperty::Power);
+                        assert_eq!(aggregate.function(), AggregateFunction::Max);
+                        assert_eq!(aggregate.property(), ObjectProperty::Power);
+                        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                            panic!("expected object source, got {:?}", aggregate.source());
+                        };
                         match filter {
                             TargetFilter::Typed(tf) => {
                                 assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
@@ -19822,12 +19834,12 @@ mod tests {
                 comparator,
                 rhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { function, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             } => {
                 assert_eq!(comparator, Comparator::LT);
-                assert_eq!(function, AggregateFunction::Min);
+                assert_eq!(aggregate.function(), AggregateFunction::Min);
             }
             other => panic!("expected QuantityComparison with Aggregate, got {other:?}"),
         }
@@ -19852,15 +19864,12 @@ mod tests {
                     },
                 rhs:
                     QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::Aggregate {
-                                function, property, ..
-                            },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
             } => {
                 assert_eq!(comparator, Comparator::GE);
-                assert_eq!(function, AggregateFunction::Max);
-                assert_eq!(property, ObjectProperty::Toughness);
+                assert_eq!(aggregate.function(), AggregateFunction::Max);
+                assert_eq!(aggregate.property(), ObjectProperty::Toughness);
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
@@ -19878,12 +19887,12 @@ mod tests {
                 comparator,
                 rhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::Aggregate { function, .. },
+                        qty: QuantityRef::PropertyAggregate(aggregate),
                     },
                 ..
             } => {
                 assert_eq!(comparator, Comparator::GT);
-                assert_eq!(function, AggregateFunction::Max);
+                assert_eq!(aggregate.function(), AggregateFunction::Max);
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
@@ -20052,17 +20061,23 @@ mod tests {
                         comparator: Comparator::GE,
                         value:
                             QuantityExpr::Ref {
-                                qty:
-                                    QuantityRef::Aggregate {
-                                        function: AggregateFunction::Max,
-                                        property: ObjectProperty::Toughness,
-                                        filter: TargetFilter::Typed(population),
-                                    },
+                                qty: QuantityRef::PropertyAggregate(aggregate),
                             },
                     } = prop
                     else {
                         return false;
                     };
+                    let CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(population),
+                    } = aggregate.source()
+                    else {
+                        return false;
+                    };
+                    if aggregate.function() != AggregateFunction::Max
+                        || aggregate.property() != ObjectProperty::Toughness
+                    {
+                        return false;
+                    }
                     population.type_filters == vec![TypeFilter::Creature]
                         && population.controller.is_none()
                 });
@@ -20108,17 +20123,23 @@ mod tests {
                         comparator: Comparator::GE,
                         value:
                             QuantityExpr::Ref {
-                                qty:
-                                    QuantityRef::Aggregate {
-                                        function: AggregateFunction::Max,
-                                        property: ObjectProperty::Power,
-                                        filter: TargetFilter::Typed(population),
-                                    },
+                                qty: QuantityRef::PropertyAggregate(aggregate),
                             },
                     } = prop
                     else {
                         return false;
                     };
+                    let CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(population),
+                    } = aggregate.source()
+                    else {
+                        return false;
+                    };
+                    if aggregate.function() != AggregateFunction::Max
+                        || aggregate.property() != ObjectProperty::Power
+                    {
+                        return false;
+                    }
                     population.type_filters == vec![TypeFilter::Creature]
                         && population.properties.iter().any(|prop| {
                             matches!(

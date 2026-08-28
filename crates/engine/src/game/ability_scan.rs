@@ -92,8 +92,8 @@
 //! for the conflict model and its CR 603.3b commutation argument.
 
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, ContinuousModification, ControllerRef,
-    CountScope, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
+    AbilityCondition, AbilityCost, AbilityDefinition, CardTypeSetSource, ContinuousModification,
+    ControllerRef, CountScope, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
     ForEachCategoryAction, GuessSubject, KeeperConstraint, ManaProduction, ModalChoice,
     MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
     RepeatContinuation, ReplacementCondition, ResolvedAbility, StaticCondition, TargetFilter,
@@ -1868,6 +1868,51 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
     }
 }
 
+fn scan_property_aggregate_source(source: &CardTypeSetSource, mode: ScanMode) -> Axes {
+    let mut axes = Axes::NONE;
+    let complete =
+        source.try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
+            axes = axes.or(match leaf {
+                CardTypeSetSource::Objects { filter } => Axes {
+                    event: false,
+                    sibling: true,
+                    projected: false,
+                }
+                .or(scan_target_filter(
+                    filter,
+                    FilterReadContext::LiveBoardCensus,
+                    mode,
+                )),
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::TriggeringBatch,
+                    ..
+                } => Axes {
+                    event: true,
+                    sibling: false,
+                    projected: false,
+                },
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    ..
+                } => Axes::NONE,
+                CardTypeSetSource::TurnJournal { .. } => Axes {
+                    event: false,
+                    sibling: false,
+                    projected: true,
+                },
+                CardTypeSetSource::Zone { .. } | CardTypeSetSource::ExiledBySource => {
+                    Axes::CONSERVATIVE
+                }
+                CardTypeSetSource::AnyOf { .. } => Axes::NONE,
+            });
+        });
+    if complete {
+        axes
+    } else {
+        Axes::CONSERVATIVE
+    }
+}
+
 fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
     match x {
         QuantityRef::HandSize { player, .. } => {
@@ -2093,22 +2138,8 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             acc
         }
         QuantityRef::SelfManaValue => Axes::NONE,
-        QuantityRef::Aggregate {
-            filter,
-            function: _,
-            property: _,
-        } => {
-            let mut acc = Axes {
-                event: false,
-                sibling: true,
-                projected: false,
-            };
-            acc = acc.or(scan_target_filter(
-                filter,
-                FilterReadContext::LiveBoardCensus,
-                mode,
-            ));
-            acc
+        QuantityRef::PropertyAggregate(aggregate) => {
+            scan_property_aggregate_source(aggregate.source(), mode)
         }
         QuantityRef::ControlledByEachPlayer {
             filter,
@@ -2176,21 +2207,6 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             ));
             acc
         }
-        QuantityRef::TrackedSetAggregate {
-            function: _,
-            property: _,
-            source,
-        } => match source {
-            // Chain-published set: reads no trigger/sibling context (unchanged).
-            TrackedAnaphorSource::ChainSet => Axes::NONE,
-            // Reads `state.current_trigger_events` (the triggering event) →
-            // event axis true, mirroring `QuantityRef::EventContextAmount` below.
-            TrackedAnaphorSource::TriggeringBatch => Axes {
-                event: true,
-                sibling: false,
-                projected: false,
-            },
-        },
         QuantityRef::ExiledFromHandThisResolution => Axes::NONE,
         // CR 608.2c + CR 608.2i: every channel and every aggregate reads
         // resolution-local state — `last_effect_amount` /
@@ -6435,6 +6451,88 @@ mod tests {
     use crate::types::identifiers::ObjectId;
     use crate::types::mana::ManaColor;
     use crate::types::player::{PlayerCounterKind, PlayerId};
+
+    #[test]
+    fn property_aggregate_source_scan_axes_are_exhaustive() {
+        use crate::types::ability::{
+            CardTypeSetSource, CountScope, ObjectProperty, PropertyAggregate, TrackedAnaphorSource,
+            TurnJournalKind, ZoneRef,
+        };
+
+        let chain = CardTypeSetSource::TrackedSet {
+            set: TrackedAnaphorSource::ChainSet,
+            caused_by: None,
+        };
+        let journal = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: None,
+        };
+        let rows = vec![
+            (
+                CardTypeSetSource::Objects {
+                    filter: TargetFilter::Any,
+                },
+                Axes {
+                    event: false,
+                    sibling: true,
+                    projected: false,
+                },
+            ),
+            (
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::TriggeringBatch,
+                    caused_by: None,
+                },
+                Axes {
+                    event: true,
+                    sibling: false,
+                    projected: false,
+                },
+            ),
+            (chain.clone(), Axes::NONE),
+            (
+                journal.clone(),
+                Axes {
+                    event: false,
+                    sibling: false,
+                    projected: true,
+                },
+            ),
+            (
+                CardTypeSetSource::Zone {
+                    zone: ZoneRef::Graveyard,
+                    scope: CountScope::Controller,
+                },
+                Axes::CONSERVATIVE,
+            ),
+            (CardTypeSetSource::ExiledBySource, Axes::CONSERVATIVE),
+            (
+                CardTypeSetSource::any_of(vec![chain, journal]).unwrap(),
+                Axes {
+                    event: false,
+                    sibling: false,
+                    projected: true,
+                },
+            ),
+        ];
+        for (source, expected) in rows {
+            let qty = QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaValue,
+                    source.clone(),
+                )
+                .unwrap(),
+            );
+            let actual = scan_quantity_ref(&qty, ScanMode::Conservative);
+            assert_eq!(
+                (actual.event, actual.sibling, actual.projected),
+                (expected.event, expected.sibling, expected.projected),
+                "{source:?}"
+            );
+        }
+    }
 
     fn ability_with_amount(qty: QuantityRef) -> ResolvedAbility {
         ResolvedAbility::new(

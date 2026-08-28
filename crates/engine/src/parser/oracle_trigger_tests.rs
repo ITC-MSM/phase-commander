@@ -7,14 +7,15 @@ use crate::parser::oracle_ir::doc::PrintedTriggerIndex;
 use crate::parser::oracle_ir::effect_chain::PlayerScopeRewrite;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
-    AttackSubject, BounceSelection, CardSelectionMode, CastingPermission, ChosenAttribute,
-    Comparator, ContinuousModification, ControllerRef, CopyChooseScope, CopyRetargetPermission,
-    CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel, DamageModification,
-    DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect, EffectScope,
-    FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice, ObjectScope,
-    PerpetualModification, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
-    QuantityRef, SeatDirection, SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange,
-    TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
+    AttackSubject, BounceSelection, CardSelectionMode, CardTypeSetSource, CastingPermission,
+    ChosenAttribute, Comparator, ContinuousModification, ControllerRef, CopyChooseScope,
+    CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel,
+    DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect,
+    EffectScope, FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice,
+    ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PropertyAggregate, PtStat,
+    PtValue, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
+    SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter, TriggerCondition,
+    TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -67,11 +68,17 @@ fn palantir_life_loss_uses_milled_chain_set_and_targeted_opponent() {
     assert_eq!(
         *amount,
         QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::ManaValue,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    crate::types::ability::ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                        caused_by: None
+                    }
+                )
+                .expect("statically valid property aggregate")
+            ),
         }
     );
     assert!(
@@ -100,14 +107,22 @@ fn combustible_gearhulk_damage_uses_milled_chain_set() {
     let Effect::DealDamage { amount, target, .. } = damage.effect.as_ref() else {
         panic!("expected DealDamage, got {:?}", damage.effect);
     };
+    let QuantityExpr::Ref {
+        qty: QuantityRef::PropertyAggregate(aggregate),
+    } = amount
+    else {
+        panic!("expected property aggregate, got {amount:?}");
+    };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(
+        aggregate.property(),
+        crate::types::ability::ObjectProperty::ManaValue
+    );
     assert!(matches!(
-        amount,
-        QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::ManaValue,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            }
+        aggregate.source(),
+        crate::types::ability::CardTypeSetSource::TrackedSet {
+            set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+            caused_by: None
         }
     ));
     assert!(matches!(target, TargetFilter::ScopedPlayer));
@@ -6655,15 +6670,13 @@ fn parse_betor_kin_to_all_trigger_structure() {
             assert_eq!(*rhs, QuantityExpr::Fixed { value: 10 });
             match lhs {
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function,
-                            property,
-                            filter,
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 } => {
-                    assert_eq!(*function, AggregateFunction::Sum);
-                    assert_eq!(*property, ObjectProperty::Toughness);
+                    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+                    assert_eq!(aggregate.property(), ObjectProperty::Toughness);
+                    let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                        panic!("expected object source, got {:?}", aggregate.source());
+                    };
                     match filter {
                         TargetFilter::Typed(t) => {
                             assert_eq!(t.controller, Some(ControllerRef::You));
@@ -6703,12 +6716,9 @@ fn parse_betor_kin_to_all_trigger_structure() {
                     matches!(
                         lhs,
                         QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate {
-                                function: AggregateFunction::Sum,
-                                property: ObjectProperty::Toughness,
-                                ..
-                            },
-                        }
+                            qty: QuantityRef::PropertyAggregate(aggregate),
+                        } if aggregate.function() == AggregateFunction::Sum
+                            && aggregate.property() == ObjectProperty::Toughness
                     ),
                     "untap sub_ability lhs must be Aggregate Sum/Toughness, got {lhs:?}",
                 );
@@ -6744,12 +6754,9 @@ fn parse_betor_kin_to_all_trigger_structure() {
                     matches!(
                         lhs,
                         QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate {
-                                function: AggregateFunction::Sum,
-                                property: ObjectProperty::Toughness,
-                                ..
-                            },
-                        }
+                            qty: QuantityRef::PropertyAggregate(aggregate),
+                        } if aggregate.function() == AggregateFunction::Sum
+                            && aggregate.property() == ObjectProperty::Toughness
                     ),
                     "lose-life sub_ability lhs must be Aggregate Sum/Toughness, got {lhs:?}",
                 );
@@ -8174,20 +8181,25 @@ fn trigger_skyclave_apparition_leaves_battlefield_uses_linked_exile_owner_scope(
         } => {
             assert_eq!(name, "Illusion");
             let expected = QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: crate::types::ability::AggregateFunction::Sum,
-                    property: crate::types::ability::ObjectProperty::ManaValue,
-                    filter: TargetFilter::And {
-                        filters: vec![
-                            TargetFilter::ExiledBySource,
-                            TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                FilterProp::Owned {
-                                    controller: ControllerRef::You,
-                                },
-                            ])),
-                        ],
-                    },
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        crate::types::ability::AggregateFunction::Sum,
+                        crate::types::ability::ObjectProperty::ManaValue,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::And {
+                                filters: vec![
+                                    TargetFilter::ExiledBySource,
+                                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                                        FilterProp::Owned {
+                                            controller: ControllerRef::You,
+                                        },
+                                    ])),
+                                ],
+                            },
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             };
             assert_eq!(power, &PtValue::Quantity(expected.clone()));
             assert_eq!(toughness, &PtValue::Quantity(expected));
@@ -26440,18 +26452,19 @@ fn trigger_intervening_if_selvala_power_greater_than_each_other() {
     );
     // RHS: Max(power) across creatures excluding the triggering object.
     let QuantityExpr::Ref {
-        qty:
-            QuantityRef::Aggregate {
-                function,
-                property,
-                filter,
-            },
+        qty: QuantityRef::PropertyAggregate(aggregate),
     } = rhs
     else {
         panic!("expected Aggregate Max Power rhs, got {rhs:?}");
     };
-    assert_eq!(*function, AggregateFunction::Max);
-    assert_eq!(*property, crate::types::ability::ObjectProperty::Power);
+    assert_eq!(aggregate.function(), AggregateFunction::Max);
+    assert_eq!(
+        aggregate.property(),
+        crate::types::ability::ObjectProperty::Power
+    );
+    let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+        panic!("expected object source, got {:?}", aggregate.source());
+    };
     let TargetFilter::Typed(tf) = filter else {
         panic!("expected Typed creature filter, got {filter:?}");
     };
@@ -26499,6 +26512,65 @@ fn substitute_another_rewrites_shared_quality_count_filter() {
     };
     assert!(tf.properties.contains(&FilterProp::OtherThanTriggerObject));
     assert!(!tf.properties.contains(&FilterProp::Another));
+}
+
+#[test]
+fn substitute_another_rewrites_turn_journal_filters_directly_and_in_unions() {
+    let journal = || CardTypeSetSource::TurnJournal {
+        journal: crate::types::ability::TurnJournalKind::SpellsCast,
+        scope: CountScope::Controller,
+        filter: Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::Another]),
+        )),
+    };
+    let direct = PropertyAggregate::new(
+        AggregateFunction::Sum,
+        crate::types::ability::ObjectProperty::ManaValue,
+        journal(),
+    )
+    .unwrap();
+    let nested = PropertyAggregate::new(
+        AggregateFunction::Sum,
+        crate::types::ability::ObjectProperty::ManaValue,
+        CardTypeSetSource::any_of(vec![
+            CardTypeSetSource::Objects {
+                filter: TargetFilter::Any,
+            },
+            CardTypeSetSource::any_of(vec![journal(), CardTypeSetSource::ExiledBySource]).unwrap(),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+
+    for aggregate in [direct, nested] {
+        let rewritten = substitute_another_in_expr(&QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        });
+        let QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        } = rewritten
+        else {
+            panic!("expected property aggregate");
+        };
+        let mut journal_count = 0;
+        assert!(aggregate.source().try_for_each_member(
+            crate::types::ability::UNION_DEPTH_BUDGET,
+            &mut |leaf| {
+                if let CardTypeSetSource::TurnJournal {
+                    filter: Some(TargetFilter::Typed(filter)),
+                    ..
+                } = leaf
+                {
+                    journal_count += 1;
+                    assert!(filter
+                        .properties
+                        .contains(&FilterProp::OtherThanTriggerObject));
+                    assert!(!filter.properties.contains(&FilterProp::Another));
+                }
+            },
+        ));
+        assert_eq!(journal_count, 1);
+    }
 }
 
 /// Issue #444 — Odric, Lunarch Marshal. The full trigger parses to a

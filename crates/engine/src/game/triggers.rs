@@ -10721,7 +10721,6 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::EnteredThisTurn { filter }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
@@ -10752,6 +10751,9 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             card_type_set_source_binding_diverges(source)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            card_type_set_source_binding_diverges(aggregate.source())
         }
         // CR 601.2h: `AbilityTarget` is a target-slot read that
         // `quantity::resolve_event_scoped_ref` explicitly answers `None` for at
@@ -10785,7 +10787,6 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         // unrelated earlier resolution left in the ledger (or nothing at all).
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -14824,7 +14825,6 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::EnteredThisTurn { filter }
         | QuantityRef::SacrificedThisTurn { filter, .. }
@@ -14862,6 +14862,9 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_references_cost_paid_object(source)
         }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_references_cost_paid_object(aggregate.source())
+        }
 
         // Mana-spent metering embeds a `TargetFilter` through its metric enum.
         QuantityRef::ManaSpentToCast { metric, .. } => match metric {
@@ -14898,7 +14901,6 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::TrackedSetSize
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -21135,7 +21137,10 @@ pub mod tests {
         for source in [
             clean,
             CardTypeSetSource::ExiledBySource,
-            CardTypeSetSource::TrackedSet { caused_by: None },
+            CardTypeSetSource::TrackedSet {
+                set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                caused_by: None,
+            },
         ] {
             assert!(
                 !characteristic_source_references_cost_paid_object(&source),
@@ -26436,44 +26441,54 @@ pub mod tests {
                                 name: "Illusion".to_string(),
                                 power: crate::types::ability::PtValue::Quantity(
                                     QuantityExpr::Ref {
-                                        qty: QuantityRef::Aggregate {
-                                            function: crate::types::ability::AggregateFunction::Sum,
-                                            property:
+                                        qty: QuantityRef::PropertyAggregate(
+                                            crate::types::ability::PropertyAggregate::new(
+                                                crate::types::ability::AggregateFunction::Sum,
                                                 crate::types::ability::ObjectProperty::ManaValue,
-                                            filter: TargetFilter::And {
-                                                filters: vec![
-                                                    TargetFilter::ExiledBySource,
-                                                    TargetFilter::Typed(
-                                                        TypedFilter::default().properties(vec![
-                                                            FilterProp::Owned {
-                                                                controller: ControllerRef::You,
-                                                            },
-                                                        ]),
-                                                    ),
-                                                ],
-                                            },
-                                        },
+                                                crate::types::ability::CardTypeSetSource::Objects {
+                                                    filter: TargetFilter::And {
+                                                        filters: vec![
+                                                            TargetFilter::ExiledBySource,
+                                                            TargetFilter::Typed(
+                                                                TypedFilter::default().properties(
+                                                                    vec![FilterProp::Owned {
+                                                                        controller:
+                                                                            ControllerRef::You,
+                                                                    }],
+                                                                ),
+                                                            ),
+                                                        ],
+                                                    },
+                                                },
+                                            )
+                                            .expect("statically valid property aggregate"),
+                                        ),
                                     },
                                 ),
                                 toughness: crate::types::ability::PtValue::Quantity(
                                     QuantityExpr::Ref {
-                                        qty: QuantityRef::Aggregate {
-                                            function: crate::types::ability::AggregateFunction::Sum,
-                                            property:
+                                        qty: QuantityRef::PropertyAggregate(
+                                            crate::types::ability::PropertyAggregate::new(
+                                                crate::types::ability::AggregateFunction::Sum,
                                                 crate::types::ability::ObjectProperty::ManaValue,
-                                            filter: TargetFilter::And {
-                                                filters: vec![
-                                                    TargetFilter::ExiledBySource,
-                                                    TargetFilter::Typed(
-                                                        TypedFilter::default().properties(vec![
-                                                            FilterProp::Owned {
-                                                                controller: ControllerRef::You,
-                                                            },
-                                                        ]),
-                                                    ),
-                                                ],
-                                            },
-                                        },
+                                                crate::types::ability::CardTypeSetSource::Objects {
+                                                    filter: TargetFilter::And {
+                                                        filters: vec![
+                                                            TargetFilter::ExiledBySource,
+                                                            TargetFilter::Typed(
+                                                                TypedFilter::default().properties(
+                                                                    vec![FilterProp::Owned {
+                                                                        controller:
+                                                                            ControllerRef::You,
+                                                                    }],
+                                                                ),
+                                                            ),
+                                                        ],
+                                                    },
+                                                },
+                                            )
+                                            .expect("statically valid property aggregate"),
+                                        ),
                                     },
                                 ),
                                 types: vec!["Creature".to_string(), "Illusion".to_string()],

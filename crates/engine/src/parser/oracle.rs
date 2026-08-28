@@ -1546,7 +1546,6 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
@@ -1564,6 +1563,9 @@ fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) 
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_uses_filter_prop(source, pred)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_uses_filter_prop(aggregate.source(), pred)
         }
         _ => false,
     }

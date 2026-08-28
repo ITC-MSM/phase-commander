@@ -2076,11 +2076,16 @@ fn parse_highest_mana_value_library_suffix(
             FilterProp::Cmc {
                 comparator: Comparator::EQ,
                 value: QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        filter: eligible_filter,
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            AggregateFunction::Max,
+                            ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: eligible_filter,
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 },
             },
         ],
@@ -5035,13 +5040,10 @@ mod tests {
             FilterProp::Cmc {
                 comparator: Comparator::EQ,
                 value: QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
-            }
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         )));
         assert!(ctx.diagnostics.iter().all(|diagnostic| !matches!(
             diagnostic,
@@ -5077,13 +5079,10 @@ mod tests {
             FilterProp::Cmc {
                 comparator: Comparator::EQ,
                 value: QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
-            }
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::ManaValue
         )));
         assert!(ctx.diagnostics.iter().all(|diagnostic| !matches!(
             diagnostic,

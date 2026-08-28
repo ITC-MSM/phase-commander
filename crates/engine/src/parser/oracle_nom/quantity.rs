@@ -28,9 +28,9 @@ use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, ControllerRef,
     CountScope, DamageChannel, DamageKindFilter, DevotionColors, FilterProp, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtStat, QuantityExpr, QuantityRef,
-    RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter, ThisWayCause, TurnJournalKind,
-    TypeFilter, TypedFilter, ZoneRef,
+    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate, PtStat,
+    QuantityExpr, QuantityRef, RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter,
+    ThisWayCause, TrackedAnaphorSource, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::keywords::Keyword;
@@ -1195,11 +1195,16 @@ fn parse_linked_exile_mana_value_ref(input: &str) -> OracleResult<'_, QuantityRe
     let (rest, _) = opt(parse_craft_materials_suffix).parse(rest)?;
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::ManaValue,
-            filter: linked_exile_owned_filter(),
-        },
+        QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaValue,
+                crate::types::ability::CardTypeSetSource::Objects {
+                    filter: linked_exile_owned_filter(),
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     ))
 }
 
@@ -1325,11 +1330,16 @@ fn parse_greatest_commander_mana_value_ref(input: &str) -> OracleResult<'_, Quan
 
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Max,
-            property,
-            filter: zone_filter,
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(
+                AggregateFunction::Max,
+                property,
+                CardTypeSetSource::Objects {
+                    filter: zone_filter,
+                },
+            )
+            .expect("object populations support every aggregate property"),
+        ),
     ))
 }
 
@@ -1647,11 +1657,17 @@ pub(crate) fn parse_contextual_bare_card_aggregate_ref(
     let (rest, _) = parse_bare_card_set_anaphor(rest)?;
     Ok((
         rest,
-        QuantityRef::TrackedSetAggregate {
-            function,
-            property,
-            source,
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(
+                function,
+                property,
+                CardTypeSetSource::TrackedSet {
+                    set: source,
+                    caused_by: None,
+                },
+            )
+            .expect("tracked populations support every aggregate property"),
+        ),
     ))
 }
 
@@ -1686,11 +1702,17 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
         if let Ok((anaphor_rest, _)) = parse_this_way_anaphor(rest) {
             return Ok((
                 anaphor_rest,
-                QuantityRef::TrackedSetAggregate {
-                    function: AggregateFunction::Sum,
-                    property,
-                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                },
+                QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        property,
+                        CardTypeSetSource::TrackedSet {
+                            set: TrackedAnaphorSource::ChainSet,
+                            caused_by: None,
+                        },
+                    )
+                    .expect("tracked populations support every aggregate property"),
+                ),
             ));
         }
     }
@@ -1704,21 +1726,26 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
     if let Ok((craft_rest, filter)) = parse_craft_materials_filter(rest) {
         return Ok((
             craft_rest,
-            QuantityRef::Aggregate {
-                function,
-                property,
-                filter,
-            },
+            QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(function, property, CardTypeSetSource::Objects { filter })
+                    .expect("object populations support every aggregate property"),
+            ),
         ));
     }
     if let Ok((anaphor_rest, _)) = parse_tracked_set_anaphor(rest) {
         return Ok((
             anaphor_rest,
-            QuantityRef::TrackedSetAggregate {
-                function,
-                property,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            },
+            QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    function,
+                    property,
+                    CardTypeSetSource::TrackedSet {
+                        set: TrackedAnaphorSource::ChainSet,
+                        caused_by: None,
+                    },
+                )
+                .expect("tracked populations support every aggregate property"),
+            ),
         ));
     }
     let (filter, remainder) = parse_type_phrase(rest);
@@ -1734,11 +1761,10 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
     }
     Ok((
         final_remainder,
-        QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(function, property, CardTypeSetSource::Objects { filter })
+                .expect("object populations support every aggregate property"),
+        ),
     ))
 }
 
@@ -2802,6 +2828,7 @@ fn parse_tracked_set_this_way_source(input: &str) -> OracleResult<'_, CardTypeSe
     Ok((
         rest,
         CardTypeSetSource::TrackedSet {
+            set: TrackedAnaphorSource::ChainSet,
             caused_by: Some(cause),
         },
     ))
@@ -4353,18 +4380,23 @@ fn parse_graveyard_chroma_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     // LKI-independent axis here.
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::ManaSymbolCount(color),
-            filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::You,
+        QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaSymbolCount(color),
+                crate::types::ability::CardTypeSetSource::Objects {
+                    filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::You,
+                        },
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                    ])),
                 },
-                FilterProp::InZone {
-                    zone: Zone::Graveyard,
-                },
-            ])),
-        },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     ))
 }
 
@@ -7131,11 +7163,9 @@ mod tests {
         assert_eq!(rest, "");
         assert!(matches!(
             q,
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::Power,
-                ..
-            }
+            QuantityRef::PropertyAggregate(ref aggregate)
+                if aggregate.function() == AggregateFunction::Max
+                    && aggregate.property() == ObjectProperty::Power
         ));
     }
 
@@ -7171,11 +7201,17 @@ mod tests {
             parse_quantity_ref("the total power of the exiled cards used to craft it").unwrap();
         assert_eq!(rest, "");
         match q {
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter,
-            } => assert_eq!(filter, linked_exile_owned_filter()),
+            QuantityRef::PropertyAggregate(aggregate)
+                if aggregate.function() == AggregateFunction::Sum
+                    && aggregate.property() == ObjectProperty::Power =>
+            {
+                assert_eq!(
+                    aggregate.source(),
+                    &CardTypeSetSource::Objects {
+                        filter: linked_exile_owned_filter()
+                    }
+                )
+            }
             other => panic!("expected craft-material power aggregate, got {other:?}"),
         }
     }
@@ -7199,11 +7235,17 @@ mod tests {
             assert_eq!(rest, "", "tracked-set phrase {phrase:?} must fully consume");
             assert_eq!(
                 q,
-                QuantityRef::TrackedSetAggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::Power,
-                    source: TrackedAnaphorSource::ChainSet,
-                },
+                QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::Power,
+                        crate::types::ability::CardTypeSetSource::TrackedSet {
+                            set: TrackedAnaphorSource::ChainSet,
+                            caused_by: None
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                ),
                 "phrase {phrase:?}"
             );
         }
@@ -7238,11 +7280,9 @@ mod tests {
         assert_eq!(rest, "");
         assert!(matches!(
             q,
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaValue,
-                ..
-            }
+            QuantityRef::PropertyAggregate(ref aggregate)
+                if aggregate.function() == AggregateFunction::Sum
+                    && aggregate.property() == ObjectProperty::ManaValue
         ));
     }
 
@@ -7259,14 +7299,11 @@ mod tests {
         assert_eq!(exprs.len(), 2);
         assert!(matches!(exprs[0], QuantityExpr::Fixed { value: 2 }));
         assert!(matches!(
-            exprs[1],
+            &exprs[1],
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::Power,
-                    ..
-                }
-            }
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::Power
         ));
     }
 
@@ -9789,6 +9826,7 @@ mod tests {
             q,
             QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Discarded),
                 },
             }
@@ -9806,6 +9844,7 @@ mod tests {
             q,
             QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Exiled),
                 },
             }
@@ -9822,6 +9861,7 @@ mod tests {
             q,
             QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Discarded),
                 },
             }
@@ -11135,18 +11175,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             q,
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
-                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                    FilterProp::Owned {
-                        controller: ControllerRef::You,
-                    },
-                    FilterProp::InZone {
-                        zone: Zone::Graveyard,
-                    },
-                ])),
-            }
+            QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                            FilterProp::Owned {
+                                controller: ControllerRef::You,
+                            },
+                            FilterProp::InZone {
+                                zone: Zone::Graveyard,
+                            },
+                        ]))
+                    }
+                )
+                .expect("statically valid property aggregate")
+            )
         );
         assert_eq!(rest, "");
     }
@@ -11691,20 +11736,25 @@ mod tests {
             assert_eq!(rest, "");
             assert_eq!(
                 q,
-                QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::ManaValue,
-                    filter: TargetFilter::And {
-                        filters: vec![
-                            TargetFilter::ExiledBySource,
-                            TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                FilterProp::Owned {
-                                    controller: ControllerRef::You,
-                                },
-                            ])),
-                        ],
-                    },
-                }
+                QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::ManaValue,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::And {
+                                filters: vec![
+                                    TargetFilter::ExiledBySource,
+                                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                                        FilterProp::Owned {
+                                            controller: ControllerRef::You,
+                                        },
+                                    ])),
+                                ],
+                            }
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                )
             );
         }
     }
@@ -11717,17 +11767,15 @@ mod tests {
         assert_eq!(rest, "", "phrase should be fully consumed");
 
         // Verify it produces Aggregate with Max function
-        let QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        } = q
-        else {
+        let QuantityRef::PropertyAggregate(aggregate) = q else {
             panic!("Expected Aggregate, got {q:?}");
         };
 
-        assert_eq!(function, AggregateFunction::Max);
-        assert_eq!(property, ObjectProperty::ManaValue);
+        assert_eq!(aggregate.function(), AggregateFunction::Max);
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!("Expected object source, got {:?}", aggregate.source());
+        };
 
         // Verify the filter uses InAnyZone for multi-zone disjunction
         let TargetFilter::Typed(tf) = filter else {
@@ -11879,12 +11927,16 @@ mod tests {
                 .unwrap();
         assert_eq!(rest, "");
         match q {
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaValue,
-                filter,
-            } => {
-                assert!(matches!(filter, TargetFilter::Typed(_)));
+            QuantityRef::PropertyAggregate(aggregate)
+                if aggregate.function() == AggregateFunction::Sum
+                    && aggregate.property() == ObjectProperty::ManaValue =>
+            {
+                assert!(matches!(
+                    aggregate.source(),
+                    CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(_)
+                    }
+                ));
             }
             _ => panic!("expected Aggregate with Sum and ManaValue"),
         }
@@ -12342,11 +12394,9 @@ mod tests {
             assert!(
                 matches!(
                     q,
-                    QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    }
+                    QuantityRef::PropertyAggregate(ref aggregate)
+                        if aggregate.function() == AggregateFunction::Max
+                            && aggregate.property() == ObjectProperty::ManaValue
                 ),
                 "{phrase:?} -> {q:?}"
             );
@@ -12387,13 +12437,21 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
             assert_eq!(rest, "", "{phrase:?} must fully consume");
             match q {
-                QuantityRef::TrackedSetAggregate {
-                    function: f,
-                    property: p,
-                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                } => {
-                    assert_eq!(f, function, "{phrase:?} aggregate function");
-                    assert_eq!(p, property, "{phrase:?} property");
+                QuantityRef::PropertyAggregate(aggregate)
+                    if matches!(
+                        aggregate.source(),
+                        CardTypeSetSource::TrackedSet {
+                            set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                            ..
+                        }
+                    ) =>
+                {
+                    assert_eq!(
+                        aggregate.function(),
+                        function,
+                        "{phrase:?} aggregate function"
+                    );
+                    assert_eq!(aggregate.property(), property, "{phrase:?} property");
                 }
                 other => panic!("{phrase:?} must be a ChainSet TrackedSetAggregate, got {other:?}"),
             }
@@ -12422,11 +12480,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
             assert_eq!(rest, "", "{phrase:?} must fully consume");
             match q {
-                QuantityRef::TrackedSetAggregate {
-                    function: AggregateFunction::Sum,
-                    property: p,
-                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                } => assert_eq!(p, property, "{phrase:?} property"),
+                QuantityRef::PropertyAggregate(aggregate)
+                    if aggregate.function() == AggregateFunction::Sum
+                        && matches!(
+                            aggregate.source(),
+                            CardTypeSetSource::TrackedSet {
+                                set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                                ..
+                            }
+                        ) =>
+                {
+                    assert_eq!(aggregate.property(), property, "{phrase:?} property")
+                }
                 other => panic!("{phrase:?} must be a ChainSet TrackedSetAggregate, got {other:?}"),
             }
         }
