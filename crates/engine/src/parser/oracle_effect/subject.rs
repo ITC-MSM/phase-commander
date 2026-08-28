@@ -1449,6 +1449,52 @@ fn try_parse_subject_base_pt_set_clause_ast(
     })
 }
 
+/// CR 613.4b + CR 608.2c: Does this chunk's text open with the bare
+/// possessive-pronoun base-P/T-set grammar ("its base power [and toughness]
+/// become[s] ..." or the transitive "[you may] change its base power [and
+/// toughness] to ...") — the class Galion, Elvenking's Butler's "Its base
+/// power and toughness become equal to ~'s power and toughness" belongs to?
+///
+/// This mirrors ONLY the bare-pronoun arm of `try_parse_subject_base_pt_set_clause_ast`
+/// (`preceded(tag("its "), parse_base_pt_axes)` + `parse_base_pt_copula`), reusing
+/// those exact combinators so the gate can never drift from the grammar it exists
+/// to scope. It deliberately does NOT match the named-possessor ("~'s base
+/// power ...") or inverted-genitive ("the base power ... of ~") forms — those
+/// bind a *named* subject, not the bare pronoun "it", so they never reach the
+/// `parse_subject_application` bare-"it" branch this gate exists to constrain.
+///
+/// Call site: `parse_effect_chain_ir`'s `prior_typed_referent` chunk-subject
+/// rebind (oracle_effect/mod.rs) must fire ONLY for this class of clause — an
+/// earlier sibling's chosen typed target outranking a trigger's watched-source
+/// default is correct here because CR 608.2c/608.2k read "its" as referring to
+/// the target just chosen two words earlier, but the same rebind applied to an
+/// unrelated clause shape (`DealDamage`, `CantUntap`, `Discard`, `GiveControl`,
+/// `Shuffle`, ...) would silently reassign THEIR bare "it"/"its" subject too,
+/// with no card-by-card proof that rebinding is correct for those classes.
+pub(super) fn is_bare_pronoun_base_pt_possessive_clause(text: &str) -> bool {
+    type VE<'a> = OracleError<'a>;
+    let (body, _) = strip_leading_duration(text);
+    let lower = body.to_lowercase();
+    let parse_lower = match alt((
+        tag::<_, _, VE>("you may change "),
+        tag::<_, _, VE>("change "),
+    ))
+    .parse(lower.as_str())
+    {
+        Ok((rest, _)) => rest,
+        Err(_) => lower.as_str(),
+    };
+    let Ok((rest, _axes)) =
+        preceded(tag::<_, _, VE>("its "), parse_base_pt_axes).parse(parse_lower)
+    else {
+        return false;
+    };
+    // Either copula surface form (intransitive "become[s]" or transitive " to ")
+    // counts — the gate only needs to recognize the subject/axes shape, not
+    // which verb frame introduced it.
+    parse_base_pt_copula(rest, false).is_ok() || parse_base_pt_copula(rest, true).is_ok()
+}
+
 /// Strip a leading duration phrase ("Until end of turn, " / "This turn, ") off a
 /// standalone effect line, returning `(remaining_body, duration)`. When no
 /// leading duration is present, returns `(text, None)` so the caller is a no-op.

@@ -33474,6 +33474,18 @@ pub(crate) fn parse_effect_chain_ir(
                 ctx.subject,
                 None | Some(TargetFilter::SelfRef | TargetFilter::Any)
             )
+            // CR 608.2c + CR 613.4b: constrain this rebind to the bare
+            // possessive-pronoun base-P/T-set grammar it exists for. Without
+            // this gate, the rebind fires for EVERY chunk shape whose subject
+            // is a bare "it"/"its" following a prior typed referent — a much
+            // broader claim than Galion's own clause needs, and one with no
+            // per-class proof that reassigning the subject of e.g. a later
+            // `DealDamage`/`CantUntap`/`Discard`/`GiveControl`/`Shuffle` chunk
+            // to the sibling's target (instead of the trigger's watched
+            // source) is rules-correct for those unrelated classes. Restrict
+            // the antecedent-precedence override to the one clause shape this
+            // PR actually introduced coverage for.
+            && subject::is_bare_pronoun_base_pt_possessive_clause(&text)
         {
             // CR 608.2c: an earlier SIBLING clause in THIS chain
             // (not merely the enclosing trigger condition) chose a genuinely
@@ -33489,11 +33501,14 @@ pub(crate) fn parse_effect_chain_ir(
             // creature you control. Its base power and toughness become equal
             // to ~'s power and toughness". Gated on `ctx.subject` being only
             // the generic default (not a real typed trigger subject, which
-            // stays authoritative — CR 608.2k) and on `if_you_do_anchor` being
+            // stays authoritative — CR 608.2k), on `if_you_do_anchor` being
             // absent (an "if you do" anchor to the source, as in The
             // Irencrag's "you may have ~ become ... . If you do, it gains
             // ...", is itself the correct nearest antecedent and must not be
-            // overridden).
+            // overridden), and on the chunk text itself being the bare
+            // possessive-pronoun base-P/T-set clause shape (see
+            // `is_bare_pronoun_base_pt_possessive_clause`) so unrelated chunk
+            // shapes never have their subject silently reassigned.
             None
         } else {
             ctx.subject.clone()
