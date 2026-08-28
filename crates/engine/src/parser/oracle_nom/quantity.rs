@@ -1006,8 +1006,14 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             parse_cards_in_zone_ref,
         )),
         // CR 208.3 / CR 306.5c: source-scoped power / toughness / loyalty
-        // self-possessives ("~'s power", "~'s loyalty").
-        parse_self_characteristic_ref,
+        // self-possessives ("~'s power", "~'s loyalty"), nested with the
+        // Equipment/Aura attached-creature possessives ("equipped creature's
+        // power", "enchanted creature's power") to stay within nom's
+        // top-level `alt` arity (nom 8.0 max: 21 items).
+        alt((
+            parse_self_characteristic_ref,
+            parse_attached_creature_pt_ref,
+        )),
         parse_damage_dealt_this_turn_ref,
         parse_life_lost_ref,
         parse_life_gained_ref,
@@ -3393,6 +3399,45 @@ fn parse_self_characteristic_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         ),
     ))
     .parse(rest)
+}
+
+/// CR 301.5f + CR 303.4m + CR 208.1: Parse "equipped creature's power/toughness"
+/// and "enchanted creature's power/toughness" — a dynamic quantity bound to
+/// whatever creature the ability's Equipment/Aura source is CURRENTLY attached
+/// to (Glamdring, Foe-hammer's "cost {X} less ..., where X is equipped
+/// creature's power"). CR 301.5f / CR 303.4m: "equipped creature" / "enchanted
+/// creature" refers to whatever creature the permanent is attached to.
+///
+/// Modeled as `Aggregate` over a `FilterProp::EquippedBy`/`EnchantedBy`-filtered
+/// creature population, not a dedicated `ObjectScope` — CR 301.5f / CR 303.4m
+/// define "equipped"/"enchanted creature" only in terms of an attachment, so
+/// there is no such creature when the source is unattached, and `Sum` over
+/// that empty population is 0 by definition, exactly the "no reduction"
+/// outcome an unattached Equipment/Aura requires. A single-object
+/// `ObjectScope` would have no object to resolve against in that case.
+/// `EquippedBy`/`EnchantedBy` are source-relative (`game/filter.rs`), so this
+/// reads the board fresh every time the enclosing quantity is resolved — never
+/// a parse-time snapshot — per CR 611.3a (a static ability's continuous effect
+/// isn't locked in).
+fn parse_attached_creature_pt_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, attachment_prop) = alt((
+        value(FilterProp::EquippedBy, tag("equipped creature's ")),
+        value(FilterProp::EnchantedBy, tag("enchanted creature's ")),
+    ))
+    .parse(input)?;
+    let (rest, property) = alt((
+        value(ObjectProperty::Power, tag("power")),
+        value(ObjectProperty::Toughness, tag("toughness")),
+    ))
+    .parse(rest)?;
+    Ok((
+        rest,
+        QuantityRef::Aggregate {
+            function: AggregateFunction::Sum,
+            property,
+            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![attachment_prop])),
+        },
+    ))
 }
 
 /// Parse damage-history references such as Chandra's Incinerator's
