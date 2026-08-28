@@ -142,14 +142,7 @@ pub fn resolve_become_unprepared(
 ) -> Result<(), EffectError> {
     let target_ids = resolve_object_targets(state, ability);
     for object_id in target_ids {
-        let Some(obj) = state.objects.get_mut(&object_id) else {
-            continue;
-        };
-        if obj.prepared.is_none() {
-            continue;
-        }
-        obj.prepared = None;
-        events.push(GameEvent::BecameUnprepared { object_id });
+        unprepare_object(state, object_id, events);
     }
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::BecomeUnprepared,
@@ -317,10 +310,11 @@ fn authorize_linked_copy_for_controller(
     Ok(())
 }
 
-pub(crate) fn remove_linked_prepared_copy_if_idle(state: &mut GameState, source_id: ObjectId) {
-    let Some(copy_id) = linked_prepared_copy_id(state, source_id) else {
-        return;
-    };
+fn linked_prepared_copy_if_idle(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Option<(ObjectId, Zone, PlayerId)> {
+    let copy_id = linked_prepared_copy_id(state, source_id)?;
     let pending = state
         .pending_cast
         .as_deref()
@@ -329,14 +323,43 @@ pub(crate) fn remove_linked_prepared_copy_if_idle(state: &mut GameState, source_
             .waiting_for
             .pending_cast_ref()
             .is_some_and(|cast| cast.object_id == copy_id);
-    let Some(object) = state.objects.get(&copy_id) else {
+    let object = state.objects.get(&copy_id)?;
+    if pending || object.zone == Zone::Stack {
+        return None;
+    }
+    Some((copy_id, object.zone, object.owner))
+}
+
+pub(crate) fn linked_prepared_copy_if_idle_id(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Option<ObjectId> {
+    linked_prepared_copy_if_idle(state, source_id).map(|(copy_id, _, _)| copy_id)
+}
+
+pub(crate) fn remove_linked_prepared_copy_if_idle(state: &mut GameState, source_id: ObjectId) {
+    let Some((copy_id, zone, owner)) = linked_prepared_copy_if_idle(state, source_id) else {
         return;
     };
-    if pending || object.zone == Zone::Stack {
-        return;
-    }
-    let (zone, owner) = (object.zone, object.owner);
     crate::game::zones::cease_object(state, copy_id, zone, owner);
+}
+
+pub(crate) fn replay_remove_linked_prepared_copy_if_idle(
+    state: &mut GameState,
+    source_id: ObjectId,
+    cause: crate::types::resolved_commands::RulesExecutionNodeRef,
+) {
+    let Some((copy_id, zone, owner)) = linked_prepared_copy_if_idle(state, source_id) else {
+        return;
+    };
+    let command = crate::types::resolved_commands::ResolvedObjectCeaseCommand {
+        object: crate::types::ObjectIncarnationRef::from_object(&state.objects[&copy_id]),
+        expected_zone: zone,
+        owner,
+        cause,
+    };
+    crate::game::zones::apply_resolved_object_cease(state, &command)
+        .expect("validated linked idle copy must cease during zone replay");
 }
 
 fn synthesize_prepared_copy_object(
@@ -806,9 +829,12 @@ mod tests {
     }
 
     #[test]
-    fn become_unprepared_is_idempotent() {
+    fn become_unprepared_cleans_linked_copy_and_is_idempotent() {
         let mut state = GameState::new_two_player(42);
         let id = setup_creature(&mut state);
+        state.objects.get_mut(&id).unwrap().back_face = Some(BackFaceForTest::prepare());
+        prepare_object(&mut state, id, &mut Vec::new());
+        let copy_id = linked_prepared_copy_id(&state, id).expect("prepare creates its exile copy");
 
         let ability = ResolvedAbility::new(
             Effect::BecomeUnprepared {
@@ -822,10 +848,22 @@ mod tests {
         resolve_become_unprepared(&mut state, &ability, &mut events).unwrap();
 
         assert!(
-            !events
+            events.iter().any(
+                |e| matches!(e, GameEvent::BecameUnprepared { object_id } if *object_id == id)
+            ),
+            "the resolver emits the designation change"
+        );
+        assert!(state.objects[&id].prepared.is_none());
+        assert!(!state.objects.contains_key(&copy_id));
+        assert!(!state.exile.contains(&copy_id));
+
+        let mut second_events = Vec::new();
+        resolve_become_unprepared(&mut state, &ability, &mut second_events).unwrap();
+        assert!(
+            !second_events
                 .iter()
-                .any(|e| matches!(e, GameEvent::BecameUnprepared { .. })),
-            "no BecameUnprepared event when already unprepared"
+                .any(|event| matches!(event, GameEvent::BecameUnprepared { .. })),
+            "an already-unprepared object emits no second designation event"
         );
     }
 
