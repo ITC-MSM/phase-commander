@@ -10518,10 +10518,8 @@ fn trigger_leonin_vanguard_control_creature_count() {
 
 #[test]
 fn parse_greatest_mana_value_among_instant_and_sorcery_spells_cast_this_turn() {
-    let def = parse_trigger_line(
-        "At the beginning of combat on your turn, if you've cast an instant or sorcery spell this turn, create an X/X blue and red Elemental creature token with flying and haste, where X is the greatest mana value among instant and sorcery spells you've cast this turn.",
-        "Rootha, Mastering the Moment",
-    );
+    let oracle = "At the beginning of combat on your turn, if you've cast an instant or sorcery spell this turn, create an X/X blue and red Elemental creature token with flying and haste, where X is the greatest mana value among instant and sorcery spells you've cast this turn.";
+    let def = parse_trigger_line(oracle, "Rootha, Mastering the Moment");
     assert_eq!(def.mode, TriggerMode::Phase);
     assert_eq!(def.phase, Some(Phase::BeginCombat));
     assert_eq!(def.constraint, Some(TriggerConstraint::OnlyDuringYourTurn));
@@ -10573,10 +10571,15 @@ fn parse_greatest_mana_value_among_instant_and_sorcery_spells_cast_this_turn() {
         } if !filter.contains_other_than_trigger_object()
     ));
 
-    let near_miss = parse_trigger_line(
-        "At the beginning of combat on your turn, create an X/X Elemental creature token, where X is the greatest mana value among creature spells you've cast this turn.",
-        "Near Miss",
+    // The typed Token and PropertyAggregate assertions above are the positive
+    // reach guard. Change only the aggregate's unsupported spell filter; the
+    // trigger condition and token clause remain byte-identical.
+    let near_miss_oracle = oracle.replacen(
+        "greatest mana value among instant and sorcery spells",
+        "greatest mana value among creature spells",
+        1,
     );
+    let near_miss = parse_trigger_line(&near_miss_oracle, "Near Miss");
     assert!(near_miss
         .execute
         .as_deref()

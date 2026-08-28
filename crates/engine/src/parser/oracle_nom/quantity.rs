@@ -1668,7 +1668,7 @@ fn parse_object_property_aggregate_head(
     .parse(input)
 }
 
-/// CR 202.3 + CR 601.2a: Parse a mana-value reduction over the controller's
+/// CR 202.3 + CR 601.2i: Parse a mana-value reduction over the controller's
 /// per-turn spell-cast journal.
 ///
 /// The aggregate head, current-cast exclusion, spell qualifier, and journal

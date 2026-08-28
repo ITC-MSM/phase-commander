@@ -5070,10 +5070,10 @@ fn parse_total_mana_value_of_other_spells_cast_this_turn() {
     assert_eq!(target.controller, Some(ControllerRef::Opponent));
     assert!(target.type_filters.contains(&TypeFilter::Creature));
 
-    let near_miss = parse_effect_chain(
-        "~ deals damage to each creature your opponents control equal to the total mana value of other spells you've cast this game",
-        AbilityKind::Spell,
-    );
+    // The typed DamageAll assertions above are the reach guard: the near miss
+    // changes only the unsupported journal suffix of that recognized clause.
+    let near_miss_oracle = oracle.replacen("this turn", "this game", 1);
+    let near_miss = parse_effect_chain(&near_miss_oracle, AbilityKind::Spell);
     assert!(
         ability_chain_has_unimplemented(&near_miss),
         "a different journal suffix must remain unsupported"
