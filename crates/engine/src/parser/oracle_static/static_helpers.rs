@@ -1624,6 +1624,10 @@ pub(crate) fn attach_parsed_static_gate(
 /// Handles patterns like:
 /// - "doesn't untap during your untap step as long as [condition]"
 /// - "doesn't untap during your untap step if [condition]"
+/// - "doesn't untap during your untap step unless [condition]" (CR 611.3a polarity:
+///   the restriction applies precisely when the trailing condition is false, so the
+///   "unless" body is negated — Bombur, Gentle Dreamer: "doesn't untap ... unless you
+///   have an enduring story" only withholds the untap while the story is absent).
 pub(crate) fn extract_cant_untap_condition(lower: &str) -> Option<StaticCondition> {
     // Find the end of the "untap step" phrase
     let untap_phrases = [
@@ -1644,6 +1648,20 @@ pub(crate) fn extract_cant_untap_condition(lower: &str) -> Option<StaticConditio
     let remaining = after_untap?;
     if remaining.is_empty() {
         return None;
+    }
+    // "unless" is negative polarity: delegate to the shared unless-condition
+    // combinator so the UnlessPay raw-passthrough rule (avoid double-negating an
+    // already-negative "unless you pay [cost]" cost condition) is applied
+    // identically to every other "unless" gate in the parser.
+    if let Some(unless_text) = nom_tag_lower(remaining, remaining, "unless ") {
+        return match nom_condition::parse_unless_condition(unless_text) {
+            Ok((_, condition)) => Some(condition),
+            Err(_) => Some(StaticCondition::Not {
+                condition: Box::new(StaticCondition::Unrecognized {
+                    text: unless_text.to_string(),
+                }),
+            }),
+        };
     }
     // Strip "as long as" or "if" prefix
     let condition_text = nom_tag_lower(remaining, remaining, "as long as ")

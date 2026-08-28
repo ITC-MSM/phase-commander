@@ -9554,6 +9554,29 @@ fn static_enchanted_creature_doesnt_untap_if_sleep_counter() {
     );
 }
 
+/// CR 502.3 + CR 702.195b (Bombur, Gentle Dreamer): "~ doesn't untap during your
+/// untap step unless you have an enduring story." "Unless" is negative polarity
+/// (CR 611.3a) — the restriction applies precisely when the trailing condition is
+/// FALSE, so the parsed condition must be `Not(HasEnduringStory)`, not the bare
+/// positive condition `parse_as_long_as`/`parse_if` would attach.
+#[test]
+fn static_bombur_doesnt_untap_unless_enduring_story() {
+    let def = parse_static_line(
+        "Bombur doesn't untap during your untap step unless you have an enduring story.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::CantUntap);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::HasEnduringStory),
+        }),
+        "'unless you have an enduring story' must negate HasEnduringStory, got {:?}",
+        def.condition
+    );
+}
+
 #[test]
 fn static_creatures_with_counters_dont_untap() {
     let def = parse_static_line(
