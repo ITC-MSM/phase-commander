@@ -43,10 +43,10 @@ const NOTARY_HOBBITS_ORACLE: &str = "When The Notary Hobbits enter, if they're n
     create two tokens that are copies of them, except the tokens aren't legendary.\n\
     {T}: Add {C} for each Halfling you control.";
 
-fn notary_hobbits_permanents<'a>(
-    state: &'a GameState,
+fn notary_hobbits_permanents(
+    state: &GameState,
     controller: PlayerId,
-) -> Vec<&'a engine::game::game_object::GameObject> {
+) -> Vec<&engine::game::game_object::GameObject> {
     state
         .battlefield
         .iter()
