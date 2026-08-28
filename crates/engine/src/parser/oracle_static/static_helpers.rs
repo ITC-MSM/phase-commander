@@ -1653,10 +1653,19 @@ pub(crate) fn extract_cant_untap_condition(lower: &str) -> Option<StaticConditio
     // combinator so the UnlessPay raw-passthrough rule (avoid double-negating an
     // already-negative "unless you pay [cost]" cost condition) is applied
     // identically to every other "unless" gate in the parser.
+    //
+    // CR 109.4 + CR 725.5: layer evaluation (`game::layers::evaluate_condition`)
+    // has no triggering event or combat anchor to bind a scoped player
+    // designation ("that player" / "that opponent") against, so it rejects any
+    // `IsMonarch`-shaped leaf whose `PlayerScope` isn't `Controller` outright —
+    // the restriction can never actually apply. A CantUntap static built from
+    // such a condition must NOT be reported as fully parsed/supported; fall
+    // through to the same `Unrecognized` shape a genuine parse failure produces
+    // so coverage tooling sees the honest gap instead of a false green.
     if let Some(unless_text) = nom_tag_lower(remaining, remaining, "unless ") {
         return match nom_condition::parse_unless_condition(unless_text) {
-            Ok((_, condition)) => Some(condition),
-            Err(_) => Some(StaticCondition::Not {
+            Ok((_, condition)) if !condition.has_unbindable_designation_anchor() => Some(condition),
+            _ => Some(StaticCondition::Not {
                 condition: Box::new(StaticCondition::Unrecognized {
                     text: unless_text.to_string(),
                 }),

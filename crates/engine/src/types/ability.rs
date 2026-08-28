@@ -9498,6 +9498,33 @@ impl StaticCondition {
             | StaticCondition::None => None,
         }
     }
+
+    /// CR 109.4 + CR 725.5: true when this condition (or a Boolean sub-condition
+    /// of it) tests a [`PlayerScope`] designation anchor other than `Controller`
+    /// — a "that player" / "that opponent" / other scoped-player reference that
+    /// has no runtime binding authority outside a triggering event or combat
+    /// context (a recipient id, a combat-tax defender, etc.).
+    ///
+    /// Single authority shared by the runtime layer evaluator
+    /// (`game::layers::evaluate_condition`, which has no triggering event to
+    /// bind a scoped player against and must reject the condition outright) and
+    /// any parser-time gate that would otherwise mark such a condition
+    /// "supported" while it can never actually apply at runtime. Recipient-
+    /// bearing evaluators (`evaluate_condition_with_recipient`) intentionally do
+    /// NOT call this — a recipient id is exactly the binding authority a
+    /// `ScopedPlayer` anchor needs.
+    pub(crate) fn has_unbindable_designation_anchor(&self) -> bool {
+        if let Some(scope) = self.designation_player_anchor() {
+            return !matches!(scope, PlayerScope::Controller);
+        }
+        match self {
+            StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+                .iter()
+                .any(StaticCondition::has_unbindable_designation_anchor),
+            StaticCondition::Not { condition } => condition.has_unbindable_designation_anchor(),
+            _ => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
