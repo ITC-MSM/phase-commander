@@ -269,6 +269,8 @@ pub fn resolve(
                             zone_pipeline::defer_completion_on_pause(
                                 state,
                                 BatchCompletion::RevealRestPile {
+                                    delivery_stage:
+                                        crate::types::game_state::DigDeliveryStage::Rest,
                                     player: revealing_player,
                                     source_id: Some(ability.source_id),
                                     rest_cards: revealed_misses,
@@ -278,6 +280,9 @@ pub fn resolve(
                                     publish_tracked_set: None,
                                     emit_reveal_until_resolved: Some(ability.source_id),
                                     manifested_for_continuation: None,
+                                    kept_delivery: Default::default(),
+                                    continuation_targets: Vec::new(),
+                                    rest_delivery: Default::default(),
                                 },
                             );
                             return Ok(());
@@ -321,6 +326,8 @@ pub fn resolve(
                             zone_pipeline::defer_completion_on_pause(
                                 state,
                                 BatchCompletion::RevealRestPile {
+                                    delivery_stage:
+                                        crate::types::game_state::DigDeliveryStage::Rest,
                                     player: revealing_player,
                                     source_id: Some(ability.source_id),
                                     rest_cards: revealed_misses,
@@ -330,6 +337,9 @@ pub fn resolve(
                                     publish_tracked_set: None,
                                     emit_reveal_until_resolved: Some(ability.source_id),
                                     manifested_for_continuation: None,
+                                    kept_delivery: Default::default(),
+                                    continuation_targets: Vec::new(),
+                                    rest_delivery: Default::default(),
                                 },
                             );
                             return Ok(());
@@ -356,6 +366,8 @@ pub fn resolve(
                             zone_pipeline::defer_completion_on_pause(
                                 state,
                                 BatchCompletion::RevealRestPile {
+                                    delivery_stage:
+                                        crate::types::game_state::DigDeliveryStage::Rest,
                                     player: revealing_player,
                                     source_id: Some(ability.source_id),
                                     rest_cards: revealed_misses,
@@ -365,6 +377,9 @@ pub fn resolve(
                                     publish_tracked_set: None,
                                     emit_reveal_until_resolved: Some(ability.source_id),
                                     manifested_for_continuation: None,
+                                    kept_delivery: Default::default(),
+                                    continuation_targets: Vec::new(),
+                                    rest_delivery: Default::default(),
                                 },
                             );
                             return Ok(());
@@ -398,6 +413,7 @@ pub fn resolve(
             zone_pipeline::defer_completion_on_pause(
                 state,
                 BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                     player: revealing_player,
                     source_id: Some(ability.source_id),
                     rest_cards: Vec::new(),
@@ -407,6 +423,9 @@ pub fn resolve(
                     publish_tracked_set: None,
                     emit_reveal_until_resolved: Some(ability.source_id),
                     manifested_for_continuation: None,
+                    kept_delivery: Default::default(),
+                    continuation_targets: Vec::new(),
+                    rest_delivery: Default::default(),
                 },
             );
             return Ok(());
