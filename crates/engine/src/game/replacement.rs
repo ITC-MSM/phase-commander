@@ -7722,6 +7722,7 @@ impl ReplacementPromptCauses {
         Self(cause.bit())
     }
 
+    #[cfg(test)]
     pub(crate) const fn contains(self, cause: ReplacementPromptCause) -> bool {
         self.0 & cause.bit() != 0
     }
