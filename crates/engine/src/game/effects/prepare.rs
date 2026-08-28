@@ -400,8 +400,9 @@ fn synthesize_prepared_copy_object(
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
-        });
+    });
     state.objects.insert(copy_id, copy_obj);
+    // allow-raw-zone: registers CR 722.3c copy birth in exile; there is no source-zone move.
     crate::game::zones::add_to_zone(state, copy_id, Zone::Exile, controller);
 
     Ok((copy_id, card_id))
