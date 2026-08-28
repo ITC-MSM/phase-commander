@@ -43,6 +43,7 @@ pub enum ServerErrorCode {
 /// handshake. When making such changes, plan a deprecation window where
 /// both the old and new variants coexist, then bump and remove the old.
 ///
+/// 45 — `GameState` gained serialized cast-occurrence provenance and prepared-copy links.
 /// 44 — Resolution-time optional `PayCost(OneOf)` branch choice added a
 ///      serialized `WaitingFor`/`GameAction` pair.
 /// 43 — Engine-owned stack-resolution automation retired the legacy native
@@ -188,7 +189,7 @@ pub enum ServerErrorCode {
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 44;
+pub const PROTOCOL_VERSION: u32 = 45;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -638,12 +639,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 44);
+        assert_eq!(PROTOCOL_VERSION, 45);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which is what refuses an older full-game peer whose GameState cannot
         // understand a success acknowledgment the submitting client awaits.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 43);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 44);
     }
 
     #[test]

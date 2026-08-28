@@ -202,6 +202,7 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 45 — GameState gained serialized cast-occurrence provenance and prepared-copy links.
  * 44 — Resolution-time optional PayCost(OneOf) branch choice added a
  *      serialized WaitingFor/GameAction pair.
  * 43 — Engine-owned stack-resolution automation retired the legacy native
@@ -325,7 +326,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 44;
+export const PROTOCOL_VERSION = 45;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -1124,6 +1124,14 @@ pub struct ManaSpentSourceSnapshot {
     pub lki: LKISnapshot,
 }
 
+/// CR 601.2i: Stable coordinate of one finalized cast in its caster's
+/// turn-scoped spell-cast journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CastOccurrence {
+    pub caster: PlayerId,
+    pub turn_journal_index: u32,
+}
+
 /// Snapshot of a spell's characteristics at cast time for per-turn history queries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpellCastRecord {
@@ -23700,6 +23708,15 @@ impl GameState {
         // CR 732.2a recurrence certification that shares this seam can confirm a
         // repeat.
         clone.chain_tracked_set_id = None;
+        // CR 104.4b: the journal coordinate is monotonic provenance, while the
+        // caster and Some-vs-None state remain rules-relevant. Canonicalize the
+        // coordinate on both object and stack-ability carriers so derived stack
+        // equality cannot split an otherwise recurring position.
+        for (_, object) in clone.objects.iter_mut() {
+            if let Some(occurrence) = object.cast_occurrence.as_mut() {
+                occurrence.turn_journal_index = 0;
+            }
+        }
         // CR 104.4b + CR 400.7: the all-zone incarnation bump advances a source's
         // epoch on every zone change, so a mandatory loop that cycles its source's
         // zones would otherwise carry a growing `TriggerSourceContext` into loop
@@ -23713,6 +23730,13 @@ impl GameState {
         for entry in clone.stack.iter_mut() {
             if let Some(ability) = entry.ability_mut() {
                 ability.clear_trigger_identity_recursive();
+                ability.normalize_cast_occurrence_for_loop_recursive();
+            }
+        }
+        if let Some(entry) = clone.resolving_stack_entry.as_mut() {
+            if let Some(ability) = entry.ability_mut() {
+                ability.clear_trigger_identity_recursive();
+                ability.normalize_cast_occurrence_for_loop_recursive();
             }
         }
         // `PendingTrigger::timestamp` is a live CR 603.3b ordering key. It is
@@ -24548,6 +24572,7 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
         && x.contraption_sprocket == y.contraption_sprocket
         && x.is_suspected == y.is_suspected // CR 701.60a designation
         && x.prepared == y.prepared // SOS prepare/unprepare toggle
+        && x.prepared_copy_source == y.prepared_copy_source // CR 722.3c linked exile copy
         && x.room_unlocks == y.room_unlocks // CR 709.5c door lock/unlock
         // §5.2c ADD set (v5, S6): firewall-blind per-iteration accumulators on
         // live battlefield/exile objects.
@@ -24556,6 +24581,9 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
         && x.detained_by == y.detained_by // CR 701.35a detain set
         && x.casting_permissions == y.casting_permissions // CR 715.3d exile-grant Vec
         && x.saddled_by == y.saddled_by // CR 702.171c saddle set
+        // #6865: a cast occurrence is resolution-semantic provenance while the
+        // spell remains on the stack. Comparing it is fail-safe for loop detection.
+        && x.cast_occurrence == y.cast_occurrence
 }
 
 /// CR 104.4b compile-time totality guard for the object-growth cover gate's
@@ -29523,6 +29551,112 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_for_loop_canonicalizes_cast_coordinates_but_preserves_identity_shape() {
+        fn ability_graph(occurrence: CastOccurrence) -> ResolvedAbility {
+            let mut epic =
+                ResolvedAbility::new(Effect::NoOp, Vec::new(), ObjectId(500), occurrence.caster);
+            epic.sub_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            epic.else_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            let mut root = ResolvedAbility::new(
+                Effect::EpicCopy {
+                    spell: Box::new(epic),
+                },
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            );
+            root.sub_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            root.else_ability = Some(Box::new(ResolvedAbility::new(
+                Effect::NoOp,
+                Vec::new(),
+                ObjectId(500),
+                occurrence.caster,
+            )));
+            root.set_cast_occurrence_recursive(Some(occurrence));
+            root
+        }
+
+        fn stack_state(occurrence: CastOccurrence) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            let mut object = GameObject::new(
+                ObjectId(500),
+                CardId(500),
+                occurrence.caster,
+                "Loop Spell".to_string(),
+                Zone::Stack,
+            );
+            object.cast_occurrence = Some(occurrence);
+            state.objects.insert(object.id, object);
+            state.stack.push_back(StackEntry {
+                id: ObjectId(500),
+                source_id: ObjectId(500),
+                controller: occurrence.caster,
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(500),
+                    ability: Some(Box::new(ability_graph(occurrence))),
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            });
+            state
+        }
+
+        let earlier = stack_state(CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 4,
+        });
+        let later = stack_state(CastOccurrence {
+            caster: PlayerId(0),
+            turn_journal_index: 5,
+        });
+        assert!(loop_states_equal(
+            &earlier.normalize_for_loop(),
+            &later.normalize_for_loop()
+        ));
+
+        let mut absent = earlier.clone();
+        absent
+            .objects
+            .get_mut(&ObjectId(500))
+            .unwrap()
+            .cast_occurrence = None;
+        absent
+            .stack
+            .back_mut()
+            .and_then(StackEntry::ability_mut)
+            .unwrap()
+            .set_cast_occurrence_recursive(None);
+        assert!(!loop_states_equal(
+            &earlier.normalize_for_loop(),
+            &absent.normalize_for_loop()
+        ));
+
+        let other_caster = stack_state(CastOccurrence {
+            caster: PlayerId(1),
+            turn_journal_index: 5,
+        });
+        assert!(!loop_states_equal(
+            &earlier.normalize_for_loop(),
+            &other_caster.normalize_for_loop()
+        ));
+    }
+
     /// T-loop (§4 Condition 2): the all-zone incarnation bump advances a source's
     /// epoch every time it changes zones, so a mandatory loop that cycles its
     /// source's zones would carry a growing `TriggerSourceContext` into loop equality
@@ -33719,6 +33853,59 @@ mod tests {
         let none_record = SpellCastRecord::default();
         let none_json = serde_json::to_string(&none_record).unwrap();
         assert!(!none_json.contains("spell_object_id"));
+    }
+
+    #[test]
+    fn legacy_stack_object_and_resolved_ability_default_cast_occurrence_to_none() {
+        let object = crate::game::game_object::GameObject::new(
+            ObjectId(6865),
+            CardId(6865),
+            PlayerId(0),
+            "Legacy Stack Spell".to_string(),
+            Zone::Stack,
+        );
+        let ability =
+            ResolvedAbility::new(Effect::Investigate, Vec::new(), ObjectId(6865), PlayerId(0));
+
+        let object_json = serde_json::to_value(&object).expect("serialize object");
+        let ability_json = serde_json::to_value(&ability).expect("serialize ability");
+        assert!(object_json.get("cast_occurrence").is_none());
+        assert!(ability_json.get("cast_occurrence").is_none());
+        let legacy_object: crate::game::game_object::GameObject =
+            serde_json::from_value(object_json.clone()).expect("legacy object loads");
+        let legacy_ability: ResolvedAbility =
+            serde_json::from_value(ability_json.clone()).expect("legacy ability loads");
+        assert_eq!(legacy_object.cast_occurrence, None);
+        assert_eq!(legacy_ability.cast_occurrence, None);
+
+        let occurrence = CastOccurrence {
+            caster: PlayerId(1),
+            turn_journal_index: 8,
+        };
+        let mut present_object = object;
+        present_object.cast_occurrence = Some(occurrence);
+        let mut present_ability = ability;
+        present_ability.cast_occurrence = Some(occurrence);
+        let object_round_trip: crate::game::game_object::GameObject = serde_json::from_value(
+            serde_json::to_value(&present_object).expect("serialize present object"),
+        )
+        .expect("present object loads");
+        let ability_round_trip: ResolvedAbility = serde_json::from_value(
+            serde_json::to_value(&present_ability).expect("serialize present ability"),
+        )
+        .expect("present ability loads");
+        assert_eq!(object_round_trip.cast_occurrence, Some(occurrence));
+        assert_eq!(ability_round_trip.cast_occurrence, Some(occurrence));
+
+        let mut malformed_object = object_json;
+        malformed_object["cast_occurrence"] = serde_json::json!("not an occurrence");
+        assert!(
+            serde_json::from_value::<crate::game::game_object::GameObject>(malformed_object)
+                .is_err()
+        );
+        let mut malformed_ability = ability_json;
+        malformed_ability["cast_occurrence"] = serde_json::json!("not an occurrence");
+        assert!(serde_json::from_value::<ResolvedAbility>(malformed_ability).is_err());
     }
 
     /// CR 601.2a: A snapshot with a real `from_zone` value (the modern non-Option

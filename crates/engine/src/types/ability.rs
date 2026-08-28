@@ -12,7 +12,7 @@ use super::card_type::{CardType, CoreType, SubtypeSet, Supertype};
 use super::counter::{CounterMatch, CounterType};
 use super::events::BendingType;
 use super::game_state::{
-    is_zero_usize, DistributionUnit, LKISnapshot, MayTriggerOrigin, RetargetScope,
+    is_zero_usize, CastOccurrence, DistributionUnit, LKISnapshot, MayTriggerOrigin, RetargetScope,
     TargetSelectionConstraint, TriggerSourceContext,
 };
 use super::identifiers::{
@@ -26857,6 +26857,10 @@ pub struct ResolvedAbility {
     /// context below; callers must never use this raw id to rebind a departed
     /// source to a newer incarnation.
     pub source_id: ObjectId,
+    /// CR 601.2i + CR 707.10: Exact finalized cast represented by this
+    /// resolving spell ability. Spell copies that were not cast carry `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_occurrence: Option<CastOccurrence>,
     /// CR 400.7: Exact source incarnation captured for self-transform guards.
     /// The full `trigger_source` context remains the authority for all triggered
     /// source facts; this field preserves the source epoch for activated and
@@ -27234,6 +27238,7 @@ impl ResolvedAbility {
             effect,
             targets,
             source_id,
+            cast_occurrence: None,
             controller,
             original_controller: None,
             scoped_player: None,
@@ -27325,6 +27330,52 @@ impl ResolvedAbility {
 
     pub(crate) fn attach_attachment_candidates(&self) -> &[ObjectIncarnationRef] {
         self.context.attach_target_bindings.attachment_candidates()
+    }
+
+    /// Stamp or clear one cast coordinate on every complete ability graph
+    /// stored by this node, including the spell snapshot embedded by Epic.
+    pub fn set_cast_occurrence_recursive(&mut self, occurrence: Option<CastOccurrence>) {
+        self.cast_occurrence = occurrence;
+        if let Effect::EpicCopy { spell } = &mut self.effect {
+            spell.set_cast_occurrence_recursive(occurrence);
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.set_cast_occurrence_recursive(occurrence);
+        }
+        if let Some(branch) = self.else_ability.as_mut() {
+            branch.set_cast_occurrence_recursive(occurrence);
+        }
+    }
+
+    pub(crate) fn normalize_cast_occurrence_for_loop_recursive(&mut self) {
+        if let Some(occurrence) = self.cast_occurrence.as_mut() {
+            occurrence.turn_journal_index = 0;
+        }
+        if let Effect::EpicCopy { spell } = &mut self.effect {
+            spell.normalize_cast_occurrence_for_loop_recursive();
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.normalize_cast_occurrence_for_loop_recursive();
+        }
+        if let Some(branch) = self.else_ability.as_mut() {
+            branch.normalize_cast_occurrence_for_loop_recursive();
+        }
+    }
+
+    pub(crate) fn cast_occurrence_matches_recursive(&self, occurrence: CastOccurrence) -> bool {
+        self.cast_occurrence == Some(occurrence)
+            && self
+                .sub_ability
+                .as_deref()
+                .is_none_or(|sub| sub.cast_occurrence_matches_recursive(occurrence))
+            && self
+                .else_ability
+                .as_deref()
+                .is_none_or(|branch| branch.cast_occurrence_matches_recursive(occurrence))
+            && match &self.effect {
+                Effect::EpicCopy { spell } => spell.cast_occurrence_matches_recursive(occurrence),
+                _ => true,
+            }
     }
 
     pub fn set_may_trigger_origin_recursive(&mut self, origin: MayTriggerOrigin) {

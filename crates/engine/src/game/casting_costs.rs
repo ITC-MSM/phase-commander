@@ -13,7 +13,7 @@ use crate::types::ability::{
 use crate::types::card_type::CoreType;
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
-    ActivationResidual, ActivationTargetSelection, AssistState, CastPaymentMode,
+    ActivationResidual, ActivationTargetSelection, AssistState, CastOccurrence, CastPaymentMode,
     CastingPermissionIndex, CastingVariant, ConvokeMode, CostResume, CounterCostChoice,
     CounterRemoveChoice, DeferredSacrificeSelection, DistributionUnit, GameState,
     ManaAbilityCostParent, ManaAbilityResume, PayCostKind, PendingCast, PendingCostMoveCompletion,
@@ -52,6 +52,58 @@ pub(crate) const ABANDONED_CAST_FINALIZATION_ERROR: &str = "__abandoned_cast_fin
 
 fn abandoned_cast_finalization_error() -> EngineError {
     EngineError::InvalidAction(ABANDONED_CAST_FINALIZATION_ERROR.to_string())
+}
+
+pub(crate) fn finalized_spell_cast_ledger_error(
+    error: crate::types::resolved_commands::ResolvedLedgerEditReplayInvariantError,
+) -> EngineError {
+    EngineError::InvalidAction(format!("failed to record finalized spell cast: {error}"))
+}
+
+/// CR 601.2i: Attach the ledger-minted identity to the finalized stack spell
+/// and every complete resolved-ability graph it carries.
+pub(crate) fn stamp_cast_occurrence_on_stack_spell(
+    state: &mut GameState,
+    object_id: ObjectId,
+    occurrence: CastOccurrence,
+) -> Result<(), EngineError> {
+    validate_cast_occurrence_stack_spell_carrier(state, object_id)?;
+
+    state
+        .objects
+        .get_mut(&object_id)
+        .expect("validated stack spell object exists")
+        .cast_occurrence = Some(occurrence);
+    if let Some(ability) = state
+        .stack
+        .iter_mut()
+        .find(|entry| entry.id == object_id)
+        .and_then(StackEntry::ability_mut)
+    {
+        ability.set_cast_occurrence_recursive(Some(occurrence));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cast_occurrence_stack_spell_carrier(
+    state: &GameState,
+    object_id: ObjectId,
+) -> Result<(), EngineError> {
+    let object_is_stack_spell = state
+        .objects
+        .get(&object_id)
+        .is_some_and(|object| object.zone == Zone::Stack);
+    let entry_is_spell = state
+        .stack
+        .iter()
+        .find(|entry| entry.id == object_id)
+        .is_some_and(|entry| matches!(entry.kind, StackEntryKind::Spell { .. }));
+    if !object_is_stack_spell || !entry_is_spell {
+        return Err(EngineError::InvalidAction(format!(
+            "cannot stamp cast occurrence on non-spell stack carrier {object_id:?}"
+        )));
+    }
+    Ok(())
 }
 
 pub(crate) fn is_abandoned_cast_finalization(error: &EngineError) -> bool {
@@ -9351,6 +9403,18 @@ fn finalize_cast_with_phyrexian_choices_inner(
         .rposition(|entry| entry.id == object_id)
         .ok_or_else(abandoned_cast_finalization_error)?;
 
+    // CR 601.2i: every recoverable failure in the cast ledger and occurrence
+    // carrier is rejected before payment or finalization mutates the spell.
+    // Mana payment cannot append a spell-cast record, so this preflight remains
+    // valid until the single record/stamp commit below.
+    crate::game::ledger::validate_spell_cast_recording(state, player)
+        .map_err(finalized_spell_cast_ledger_error)?;
+    if !state.objects.contains_key(&object_id) {
+        return Err(EngineError::InvalidAction(format!(
+            "spell object {object_id:?} no longer exists before finalization records cast occurrence"
+        )));
+    }
+
     // CR 702.150a: Record how many of this spell's Phyrexian mana symbols are
     // being paid with life. A compleated planeswalker entering from this spell
     // exposes this as an intrinsic AddCounter replacement so it can order with
@@ -9883,23 +9947,10 @@ fn finalize_cast_with_phyrexian_choices_inner(
     let expected_old_paid_facts = state
         .stack_paid_facts
         .insert(object_id, resulting_paid_facts.clone());
-
-    // CR 733: journal the settled finalization once BOTH mutations are written,
-    // so the record carries the values that were installed rather than the
-    // inputs they were derived from.
-    let cause = state.current_or_begin_rules_execution_node();
-    state
-        .resolved_rules_journal
-        .record_stack_entry_finalize(ResolvedStackEntryFinalizeCommand {
-            object: object_id,
-            entry_position,
-            expected_old_kind: Box::new(expected_old_kind),
-            resulting_kind: Box::new(resulting_kind),
-            expected_old_paid_facts: expected_old_paid_facts.map(Box::new),
-            resulting_paid_facts: Box::new(resulting_paid_facts),
-            cause,
-        })
-        .expect("resolved stack entry finalize must have a live journal cause");
+    let expected_old_cast_occurrence = state
+        .objects
+        .get(&object_id)
+        .and_then(|object| object.cast_occurrence);
 
     let crime_candidate = deferred_life_resume_pending
         .is_some_and(|pending| pending.crime_candidate)
@@ -10089,7 +10140,40 @@ fn finalize_cast_with_phyrexian_choices_inner(
         .get(&object_id)
         .expect("spell object still exists after stack push")
         .clone();
-    restrictions::record_spell_cast_from_zone(state, player, &obj, source_zone, casting_variant);
+    let occurrence = restrictions::record_spell_cast_from_zone(
+        state,
+        player,
+        &obj,
+        source_zone,
+        casting_variant,
+    )
+    .map_err(finalized_spell_cast_ledger_error)?;
+    stamp_cast_occurrence_on_stack_spell(state, object_id, occurrence)?;
+
+    // Record the resolved-command finalization only after the ledger has minted
+    // and the shared authority has stamped the occurrence, so replay reproduces
+    // both the object and complete stack graph.
+    let resulting_kind = state
+        .stack
+        .get(entry_position)
+        .expect("the finalized spell remains at its validated stack position")
+        .kind
+        .clone();
+    let cause = state.current_or_begin_rules_execution_node();
+    state
+        .resolved_rules_journal
+        .record_stack_entry_finalize(ResolvedStackEntryFinalizeCommand {
+            object: object_id,
+            entry_position,
+            expected_old_kind: Box::new(expected_old_kind),
+            resulting_kind: Box::new(resulting_kind),
+            expected_old_paid_facts: expected_old_paid_facts.map(Box::new),
+            resulting_paid_facts: Box::new(resulting_paid_facts),
+            expected_old_cast_occurrence,
+            resulting_cast_occurrence: Some(occurrence),
+            cause,
+        })
+        .expect("resolved stack entry finalize must have a live journal cause");
 
     // CR 601.2f: Consume any one-shot pending cost reductions now that the spell is finalized.
     super::casting::consume_pending_spell_cost_reduction(state, player, object_id);
