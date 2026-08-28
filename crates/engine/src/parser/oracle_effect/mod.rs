@@ -3581,11 +3581,20 @@ pub(crate) fn parse_cast_this_way_enters_with_counter(lower: &str) -> Option<(Co
         tag("that permanent enters with "),
         tag("that artifact enters with "),
         // Self-granting permission (Undead Sprinter) refers to itself as "this
-        // creature", normalized to the `~` self-reference token upstream before
-        // this parser runs — distinct from the anaphoric "that creature" a
+        // creature" in the printed Oracle text. The main parse pipeline
+        // normalizes that phrase to the `~` self-reference token upstream
+        // before this parser runs, but this recognizer is also the shared
+        // authority `swallow_check`'s carrier-scoping detectors call directly
+        // against RAW, un-normalized unit text (by design — see
+        // `enters_with_counter_carrier_is_only_enters_with_marker`), so both
+        // the normalized and literal CR 201.5 self-reference forms must be
+        // accepted here — distinct from the anaphoric "that creature" a
         // separate-source grant uses.
         tag("~ enters with "),
         tag("it enters with "),
+        tag("this creature enters with "),
+        tag("this permanent enters with "),
+        tag("this artifact enters with "),
     ))
     .parse(lower)
     .ok()?;

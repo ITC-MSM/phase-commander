@@ -377,18 +377,20 @@ fn detect_replacement(
     // `enters_with_finality_this_way_is_only_if_marker` below, which already
     // accepts this exact carrier shape — both detectors must agree on what
     // counts as "represented" for the same AST shape.
-    if evidence.any_static_mode(|mode| {
-        matches!(
-            mode,
-            StaticMode::GraveyardCastPermission {
-                enters_with_counter: Some(_),
-                ..
-            } | StaticMode::ExileCastPermission {
-                enters_with_counter: Some(_),
-                ..
-            }
-        )
-    }) {
+    //
+    // Scoped to the carrier's OWN sentence, not the whole unit: a unit is one per
+    // SOURCE LINE (`audit_units` in `oracle_ir/feature.rs`), and can absorb several
+    // physical lines when no new item starts one — a card could plausibly print a
+    // represented graveyard/exile-cast-with-counter clause and a separate,
+    // genuinely unrepresented "enters with" rider (e.g. CR 614.1c's bare "[This
+    // permanent] enters with . . ." template) sharing that same unit.
+    // `evidence.any_static_mode` alone cannot see which sentence the carrier came
+    // from, so it would silently swallow the second, unrelated rider too.
+    // `enters_with_counter_carrier_is_only_enters_with_marker` removes only the
+    // carrier's own recognized sentence before re-checking for a residual "enters
+    // with" marker, mirroring the identical technique the sibling Condition_If
+    // detector already uses for this exact carrier shape.
+    if enters_with_counter_carrier_is_only_enters_with_marker(cleaned, evidence) {
         return;
     }
     if evidence.any_static_mode(|m| {
@@ -419,6 +421,54 @@ fn detect_replacement(
         OracleSemanticFeature::Replacement.detector_label(),
         truncate(original, 140),
     ));
+}
+
+/// CR 614.1c: true when the unit's `GraveyardCastPermission`/`ExileCastPermission{
+/// enters_with_counter: Some(_)}` carrier accounts for EVERY "enters with" marker in
+/// the unit — i.e. it is safe to suppress the `Replacement` expectation entirely.
+/// False when a distinct, unrepresented "enters with ..." clause survives after the
+/// carrier's own sentence is removed, even if that clause shares the carrier's source
+/// line (a unit owns every line up to the next item's start, so two "enters with"
+/// sentences CAN legitimately share one unit).
+///
+/// Segmentation delegates to the same `nom_primitives::split_sentence_units` +
+/// `parse_cast_this_way_enters_with_counter` pairing the sibling Condition_If
+/// detector `enters_with_finality_this_way_is_only_if_marker` already uses to scope
+/// this identical carrier shape to its own sentence — the two detectors must not
+/// drift apart on what counts as "the carrier's clause" for the same AST shape.
+/// Unlike that sibling (which re-scans the residual for a bare " if "), this checks
+/// the residual for the SAME "enters with " + trigger-filter marker `detect_replacement`
+/// itself uses, so a genuinely unrepresented "enters with" sentence keeps raising the
+/// diagnostic even when it sits on the carrier's own line.
+fn enters_with_counter_carrier_is_only_enters_with_marker(
+    cleaned: &str,
+    evidence: &UnitEvidence,
+) -> bool {
+    if !evidence.any_static_mode(|mode| {
+        matches!(
+            mode,
+            StaticMode::GraveyardCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            } | StaticMode::ExileCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            }
+        )
+    }) {
+        return false;
+    }
+
+    crate::parser::oracle_nom::primitives::split_sentence_units(cleaned)
+        .into_iter()
+        .filter(|sentence| {
+            crate::parser::oracle_effect::parse_cast_this_way_enters_with_counter(sentence)
+                .is_none()
+        })
+        .all(|sentence| {
+            // allow-noncombinator: swallow detector marker scan on classified text
+            !sentence.contains("enters with ") || enters_with_is_trigger_filter(sentence)
+        })
 }
 
 // ── Detector A: Replacement_Instead ─────────────────────────────────────
@@ -4711,7 +4761,8 @@ mod tests {
 
     use super::{
         any_ability_has_unimplemented, def_tree_has_optional, def_tree_has_unimplemented,
-        effect_has_internal_optionality, trigger_tree_has_optional, twice_is_activation_limit,
+        detect_replacement, effect_has_internal_optionality, trigger_tree_has_optional,
+        twice_is_activation_limit,
     };
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -9230,6 +9281,164 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             replacement_swallows[0].contains("top of your library"), // allow-noncombinator: test assertion on diagnostic output text, not Oracle-text parsing dispatch
             "the swallow must be attributed to the unrepresented clause, not the \
              represented graveyard-cast rider: got {replacement_swallows:?}"
+        );
+    }
+
+    /// Same-UNIT mixed-rider regression (CR 614.1c boundary, maintainer finding on
+    /// PR #7970): the represented carrier and a second, genuinely unrepresented
+    /// "enters with" replacement clause in the SAME audit unit (one `UnitEvidence`,
+    /// one `detect_replacement` call) — the shape the maintainer's finding says the
+    /// existing per-clause test (above, two separate lines / two separate units)
+    /// does not exercise. `evidence.any_static_mode(..)` alone cannot see which
+    /// sentence produced the carrier; a naive unit-wide exemption would suppress
+    /// the `Replacement` diagnostic for the WHOLE unit merely because the carrier
+    /// is present somewhere in it, silently hiding the second, unrelated rider.
+    ///
+    /// Constructed directly against `detect_replacement` (mirroring the
+    /// `no_activation_limit_evidence` / `repeat_for_without_activation_limit_evidence`
+    /// direct-`UnitEvidence` pattern above) rather than through `parse_named`: the
+    /// real front-end recognizes at most one ability grammar per physical source
+    /// line, so two unrelated cast-permission abilities cannot be forced onto one
+    /// line through the public parser entry point. A single `AuditUnit` spanning
+    /// two independent "enters with" clauses is still reachable in production,
+    /// though — `audit_units` (`oracle_ir/feature.rs`) grants a unit every line up
+    /// to the next line that starts a NEW item, so a second, unparseable "enters
+    /// with" line following a cast-permission line on the same card is absorbed
+    /// into the cast-permission's own unit. Driving `detect_replacement` directly
+    /// exercises that exact unit shape without depending on which Oracle-text
+    /// layout produces it.
+    ///
+    /// The second clause deliberately does NOT reuse the "if you cast ... this
+    /// way, it enters with a [counter] counter on it" rider grammar the carrier
+    /// itself is built from (`parse_cast_this_way_enters_with_counter` matches on
+    /// TEXT, not on which static a sentence is actually linked to, so an identical
+    /// second rider sentence would be filtered out of the residual regardless of
+    /// which static it truly belongs to — a pre-existing characteristic shared
+    /// with the sibling `enters_with_finality_this_way_is_only_if_marker` detector
+    /// this fix mirrors, not a new gap this fix introduces). It instead uses CR
+    /// 614.1c's own bare first template ("[This permanent] enters with . . .",
+    /// `docs/MagicCompRules.txt` 3064), which is structurally distinct from the
+    /// rider grammar and has no carrier of any kind in this fixture's evidence.
+    #[test]
+    fn replacement_carrier_scoping_ignores_a_second_enters_with_clause_in_the_same_unit() {
+        use crate::types::ability::{CardPlayMode, StaticDefinition};
+        use crate::types::counter::CounterType;
+        use crate::types::statics::CastFrequency;
+
+        // The represented carrier, built exactly as the real parser builds it for
+        // Hundred-Battle Veteran: `GraveyardCastPermission{enters_with_counter: Some(_)}`.
+        let carrier = StaticDefinition::new(StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: Some(CounterType::Finality),
+        });
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: Vec::new(),
+            triggers: Vec::new(),
+            statics: vec![carrier],
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+
+        // REACH GUARD: the carrier must actually be visible to `evidence.any_static_mode`,
+        // or the suppression this test is probing never engages and the assertion below
+        // would be vacuous.
+        assert!(
+            evidence.any_static_mode(|mode| matches!(
+                mode,
+                StaticMode::GraveyardCastPermission {
+                    enters_with_counter: Some(_),
+                    ..
+                }
+            )),
+            "fixture evidence must expose the GraveyardCastPermission carrier"
+        );
+
+        let cleaned = "you may cast this card from your graveyard. if you do, it enters with \
+                        a finality counter on it. this permanent also enters with a shield \
+                        counter on it.";
+        let mut diagnostics = Vec::new();
+        detect_replacement(cleaned, cleaned, &parsed, &evidence, &mut diagnostics);
+
+        let replacement_swallows: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replacement_swallows.len(),
+            1,
+            "expected exactly one Replacement swallow (the unrepresented bare \"enters with\" \
+             clause sharing the carrier's unit), got {replacement_swallows:?} — a unit-wide \
+             carrier exemption would report zero here"
+        );
+    }
+
+    /// Real-card regression (found while landing the fix above): Undead Sprinter's
+    /// PRINTED Oracle text is self-granting and self-referential — "You may cast
+    /// this card from your graveyard if a non-Zombie creature died this turn. If
+    /// you do, THIS CREATURE enters with a +1/+1 counter on it." — using the
+    /// literal `SELF_REF_TYPE_PHRASES` wording "this creature", never the
+    /// anaphoric "it"/"that creature" forms the other carrier fixtures above use.
+    ///
+    /// `swallow_check`'s audit units are sliced from RAW, un-normalized
+    /// `source_text` (deliberately — see the comment on the CR 614.1c template
+    /// match above: "the unit text carries the card's REAL name, not the
+    /// normalized ~"), so `enters_with_counter_carrier_is_only_enters_with_marker`
+    /// sees "this creature enters with", not the `~`-normalized form the main
+    /// parse pipeline builds the actual `StaticMode` from. The shared
+    /// `parse_cast_this_way_enters_with_counter` recognizer must accept the
+    /// literal "this creature"/"this permanent"/"this artifact" subject forms
+    /// too, or this exact carrier shape regresses to a false-positive
+    /// `Swallow:Replacement` the moment the scoping fix above starts reading
+    /// per-sentence text instead of the old unit-wide `any_static_mode` check
+    /// (caught via `client/public/coverage-data.json` showing Undead Sprinter
+    /// drop to `supported:false` after that change — this test pins the fix at
+    /// the unit level so it can't regress silently again).
+    #[test]
+    fn replacement_carrier_scoping_accepts_the_literal_self_reference_form() {
+        let parsed = parse_named(
+            "Trample, haste\nYou may cast this card from your graveyard if a non-Zombie \
+             creature died this turn. If you do, this creature enters with a +1/+1 counter \
+             on it.",
+            "Undead Sprinter",
+            &["Creature"],
+        );
+
+        let replacement_swallows: Vec<_> = parsed
+            .parse_warnings
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            replacement_swallows.is_empty(),
+            "the literal \"this creature enters with\" self-reference form must be \
+             recognized as the represented CR 614.1c carrier, got {replacement_swallows:?}"
         );
     }
 
