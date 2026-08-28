@@ -9818,10 +9818,15 @@ fn dreadhorde_invasion_upkeep_lose_life_and_amass() {
 ///   Goblins X, where X is that creature's power" — the amass PERFORMER is
 ///   the destroyed creature's controller (`TargetFilter::ParentTargetController`,
 ///   not `Controller`, unlike every other printed "amass [subtype] N" card),
-///   and X reads the destroyed creature's last-known-information power
-///   (`QuantityRef::Power { scope: ObjectScope::CostPaidObject }`, bound via
-///   the chain's `effect_context_object` — the same mechanism Consuming
-///   Vapors's "that creature's toughness" uses).
+///   and X reads that creature's power (`QuantityRef::Power { scope:
+///   ObjectScope::Target }`, bound via the chain's inherited `ability.targets`
+///   — the same referent `ParentTargetController` resolves against). `Target`
+///   reads the object LIVE while it remains on the battlefield (indestructible,
+///   regenerated, or otherwise-prevented destruction) and falls back to its
+///   LKI once it has actually left — unlike `ObjectScope::CostPaidObject`
+///   (Consuming Vapors's "that creature's toughness" class), which only reads
+///   a cost/trigger-condition snapshot that a non-destroyed target never
+///   populates.
 /// - CR 608.2c: "If you controlled that creature, draw a card" — conditional
 ///   on AZOG'S controller (not the amass performer) having controlled the
 ///   destroyed creature; this is pre-existing coverage (`TargetMatchesFilter`
@@ -9880,14 +9885,27 @@ fn azog_morias_ruin_destroy_amass_by_destroyed_controller_conditional_draw() {
             ref player,
         } => {
             assert_eq!(subtype, "Goblin");
+            // CR 608.2c + CR 608.2h: "that creature" anaphors the parent
+            // Destroy's own object target (the same referent
+            // `ParentTargetController` below reads via `ability.targets`),
+            // NOT a cost/trigger-condition snapshot — the destroyed creature
+            // may still be on the battlefield (indestructible, regenerated,
+            // or prevented), in which case there is no destroy/LKI snapshot
+            // to read at all. `ObjectScope::Target` resolves against that
+            // same inherited target: live power while present, LKI power
+            // once the creature has actually left (see
+            // `try_parse_amass`'s `rebind_cost_paid_object_pt_to_target`
+            // call, mirroring Xenagos, God of Revels's identical rebind).
             assert_eq!(
                 *count,
                 QuantityExpr::Ref {
                     qty: QuantityRef::Power {
-                        scope: ObjectScope::CostPaidObject,
+                        scope: ObjectScope::Target,
                     }
                 },
-                "X must bind to the destroyed creature's LKI power, not a bare Variable(\"X\")"
+                "X must bind to the destroyed creature's power, read live \
+                 while present and via LKI once it has left — not a bare \
+                 Variable(\"X\") or an event/cost snapshot that may not exist"
             );
             assert_eq!(
                 *player,
@@ -9896,7 +9914,9 @@ fn azog_morias_ruin_destroy_amass_by_destroyed_controller_conditional_draw() {
                  not Azog's own controller"
             );
         }
-        ref other => panic!("expected Amass{{Goblin, Power{{CostPaidObject}}, ParentTargetController}}, got {other:?}"),
+        ref other => panic!(
+            "expected Amass{{Goblin, Power{{Target}}, ParentTargetController}}, got {other:?}"
+        ),
     }
     assert_eq!(
         amass.condition,

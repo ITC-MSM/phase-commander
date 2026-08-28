@@ -13,7 +13,8 @@ use super::counter::{
 };
 use super::lower::{
     parse_for_each_multiplier_prefix, parse_multi_target_count_expr,
-    parse_where_x_quantity_expression, strip_leading_quantifier, strip_trailing_where_x,
+    parse_where_x_quantity_expression, rebind_cost_paid_object_pt_to_target,
+    strip_leading_quantifier, strip_trailing_where_x,
 };
 use super::mana::{try_parse_activate_only_condition, try_parse_add_mana_effect_with_context};
 use super::token::try_parse_token;
@@ -14117,7 +14118,36 @@ pub(super) fn try_parse_amass(text: &str, lower: &str, player: TargetFilter) -> 
 
     // CR 701.47a: Amass requires an explicit count after the subtype. If it
     // doesn't parse, surface as Unimplemented rather than amassing 1.
-    let count = parse_count_expr(remainder).map(|(q, _)| q)?;
+    let mut count = parse_count_expr(remainder).map(|(q, _)| q)?;
+
+    // CR 608.2c + CR 109.4 + CR 608.2h: when the amass PERFORMER anaphors a
+    // parent target ("its controller amasses ..." — Azog, Moria's Ruin), a
+    // same-clause "that creature's power/toughness" in the count is the SAME
+    // anaphor: the creature named by the parent effect's own object target
+    // (e.g. "destroy up to one other target creature"), not a cost/trigger
+    // referent. The shared where-X/CDA quantity grammar lowers the
+    // context-free phrase to `ObjectScope::CostPaidObject` (its
+    // sacrifice-cost / dies-trigger sense), which reads only
+    // `cost_paid_object` / `effect_context_object` snapshots populated when
+    // the parent effect actually moved the object to a public zone — so an
+    // indestructible/regenerated/prevented creature (never destroyed, no
+    // such snapshot) silently amasses 0 even though it is still sitting
+    // right there on the battlefield. Rebind to `ObjectScope::Target`, which
+    // reads the SAME inherited `ability.targets` slot `ParentTargetController`
+    // already resolves against (see `parent_target_controller`) and reads the
+    // object live while present, falling back to its LKI once it has left
+    // (CR 608.2h) — mirroring the identical rebind
+    // `rebind_cost_paid_object_pt_to_target` already performs for a targeted
+    // continuous grant's "that creature's power" (Xenagos, God of Revels).
+    // Gated on the parent-target player anaphor so a plain "you"/"they"
+    // amass (`player == Controller`, no parent-target dependency) is
+    // untouched.
+    if matches!(
+        player,
+        TargetFilter::ParentTargetController | TargetFilter::ParentTargetOwner
+    ) {
+        rebind_cost_paid_object_pt_to_target(&mut count);
+    }
 
     Some(Effect::Amass {
         subtype,
@@ -17805,6 +17835,19 @@ mod tests {
     /// to whatever `TargetFilter` the subject layer resolved (here
     /// `ParentTargetController`, standing in for "its controller"), instead of
     /// the imperative form's default `Controller`.
+    ///
+    /// CR 608.2c + CR 608.2h (maintainer review, PR #8011): when `player`
+    /// anaphors a parent target, "that creature's power" anaphors the SAME
+    /// parent target (the object the parent effect — e.g. "destroy up to one
+    /// other target creature" — established), not a cost/trigger-condition
+    /// snapshot. The shared where-X/CDA grammar lowers the context-free
+    /// phrase to `ObjectScope::CostPaidObject`; `try_parse_amass` rebinds it
+    /// to `ObjectScope::Target` (`rebind_cost_paid_object_pt_to_target`) so
+    /// the quantity reads the referenced creature LIVE while it remains on
+    /// the battlefield (indestructible, regenerated, or otherwise-prevented
+    /// destruction) and falls back to its LKI only once it has actually
+    /// left — mirroring the identical rebind already applied to Xenagos, God
+    /// of Revels's targeted "+X/+X where X is that creature's power" grant.
     #[test]
     fn parse_amasses_goblins_x_where_x_is_that_creatures_power_with_performer() {
         let result = try_parse_amass(
@@ -17827,11 +17870,52 @@ mod tests {
                     count,
                     QuantityExpr::Ref {
                         qty: QuantityRef::Power {
-                            scope: crate::types::ability::ObjectScope::CostPaidObject,
+                            scope: crate::types::ability::ObjectScope::Target,
                         }
-                    }
+                    },
+                    "X must bind to the parent target's power, read live while \
+                     present and via LKI once it has left — not a cost/trigger \
+                     snapshot that a non-destroyed target never populates"
                 );
                 assert_eq!(player, TargetFilter::ParentTargetController);
+            }
+            other => panic!("Expected Amass, got {other:?}"),
+        }
+    }
+
+    /// CR 701.47a: The plain imperative "amass [subtype] N" form (`player ==
+    /// Controller`, no parent-target dependency) must NOT be touched by the
+    /// `ParentTargetController`/`ParentTargetOwner`-gated rebind above — a
+    /// hypothetical "amass Goblins X, where X is that creature's power" with
+    /// `player: Controller` has no parent target to bind `Target` against, so
+    /// leaving it on the generic `CostPaidObject` (cost/trigger-condition)
+    /// referent is correct here.
+    #[test]
+    fn parse_amass_goblins_x_where_x_is_that_creatures_power_plain_controller_unrebound() {
+        let result = try_parse_amass(
+            "amass Goblins X, where X is that creature's power",
+            "amass goblins x, where x is that creature's power",
+            TargetFilter::Controller,
+        );
+        match result.expect("Should parse 'amass Goblins X, where X is that creature's power'") {
+            Effect::Amass {
+                subtype,
+                count,
+                player,
+            } => {
+                assert_eq!(subtype, "Goblin");
+                assert_eq!(
+                    count,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: crate::types::ability::ObjectScope::CostPaidObject,
+                        }
+                    },
+                    "a plain Controller-performed amass has no parent target to \
+                     rebind against, so the generic CostPaidObject referent \
+                     must survive unrebound"
+                );
+                assert_eq!(player, TargetFilter::Controller);
             }
             other => panic!("Expected Amass, got {other:?}"),
         }
