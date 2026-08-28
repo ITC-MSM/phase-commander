@@ -193,6 +193,7 @@ pub fn cast_paradigm_copy(
     copy_obj.is_token = true;
     copy_obj.tapped = false;
     copy_obj.prepared = None;
+    copy_obj.prepared_copy_source = None;
     // CR 707.10: the paradigm copy is put on the stack without paying mana —
     // reset the cast-payment stamps inherited from the exiled source's cast.
     copy_obj.clear_cast_payment_stamps();

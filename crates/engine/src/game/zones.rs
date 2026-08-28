@@ -191,6 +191,7 @@ pub(crate) fn apply_zone_exit_cleanup(
         // represented on the stack, never to the new object after it leaves.
         if from == Zone::Stack && to != Zone::Stack {
             obj.cast_occurrence = None;
+            obj.prepared_copy_source = None;
         }
     }
     // CR 400.7 + CR 403.4: Activation-use history belongs to the old
@@ -269,6 +270,12 @@ pub(crate) fn apply_zone_exit_cleanup(
     // Immortal / Skullbriar keep their counters on a move to any zone outside
     // their `excluded_zones`; every other object follows the CR 122.2 default.
     let preserve_counters = counters_persist_on_move(state, object_id, to);
+
+    // CR 722.3c: the prepare-face copy remains in exile only while its linked
+    // permanent remains on the battlefield with the prepared designation.
+    if from == Zone::Battlefield {
+        crate::game::effects::prepare::remove_linked_prepared_copy_if_idle(state, object_id);
+    }
 
     if let Some(obj_mut) = state.objects.get_mut(&object_id) {
         // CR 400.7 + CR 614.1a: Rod of Absorption's stack-exile rider is a

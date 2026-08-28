@@ -1118,10 +1118,9 @@ pub struct GameObject {
 
     /// CR 702.xxx: Prepared (Strixhaven) designation. Present only on a
     /// permanent whose printed-card layout is `CardLayout::Prepare(a, b)`.
-    /// While prepared, the controller may activate a synthesized priority-time
-    /// cast-offer that creates a token spell-copy of face `b` on the stack
-    /// (CR 707.10 copy semantics); casting unprepares (reminder text: "Doing
-    /// so unprepares it."). Cleared by `reset_for_battlefield_exit` (CR 400.7 —
+    /// While prepared, its linked face-`b` copy remains in exile and the
+    /// controller may cast it (CR 722.3c); becoming cast unprepares the source.
+    /// Cleared by `reset_for_battlefield_exit` (CR 400.7 —
     /// a permanent that leaves the battlefield becomes a new object with no
     /// memory of its previous existence). `Option<PreparedState>` over a bool
     /// per project idiom (no bool flags). Assign when WotC publishes SOS CR
@@ -1132,6 +1131,12 @@ pub struct GameObject {
         skip_serializing_if = "Option::is_none"
     )]
     pub prepared: Option<PreparedState>,
+
+    /// CR 722.3c: Back-link carried only by the prepare-spell copy created in
+    /// exile when a permanent becomes prepared. This lets the Prepare authority
+    /// retain, cast, and clean up that exact copy without name/card-id guesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_copy_source: Option<ObjectId>,
 
     /// CR 702.171b: Saddled designation. A permanent stays saddled until the end
     /// of the turn or it leaves the battlefield. Not a copiable value — purely
@@ -1496,6 +1501,7 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         monstrous: _,
         harnessed: _,
         prepared: _,
+        prepared_copy_source: _,
         is_saddled: _,
         saddled_by: _,
         assigns_damage_from_toughness: _,
@@ -2427,6 +2433,7 @@ impl GameObject {
             monstrous: false,
             harnessed: false,
             prepared: None,
+            prepared_copy_source: None,
             is_saddled: false,
             saddled_by: Vec::new(),
             assigns_damage_from_toughness: false,
@@ -2571,6 +2578,7 @@ impl GameObject {
         // CR 400.7. A re-entering permanent has no memory of a prior prepared
         // state. Assign when WotC publishes SOS CR update.
         self.prepared = None;
+        self.prepared_copy_source = None;
         self.is_saddled = false;
         self.saddled_by.clear();
         self.paired_with = None;
@@ -2744,6 +2752,7 @@ impl GameObject {
         // re-entering permanent is a new object with no memory of its previous
         // prepared state. Assign when WotC publishes SOS CR update.
         self.prepared = None;
+        self.prepared_copy_source = None;
         // CR 107.3m: The paid-X value is tied to the spell-resolution that brought
         // this permanent to the battlefield. When the permanent leaves, the value
         // is no longer meaningful; a re-cast will re-populate it via `finalize_cast`.
@@ -4290,5 +4299,45 @@ mod tests {
             4,
             "a missing stash falls back to the baseline rather than panicking"
         );
+    }
+
+    #[test]
+    fn prepared_copy_source_serde_defaults_omits_and_round_trips() {
+        let mut object = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Prepare copy".to_string(),
+            Zone::Exile,
+        );
+        let absent = serde_json::to_value(&object).unwrap();
+        assert!(absent.get("prepared_copy_source").is_none());
+
+        let legacy: GameObject = serde_json::from_value(absent).unwrap();
+        assert_eq!(legacy.prepared_copy_source, None);
+
+        object.prepared_copy_source = Some(ObjectId(77));
+        let canonical = serde_json::to_value(&object).unwrap();
+        assert_eq!(canonical["prepared_copy_source"], serde_json::json!(77));
+        let restored: GameObject = serde_json::from_value(canonical).unwrap();
+        assert_eq!(restored.prepared_copy_source, Some(ObjectId(77)));
+    }
+
+    #[test]
+    fn prepared_copy_source_is_non_copiable_zone_bookkeeping() {
+        let mut entering = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Copied permanent".to_string(),
+            Zone::Battlefield,
+        );
+        entering.prepared_copy_source = Some(ObjectId(77));
+        entering.reset_for_battlefield_entry(1, 1);
+        assert_eq!(entering.prepared_copy_source, None);
+
+        entering.prepared_copy_source = Some(ObjectId(77));
+        entering.reset_for_battlefield_exit();
+        assert_eq!(entering.prepared_copy_source, None);
     }
 }

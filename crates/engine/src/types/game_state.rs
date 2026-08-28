@@ -24555,6 +24555,7 @@ pub(crate) fn object_content_eq(x: &GameObject, y: &GameObject) -> bool {
         && x.contraption_sprocket == y.contraption_sprocket
         && x.is_suspected == y.is_suspected // CR 701.60a designation
         && x.prepared == y.prepared // SOS prepare/unprepare toggle
+        && x.prepared_copy_source == y.prepared_copy_source // CR 722.3c linked exile copy
         && x.room_unlocks == y.room_unlocks // CR 709.5c door lock/unlock
         // §5.2c ADD set (v5, S6): firewall-blind per-iteration accumulators on
         // live battlefield/exile objects.

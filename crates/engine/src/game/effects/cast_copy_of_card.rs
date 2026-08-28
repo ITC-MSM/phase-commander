@@ -194,6 +194,7 @@ fn cast_one_copy(
     copy.is_copy = true;
     copy.tapped = false;
     copy.prepared = None;
+    copy.prepared_copy_source = None;
     // CR 707.12: The copy is created in the same zone as the source object before casting.
     copy.cast_from_zone = Some(origin_zone);
     copy.cost_x_paid = None;

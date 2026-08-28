@@ -1,6 +1,5 @@
 use super::super::engine::apply_as_current;
 use super::*;
-use crate::game::casting_costs::stamp_cast_occurrence_on_stack_spell;
 use crate::game::zones;
 use crate::game::zones::create_object;
 use crate::parser::oracle_effect::parse_effect_chain;
@@ -205,33 +204,41 @@ fn same_object_id_recast_receives_a_distinct_cast_occurrence() {
         CardId(68_651),
         PlayerId(0),
         "Recast Spell".to_string(),
-        Zone::Stack,
+        Zone::Hand,
     );
-    state.stack.push_back(StackEntry {
-        id: spell,
-        source_id: spell,
-        controller: PlayerId(0),
-        kind: StackEntryKind::Spell {
-            card_id: CardId(68_651),
-            ability: Some(Box::new(ResolvedAbility::new(
-                Effect::Investigate,
-                Vec::new(),
-                spell,
-                PlayerId(0),
-            ))),
-            casting_variant: CastingVariant::Normal,
-            actual_mana_spent: 0,
-        },
-    });
-    let object = state.objects[&spell].clone();
-    let first =
-        restrictions::record_spell_cast(&mut state, PlayerId(0), &object, CastingVariant::Normal)
-            .expect("first cast records");
-    stamp_cast_occurrence_on_stack_spell(&mut state, spell, first).unwrap();
-    let second =
-        restrictions::record_spell_cast(&mut state, PlayerId(0), &object, CastingVariant::Normal)
-            .expect("recast records");
-    stamp_cast_occurrence_on_stack_spell(&mut state, spell, second).unwrap();
+    {
+        let object = state.objects.get_mut(&spell).unwrap();
+        object.card_types.core_types.push(CoreType::Sorcery);
+        object.mana_cost = ManaCost::zero();
+        Arc::make_mut(&mut object.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Investigate,
+        ));
+    }
+
+    let cast = |state: &mut GameState| {
+        apply_as_current(
+            state,
+            GameAction::CastSpell {
+                object_id: spell,
+                card_id: CardId(68_651),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+        .expect("zero-cost spell finalizes through the production cast path");
+        state.objects[&spell]
+            .cast_occurrence
+            .expect("production finalizer stamps occurrence")
+    };
+
+    let first = cast(&mut state);
+    zones::move_to_zone(&mut state, spell, Zone::Hand, &mut Vec::new());
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(0),
+    };
+    state.priority_player = PlayerId(0);
+    let second = cast(&mut state);
 
     assert_ne!(first, second);
     assert_eq!(first.turn_journal_index, 0);
