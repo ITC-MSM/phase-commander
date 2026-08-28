@@ -95,6 +95,8 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  34 — Resolution-time optional fixed sacrifice payments add a typed
+ *       replacement-resumable continuation to GameState.
  *  33 — Resolution-time optional PayCost(OneOf) branch choice added a
  *       serialized WaitingFor/GameAction pair.
  *  32 — FormatConfig.deck_size changed from a bare u16 to the adjacently
@@ -197,7 +199,7 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *       sub-phase on WaitingFor::MulliganDecision; the MulliganBottomCards
  *       variant was removed
  */
-export const WIRE_PROTOCOL_VERSION = 33 as const;
+export const WIRE_PROTOCOL_VERSION = 34 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

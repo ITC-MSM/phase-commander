@@ -1930,12 +1930,14 @@ pub(crate) fn can_pay(
 /// A shape outside this set has no resolution-time payment arm: at resolution
 /// there is no interactive `WaitingFor` interceptor and no activation-window
 /// mana detour, so executing such an arm would either silently report a no-op
-/// cost as `Paid` (`Waterbend`, `ExileMaterials`, non-self `Sacrifice`, targeted
-/// `RemoveCounter`) or perform an effect that was never meant to fire at
+/// cost as `Paid` (`Waterbend`, `ExileMaterials`, targeted `RemoveCounter`) or
+/// perform an effect that was never meant to fire at
 /// resolution (singleton `Tap`, self-ref `Sacrifice`/`Exile`, `Loyalty`,
 /// `RemoveCounter { target: None }`, `Exert`, `Unattach`, arbitrary `EffectCost`,
 /// source-card `Discard`). Both outcomes violate CR 118.3 / CR 601.2h, so the
-/// guard refuses them with `Failed`.
+/// guard refuses them with `Failed`. Fixed non-self sacrifice is deliberately
+/// absent: the optional-branch selector intercepts it before this executor and
+/// rewrites the completed frame to an empty prepaid composite.
 pub(crate) fn supported_at_resolution(cost: &AbilityCost) -> bool {
     use crate::types::ability::{CardSelectionMode, DiscardSelfScope};
     match cost {
@@ -1966,10 +1968,10 @@ pub(crate) fn supported_at_resolution(cost: &AbilityCost) -> bool {
         // payment effects that the authority resolves directly.
         AbilityCost::EffectCost { .. } if cost.supports_effect_cost_payment() => true,
         AbilityCost::Discard { .. }
+        | AbilityCost::Sacrifice(_)
         | AbilityCost::Tap
         | AbilityCost::Untap
         | AbilityCost::Loyalty { .. }
-        | AbilityCost::Sacrifice(_)
         | AbilityCost::Exile { .. }
         | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
@@ -2303,6 +2305,22 @@ fn can_pay_resolution(
                 }
             }
         }
+        // CR 118.3: fixed non-self sacrifice is payable only when the complete
+        // controlled matching set can be selected at resolution.
+        AbilityCost::Sacrifice(cost)
+            if !matches!(cost.target, TargetFilter::SelfRef)
+                && cost.requirement.fixed_count().is_some() =>
+        {
+            let eligible = super::casting::find_eligible_sacrifice_targets(
+                state,
+                payer,
+                ability.source_id,
+                &cost.target,
+            );
+            cost.requirement
+                .fixed_count()
+                .is_some_and(|count| eligible.len() >= count as usize)
+        }
         // CR 117 + CR 118.3: Composite is payable iff every sub-cost is payable.
         AbilityCost::Composite { costs } => costs
             .iter()
@@ -2391,6 +2409,12 @@ mod tests {
     use crate::types::mana::ManaCost;
 
     const P0: PlayerId = PlayerId(0);
+
+    #[test]
+    fn direct_resolution_executor_does_not_support_non_self_sacrifice() {
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 1));
+        assert!(!supported_at_resolution(&cost));
+    }
 
     /// Build one representative value for EVERY `AbilityCost` variant via an
     /// exhaustive `match` over a tag enum. The `match` has no wildcard, so a new

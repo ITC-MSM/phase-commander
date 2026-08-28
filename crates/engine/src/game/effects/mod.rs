@@ -7266,10 +7266,18 @@ pub(crate) fn resolution_optional_payment_options(
                     zone: Some(_),
                     filter,
                 } => *count > 0 && matches!(filter, None | Some(TargetFilter::Typed(_))),
+                AbilityCost::Sacrifice(cost) => {
+                    !matches!(cost.target, TargetFilter::SelfRef)
+                        && cost
+                            .requirement
+                            .fixed_count()
+                            .is_some_and(|count| count > 0)
+                }
                 _ => false,
             };
+            let intercepted_sacrifice = matches!(cost, AbilityCost::Sacrifice(_));
             direct
-                && crate::game::costs::supported_at_resolution(cost)
+                && (intercepted_sacrifice || crate::game::costs::supported_at_resolution(cost))
                 && crate::game::costs::can_pay(state, payer, ability.source_id, cost, &scope)
         })
         .map(|(index, cost)| ResolutionOptionalPaymentOption {

@@ -203,6 +203,8 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 44 — Resolution-time optional fixed sacrifice payments add a typed
+ *      replacement-resumable continuation to GameState.
  * 43 — Resolution-time optional PayCost(OneOf) branch choice added a
  *      serialized WaitingFor/GameAction pair.
  * 42 — FormatConfig.deck_size changed from a bare u16 to the adjacently
@@ -326,7 +328,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 43;
+export const PROTOCOL_VERSION = 44;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -2,8 +2,9 @@ use std::collections::HashSet;
 
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    ActiveSearchDecisionAuthority, CollectEvidenceResume, DeferredLifeCostResume, GameState,
-    PendingCast, PendingCostMoveResume, WaitingFor,
+    ActiveSearchDecisionAuthority, CollectEvidenceResume, CostResume, DeferredLifeCostResume,
+    GameState, PayCostKind, PendingCast, PendingCostMoveResume, PendingSacrificeCostCompletion,
+    WaitingFor,
 };
 use crate::types::identifiers::ObjectIncarnationRef;
 use crate::types::match_config::MatchPhase;
@@ -71,10 +72,11 @@ fn abandon_pending_spell_casts(
             PendingCostMoveResume::Cast {
                 pending: Some(pending),
                 ..
-            }
-            | PendingCostMoveResume::SacrificeForCost { pending, .. } => {
-                is_abandoned_spell(state, departing_player, spell_ids, pending)
-            }
+            } => is_abandoned_spell(state, departing_player, spell_ids, pending),
+            PendingCostMoveResume::SacrificeForCost {
+                pending: Some(pending),
+                ..
+            } => is_abandoned_spell(state, departing_player, spell_ids, pending),
             PendingCostMoveResume::CollectEvidencePayment { resume, .. } => matches!(
                 resume.as_ref(),
                 CollectEvidenceResume::Casting { pending_cast, .. }
@@ -84,6 +86,7 @@ fn abandon_pending_spell_casts(
                 is_abandoned_spell(state, departing_player, spell_ids, pending)
             }
             PendingCostMoveResume::Cast { pending: None, .. }
+            | PendingCostMoveResume::SacrificeForCost { pending: None, .. }
             | PendingCostMoveResume::WardSacrificePayment { .. }
             | PendingCostMoveResume::ReplacementMayCost { .. }
             | PendingCostMoveResume::Foretell { .. }
@@ -108,6 +111,50 @@ fn abandon_pending_spell_casts(
     {
         state.pending_discard_for_cost = None;
     }
+}
+
+/// CR 800.4a + CR 118.3: a departed payer cannot finish a resolving optional
+/// sacrifice payment. Remove its sole authoritative root at either selection
+/// or replacement-pause time; an unrelated departure leaves the root intact.
+fn abandon_resolution_optional_sacrifice_for_departures(
+    state: &mut GameState,
+    leaving_set: &HashSet<PlayerId>,
+) {
+    let selecting_payer = match &state.waiting_for {
+        WaitingFor::PayCost {
+            player,
+            kind: PayCostKind::Sacrifice,
+            resume: CostResume::Resolution,
+            ..
+        } => Some(*player),
+        _ => None,
+    };
+    let parked_payer = match state.pending_cost_move_resume.as_ref() {
+        Some(PendingCostMoveResume::SacrificeForCost {
+            player,
+            pending: None,
+            completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment { .. },
+            ..
+        }) => Some(*player),
+        _ => None,
+    };
+    let Some(payer) = selecting_payer.or(parked_payer) else {
+        return;
+    };
+    if !leaving_set.contains(&payer) {
+        return;
+    }
+
+    if selecting_payer.is_some() {
+        let _ = state.take_active_optional_effect_frame();
+    }
+    state.pending_cost_move_resume = None;
+    state.pending_replacement = None;
+    state.replacement_may_cost_paused = false;
+    super::replacement::abandon_post_replacement_continuation(state);
+    state.waiting_for = WaitingFor::Priority {
+        player: state.active_player,
+    };
 }
 
 /// Eliminate a player from the game per CR 800.4.
@@ -152,6 +199,8 @@ pub fn eliminate_players_simultaneously(
             }
         }
     }
+
+    abandon_resolution_optional_sacrifice_for_departures(state, &leaving_set);
 
     let interrupted_ordinary_search = state
         .pending_scoped_library_search

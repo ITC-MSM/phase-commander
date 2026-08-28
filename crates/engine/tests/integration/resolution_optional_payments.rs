@@ -1,17 +1,19 @@
 use engine::game::effects::resolve_ability_chain;
+use engine::game::elimination::eliminate_player;
 use engine::game::engine::apply;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::zones::move_to_zone;
 use engine::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, CardSelectionMode,
     DiscardSelfScope, Effect, QuantityExpr, ReplacementDefinition, ReplacementMode,
-    ResolvedAbility, TargetFilter,
+    ResolvedAbility, SacrificeCost, TargetFilter,
 };
 use engine::types::actions::{GameAction, ResolutionOptionalPaymentChoice};
 use engine::types::game_state::{LoopDetectSample, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
@@ -82,6 +84,59 @@ fn optional_graveyard_exile_replacement() -> ReplacementDefinition {
                 face_down_profile: None,
             },
         ))
+}
+
+fn optional_graveyard_prevention() -> ReplacementDefinition {
+    ReplacementDefinition::new(ReplacementEvent::Moved)
+        .destination_zone(Zone::Graveyard)
+        .mode(ReplacementMode::Optional { decline: None })
+        .execute(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                enters_modified_if: None,
+                face_down_profile: None,
+            },
+        ))
+}
+
+fn sacrifice(count: u32) -> AbilityCost {
+    AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, count))
+}
+
+#[test]
+fn direct_resolution_paycost_cannot_silently_prepaid_non_self_sacrifice() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_creature(P0, "Direct Payment Source", 1, 1)
+        .id();
+    let fodder = scenario.add_creature(P0, "Direct Fodder", 1, 1).id();
+    let mut runner = scenario.build();
+    let mut hostile = optional_payment(source, vec![sacrifice(1)]);
+    hostile.optional = false;
+    let Effect::PayCost {
+        cost: hostile_cost, ..
+    } = &mut hostile.effect
+    else {
+        unreachable!();
+    };
+    *hostile_cost = sacrifice(1);
+
+    resolve_ability_chain(runner.state_mut(), &hostile, &mut Vec::new(), 0).unwrap();
+    assert_eq!(runner.state().objects[&source].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&fodder].zone, Zone::Battlefield);
+    assert_eq!(runner.state().players[P0.0 as usize].life, 20);
 }
 
 #[test]
@@ -495,4 +550,442 @@ fn resolution_optional_oneof_routes_mana_through_existing_payment() {
     let after = serde_json::to_string(runner.state()).unwrap();
     assert!(apply(runner.state_mut(), P0, pay).is_err());
     assert_eq!(serde_json::to_string(runner.state()).unwrap(), after);
+}
+
+#[test]
+fn resolution_optional_oneof_routes_fixed_sacrifice_through_existing_cursor() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let first = scenario.add_creature(P0, "First Fodder", 1, 1).id();
+    let second = scenario.add_creature(P0, "Second Fodder", 1, 1).id();
+    let opponent = scenario.add_creature(P1, "Opponent Fodder", 1, 1).id();
+    let mut runner = scenario.build();
+    let life = runner.state().players[P0.0 as usize].life;
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(2)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    let WaitingFor::PayCost {
+        player,
+        choices,
+        count,
+        min_count,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!("fixed sacrifice must surface the canonical PayCost selector");
+    };
+    assert_eq!((*player, *count, *min_count), (P0, 2, 2));
+    assert!(choices.contains(&first) && choices.contains(&second));
+    assert!(!choices.contains(&opponent));
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![first, second],
+        },
+    )
+    .unwrap();
+    assert_eq!(runner.state().objects[&first].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&second].zone, Zone::Graveyard);
+    assert!(runner
+        .state()
+        .zone_changes_this_turn
+        .iter()
+        .any(|record| record.object_id == first && record.co_departed == vec![second]));
+    assert!(runner
+        .state()
+        .zone_changes_this_turn
+        .iter()
+        .any(|record| record.object_id == second && record.co_departed == vec![first]));
+    assert_eq!(runner.state().players[P0.0 as usize].life, life + 3);
+}
+
+#[test]
+fn resolution_optional_sacrifice_rejects_stale_control_before_performed_latch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let fodder = scenario.add_creature(P0, "Fodder", 1, 1).id();
+    let mut runner = scenario.build();
+    let life = runner.state().players[P0.0 as usize].life;
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(1)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&fodder)
+        .unwrap()
+        .controller = P1;
+    let before = serde_json::to_string(runner.state()).unwrap();
+    assert!(apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![fodder]
+        },
+    )
+    .is_err());
+    assert_eq!(serde_json::to_string(runner.state()).unwrap(), before);
+    assert_eq!(runner.state().players[P0.0 as usize].life, life);
+    assert!(runner.state().active_optional_effect_frame().is_some());
+}
+
+#[test]
+fn resolution_optional_sacrifice_replacement_redirect_still_counts_paid() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let fodder = scenario.add_creature(P0, "Fodder", 1, 1).id();
+    scenario
+        .add_creature(P1, "Graveyard Warden", 1, 1)
+        .with_replacement_definition(optional_graveyard_exile_replacement());
+    let mut runner = scenario.build();
+    let life = runner.state().players[P0.0 as usize].life;
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(1)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![fodder],
+        },
+    )
+    .unwrap();
+    let WaitingFor::ReplacementChoice { candidates, .. } = &runner.state().waiting_for else {
+        panic!("sacrifice payment must park on the existing replacement cursor");
+    };
+    assert!(matches!(
+        runner.state().pending_cost_move_resume,
+        Some(engine::types::game_state::PendingCostMoveResume::SacrificeForCost {
+            pending: None,
+            completion: engine::types::game_state::PendingSacrificeCostCompletion::ResolutionOptionalPayment { .. },
+            ..
+        })
+    ));
+    let accept = candidates
+        .iter()
+        .position(|candidate| candidate.description == "Accept")
+        .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement { index: accept },
+    )
+    .unwrap();
+    assert_eq!(runner.state().objects[&fodder].zone, Zone::Exile);
+    assert_eq!(runner.state().players[P0.0 as usize].life, life + 3);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+}
+
+#[test]
+fn replacement_paused_resolution_sacrifice_stamps_the_full_selected_batch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let redirected = scenario
+        .add_creature(P0, "Redirected Fodder", 1, 1)
+        .with_replacement_definition(optional_graveyard_exile_replacement())
+        .id();
+    let ordinary = scenario.add_creature(P0, "Ordinary Fodder", 1, 1).id();
+    let mut runner = scenario.build();
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(2)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![redirected, ordinary],
+        },
+    )
+    .unwrap();
+    let WaitingFor::ReplacementChoice { candidates, .. } = &runner.state().waiting_for else {
+        panic!("first selected sacrifice must pause on replacement");
+    };
+    let accept = candidates
+        .iter()
+        .position(|candidate| candidate.description == "Accept")
+        .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement { index: accept },
+    )
+    .unwrap();
+    assert_eq!(runner.state().objects[&redirected].zone, Zone::Exile);
+    assert_eq!(runner.state().objects[&ordinary].zone, Zone::Graveyard);
+    assert!(runner
+        .state()
+        .zone_changes_this_turn
+        .iter()
+        .any(|record| record.object_id == redirected && record.co_departed == vec![ordinary]));
+    assert!(runner
+        .state()
+        .zone_changes_this_turn
+        .iter()
+        .any(|record| record.object_id == ordinary && record.co_departed == vec![redirected]));
+    assert_eq!(runner.state().players[P0.0 as usize].life, 23);
+}
+
+#[test]
+fn serialized_replacement_pause_rejects_same_id_new_incarnation_suffix() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let first = scenario
+        .add_creature(P0, "Replacement Fodder", 1, 1)
+        .with_replacement_definition(optional_graveyard_exile_replacement())
+        .id();
+    let stale = scenario.add_creature(P0, "Stale Fodder", 1, 1).id();
+    let mut runner = scenario.build();
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(2)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![first, stale],
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+
+    let wire = serde_json::to_string(runner.state()).unwrap();
+    *runner.state_mut() = serde_json::from_str(&wire).unwrap();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&stale)
+        .unwrap()
+        .incarnation += 1;
+    let stale_incarnation = runner.state().objects[&stale].incarnation;
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement { index: 0 },
+    )
+    .unwrap();
+
+    assert_eq!(runner.state().objects[&first].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&stale].zone, Zone::Battlefield);
+    assert_eq!(
+        runner.state().objects[&stale].incarnation,
+        stale_incarnation
+    );
+    assert_eq!(runner.state().players[P0.0 as usize].life, 20);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().pending_replacement.is_none());
+    assert!(!matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+}
+
+#[test]
+fn resolution_optional_sacrifice_prevented_move_still_counts_paid() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let fodder = scenario
+        .add_creature(P0, "Protected Fodder", 1, 1)
+        .with_replacement_definition(optional_graveyard_prevention())
+        .id();
+    let mut runner = scenario.build();
+    let life = runner.state().players[P0.0 as usize].life;
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(1)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![fodder],
+        },
+    )
+    .unwrap();
+    let WaitingFor::ReplacementChoice { candidates, .. } = &runner.state().waiting_for else {
+        panic!("preventing replacement must pause sacrifice payment");
+    };
+    let accept = candidates
+        .iter()
+        .position(|candidate| candidate.description == "Accept")
+        .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseReplacement { index: accept },
+    )
+    .unwrap();
+    assert_eq!(runner.state().objects[&fodder].zone, Zone::Battlefield);
+    assert_eq!(runner.state().players[P0.0 as usize].life, life + 3);
+}
+
+#[test]
+fn eliminated_resolution_sacrifice_payer_clears_root_without_payoff() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let fodder = scenario.add_creature(P0, "Fodder", 1, 1).id();
+    scenario
+        .add_creature(P1, "Graveyard Warden", 1, 1)
+        .with_replacement_definition(optional_graveyard_exile_replacement());
+    let mut runner = scenario.build();
+    let life = runner.state().players[P0.0 as usize].life;
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(1)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![fodder],
+        },
+    )
+    .unwrap();
+    assert!(runner.state().pending_replacement.is_some());
+    assert!(runner.state().pending_cost_move_resume.is_some());
+    eliminate_player(runner.state_mut(), P0, &mut Vec::new());
+    assert!(runner.state().active_optional_effect_frame().is_none());
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().pending_replacement.is_none());
+    assert_eq!(runner.state().players[P0.0 as usize].life, life);
+    assert!(!matches!(
+        runner.state().waiting_for,
+        WaitingFor::PayCost { .. }
+    ));
+}
+
+#[test]
+fn unrelated_elimination_preserves_resolution_sacrifice_root() {
+    let p2 = PlayerId(2);
+    let mut scenario = GameScenario::new_n_player(3, 42);
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario.add_creature(P0, "Payment Source", 1, 1).id();
+    let fodder = scenario.add_creature(P0, "Fodder", 1, 1).id();
+    let mut runner = scenario.build();
+    resolve_ability_chain(
+        runner.state_mut(),
+        &optional_payment(source, vec![sacrifice(1)]),
+        &mut Vec::new(),
+        0,
+    )
+    .unwrap();
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::ChooseResolutionOptionalPaymentBranch {
+            choice: ResolutionOptionalPaymentChoice::Pay { index: 0 },
+        },
+    )
+    .unwrap();
+    eliminate_player(runner.state_mut(), p2, &mut Vec::new());
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::PayCost {
+            player: P0,
+            kind: engine::types::game_state::PayCostKind::Sacrifice,
+            ..
+        }
+    ));
+    assert!(runner.state().active_optional_effect_frame().is_some());
+    apply(
+        runner.state_mut(),
+        P0,
+        GameAction::SelectCards {
+            cards: vec![fodder],
+        },
+    )
+    .unwrap();
+    assert_eq!(runner.state().players[P0.0 as usize].life, 23);
 }

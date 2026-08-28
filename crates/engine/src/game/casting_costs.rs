@@ -20,7 +20,7 @@ use crate::types::game_state::{
     PendingCostMoveResume, PendingDiscardForCostResume, PendingSacrificeCostCompletion,
     SpellCostSource, StackEntry, StackEntryKind, StackPaidSnapshot, WaitingFor,
 };
-use crate::types::identifiers::{CardId, ObjectId};
+use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
 use crate::types::keywords::{GiftKind, Keyword};
 use crate::types::mana::{ManaCost, ManaCostShard, ManaType, PaymentContext};
 use crate::types::player::PlayerId;
@@ -2676,6 +2676,67 @@ fn record_sacrifice_cost_departure_records(
     }
 }
 
+fn sacrifice_selection_member_is_current(
+    state: &GameState,
+    completion: &PendingSacrificeCostCompletion,
+    index: usize,
+    object_id: ObjectId,
+) -> bool {
+    match completion {
+        PendingSacrificeCostCompletion::ResolutionOptionalPayment { selected, .. } => {
+            selected.get(index).is_some_and(|expected| {
+                expected.object_id == object_id
+                    && state.objects.get(&object_id).is_some_and(|object| {
+                        ObjectIncarnationRef::from_object(object) == *expected
+                    })
+            })
+        }
+        PendingSacrificeCostCompletion::SelectedNonSelf
+        | PendingSacrificeCostCompletion::SelfRef => true,
+    }
+}
+
+/// A serialized replacement prompt can outlive the selected permanent's zone
+/// incarnation. Fail closed before the replacement action can apply to a new
+/// object reusing the same ObjectId, and discard the optional payoff tail.
+pub(crate) fn abandon_stale_resolution_sacrifice_cursor(
+    state: &mut GameState,
+) -> Option<WaitingFor> {
+    let stale = match state.pending_cost_move_resume.as_ref() {
+        Some(PendingCostMoveResume::SacrificeForCost {
+            pending: None,
+            chosen,
+            paused_at_index,
+            completion,
+            ..
+        }) if matches!(
+            completion,
+            PendingSacrificeCostCompletion::ResolutionOptionalPayment { .. }
+        ) =>
+        {
+            chosen
+                .iter()
+                .enumerate()
+                .skip(*paused_at_index)
+                .any(|(index, id)| {
+                    !sacrifice_selection_member_is_current(state, completion, index, *id)
+                })
+        }
+        _ => false,
+    };
+    if !stale {
+        return None;
+    }
+    state.pending_cost_move_resume = None;
+    state.pending_replacement = None;
+    state.replacement_may_cost_paused = false;
+    super::replacement::abandon_post_replacement_continuation(state);
+    state.waiting_for = WaitingFor::Priority {
+        player: state.active_player,
+    };
+    Some(state.waiting_for.clone())
+}
+
 /// CR 601.2h + CR 602.2b + CR 616.1: Park one selected sacrifice component
 /// without exposing a partial event group to trigger collection. The currently
 /// paused object is delivered or prevented by the replacement action; the
@@ -2684,7 +2745,7 @@ fn record_sacrifice_cost_departure_records(
 fn pause_sacrifice_for_cost(
     state: &mut GameState,
     player: PlayerId,
-    pending: PendingCast,
+    pending: Option<PendingCast>,
     chosen: Vec<ObjectId>,
     paused_at_index: usize,
     completion: PendingSacrificeCostCompletion,
@@ -2702,7 +2763,7 @@ fn pause_sacrifice_for_cost(
     deferred_cost_events.extend_from_slice(&events[cost_event_start..]);
     state.pending_cost_move_resume = Some(PendingCostMoveResume::SacrificeForCost {
         player,
-        pending: Box::new(pending),
+        pending: pending.map(Box::new),
         chosen,
         paused_at_index,
         completion,
@@ -2724,13 +2785,15 @@ fn pause_sacrifice_for_cost(
 /// pipeline cannot collect the same events again.
 fn settle_sacrifice_for_cost_events(
     state: &mut GameState,
-    pending: &mut PendingCast,
+    pending: Option<&mut PendingCast>,
     deferred_cost_events: Vec<GameEvent>,
     events: &[GameEvent],
     current_start: usize,
     current_end: usize,
 ) {
-    if let Some(collection) = pending.activation_trigger_collection.as_mut() {
+    if let Some(collection) =
+        pending.and_then(|pending| pending.activation_trigger_collection.as_mut())
+    {
         // Earlier action fragments carry no ordinal in THIS buffer, so the
         // consumed journal — whose ordinals are absolute within the current
         // action — must not be applied to them. The queued-context witness is
@@ -2814,7 +2877,7 @@ fn settle_sacrifice_for_cost_events(
 fn finish_sacrifice_for_cost(
     state: &mut GameState,
     player: PlayerId,
-    mut pending: PendingCast,
+    mut pending: Option<PendingCast>,
     chosen: &[ObjectId],
     completion: PendingSacrificeCostCompletion,
     mut deferred_cost_events: Vec<GameEvent>,
@@ -2841,24 +2904,52 @@ fn finish_sacrifice_for_cost(
     // before a later cast/activation prompt can hide this action's event span.
     settle_sacrifice_for_cost_events(
         state,
-        &mut pending,
+        pending.as_mut(),
         deferred_cost_events,
         events,
         current_start,
         current_end,
     );
 
-    if pending.activation_ability_index.is_some() {
-        pending.mark_activation_cost_committed();
-        if matches!(completion, PendingSacrificeCostCompletion::SelectedNonSelf) {
-            pending.activation_cost = pending
-                .activation_cost
-                .take()
-                .and_then(super::casting::remove_selected_non_self_sacrifice_cost);
+    if let Some(pending) = pending.as_mut() {
+        if pending.activation_ability_index.is_some() {
+            pending.mark_activation_cost_committed();
+            if matches!(completion, PendingSacrificeCostCompletion::SelectedNonSelf) {
+                pending.activation_cost = pending
+                    .activation_cost
+                    .take()
+                    .and_then(super::casting::remove_selected_non_self_sacrifice_cost);
+            }
         }
     }
 
-    let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
+    let waiting_for = match (pending, completion) {
+        (
+            Some(pending),
+            PendingSacrificeCostCompletion::SelectedNonSelf
+            | PendingSacrificeCostCompletion::SelfRef,
+        ) => finish_pending_cost_or_cast(state, player, pending, events)?,
+        (None, PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. }) => {
+            let mut frame = *frame;
+            let Effect::PayCost { cost, .. } = &mut frame.ability.effect else {
+                return Err(EngineError::InvalidAction(
+                    "resolution sacrifice completion lost its PayCost root".into(),
+                ));
+            };
+            // The selected sacrifice has already been fully committed through
+            // this cursor. Resume the optional resolver with an explicit prepaid
+            // no-op, never by globally teaching the direct executor to accept a
+            // non-self sacrifice that it does not itself perform.
+            *cost = AbilityCost::Composite { costs: Vec::new() };
+            state.push_optional_effect_frame(frame);
+            super::engine_payment_choices::handle_optional_effect_choice(state, true, events)?
+        }
+        _ => {
+            return Err(EngineError::InvalidAction(
+                "sacrifice payment completion does not match its root".into(),
+            ));
+        }
+    };
     // CR 602.2b + CR 603.3b: The replacement-resumed sacrifice can itself
     // reach a later payment prompt. Park this action's final event fragment in
     // the same activation-local transaction as the earlier fragments.
@@ -2888,6 +2979,15 @@ pub(crate) fn resume_sacrifice_for_cost(
     };
 
     for index in paused_at_index + 1..chosen.len() {
+        if !sacrifice_selection_member_is_current(state, &completion, index, chosen[index]) {
+            state.pending_replacement = None;
+            state.replacement_may_cost_paused = false;
+            super::replacement::abandon_post_replacement_continuation(state);
+            state.waiting_for = WaitingFor::Priority {
+                player: state.active_player,
+            };
+            return Ok(state.waiting_for.clone());
+        }
         match super::sacrifice::sacrifice_permanent(state, chosen[index], player, events)
             .map_err(|error| EngineError::InvalidAction(error.to_string()))?
         {
@@ -2896,7 +2996,7 @@ pub(crate) fn resume_sacrifice_for_cost(
                 return Ok(pause_sacrifice_for_cost(
                     state,
                     player,
-                    *pending,
+                    pending.map(|pending| *pending),
                     chosen,
                     index,
                     completion,
@@ -2913,7 +3013,7 @@ pub(crate) fn resume_sacrifice_for_cost(
     finish_sacrifice_for_cost(
         state,
         player,
-        *pending,
+        pending.map(|pending| *pending),
         &chosen,
         completion,
         deferred_cost_events,
@@ -3100,7 +3200,7 @@ pub(crate) fn handle_sacrifice_for_cost(
                 return Ok(pause_sacrifice_for_cost(
                     state,
                     player,
-                    pending,
+                    Some(pending),
                     chosen.to_vec(),
                     index,
                     PendingSacrificeCostCompletion::SelectedNonSelf,
@@ -3138,6 +3238,118 @@ pub(crate) fn handle_sacrifice_for_cost(
         &waiting_for,
     );
     Ok(waiting_for)
+}
+
+/// CR 118.3 + CR 118.11-12: commit a fixed, non-self sacrifice selected while
+/// a root optional PayCost ability is resolving. The live controlled set is
+/// recomputed before the optional frame is consumed, so a stale prompt cannot
+/// latch the "if you do" branch. Once committed, the ordinary sacrifice-cost
+/// cursor owns replacement pauses, simultaneous stamping, and trigger settling.
+pub(crate) fn handle_resolution_optional_sacrifice_for_cost(
+    state: &mut GameState,
+    player: PlayerId,
+    advertised_choices: &[ObjectId],
+    chosen: &[ObjectId],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    let frame = state
+        .active_optional_effect_frame()
+        .ok_or_else(|| EngineError::InvalidAction("optional payment frame is missing".into()))?;
+    let Effect::PayCost {
+        cost: AbilityCost::Sacrifice(cost),
+        ..
+    } = &frame.ability.effect
+    else {
+        return Err(EngineError::InvalidAction(
+            "optional payment root is not a sacrifice cost".into(),
+        ));
+    };
+    let count = cost.requirement.fixed_count().ok_or_else(|| {
+        EngineError::InvalidAction("resolution sacrifice cost is not fixed".into())
+    })? as usize;
+    if matches!(cost.target, TargetFilter::SelfRef) {
+        return Err(EngineError::InvalidAction(
+            "self sacrifice is not a selectable resolution cost".into(),
+        ));
+    }
+    let live = super::casting::find_eligible_sacrifice_targets(
+        state,
+        player,
+        frame.ability.source_id,
+        &cost.target,
+    );
+    if live.len() != advertised_choices.len()
+        || live.iter().any(|id| !advertised_choices.contains(id))
+    {
+        return Err(EngineError::InvalidAction(
+            "sacrifice payment choices are stale".into(),
+        ));
+    }
+    if chosen.len() != count
+        || chosen
+            .iter()
+            .enumerate()
+            .any(|(index, id)| chosen[index + 1..].contains(id) || !live.contains(id))
+    {
+        return Err(EngineError::InvalidAction(
+            "selected permanents do not fully pay the sacrifice cost".into(),
+        ));
+    }
+    let selected = chosen
+        .iter()
+        .map(|id| {
+            state
+                .objects
+                .get(id)
+                .map(ObjectIncarnationRef::from_object)
+                .ok_or_else(|| EngineError::InvalidAction("selected permanent is stale".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // This is the performed-latch boundary: every authority check above has
+    // succeeded, and only now may the optional root leave the resolution stack.
+    let frame = state
+        .take_active_optional_effect_frame()
+        .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+        .ok_or_else(|| EngineError::InvalidAction("optional payment frame is missing".into()))?;
+    let completion = PendingSacrificeCostCompletion::ResolutionOptionalPayment {
+        frame: Box::new(frame),
+        selected,
+    };
+    let cost_event_start = events.len();
+    for (index, &id) in chosen.iter().enumerate() {
+        match super::sacrifice::sacrifice_permanent(state, id, player, events)
+            .map_err(|error| EngineError::InvalidAction(error.to_string()))?
+        {
+            super::sacrifice::SacrificeOutcome::Complete => {}
+            super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(choice_player) => {
+                return Ok(pause_sacrifice_for_cost(
+                    state,
+                    player,
+                    None,
+                    chosen.to_vec(),
+                    index,
+                    completion,
+                    Vec::new(),
+                    Vec::new(),
+                    events,
+                    cost_event_start,
+                    choice_player,
+                ));
+            }
+        }
+    }
+    finish_sacrifice_for_cost(
+        state,
+        player,
+        None,
+        chosen,
+        completion,
+        Vec::new(),
+        Vec::new(),
+        events,
+        cost_event_start,
+    )
 }
 
 /// CR 701.3d + CR 608.2k + CR 601.2d: Complete a non-self `UnattachFrom` cost
@@ -7384,7 +7596,7 @@ fn pay_additional_cost_with_source(
                         return Ok(pause_sacrifice_for_cost(
                             state,
                             player,
-                            pending,
+                            Some(pending),
                             vec![object_id],
                             0,
                             PendingSacrificeCostCompletion::SelfRef,
