@@ -10339,6 +10339,7 @@ fn effect_chain_lose_life_and_amass_keeps_both_clauses() {
         Effect::Amass {
             ref subtype,
             ref count,
+            ..
         } => {
             assert_eq!(subtype, "Zombie");
             assert!(
