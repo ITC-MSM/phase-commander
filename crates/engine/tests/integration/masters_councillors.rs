@@ -64,27 +64,60 @@ fn graveyard_len(runner: &GameRunner, player: PlayerId) -> usize {
     runner.state().players[player.0 as usize].graveyard.len()
 }
 
-/// Add `count` generic, ruleless cards directly to `player`'s graveyard
-/// (mirrors `GameScenario::with_graveyard`, but usable post-`build()` so the
-/// census can be grown incrementally across assertions on one board).
-fn add_graveyard_cards(runner: &mut GameRunner, player: PlayerId, count: usize, label: &str) {
+/// Move `count` generic, ruleless cards into `player`'s graveyard through the
+/// REAL zone-move pipeline (`zones::move_to_zone`), mirroring an ordinary
+/// discard/mill rather than seeding the destination zone directly. This is
+/// the seam the zone-invalidation regression requires: a card entering
+/// `Zone::Graveyard` via `move_to_zone` -- not `create_object` straight into
+/// the destination zone -- is what exercises
+/// `any_active_static_reads_zone_membership` at the production zone-change
+/// site (`zones.rs`), so a test that only ever seeds the graveyard directly
+/// (as `GameScenario::with_graveyard` and the old version of this helper did)
+/// can stay green even if that invalidation path is broken. Returns the moved
+/// objects' ids (stable across the move -- CR 400.7's "becomes a new object"
+/// is a game-rules fiction about characteristics, not an engine id reissue).
+fn move_cards_into_graveyard(
+    runner: &mut GameRunner,
+    player: PlayerId,
+    count: usize,
+    label: &str,
+) -> Vec<ObjectId> {
+    let mut moved = Vec::with_capacity(count);
     for i in 0..count {
         let card_id = CardId(runner.state().next_object_id);
-        create_object(
+        let id = create_object(
             runner.state_mut(),
             card_id,
             player,
             format!("{label} {i}"),
-            Zone::Graveyard,
+            Zone::Hand,
         );
+        let mut events = Vec::new();
+        engine::game::zones::move_to_zone(runner.state_mut(), id, Zone::Graveyard, &mut events);
+        moved.push(id);
     }
+    moved
 }
 
 /// CR 404.1: the static P/T boost is a CENSUS over every player's graveyard,
 /// not just the controller's -- (a) zero qualifying graveyards leaves the
 /// creature at its printed 1/3, (b) the controller's OWN graveyard crossing
-/// seven cards adds +2/+0, and (c) a SECOND, unrelated player's graveyard also
-/// crossing seven cards stacks a second +2/+0, proving the count is global.
+/// seven cards adds +2/+0, (c) a SECOND, unrelated player's graveyard also
+/// crossing seven cards stacks a second +2/+0 (proving the count is global),
+/// and (d) a graveyard re-crossing the threshold DOWNWARD drops its
+/// contribution again.
+///
+/// Every threshold transition here happens through the REAL `move_to_zone`
+/// zone-change pipeline (`move_cards_into_graveyard`), and each transition
+/// asserts `layers_dirty.is_dirty()` BEFORE the forced recompute in
+/// `effective_pt`. This is the zone-invalidation regression: before
+/// `QuantityRef::PlayerCount { filter: PlayerAttribute { attr: GraveyardSize,
+/// .. } }` was classified as reading the graveyard zone, an ORDINARY
+/// mill/discard move (not Master's Councillors' own ability) never dirtied
+/// the layer cache, so the +2/+0 census could go stale until an unrelated
+/// full refresh happened to occur. Forcing `mark_full` unconditionally (as
+/// the old version of this test did before every assertion) would mask
+/// exactly that bug -- these `is_dirty()` checks are the seam that catches it.
 #[test]
 fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
     let mut scenario = GameScenario::new_n_player(4, 42);
@@ -108,21 +141,39 @@ fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
         (1, 3),
         "no graveyard has reached seven cards yet -- Master's Councillors is a plain 1/3"
     );
+    assert!(
+        !runner.state().layers_dirty.is_dirty(),
+        "precondition: the layer cache is clean before the first zone move"
+    );
 
-    // (b) P0's own graveyard crosses the threshold (7th card): +2/+0 -> 3/3.
-    add_graveyard_cards(&mut runner, P0, 1, "Filler G");
+    // (b) P0's own graveyard crosses the threshold (7th card) via the REAL
+    // zone-move pipeline: +2/+0 -> 3/3.
+    move_cards_into_graveyard(&mut runner, P0, 1, "Filler G");
     assert_eq!(graveyard_len(&runner, P0), 7);
+    assert!(
+        runner.state().layers_dirty.is_dirty(),
+        "THE FIX: crossing the seven-card graveyard threshold via a normal zone move \
+         must dirty the layer cache, not just Master's Councillors' own mill"
+    );
     assert_eq!(
         effective_pt(&mut runner, mc),
         (3, 3),
         "CR 404.1: one qualifying graveyard (the controller's own) adds +2/+0"
     );
+    assert!(!runner.state().layers_dirty.is_dirty());
 
-    // (c) P2 -- NOT the controller -- also reaches seven cards: the boost
-    // stacks to +4/+0 total, proving the census counts every player's
-    // graveyard in the game, not just the controller's.
-    add_graveyard_cards(&mut runner, P2, 7, "P2 Filler");
+    // (c) P2 -- NOT the controller -- also reaches seven cards through the
+    // same production pipeline: the boost stacks to +4/+0 total, proving the
+    // census counts every player's graveyard in the game, not just the
+    // controller's, AND that the invalidation fires again for a second,
+    // independent player's zone move.
+    move_cards_into_graveyard(&mut runner, P2, 7, "P2 Filler");
     assert_eq!(graveyard_len(&runner, P2), 7);
+    assert!(
+        runner.state().layers_dirty.is_dirty(),
+        "a second, unrelated player's graveyard crossing the threshold must also dirty \
+         the layer cache"
+    );
     assert_eq!(
         effective_pt(&mut runner, mc),
         (5, 3),
@@ -132,6 +183,30 @@ fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
     // Sanity: P1 and P3 never crossed the threshold and contribute nothing.
     assert_eq!(graveyard_len(&runner, P1), 0);
     assert_eq!(graveyard_len(&runner, P3), 0);
+
+    // (d) RE-CROSS DOWNWARD: an unrelated effect exiles a card straight out of
+    // P0's graveyard, dropping it back to six cards -- below the threshold.
+    // The dependency walker must dirty the cache on the way back down too,
+    // not only when a graveyard first reaches seven.
+    assert!(!runner.state().layers_dirty.is_dirty());
+    let p0_gy_card = runner.state().players[P0.0 as usize]
+        .graveyard
+        .last()
+        .copied()
+        .expect("P0's graveyard has a card to exile");
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), p0_gy_card, Zone::Exile, &mut events);
+    assert_eq!(graveyard_len(&runner, P0), 6);
+    assert!(
+        runner.state().layers_dirty.is_dirty(),
+        "re-crossing the seven-card threshold DOWNWARD (a graveyard card leaving via a \
+         normal zone move) must also dirty the layer cache"
+    );
+    assert_eq!(
+        effective_pt(&mut runner, mc),
+        (3, 3),
+        "P0 drops back below the threshold -- only P2's graveyard boost remains (+2/+0)"
+    );
 }
 
 /// Resolve one draw for `drawer` through the production `draw::resolve` seam,
@@ -179,6 +254,16 @@ fn masters_councillors_second_draw_mills_chosen_target_once_per_turn() {
         runner.state().stack.len(),
         0,
         "first draw must not queue the second-draw trigger"
+    );
+    // An empty stack alone doesn't prove the trigger never fired -- a fired
+    // trigger can sit in `WaitingFor::TriggerTargetSelection` before it ever
+    // reaches the stack (see the polling loop below). Asserting `Priority` here
+    // is the paired positive reach-guard: it proves the engine is back to a
+    // normal priority window, not stalled on a pending target-selection prompt
+    // from a trigger that should not have fired.
+    assert!(
+        matches!(&runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "first draw must not leave a pending trigger target-selection prompt"
     );
     assert_eq!(graveyard_len(&runner, P1), 0);
 
@@ -245,6 +330,10 @@ fn masters_councillors_second_draw_mills_chosen_target_once_per_turn() {
         runner.state().stack.len(),
         0,
         "a third draw the same turn must not re-fire the second-draw trigger"
+    );
+    assert!(
+        matches!(&runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "a third draw must not leave a pending trigger target-selection prompt either"
     );
     assert_eq!(
         graveyard_len(&runner, P1),

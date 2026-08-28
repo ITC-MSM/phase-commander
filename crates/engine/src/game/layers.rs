@@ -2834,6 +2834,70 @@ fn quantity_expr_reads_zone(expr: &QuantityExpr, zone: Zone) -> bool {
     }
 }
 
+/// CR 404 + CR 611.3a: Does a `PlayerFilter` population/predicate depend on the
+/// membership of `zone`? Mirrors `player_filter_reads_life`'s recursion at the
+/// zone axis — a `PlayerCount`/`EventContextPlayerCount` quantity wraps a
+/// `PlayerFilter`, and that filter's nested `TargetFilter` / `QuantityRef` /
+/// `QuantityExpr` payloads must be walked here or the wrapping quantity
+/// silently reports zone-independent. Master's Councillors class ("+2/+0 for
+/// each graveyard with seven or more cards in it") parses to `PlayerCount {
+/// filter: PlayerAttribute { attr: GraveyardSize, .. } }`: without this route,
+/// an ordinary mill/discard/zone move through `zones::move_to_zone` never
+/// re-evaluates the census, so the P/T boost can go stale after any graveyard
+/// move that isn't the one full-refresh path some other unrelated static
+/// happens to trigger.
+fn player_filter_reads_zone(filter: &PlayerFilter, zone: Zone) -> bool {
+    match filter {
+        // CR 120.9: the damage-history player set can restrict by a source
+        // `TargetFilter`; route it.
+        PlayerFilter::OpponentDealtDamage { source, .. } => source
+            .as_deref()
+            .is_some_and(|f| target_filter_reads_zone(f, zone)),
+        // CR 608.2c: self-composing exclusion anchor — recurse on the exclude.
+        PlayerFilter::AllExcept { exclude } => player_filter_reads_zone(exclude, zone),
+        // CR 109.4 + CR 109.5: controls-count routes its object `filter` and its
+        // comparison `count` expression.
+        PlayerFilter::ControlsCount { filter, count, .. } => {
+            target_filter_reads_zone(filter, zone) || quantity_expr_reads_zone(count, zone)
+        }
+        // CR 404.1 (graveyard) / CR 402.1 (hand) / etc: per-candidate scalar
+        // attribute (`attr = GraveyardSize` reads `zone` when `zone ==
+        // Graveyard`) compared against a controller-relative `value`
+        // expression (Master's Councillors / Wolfcaller's Howl class). Route
+        // both.
+        PlayerFilter::PlayerAttribute { attr, value, .. } => {
+            quantity_ref_reads_zone(attr, zone) || quantity_expr_reads_zone(value, zone)
+        }
+        // CR 608.2c + CR 109.4: the tracked-set possession predicate applies its
+        // object `filter` to each member; route it like `ControlsCount`.
+        PlayerFilter::TrackedSetPossessor { filter, .. } => target_filter_reads_zone(filter, zone),
+        // Payload-free player sets, action/vote ledgers, and combat/attack
+        // relations — none read zone membership. Enumerated explicitly (no
+        // wildcard), mirroring `player_filter_reads_life`.
+        PlayerFilter::Controller
+        | PlayerFilter::Opponent
+        | PlayerFilter::DefendingPlayer
+        | PlayerFilter::OpponentLostLife
+        | PlayerFilter::OpponentGainedLife
+        | PlayerFilter::HasLostTheGame
+        | PlayerFilter::OpponentAttacked { .. }
+        | PlayerFilter::OpponentAttackingEnchantedPlayer
+        | PlayerFilter::All
+        | PlayerFilter::HighestSpeed
+        | PlayerFilter::ZoneChangedThisWay
+        | PlayerFilter::PerformedActionThisWay { .. }
+        | PlayerFilter::OwnersOfCardsExiledBySource
+        | PlayerFilter::TriggeringPlayer
+        | PlayerFilter::OpponentOtherThanTriggering
+        | PlayerFilter::OpponentOfTriggeringPlayer
+        | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+        | PlayerFilter::VotedFor { .. }
+        | PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ChosenPlayer { .. }
+        | PlayerFilter::ParentObjectTargetOwner => false,
+    }
+}
+
 /// CR 404 + CR 611.3a: Leaf classification for `quantity_expr_reads_zone` — does
 /// a `QuantityRef` read the card count / object population of `zone`? EXHAUSTIVE
 /// and wildcard-free (mirroring `quantity_ref_uses_object_count`) so any future
@@ -2875,6 +2939,15 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_reads_zone(source, zone)
         }
+        // CR 404.1 + CR 611.3a: a player-population census routes its
+        // `PlayerFilter` — `PlayerCount{PlayerAttribute{attr: GraveyardSize}}`
+        // (Master's Councillors: "for each graveyard with seven or more cards
+        // in it") reads `zone` exactly when the wrapped filter does. Mirrors
+        // `quantity_ref_reads_life`'s identical routing of these two variants
+        // through `player_filter_reads_life`.
+        QuantityRef::PlayerCount { filter } | QuantityRef::EventContextPlayerCount { filter } => {
+            player_filter_reads_zone(filter, zone)
+        }
         // Everything else reads player-level state, single-object state, battle-
         // field-only population, history records, choices, or tracked sets — none
         // depend on `zone` membership. Enumerated explicitly (no wildcard) so a
@@ -2895,8 +2968,6 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::DistinctCounterKindsAmong { .. }
         | QuantityRef::EnteredThisTurn { .. }
         | QuantityRef::CommanderManaValue { .. }
-        | QuantityRef::PlayerCount { .. }
-        | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }

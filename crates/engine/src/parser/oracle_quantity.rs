@@ -1673,7 +1673,12 @@ fn parse_for_each_graveyard_size_clause(clause: &str) -> Option<QuantityRef> {
                 player: PlayerScope::ScopedPlayer,
             }),
             comparator: Comparator::GE,
-            value: Box::new(QuantityExpr::Fixed { value: n as i32 }),
+            // A raw `n as i32` would wrap values above `i32::MAX` (e.g.
+            // `2_147_483_648` → `i32::MIN`), making the `GE` threshold vacuous
+            // — reject rather than silently wrap.
+            value: Box::new(QuantityExpr::Fixed {
+                value: i32::try_from(n).ok()?,
+            }),
         },
     })
 }
