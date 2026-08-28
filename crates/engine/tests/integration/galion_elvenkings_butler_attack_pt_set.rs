@@ -7,14 +7,17 @@
 //! CR 508.1 + CR 508.2: attack triggers fire when attackers are declared.
 //! CR 115.6 + CR 601.2c: "choose up to one ... target" permits declining —
 //!   zero targets may be chosen.
-//! CR 115.10a: "another target creature you control" excludes Galion itself
-//!   (the source) from the legal target set.
-//! CR 208.1 + CR 613.4b + CR 608.2k: "Its base power and toughness become
+//! "another target creature you control" excludes Galion itself (the source)
+//!   from the legal target set via the `Another` filter property; CR 115.10a
+//!   only distinguishes targets from non-targets and does not itself govern
+//!   this exclusion.
+//! CR 208.4a + CR 613.4b + CR 608.2c: "Its base power and toughness become
 //!   equal to [source]'s power and toughness" is a characteristic-setting
 //!   effect (Layer 7b) that reads the source's power/toughness dynamically —
 //!   the bare possessive pronoun "Its" resolves to the target chosen by the
-//!   first sentence (CR 608.2k: an effect may refer to an object previously
-//!   introduced by the same ability), and "Galion's" resolves to the source.
+//!   first sentence (CR 608.2c: the controller follows the ability's
+//!   instructions in the order written and applies the rules of English),
+//!   and "Galion's" resolves to the source.
 //!
 //! Before the fix, the second sentence's subject grammar only recognized a
 //! NAMED possessor ("~'s base power ...", "Sita Varma's base power ..."), not
@@ -109,7 +112,7 @@ fn galion_attack_trigger_parses_choose_and_pt_set_shape() {
     );
     assert!(
         typed.properties.contains(&FilterProp::Another),
-        "'other' must exclude Galion itself (CR 115.10a), got {:?}",
+        "'other' must exclude Galion itself via the Another filter property, got {:?}",
         typed.properties
     );
     let spec = execute
@@ -159,7 +162,7 @@ fn galion_attack_trigger_parses_choose_and_pt_set_shape() {
         def.affected,
         Some(TargetFilter::ParentTarget),
         "the P/T set must apply to the creature chosen by the first clause \
-         (CR 608.2k 'Its' anaphor), got {:?}",
+         (CR 608.2c 'Its' anaphor), got {:?}",
         def.affected
     );
     assert!(
@@ -279,7 +282,7 @@ fn galion_attack_declining_target_leaves_other_creature_unaffected() {
 
 /// -----------------------------------------------------------------------
 /// Runtime — "another target creature you control" excludes Galion itself
-/// from the legal target set (CR 115.10a).
+/// from the legal target set via the Another filter property.
 /// -----------------------------------------------------------------------
 #[test]
 fn galion_attack_trigger_cannot_target_itself() {

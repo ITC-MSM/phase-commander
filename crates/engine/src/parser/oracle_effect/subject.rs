@@ -1002,7 +1002,7 @@ fn parse_base_pt_axes(input: &str) -> OracleResult<'_, BasePtSetAxes> {
     ))
 }
 
-/// CR 208.1 + CR 613.4b: The dynamic-or-fixed value side of a "base power …
+/// CR 208.4a + CR 613.4b: The dynamic-or-fixed value side of a "base power …
 /// become[s] <value>" clause, resolved into per-axis layer-7b modifications.
 enum BasePtSetValue {
     /// Fixed "N/M" — `SetPower`/`SetToughness`.
@@ -1017,7 +1017,7 @@ enum BasePtSetValue {
     },
 }
 
-/// CR 208.1: Parse the value following the "become[s] " copula of a base-P/T-set
+/// CR 208.4a + CR 613.4b: Parse the value following the "become[s] " copula of a base-P/T-set
 /// clause. Tries the fixed "N/M" form first (so "6/6" is not mis-routed through
 /// the quantity grammar), then a paired "<X>'s power and toughness" referent
 /// (splitting into independent per-axis quantities reading the same object —
@@ -1032,7 +1032,7 @@ fn parse_base_pt_set_value(remainder: &str) -> Option<(BasePtSetValue, &str)> {
     {
         return Some((BasePtSetValue::Fixed { power, toughness }, after_pt));
     }
-    // CR 208.1: "[each] equal to <quantity>" dynamic value. "each equal to" and
+    // CR 208.4a + CR 613.4b: "[each] equal to <quantity>" dynamic value. "each equal to" and
     // "equal to" are the two surface forms (each/each-not are not independent
     // axes here — the optional "each " is the only variation).
     let lower = remainder.to_lowercase();
@@ -1044,7 +1044,7 @@ fn parse_base_pt_set_value(remainder: &str) -> Option<(BasePtSetValue, &str)> {
         value((), tag::<_, _, OracleError<'_>>("equal to ")).parse(i)
     })?;
     let tail = after_copula.trim().trim_end_matches('.').trim();
-    // CR 208.1: a paired referent ("<X>'s power and toughness" / "the power and
+    // CR 208.4a + CR 613.4b: a paired referent ("<X>'s power and toughness" / "the power and
     // toughness of <X>") splits into independent per-axis quantities reading
     // the same object — shares the transitive "change ... to" frame's building
     // block (`parse_pt_pair_referent`) rather than re-deriving the
@@ -1057,7 +1057,7 @@ fn parse_base_pt_set_value(remainder: &str) -> Option<(BasePtSetValue, &str)> {
     Some((BasePtSetValue::Dynamic(expr), ""))
 }
 
-/// CR 208.1 + CR 613.4b: Parse the copula that separates a base-P/T subject from
+/// CR 208.4a + CR 613.4b: Parse the copula that separates a base-P/T subject from
 /// its value. The intransitive "become[s] " form and the transitive
 /// "change … to " form (Riptide Mangler, Shape Stealer, Halfdane) share one
 /// downstream value/emission path; `is_change` selects the token so the two
@@ -1070,7 +1070,7 @@ fn parse_base_pt_copula(input: &str, is_change: bool) -> OracleResult<'_, ()> {
     }
 }
 
-/// CR 208.1 + CR 613.4b: value side of the transitive "change <subject>'s base
+/// CR 208.4a + CR 613.4b: value side of the transitive "change <subject>'s base
 /// power [and toughness] to <value>" frame. Unlike the "become[s] equal to"
 /// copula, the "change … to" frame introduces the value with a bare " to ", so
 /// the value is a fixed "N/M" (Brine Hag), a paired "<X>'s power and toughness"
@@ -1091,7 +1091,7 @@ fn parse_change_base_pt_value(remainder: &str) -> Option<(BasePtSetValue, &str)>
     Some((BasePtSetValue::Dynamic(expr), ""))
 }
 
-/// CR 208.1: Resolve a paired "<X>'s power and toughness" / "the power and
+/// CR 208.4a + CR 613.4b: Resolve a paired "<X>'s power and toughness" / "the power and
 /// toughness of <X>" referent into its two single-axis quantities, both reading
 /// the same object `X` (its power feeds base power, its toughness feeds base
 /// toughness). Rather than duplicate the referent-scope grammar (event-context
@@ -1167,7 +1167,7 @@ fn parse_base_pt_axis_quantity(tail: &str) -> Option<QuantityExpr> {
     })
 }
 
-/// CR 208.1 + CR 608.2c: "<power-expr> and its base toughness becomes <toughness-expr>"
+/// CR 208.4a + CR 613.4b + CR 608.2c: "<power-expr> and its base toughness becomes <toughness-expr>"
 /// when power and toughness each carry independent dynamic quantities (Amplifire).
 fn parse_split_base_pt_dynamic_values(
     remainder: &str,
@@ -1335,7 +1335,7 @@ fn try_parse_subject_base_pt_set_clause_ast(
                     parse_base_pt_axes,
                 )
                     .map(|(subject, _, axes)| (subject, axes)),
-                // CR 608.2k: bare possessive pronoun "its base power [and
+                // CR 608.2c: bare possessive pronoun "its base power [and
                 // toughness]" (Galion, Elvenking's Butler: "Its base power and
                 // toughness become equal to ~'s power and toughness"). Unlike
                 // the named-possessor forms above, "its" already IS the
@@ -1382,7 +1382,7 @@ fn try_parse_subject_base_pt_set_clause_ast(
     let application = target_application.or_else(|| parse_subject_application(subject, ctx))?;
     let affected = static_affected_for_application(&application);
 
-    // CR 208.1 + CR 613.4b: emit per-axis layer-7b set modifications. Fixed
+    // CR 208.4a + CR 613.4b: emit per-axis layer-7b set modifications. Fixed
     // values stay `SetPower`/`SetToughness`; dynamic values use the
     // `SetPowerDynamic`/`SetToughnessDynamic` variants the layer system
     // re-evaluates each tick.
@@ -10149,7 +10149,7 @@ mod tests {
         // equal to ~'s power and toughness" — the bare possessive pronoun
         // "Its" (as opposed to a named possessor like "~'s base power...")
         // must resolve through the shared bare-pronoun anaphor to the object
-        // introduced earlier in the same effect chain (CR 608.2k: "choose up
+        // introduced earlier in the same effect chain (CR 608.2c: "choose up
         // to one other target creature you control"), not fall back to
         // SelfRef.
         let mut ctx = ParseContext {

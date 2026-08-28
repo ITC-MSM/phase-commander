@@ -33442,7 +33442,7 @@ pub(crate) fn parse_effect_chain_ir(
                 None | Some(TargetFilter::SelfRef | TargetFilter::Any)
             )
         {
-            // CR 608.2c + CR 608.2k: an earlier SIBLING clause in THIS chain
+            // CR 608.2c: an earlier SIBLING clause in THIS chain
             // (not merely the enclosing trigger condition) chose a genuinely
             // new typed object referent (`prior_typed_referent`) — that is a
             // CLOSER antecedent than the trigger's own passive "self-watching"
