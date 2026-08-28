@@ -867,6 +867,7 @@ mod maraxus_team_pump_anthem;
 mod martial_impetus_other_attacker_exclusion_6017;
 mod mass_phase_out_1792_repro;
 mod master_of_ceremonies;
+mod masters_councillors;
 mod mauhur_swarming_of_moria;
 mod max_speed_owner_arm_from_graveyard;
 mod maze_of_ith_untap_bidirectional_prevent;
