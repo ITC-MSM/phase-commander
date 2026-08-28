@@ -3363,7 +3363,6 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
@@ -3394,6 +3393,9 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             card_type_set_source_counts_population_matching(source, filter_pred)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            card_type_set_source_counts_population_matching(aggregate.source(), filter_pred)
         }
         // No `TargetFilter` anywhere: player-scoped totals, per-object scopes,
         // resolution/turn counters, and cost bookkeeping.
@@ -3430,7 +3432,6 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::TrackedSetSize
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -5765,7 +5766,6 @@ fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
         QuantityExpr::Ref { qty } => match qty {
             QuantityRef::TrackedSetSize
             | QuantityRef::FilteredTrackedSetSize { .. }
-            | QuantityRef::TrackedSetAggregate { .. }
             | QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet { .. },
             }
@@ -5773,6 +5773,15 @@ fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
                 source: CardTypeSetSource::TrackedSet { .. },
                 ..
             } => true,
+            QuantityRef::PropertyAggregate(aggregate) => {
+                let mut found = false;
+                let complete = aggregate
+                    .source()
+                    .try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
+                        found |= matches!(leaf, CardTypeSetSource::TrackedSet { .. })
+                    });
+                found || !complete
+            }
             // CR 608.2c: a player-count whose filter is keyed on the chain's
             // tracked object set is a CONSUMER of that set — the preceding
             // producer must publish it, or the count resolves to 0. This is the
@@ -6310,6 +6319,35 @@ fn affected_objects_from_events(
                 _ => None,
             })
             .collect(),
+        // CR 701.20a + CR 608.2c: A per-hit conditional keep destination (Part
+        // in Friendship's "if its mana value is 2 or less, put it onto the
+        // battlefield. Otherwise, put it into your hand") routes each hit card
+        // to EITHER `kept_destination` (the otherwise branch) OR the
+        // `kept_destination_if` zone (reveal_until.rs's `hit_destination`
+        // selection re-checks the card-property filter per hit). Scoping the
+        // tracked set to only `kept_destination` — as the generic arm below
+        // does for the unconditional case — silently drops every hit that
+        // landed via the conditional branch, truncating a chained "from among
+        // cards put onto the battlefield this way" consumer to just the
+        // otherwise-branch hits. Track both possible landing zones so the
+        // published set matches the full resolved hit population regardless
+        // of which branch each individual hit took.
+        Effect::RevealUntil {
+            kept_destination,
+            kept_destination_if: Some((_, if_true_zone)),
+            ..
+        } => {
+            let zones = [*kept_destination, *if_true_zone];
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GameEvent::ZoneChanged { object_id, to, .. } if zones.contains(to) => {
+                        Some(*object_id)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
         _ => {
             let dest_zone = match effect {
                 Effect::ChangeZone { destination, .. }
@@ -16356,11 +16394,17 @@ mod tests {
     #[test]
     fn token_power_toughness_tracked_set_marks_ability_as_referencing_tracked_set() {
         let tracked_pt = PtValue::Quantity(QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: crate::types::ability::AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::Power,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    crate::types::ability::AggregateFunction::Sum,
+                    crate::types::ability::ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                        caused_by: None,
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         });
         let ability = ResolvedAbility::new(
             Effect::Token {
@@ -21664,6 +21708,7 @@ mod tests {
             enters_attacking: false,
             kept_optional_to: None,
             enters_under: None,
+            kept_destination_if: None,
         };
         // The RevealUntil arm is event-driven; `state`/`ability` are ignored (only
         // the GenericEffect arm reads them). Minimal state + empty-target ability.
@@ -21673,6 +21718,90 @@ mod tests {
         assert_eq!(
             affected_objects_from_events(&state, &ability, &effect, &events),
             vec![hit]
+        );
+    }
+
+    /// CR 701.20a + CR 608.2c (PR #8008 review): Part in Friendship's per-hit
+    /// conditional keep ("if its mana value is <= X, put it onto the
+    /// battlefield. Otherwise, put it into your hand") routes each hit to
+    /// EITHER `kept_destination` (the otherwise/Hand branch) OR the
+    /// `kept_destination_if` zone (Battlefield). Before this fix,
+    /// `affected_objects_from_events`'s `_` arm derived a single `dest_zone`
+    /// from `kept_destination` alone, so a hit that actually resolved through
+    /// the CONDITIONAL branch (Battlefield) was silently dropped from the
+    /// published tracked set — any chained "put a counter on it" / "from
+    /// among cards put onto the battlefield this way" consumer would see an
+    /// empty or incomplete set. This test seeds ONE `ZoneChanged` per branch
+    /// and asserts both are published.
+    #[test]
+    fn reveal_until_conditional_kept_publishes_both_destinations_for_tracked_set() {
+        let battlefield_hit = ObjectId(4);
+        let hand_hit = ObjectId(5);
+        let miss = ObjectId(6);
+        let events = vec![
+            // The conditional branch: mana value <= threshold → Battlefield.
+            GameEvent::ZoneChanged {
+                object_id: battlefield_hit,
+                from: Some(Zone::Library),
+                to: Zone::Battlefield,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    battlefield_hit,
+                    Some(Zone::Library),
+                    Zone::Battlefield,
+                )),
+            },
+            // The otherwise branch: mana value > threshold → Hand
+            // (`kept_destination`).
+            GameEvent::ZoneChanged {
+                object_id: hand_hit,
+                from: Some(Zone::Library),
+                to: Zone::Hand,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    hand_hit,
+                    Some(Zone::Library),
+                    Zone::Hand,
+                )),
+            },
+            // A dug-past non-matching card returns to the library (the rest
+            // pile) — must NOT be published.
+            GameEvent::ZoneChanged {
+                object_id: miss,
+                from: Some(Zone::Library),
+                to: Zone::Library,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    miss,
+                    Some(Zone::Library),
+                    Zone::Library,
+                )),
+            },
+        ];
+        let effect = Effect::RevealUntil {
+            player: TargetFilter::Controller,
+            filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+            count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+            matched_disposition: crate::types::ability::RevealUntilDisposition::KeepEach,
+            kept_destination: Zone::Hand,
+            rest_destination: Zone::Library,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            kept_optional_to: None,
+            enters_under: None,
+            kept_destination_if: Some((
+                Box::new(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature))),
+                Zone::Battlefield,
+            )),
+        };
+        let state = GameState::new_two_player(42);
+        let ability = ResolvedAbility::new(effect.clone(), vec![], ObjectId(0), PlayerId(0));
+
+        let mut published = affected_objects_from_events(&state, &ability, &effect, &events);
+        published.sort();
+        let mut expected = vec![battlefield_hit, hand_hit];
+        expected.sort();
+        assert_eq!(
+            published, expected,
+            "both the conditional (battlefield) and otherwise (hand) hit destinations must be \
+             published to the tracked set — the rest-pile miss must not be"
         );
     }
 
@@ -26089,13 +26218,18 @@ mod tests {
 
         let condition = AbilityCondition::QuantityCheck {
             lhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::Toughness,
-                    filter: TargetFilter::Typed(
-                        TypedFilter::creature().controller(ControllerRef::You),
-                    ),
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::Toughness,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(
+                                TypedFilter::creature().controller(ControllerRef::You),
+                            ),
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             },
             comparator: Comparator::GE,
             rhs: QuantityExpr::Fixed { value: 40 },
@@ -26720,36 +26854,46 @@ mod tests {
             Effect::Token {
                 name: "Illusion".to_string(),
                 power: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 toughness: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 types: vec!["Creature".to_string(), "Illusion".to_string()],
                 colors: vec![ManaColor::Blue],
@@ -26865,36 +27009,46 @@ mod tests {
             Effect::Token {
                 name: "Illusion".to_string(),
                 power: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 toughness: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 types: vec!["Creature".to_string(), "Illusion".to_string()],
                 colors: vec![ManaColor::Blue],

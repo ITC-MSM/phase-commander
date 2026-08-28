@@ -7,14 +7,15 @@ use crate::parser::oracle_ir::doc::PrintedTriggerIndex;
 use crate::parser::oracle_ir::effect_chain::PlayerScopeRewrite;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
-    AttackSubject, BounceSelection, CardSelectionMode, CastingPermission, ChosenAttribute,
-    Comparator, ContinuousModification, ControllerRef, CopyChooseScope, CopyRetargetPermission,
-    CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel, DamageModification,
-    DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect, EffectScope,
-    FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice, ObjectScope,
-    PerpetualModification, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
-    QuantityRef, SeatDirection, SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange,
-    TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
+    AttackSubject, BounceSelection, CardSelectionMode, CardTypeSetSource, CastingPermission,
+    ChosenAttribute, Comparator, ContinuousModification, ControllerRef, CopyChooseScope,
+    CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel,
+    DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect,
+    EffectScope, FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice,
+    ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PropertyAggregate, PtStat,
+    PtValue, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
+    SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter, TriggerCondition,
+    TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -67,11 +68,17 @@ fn palantir_life_loss_uses_milled_chain_set_and_targeted_opponent() {
     assert_eq!(
         *amount,
         QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::ManaValue,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    crate::types::ability::ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                        caused_by: None
+                    }
+                )
+                .expect("statically valid property aggregate")
+            ),
         }
     );
     assert!(
@@ -100,14 +107,22 @@ fn combustible_gearhulk_damage_uses_milled_chain_set() {
     let Effect::DealDamage { amount, target, .. } = damage.effect.as_ref() else {
         panic!("expected DealDamage, got {:?}", damage.effect);
     };
+    let QuantityExpr::Ref {
+        qty: QuantityRef::PropertyAggregate(aggregate),
+    } = amount
+    else {
+        panic!("expected property aggregate, got {amount:?}");
+    };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(
+        aggregate.property(),
+        crate::types::ability::ObjectProperty::ManaValue
+    );
     assert!(matches!(
-        amount,
-        QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::ManaValue,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            }
+        aggregate.source(),
+        crate::types::ability::CardTypeSetSource::TrackedSet {
+            set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+            caused_by: None
         }
     ));
     assert!(matches!(target, TargetFilter::ScopedPlayer));
@@ -6655,15 +6670,13 @@ fn parse_betor_kin_to_all_trigger_structure() {
             assert_eq!(*rhs, QuantityExpr::Fixed { value: 10 });
             match lhs {
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function,
-                            property,
-                            filter,
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 } => {
-                    assert_eq!(*function, AggregateFunction::Sum);
-                    assert_eq!(*property, ObjectProperty::Toughness);
+                    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+                    assert_eq!(aggregate.property(), ObjectProperty::Toughness);
+                    let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+                        panic!("expected object source, got {:?}", aggregate.source());
+                    };
                     match filter {
                         TargetFilter::Typed(t) => {
                             assert_eq!(t.controller, Some(ControllerRef::You));
@@ -6703,12 +6716,9 @@ fn parse_betor_kin_to_all_trigger_structure() {
                     matches!(
                         lhs,
                         QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate {
-                                function: AggregateFunction::Sum,
-                                property: ObjectProperty::Toughness,
-                                ..
-                            },
-                        }
+                            qty: QuantityRef::PropertyAggregate(aggregate),
+                        } if aggregate.function() == AggregateFunction::Sum
+                            && aggregate.property() == ObjectProperty::Toughness
                     ),
                     "untap sub_ability lhs must be Aggregate Sum/Toughness, got {lhs:?}",
                 );
@@ -6744,12 +6754,9 @@ fn parse_betor_kin_to_all_trigger_structure() {
                     matches!(
                         lhs,
                         QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate {
-                                function: AggregateFunction::Sum,
-                                property: ObjectProperty::Toughness,
-                                ..
-                            },
-                        }
+                            qty: QuantityRef::PropertyAggregate(aggregate),
+                        } if aggregate.function() == AggregateFunction::Sum
+                            && aggregate.property() == ObjectProperty::Toughness
                     ),
                     "lose-life sub_ability lhs must be Aggregate Sum/Toughness, got {lhs:?}",
                 );
@@ -8174,20 +8181,25 @@ fn trigger_skyclave_apparition_leaves_battlefield_uses_linked_exile_owner_scope(
         } => {
             assert_eq!(name, "Illusion");
             let expected = QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: crate::types::ability::AggregateFunction::Sum,
-                    property: crate::types::ability::ObjectProperty::ManaValue,
-                    filter: TargetFilter::And {
-                        filters: vec![
-                            TargetFilter::ExiledBySource,
-                            TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                FilterProp::Owned {
-                                    controller: ControllerRef::You,
-                                },
-                            ])),
-                        ],
-                    },
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        crate::types::ability::AggregateFunction::Sum,
+                        crate::types::ability::ObjectProperty::ManaValue,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::And {
+                                filters: vec![
+                                    TargetFilter::ExiledBySource,
+                                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                                        FilterProp::Owned {
+                                            controller: ControllerRef::You,
+                                        },
+                                    ])),
+                                ],
+                            },
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             };
             assert_eq!(power, &PtValue::Quantity(expected.clone()));
             assert_eq!(toughness, &PtValue::Quantity(expected));
@@ -9803,6 +9815,75 @@ fn dreadhorde_invasion_upkeep_lose_life_and_amass() {
         }
         other => panic!("expected Amass{{Zombie, 1}}, got {other:?}"),
     }
+}
+
+/// CR 701.47a + CR 701.47c + CR 301.5a (Goblin Plate Mail, HOB): "When this
+/// Equipment enters, amass Goblins 1, then attach this Equipment to the
+/// amassed Army." Amass is the `execute` head; the attach rides as its
+/// `SequentialSibling` sub_ability with `attachment: SelfRef` (the default —
+/// "this Equipment") and `target: AmassedArmy` — the CR 701.47c binding to
+/// the EXACT Army object amass just touched, not a re-scan of the
+/// battlefield for "an Army you control". Zero `Effect::Unimplemented` nodes.
+#[test]
+fn goblin_plate_mail_amass_then_attach_to_amassed_army() {
+    let def = parse_trigger_line(
+        "When this Equipment enters, amass Goblins 1, then attach this Equipment to the amassed \
+         Army.",
+        "Goblin Plate Mail",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.destination, Some(Zone::Battlefield));
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+
+    let execute = def.execute.expect("execute");
+    match *execute.effect {
+        Effect::Amass {
+            ref subtype,
+            ref count,
+        } => {
+            assert_eq!(subtype, "Goblin");
+            assert!(
+                matches!(count, QuantityExpr::Fixed { value: 1 }),
+                "expected Amass count 1, got {count:?}"
+            );
+        }
+        ref other => panic!("expected Amass{{Goblin, 1}} head, got {other:?}"),
+    }
+
+    let sub = execute
+        .sub_ability
+        .expect("attach conjunct must survive as a sub_ability");
+    assert_eq!(
+        sub.sub_link,
+        SubAbilityLink::ContinuationStep,
+        "\"amass X, then attach ~\" is a within-sentence continuation (comma/\"then\" joined), \
+         the same shape as Squadron Hawk's \"...then shuffle\""
+    );
+    match *sub.effect {
+        Effect::Attach {
+            ref attachment,
+            ref target,
+        } => {
+            assert_eq!(
+                *attachment,
+                TargetFilter::SelfRef,
+                "attach \"this Equipment\" to the amassed Army — attachment is the source"
+            );
+            assert_eq!(
+                *target,
+                TargetFilter::AmassedArmy,
+                "must bind to the EXACT Army amass just touched, not a battlefield re-scan"
+            );
+        }
+        ref other => panic!("expected Attach{{SelfRef, AmassedArmy}}, got {other:?}"),
+    }
+
+    // No parse gap: neither clause fell back to `Effect::Unimplemented`.
+    assert!(
+        !matches!(*execute.effect, Effect::Unimplemented { .. })
+            && !matches!(*sub.effect, Effect::Unimplemented { .. }),
+        "expected zero Unimplemented nodes"
+    );
 }
 
 /// CR 603.4 + CR 122.1: "at the beginning of your end step, if there are
@@ -26440,18 +26521,19 @@ fn trigger_intervening_if_selvala_power_greater_than_each_other() {
     );
     // RHS: Max(power) across creatures excluding the triggering object.
     let QuantityExpr::Ref {
-        qty:
-            QuantityRef::Aggregate {
-                function,
-                property,
-                filter,
-            },
+        qty: QuantityRef::PropertyAggregate(aggregate),
     } = rhs
     else {
         panic!("expected Aggregate Max Power rhs, got {rhs:?}");
     };
-    assert_eq!(*function, AggregateFunction::Max);
-    assert_eq!(*property, crate::types::ability::ObjectProperty::Power);
+    assert_eq!(aggregate.function(), AggregateFunction::Max);
+    assert_eq!(
+        aggregate.property(),
+        crate::types::ability::ObjectProperty::Power
+    );
+    let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+        panic!("expected object source, got {:?}", aggregate.source());
+    };
     let TargetFilter::Typed(tf) = filter else {
         panic!("expected Typed creature filter, got {filter:?}");
     };
@@ -26499,6 +26581,65 @@ fn substitute_another_rewrites_shared_quality_count_filter() {
     };
     assert!(tf.properties.contains(&FilterProp::OtherThanTriggerObject));
     assert!(!tf.properties.contains(&FilterProp::Another));
+}
+
+#[test]
+fn substitute_another_rewrites_turn_journal_filters_directly_and_in_unions() {
+    let journal = || CardTypeSetSource::TurnJournal {
+        journal: crate::types::ability::TurnJournalKind::SpellsCast,
+        scope: CountScope::Controller,
+        filter: Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::Another]),
+        )),
+    };
+    let direct = PropertyAggregate::new(
+        AggregateFunction::Sum,
+        crate::types::ability::ObjectProperty::ManaValue,
+        journal(),
+    )
+    .unwrap();
+    let nested = PropertyAggregate::new(
+        AggregateFunction::Sum,
+        crate::types::ability::ObjectProperty::ManaValue,
+        CardTypeSetSource::any_of(vec![
+            CardTypeSetSource::Objects {
+                filter: TargetFilter::Any,
+            },
+            CardTypeSetSource::any_of(vec![journal(), CardTypeSetSource::ExiledBySource]).unwrap(),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+
+    for aggregate in [direct, nested] {
+        let rewritten = substitute_another_in_expr(&QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        });
+        let QuantityExpr::Ref {
+            qty: QuantityRef::PropertyAggregate(aggregate),
+        } = rewritten
+        else {
+            panic!("expected property aggregate");
+        };
+        let mut journal_count = 0;
+        assert!(aggregate.source().try_for_each_member(
+            crate::types::ability::UNION_DEPTH_BUDGET,
+            &mut |leaf| {
+                if let CardTypeSetSource::TurnJournal {
+                    filter: Some(TargetFilter::Typed(filter)),
+                    ..
+                } = leaf
+                {
+                    journal_count += 1;
+                    assert!(filter
+                        .properties
+                        .contains(&FilterProp::OtherThanTriggerObject));
+                    assert!(!filter.properties.contains(&FilterProp::Another));
+                }
+            },
+        ));
+        assert_eq!(journal_count, 1);
+    }
 }
 
 /// Issue #444 — Odric, Lunarch Marshal. The full trigger parses to a
@@ -30408,5 +30549,126 @@ fn ring_tempts_put_choice_from_among_lowers_to_counter_choice() {
             }
             other => panic!("expected PutCounter branch, got {other:?}"),
         }
+    }
+}
+
+/// CR 707.2 + CR 707.9b + CR 603.4 + CR 205.4a: The Notary Hobbits —
+/// "When ~ enter, if they're not a token, create two tokens that are
+/// copies of them, except the tokens aren't legendary." plus a scaled mana
+/// ability. The ETB uses gender-neutral singular "they" for the same
+/// single-permanent subject `parse_zone_change_object_token_contraction_
+/// intervening_if` already recognizes as "it" (Vaultborn Tyrant class), and
+/// the "except" clause uses plural "the tokens aren't" for the two-token
+/// count (Miirym, Sentinel Wyrm class, singular "the token isn't").
+///
+/// Reach-guard: zero `Effect::Unimplemented` and zero parse warnings prove
+/// the parse actually reached the typed shapes below rather than silently
+/// swallowing the intervening-if or the except clause (both failure modes
+/// still yield a well-typed `CopyTokenOf`, so the condition and
+/// `additional_modifications` fields are the only assertions that would
+/// actually catch a regression).
+#[test]
+fn the_notary_hobbits_etb_copy_guards_on_token_and_strips_legendary() {
+    let parsed = parse_oracle_text(
+        "When The Notary Hobbits enter, if they're not a token, create two tokens that are copies of them, except the tokens aren't legendary.\n\
+         {T}: Add {C} for each Halfling you control.",
+        "The Notary Hobbits",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Halfling".to_string(), "Advisor".to_string()],
+    );
+
+    for def in &parsed.abilities {
+        assert!(
+            !matches!(*def.effect, Effect::Unimplemented { .. }),
+            "activated ability must not be Unimplemented: {def:?}"
+        );
+    }
+    for trig in &parsed.triggers {
+        if let Some(execute) = trig.execute.as_ref() {
+            assert!(
+                !matches!(*execute.effect, Effect::Unimplemented { .. }),
+                "trigger effect must not be Unimplemented: {execute:?}"
+            );
+        }
+    }
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "expected zero parse warnings (no swallowed clauses), got {:?}",
+        parsed.parse_warnings
+    );
+
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| {
+            matches!(
+                t.execute.as_ref().map(|e| e.effect.as_ref()),
+                Some(Effect::CopyTokenOf { .. })
+            )
+        })
+        .expect("The Notary Hobbits ETB CopyTokenOf trigger");
+
+    // "if they're not a token" — the anti-recursion self-check.
+    assert_eq!(
+        trigger.condition,
+        Some(TriggerCondition::ZoneChangeObjectMatchesFilter {
+            origin: None,
+            destination: Zone::Battlefield,
+            filter: TargetFilter::Typed(
+                TypedFilter::permanent().properties(vec![FilterProp::NonToken])
+            ),
+        }),
+        "expected a NonToken intervening-if, got {:?}",
+        trigger.condition
+    );
+
+    let execute = trigger.execute.as_ref().expect("trigger execute");
+    match execute.effect.as_ref() {
+        Effect::CopyTokenOf {
+            target,
+            count,
+            additional_modifications,
+            ..
+        } => {
+            assert_eq!(*target, TargetFilter::TriggeringSource);
+            assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
+            assert_eq!(
+                additional_modifications,
+                &vec![ContinuousModification::RemoveSupertype {
+                    supertype: Supertype::Legendary,
+                }],
+                "expected the 'except the tokens aren't legendary' RemoveSupertype modification"
+            );
+        }
+        other => panic!("expected CopyTokenOf effect, got {other:?}"),
+    }
+
+    // "{T}: Add {C} for each Halfling you control." — standard tap-for-
+    // colorless-scaled-by-creature-type-count mana ability.
+    let mana_ability = parsed
+        .abilities
+        .iter()
+        .find(|a| matches!(*a.effect, Effect::Mana { .. }))
+        .expect("mana ability");
+    match mana_ability.effect.as_ref() {
+        Effect::Mana { produced, .. } => match produced {
+            ManaProduction::Colorless { count } => {
+                assert_eq!(
+                    *count,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(
+                                TypedFilter::new(TypeFilter::Subtype("Halfling".to_string()))
+                                    .controller(ControllerRef::You)
+                            ),
+                        },
+                    },
+                    "expected {{C}} scaled by Halflings you control"
+                );
+            }
+            other => panic!("expected Colorless mana production, got {other:?}"),
+        },
+        other => panic!("expected Mana effect, got {other:?}"),
     }
 }

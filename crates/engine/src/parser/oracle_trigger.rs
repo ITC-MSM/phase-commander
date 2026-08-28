@@ -52,16 +52,16 @@ use crate::types::ability::ManaProduction;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     AdditionalCostOrigin, AdditionalCostPaymentSource, AggregateFunction, AttachmentKind,
-    AttackersDeclaredCountSubject, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric,
-    CastVariantPaid, CoinFlipResult, Comparator, ControllerRef, CountScope, CounterTriggerFilter,
-    DamageAmountScope, DamageAmountThreshold, DamageChannel, DamageKindFilter,
-    DestinationConstraint, DieResultFilter, Effect, EffectScope, FilterProp,
+    AttackersDeclaredCountSubject, CardSelectionMode, CardTypeSetSource, CastManaObjectScope,
+    CastManaSpentMetric, CastVariantPaid, CoinFlipResult, Comparator, ControllerRef, CountScope,
+    CounterTriggerFilter, DamageAmountScope, DamageAmountThreshold, DamageChannel,
+    DamageKindFilter, DestinationConstraint, DieResultFilter, Effect, EffectScope, FilterProp,
     ManaAbilityProducedFilter, ObjectScope, OriginConstraint, ParsedCondition, PlayerFilter,
-    PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
-    SacrificeAggregateStat, SacrificeCost, SacrificeRequirement, SharedQuality, StaticCondition,
-    SubAbilityLink, TapCreaturesRequirement, TapStateChange, TargetFilter, TriggerCondition,
-    TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
-    ZoneChangeClause,
+    PlayerRelation, PlayerScope, PropertyAggregate, PtStat, PtValueScope, QuantityExpr,
+    QuantityRef, RenownSubject, SacrificeAggregateStat, SacrificeCost, SacrificeRequirement,
+    SharedQuality, StaticCondition, SubAbilityLink, TapCreaturesRequirement, TapStateChange,
+    TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
+    UnlessPayModifier, ZoneChangeClause,
 };
 use crate::types::card_type::{is_land_subtype, CoreType};
 use crate::types::counter::CounterType;
@@ -4367,6 +4367,33 @@ fn substitute_another_in_filter(filter: &TargetFilter) -> TargetFilter {
     }
 }
 
+fn substitute_another_in_aggregate_source(source: &CardTypeSetSource) -> CardTypeSetSource {
+    match source {
+        CardTypeSetSource::Objects { filter } => CardTypeSetSource::Objects {
+            filter: substitute_another_in_filter(filter),
+        },
+        CardTypeSetSource::TurnJournal {
+            journal,
+            scope,
+            filter,
+        } => CardTypeSetSource::TurnJournal {
+            journal: *journal,
+            scope: scope.clone(),
+            filter: filter.as_ref().map(substitute_another_in_filter),
+        },
+        CardTypeSetSource::AnyOf { sources } => CardTypeSetSource::any_of(
+            sources
+                .iter()
+                .map(substitute_another_in_aggregate_source)
+                .collect(),
+        )
+        .expect("rewriting preserves union arity"),
+        CardTypeSetSource::TrackedSet { .. }
+        | CardTypeSetSource::Zone { .. }
+        | CardTypeSetSource::ExiledBySource => source.clone(),
+    }
+}
+
 /// CR 603.4: Rewrite `Another` inside any `ObjectCount` / `ObjectCountDistinct`
 /// or `Aggregate` filter carried by a `QuantityExpr`. Leaves non-population
 /// refs untouched.
@@ -4406,18 +4433,16 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
         // intervening-if references an aggregate over "each other <type>",
         // the exclusion must be trigger-relative, not source-relative.
         QuantityExpr::Ref {
-            qty:
-                QuantityRef::Aggregate {
-                    function,
-                    property,
-                    filter,
-                },
+            qty: QuantityRef::PropertyAggregate(aggregate),
         } => QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: *function,
-                property: *property,
-                filter: substitute_another_in_filter(filter),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    aggregate.function(),
+                    aggregate.property(),
+                    substitute_another_in_aggregate_source(aggregate.source()),
+                )
+                .expect("rewriting filters preserves aggregate validity"),
+            ),
         },
         QuantityExpr::Offset { inner, offset } => QuantityExpr::Offset {
             inner: Box::new(substitute_another_in_expr(inner)),
@@ -6608,10 +6633,17 @@ fn build_event_object_subtype_condition(
 /// already covers explicit negation; only the apostrophe contraction needs
 /// a dedicated arm so attachment lookbacks (`if it was enchanted`) keep their
 /// leading `was` for `parse_zone_change_object_filter_predicate`.
+///
+/// Pronoun axis (mirrors `parse_cast_using_variant_intervening_if`'s "they
+/// were"/"it was" split): a self-copying permanent with a grammatically
+/// plural name — The Notary Hobbits: "When ~ enter, if they're not a
+/// token, create two tokens that are copies of them, except the tokens
+/// aren't legendary" — uses gender-neutral singular "they" for the same
+/// single-permanent subject that singular cards refer to as "it".
 fn parse_zone_change_object_token_contraction_intervening_if(
     input: &str,
 ) -> OracleResult<'_, TriggerCondition> {
-    let (rest, _) = tag("if it's not a ").parse(input)?;
+    let (rest, _) = alt((tag("if it's not a "), tag("if they're not a "))).parse(input)?;
     let (rest, _) = tag("token").parse(rest)?;
     Ok((rest, zone_change_object_token_condition(true)))
 }
