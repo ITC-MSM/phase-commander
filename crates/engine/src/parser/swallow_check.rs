@@ -3274,6 +3274,39 @@ fn enters_with_finality_this_way_is_only_if_marker(
     !has_other_if
 }
 
+/// CR 118.9 + CR 119.4 + CR 305.1: Inside Information class — mirrors
+/// `cast_this_way_alt_cost_is_only_if_marker`'s text-scoped exemption for the
+/// sibling `PlayFromExile.alt_ability_cost` shape. Structural presence of the
+/// field (`any_ability_has_play_from_exile_alt_ability_cost`) only proves the
+/// card HAS a folded "pay <cost> rather than pay its mana cost" rider
+/// somewhere — it must not exempt the whole parse unit from `detect_condition_if`.
+/// Only the sentence that represents the rider is stripped before scanning
+/// for a residual, unrepresented " if " so an unrelated conditional on the
+/// same card (or unit) is still caught.
+fn play_from_exile_alt_ability_cost_is_only_if_marker(
+    stripped: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    if !any_ability_has_play_from_exile_alt_ability_cost(parsed) {
+        return false;
+    }
+    let residual: String = stripped
+        .split('.')
+        .filter(|sentence| {
+            let sentence = sentence.trim_start();
+            let is_rider = (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
+                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
+                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some();
+            !is_rider
+        })
+        .collect::<Vec<_>>()
+        .join(".");
+    let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
+    !has_other_if
+}
+
 /// CR 118.9 + CR 607.1 + CR 608.2c: an alternative-cost rider on a cast
 /// permission represents its linked "if you cast a spell this way, pay …"
 /// clause. Additional-cost riders deliberately remain outside this exemption.
@@ -3355,9 +3388,6 @@ fn detect_condition_if(
         return;
     }
     if any_ability_has_cast_from_zone_alt_ability_cost(parsed) {
-        return;
-    }
-    if any_ability_has_play_from_exile_alt_ability_cost(parsed) {
         return;
     }
     if any_static_has_target_gated_cost_modification(parsed) {
@@ -3442,6 +3472,9 @@ fn detect_condition_if(
         return;
     }
     if cast_this_way_alt_cost_is_only_if_marker(&stripped, evidence) {
+        return;
+    }
+    if play_from_exile_alt_ability_cost_is_only_if_marker(&stripped, parsed) {
         return;
     }
     // CR 615.5: "If damage is prevented this way, [effect]" is not an

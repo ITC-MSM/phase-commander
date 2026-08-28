@@ -6643,11 +6643,19 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // are paid through the same pipeline as flashback's non-mana cost.
     let alt_ability_cost = state.objects.get(&object_id).and_then(|obj| {
         if obj.zone == Zone::Exile {
-            // CR 611.2a: Match the grantee filter used by
-            // `prepare_spell_cast_with_variant_override` so the alt-ability
-            // cost is only consumed by the granted player.
-            obj.casting_permissions
-                .iter()
+            // CR 611.2a: Restrict to the exact permission instance selected for
+            // this cast (`casting_permission_index`), not a scan of every exile
+            // permission on the object. `casting::cast_spell`'s `alt_cost_from_exile`
+            // already zeroes the mana cost only for that same selected permission
+            // (see `casting.rs`'s mirrored `selected_permission` lookup); charging
+            // the `AbilityCost` body from an unscoped scan would let an object
+            // with two overlapping `PlayFromExile`/`ExileWithAltAbilityCost` grants
+            // (e.g. a normal grant plus an Inside Information-class grant) pay the
+            // OTHER grant's alt cost instead of the one actually elected.
+            let selected_permission = casting_permission_index
+                .and_then(|CastingPermissionIndex(index)| obj.casting_permissions.get(index));
+            selected_permission
+                .into_iter()
                 .find_map(|p| match p {
                     crate::types::ability::CastingPermission::ExileWithAltAbilityCost {
                         cost,

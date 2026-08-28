@@ -23,23 +23,26 @@
 
 use engine::game::casting::spell_objects_available_to_cast;
 use engine::game::scenario::{GameScenario, P0, P1};
-use engine::types::ability::{AbilityCost, CastingPermission, Duration, QuantityExpr, QuantityRef};
+use engine::types::ability::{
+    AbilityCost, CastingPermission, Duration, PlayFromExileProvenance, QuantityExpr, QuantityRef,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
-use engine::types::zones::Zone;
+use engine::types::statics::CastFrequency;
+use engine::types::zones::{EtbTapState, Zone};
 
 const ORACLE: &str = "Exile the top X cards of target opponent's library. You may play those \
 cards this turn. If you cast a spell this way, pay life equal to its mana value rather than \
 pay its mana cost.";
 
 /// Find the `PlayFromExile` grant on `obj_id` bound to `grantee`.
-fn play_from_exile_for<'a>(
-    state: &'a engine::types::game_state::GameState,
+fn play_from_exile_for(
+    state: &engine::types::game_state::GameState,
     obj_id: engine::types::identifiers::ObjectId,
     grantee: engine::types::player::PlayerId,
-) -> Option<&'a CastingPermission> {
+) -> Option<&CastingPermission> {
     state.objects[&obj_id].casting_permissions.iter().find(|p| {
         matches!(
             p,
@@ -316,4 +319,104 @@ fn unplayed_exiled_cards_expire_at_end_of_turn() {
         play_from_exile_for(runner.state(), rig.spell_c, P0).is_none(),
         "CR 514.2 + CR 611.2a: the expired PlayFromExile grant must be pruned at end of turn"
     );
+}
+
+/// Regression (PR #8007 review): CR 601.2a + CR 118.9a — the cost pipeline
+/// must charge the alt cost from the `PlayFromExile` grant SELECTED for this
+/// cast, never a different overlapping grant on the same exiled object. A
+/// prior bug in `check_additional_cost_or_pay` scanned every exile
+/// permission on the object (`obj.casting_permissions.iter().find_map(..)`)
+/// instead of indexing the one `casting_permission_index` actually elected,
+/// so a normally-selected plain `PlayFromExile` grant could still get
+/// charged a SIBLING grant's alternative life cost (Inside Information
+/// class) even though the mana-zeroing pipeline (`casting::cast_spell`)
+/// correctly left its mana cost intact — the player paid both the full mana
+/// cost AND an unrelated life cost.
+///
+/// Setup: `spell_a` sits in exile carrying TWO `PlayFromExile` grants for
+/// P0 — a plain grant with no alt cost inserted at index 0 (so
+/// `selected_object_cast_permission_index`'s first-match scan elects it),
+/// and the pre-existing Inside Information alt-cost grant (pay life equal to
+/// mana value) at index 1. Casting `spell_a` must pay its normal mana cost
+/// and NOT touch life, proving the selected (index-0) grant's cost — not
+/// index 1's — governs the cast.
+#[test]
+fn overlapping_exile_grant_pays_the_selected_permissions_cost_not_a_sibling_grants() {
+    let rig = build_rig();
+    let mut runner = rig.scenario.build();
+
+    runner
+        .cast(rig.inside_information)
+        .x(3)
+        .target_player(P1)
+        .resolve();
+
+    // spell_a now carries exactly one grant: the Inside Information alt-cost
+    // `PlayFromExile`. Insert a plain grant BEFORE it (index 0) so cast-time
+    // permission selection elects the plain grant, not the alt-cost one.
+    {
+        let state = runner.state_mut();
+        let obj = state.objects.get_mut(&rig.spell_a).unwrap();
+        assert_eq!(
+            obj.casting_permissions.len(),
+            1,
+            "reach-guard: spell_a must start with exactly the Inside Information grant"
+        );
+        obj.casting_permissions.insert(
+            0,
+            CastingPermission::PlayFromExile {
+                provenance: PlayFromExileProvenance::Impulse,
+                duration: Duration::UntilEndOfTurn,
+                granted_to: P0,
+                frequency: CastFrequency::Unlimited,
+                source_id: None,
+                invalidation: None,
+                exiled_by_ability_controller: None,
+                mana_spend_permission: None,
+                card_filter: None,
+                single_use_group: None,
+                single_use: false,
+                cast_cost_raise: None,
+                alt_ability_cost: None,
+                land_enter_tapped: EtbTapState::Unspecified,
+            },
+        );
+        // The Inside Information cast (X=3) fully drained P0's pool. Top it
+        // back up with exactly spell_a's real printed cost ({R}{2} = 3 mana
+        // units) so a normal-mana cast through the plain grant is affordable.
+        state.players[0].mana_pool.mana.extend(vec![
+            ManaUnit::new(
+                ManaType::Red,
+                engine::types::identifiers::ObjectId(9_994),
+                false,
+                vec![],
+            ),
+            ManaUnit::new(
+                ManaType::Colorless,
+                engine::types::identifiers::ObjectId(9_993),
+                false,
+                vec![],
+            ),
+            ManaUnit::new(
+                ManaType::Colorless,
+                engine::types::identifiers::ObjectId(9_992),
+                false,
+                vec![],
+            ),
+        ]);
+    }
+
+    let cast = runner.cast(rig.spell_a).resolve();
+
+    // The selected (plain) grant carries no alt cost — casting through it
+    // must never charge the sibling Inside Information grant's pay-life
+    // alternative cost.
+    cast.assert_life_delta(P0, 0);
+    cast.assert_hand_drawn(P0, 1);
+    assert_eq!(
+        cast.state().players[0].mana_pool.total(),
+        0,
+        "the selected plain grant must pay spell_a's real {{R}}{{2}} mana cost normally"
+    );
+    cast.assert_zone(&[rig.spell_a], Zone::Graveyard);
 }
