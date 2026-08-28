@@ -1738,15 +1738,20 @@ fn ability_condition_currently_met_gates_on_board_relative_quantity() {
     );
     let your_power_ge_10 = AbilityCondition::QuantityCheck {
         lhs: QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: crate::types::ability::AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::Power,
-                filter: TargetFilter::Typed(
-                    crate::types::ability::TypedFilter::default()
-                        .with_type(crate::types::ability::TypeFilter::Creature)
-                        .controller(crate::types::ability::ControllerRef::You),
-                ),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    crate::types::ability::AggregateFunction::Sum,
+                    crate::types::ability::ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(
+                            crate::types::ability::TypedFilter::default()
+                                .with_type(crate::types::ability::TypeFilter::Creature)
+                                .controller(crate::types::ability::ControllerRef::You),
+                        ),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         },
         comparator: crate::types::ability::Comparator::GE,
         rhs: QuantityExpr::Fixed { value: 10 },
@@ -3383,23 +3388,28 @@ fn visions_of_ruin_flashback_commander_mv_reduces_flashback_cost() {
             mode: CostModifyMode::Reduce,
             amount: ManaCost::generic(1),
             spell_filter: None,
-            dynamic_count: Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::ManaValue,
-                filter: TargetFilter::Typed(
-                    TypedFilter::default()
-                        .with_type(TypeFilter::Creature)
-                        .properties(vec![
-                            FilterProp::IsCommander,
-                            FilterProp::Owned {
-                                controller: ControllerRef::You,
-                            },
-                            FilterProp::InAnyZone {
-                                zones: vec![Zone::Battlefield, Zone::Command],
-                            },
-                        ]),
-                ),
-            }),
+            dynamic_count: Some(QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::ManaValue,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::default()
+                                .with_type(TypeFilter::Creature)
+                                .properties(vec![
+                                    FilterProp::IsCommander,
+                                    FilterProp::Owned {
+                                        controller: ControllerRef::You,
+                                    },
+                                    FilterProp::InAnyZone {
+                                        zones: vec![Zone::Battlefield, Zone::Command],
+                                    },
+                                ]),
+                        ),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            )),
         })
         .affected(TargetFilter::SelfRef)
         .condition(StaticCondition::CastingAsVariant {
@@ -12027,11 +12037,18 @@ fn self_cost_reduction_applies_from_command_zone() {
             mode: CostModifyMode::Reduce,
             amount: ManaCost::generic(1),
             spell_filter: None,
-            dynamic_count: Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-            }),
+            dynamic_count: Some(QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().controller(ControllerRef::You),
+                        ),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            )),
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -50673,15 +50690,20 @@ fn cosmic_cube_dynamic_mv_ceiling_enforced_at_finalize() {
     let constraint = Some(CastPermissionConstraint::ManaValue {
         comparator: Comparator::LE,
         value: QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::Typed(TypedFilter {
-                    type_filters: vec![TypeFilter::Creature],
-                    controller: Some(ControllerRef::You),
-                    properties: vec![FilterProp::Attacking { defender: None }],
-                }),
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Max,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Creature],
+                            controller: Some(ControllerRef::You),
+                            properties: vec![FilterProp::Attacking { defender: None }],
+                        }),
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         },
     });
 

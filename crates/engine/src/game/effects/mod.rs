@@ -3363,7 +3363,6 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
@@ -3394,6 +3393,9 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             card_type_set_source_counts_population_matching(source, filter_pred)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            card_type_set_source_counts_population_matching(aggregate.source(), filter_pred)
         }
         // No `TargetFilter` anywhere: player-scoped totals, per-object scopes,
         // resolution/turn counters, and cost bookkeeping.
@@ -3430,7 +3432,6 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::TrackedSetSize
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -5765,7 +5766,6 @@ fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
         QuantityExpr::Ref { qty } => match qty {
             QuantityRef::TrackedSetSize
             | QuantityRef::FilteredTrackedSetSize { .. }
-            | QuantityRef::TrackedSetAggregate { .. }
             | QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet { .. },
             }
@@ -5773,6 +5773,15 @@ fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
                 source: CardTypeSetSource::TrackedSet { .. },
                 ..
             } => true,
+            QuantityRef::PropertyAggregate(aggregate) => {
+                let mut found = false;
+                let complete = aggregate
+                    .source()
+                    .try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
+                        found |= matches!(leaf, CardTypeSetSource::TrackedSet { .. })
+                    });
+                found || !complete
+            }
             // CR 608.2c: a player-count whose filter is keyed on the chain's
             // tracked object set is a CONSUMER of that set — the preceding
             // producer must publish it, or the count resolves to 0. This is the
@@ -16356,11 +16365,17 @@ mod tests {
     #[test]
     fn token_power_toughness_tracked_set_marks_ability_as_referencing_tracked_set() {
         let tracked_pt = PtValue::Quantity(QuantityExpr::Ref {
-            qty: QuantityRef::TrackedSetAggregate {
-                function: crate::types::ability::AggregateFunction::Sum,
-                property: crate::types::ability::ObjectProperty::Power,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    crate::types::ability::AggregateFunction::Sum,
+                    crate::types::ability::ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::TrackedSet {
+                        set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                        caused_by: None,
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         });
         let ability = ResolvedAbility::new(
             Effect::Token {
@@ -26089,13 +26104,18 @@ mod tests {
 
         let condition = AbilityCondition::QuantityCheck {
             lhs: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::Toughness,
-                    filter: TargetFilter::Typed(
-                        TypedFilter::creature().controller(ControllerRef::You),
-                    ),
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::Toughness,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::Typed(
+                                TypedFilter::creature().controller(ControllerRef::You),
+                            ),
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             },
             comparator: Comparator::GE,
             rhs: QuantityExpr::Fixed { value: 40 },
@@ -26720,36 +26740,46 @@ mod tests {
             Effect::Token {
                 name: "Illusion".to_string(),
                 power: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 toughness: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 types: vec!["Creature".to_string(), "Illusion".to_string()],
                 colors: vec![ManaColor::Blue],
@@ -26865,36 +26895,46 @@ mod tests {
             Effect::Token {
                 name: "Illusion".to_string(),
                 power: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 toughness: PtValue::Quantity(QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: crate::types::ability::AggregateFunction::Sum,
-                        property: crate::types::ability::ObjectProperty::ManaValue,
-                        filter: TargetFilter::And {
-                            filters: vec![
-                                TargetFilter::ExiledBySource,
-                                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                    FilterProp::Owned {
-                                        controller: ControllerRef::You,
-                                    },
-                                ])),
-                            ],
-                        },
-                    },
+                    qty: QuantityRef::PropertyAggregate(
+                        crate::types::ability::PropertyAggregate::new(
+                            crate::types::ability::AggregateFunction::Sum,
+                            crate::types::ability::ObjectProperty::ManaValue,
+                            crate::types::ability::CardTypeSetSource::Objects {
+                                filter: TargetFilter::And {
+                                    filters: vec![
+                                        TargetFilter::ExiledBySource,
+                                        TargetFilter::Typed(TypedFilter::default().properties(
+                                            vec![FilterProp::Owned {
+                                                controller: ControllerRef::You,
+                                            }],
+                                        )),
+                                    ],
+                                },
+                            },
+                        )
+                        .expect("statically valid property aggregate"),
+                    ),
                 }),
                 types: vec!["Creature".to_string(), "Illusion".to_string()],
                 colors: vec![ManaColor::Blue],
