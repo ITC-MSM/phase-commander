@@ -7270,8 +7270,10 @@ pub(crate) fn resolution_optional_payment_options(
         .iter()
         .enumerate()
         .filter(|(_, cost)| {
-            crate::game::costs::is_direct_resolution_optional_payment_branch(cost)
-                && crate::game::costs::supported_at_resolution(cost)
+            let intercepted_sacrifice = matches!(cost, AbilityCost::Sacrifice(_));
+            crate::game::costs::is_resolution_optional_payment_prompt_branch(cost)
+                && ((!intercepted_sacrifice || ability.repeat_for.is_none())
+                    && (intercepted_sacrifice || crate::game::costs::supported_at_resolution(cost)))
                 && crate::game::costs::can_pay(state, payer, ability.source_id, cost, &scope)
         })
         .map(|(index, cost)| ResolutionOptionalPaymentOption {

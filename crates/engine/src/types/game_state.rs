@@ -6897,11 +6897,18 @@ pub struct ManaAbilityCostCursor {
 /// replacement-paused sacrifice cost. Selected sacrifices remove their
 /// activation-cost component; a SelfRef sacrifice resumes the automatic
 /// additional-cost path without replaying the sacrifice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PendingSacrificeCostCompletion {
     SelectedNonSelf,
     SelfRef,
+    /// CR 118.3 + CR 118.11-12: a resolving optional PayCost branch owns its
+    /// substituted root and exact selected incarnations until every sacrifice
+    /// has reached a terminal replacement outcome.
+    ResolutionOptionalPayment {
+        frame: Box<OptionalEffectFrame>,
+        selected: Vec<ObjectIncarnationRef>,
+    },
 }
 
 /// CR 702.21a + CR 701.21 + CR 616.1: The unpaid work after one ward sacrifice
@@ -6953,7 +6960,10 @@ pub enum PendingCostMoveResume {
     },
     SacrificeForCost {
         player: PlayerId,
-        pending: Box<PendingCast>,
+        /// Cast/activation payments retain their announcement. Resolution-time
+        /// optional payments instead carry their typed tail in `completion`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending: Option<Box<PendingCast>>,
         chosen: Vec<ObjectId>,
         /// Index into `chosen` whose sacrifice completes or is prevented by
         /// the replacement action. Resumption continues at the next index.

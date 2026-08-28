@@ -2243,13 +2243,14 @@ mod tests {
         FrozenScopedSearchFoundDisposition, ManaAbilityCostCursor, ManaAbilityCostResolutionMode,
         ManaAbilityResume, MayTriggerAutoChoiceKey, MayTriggerOrigin, PendingBeginGameAbility,
         PendingCast, PendingCostMoveCompletion, PendingCostMoveResume, PendingManaAbility,
-        PendingScopedLibrarySearch, PendingSearchFoundBatch, PreparedScopedLibrarySearchChoice,
-        TargetEffectDetail,
+        PendingSacrificeCostCompletion, PendingScopedLibrarySearch, PendingSearchFoundBatch,
+        PreparedScopedLibrarySearchChoice, TargetEffectDetail,
     };
-    use crate::types::identifiers::CardId;
+    use crate::types::identifiers::{CardId, ObjectIncarnationRef};
     use crate::types::mana::ManaCost;
     use crate::types::proposed_event::{ProposedEvent, SearchFoundDisposition};
     use crate::types::replacements::ReplacementEvent;
+    use crate::types::resolution::OptionalEffectFrame;
     use crate::types::zones::{ExileCostSourceZone, Zone};
     use rand::RngCore;
 
@@ -6266,6 +6267,28 @@ mod tests {
             PendingCostMoveResume::DelveManaPayment {
                 player: PlayerId(0),
                 fuel_id: hidden,
+            },
+            PendingCostMoveResume::SacrificeForCost {
+                player: PlayerId(0),
+                pending: None,
+                chosen: vec![hidden],
+                paused_at_index: 0,
+                completion: PendingSacrificeCostCompletion::ResolutionOptionalPayment {
+                    frame: Box::new(OptionalEffectFrame {
+                        ability: Box::new(ResolvedAbility::new(
+                            Effect::NoOp,
+                            vec![],
+                            ObjectId(70_002),
+                            PlayerId(0),
+                        )),
+                        trigger_event: None,
+                        trigger_events: Vec::new(),
+                        trigger_match_count: None,
+                    }),
+                    selected: vec![ObjectIncarnationRef::from_object(&state.objects[&hidden])],
+                },
+                deferred_cost_events: Vec::new(),
+                departure_record_indices: Vec::new(),
             },
             mana_resume,
         ];

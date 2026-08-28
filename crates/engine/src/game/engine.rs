@@ -10374,6 +10374,15 @@ fn apply_action(
                 }
             },
             CostResume::Resolution => match kind {
+                PayCostKind::Sacrifice => {
+                    casting_costs::handle_resolution_optional_sacrifice_for_cost(
+                        state,
+                        *player,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?
+                }
                 PayCostKind::TapCreatures { mode } => {
                     casting_costs::pay_tap_creatures_selection(
                         state,
@@ -10393,7 +10402,6 @@ fn apply_action(
                 }
                 PayCostKind::Discard
                 | PayCostKind::Reveal
-                | PayCostKind::Sacrifice
                 | PayCostKind::ReturnToHand
                 | PayCostKind::ExileFromZone { .. }
                 | PayCostKind::ExilePermanent { .. }
@@ -12004,7 +12012,13 @@ fn apply_action(
             }
         }
         (WaitingFor::ReplacementChoice { .. }, GameAction::ChooseReplacement { index }) => {
-            engine_replacement::handle_replacement_choice(state, index, &mut events)?
+            if let Some(waiting_for) =
+                casting_costs::abandon_stale_resolution_sacrifice_cursor(state, &mut events)
+            {
+                waiting_for
+            } else {
+                engine_replacement::handle_replacement_choice(state, index, &mut events)?
+            }
         }
         (
             WaitingFor::EntryControllerChoice { .. },
