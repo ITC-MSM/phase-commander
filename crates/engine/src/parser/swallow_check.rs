@@ -3387,6 +3387,64 @@ fn enters_with_finality_this_way_is_only_if_marker(
     !has_other_if
 }
 
+/// CR 118.9 + CR 607.1 + CR 608.2c: conservative cardinality guard shared by
+/// every detector that exempts an alternative-cost-rider carrier's OWN
+/// sentence ("[if you cast a spell / it this way,] pay <cost> rather than pay
+/// its mana cost") from its residual " if " marker scan.
+///
+/// Mirrors `enters_with_counter_rider_residual_sentences` (PR #7970 /
+/// Hundred-Battle Veteran, `a8042ab56`) for this sibling carrier shape: the
+/// caller's structural evidence — a `GraveyardCastPermission`/
+/// `ExileCastPermission { extra_cost: Some(Alternative), .. }` static, or a
+/// `PlayFromExile { alt_ability_cost: Some(_), .. }` grant — only proves the
+/// unit contains AT LEAST ONE such carrier. It carries no sentence-level
+/// provenance linking that carrier to a SPECIFIC "cast ... this way, pay ..."
+/// sentence. When exactly one sentence in the unit matches
+/// `try_parse_alt_cost_rider`'s syntactic shape, evidence and syntax
+/// necessarily agree on which sentence produced the carrier, so it is sound
+/// to remove exactly that sentence and hand the caller the residual for its
+/// own " if " marker scan (`Some`). When two or more sentences match,
+/// evidence cannot distinguish "the represented carrier's sentence" from "an
+/// unrelated, unrepresented second rider that happens to parse the same way"
+/// — removing every matching sentence in that case would silently swallow
+/// the unlinked rider, so `None` is returned instead and no sentence is
+/// removed, keeping every matching sentence's `if` visible to the caller's
+/// residual scan.
+///
+/// Shared by `cast_this_way_alt_cost_is_only_if_marker` (extra_cost on a
+/// `GraveyardCastPermission`/`ExileCastPermission`) and
+/// `play_from_exile_alt_ability_cost_is_only_if_marker`
+/// (`PlayFromExile.alt_ability_cost`) — both gate on the identical
+/// "cast ... this way, pay ..." rider shape and must not drift apart on what
+/// counts as "the carrier's clause".
+fn alt_cost_rider_residual_sentences(stripped: &str) -> Option<Vec<&str>> {
+    let sentences: Vec<&str> = stripped.split('.').collect();
+    let matching_rider_count = sentences
+        .iter()
+        .filter(|sentence| {
+            let sentence = sentence.trim_start();
+            (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
+                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
+                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some()
+        })
+        .count();
+    if matching_rider_count != 1 {
+        return None;
+    }
+    Some(
+        sentences
+            .into_iter()
+            .filter(|sentence| {
+                let trimmed = sentence.trim_start();
+                let is_rider = (trimmed.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
+                    || trimmed.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
+                    && crate::parser::oracle_effect::try_parse_alt_cost_rider(trimmed).is_some();
+                !is_rider
+            })
+            .collect(),
+    )
+}
+
 /// CR 118.9 + CR 119.4 + CR 305.1: Inside Information class — mirrors
 /// `cast_this_way_alt_cost_is_only_if_marker`'s text-scoped exemption for the
 /// sibling `PlayFromExile.alt_ability_cost` shape. Structural presence of the
@@ -3395,7 +3453,10 @@ fn enters_with_finality_this_way_is_only_if_marker(
 /// somewhere — it must not exempt the whole parse unit from `detect_condition_if`.
 /// Only the sentence that represents the rider is stripped before scanning
 /// for a residual, unrepresented " if " so an unrelated conditional on the
-/// same card (or unit) is still caught.
+/// same card (or unit) is still caught. Also stays visible when a SECOND
+/// sentence in the unit syntactically matches the rider's own shape — see
+/// `alt_cost_rider_residual_sentences` for why cardinality (not just
+/// presence) of the carrier evidence matters.
 fn play_from_exile_alt_ability_cost_is_only_if_marker(
     stripped: &str,
     parsed: &ParsedAbilities,
@@ -3403,17 +3464,10 @@ fn play_from_exile_alt_ability_cost_is_only_if_marker(
     if !any_ability_has_play_from_exile_alt_ability_cost(parsed) {
         return false;
     }
-    let residual: String = stripped
-        .split('.')
-        .filter(|sentence| {
-            let sentence = sentence.trim_start();
-            let is_rider = (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
-                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
-                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some();
-            !is_rider
-        })
-        .collect::<Vec<_>>()
-        .join(".");
+    let Some(residual_sentences) = alt_cost_rider_residual_sentences(stripped) else {
+        return false;
+    };
+    let residual = residual_sentences.join(".");
     let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -3423,6 +3477,9 @@ fn play_from_exile_alt_ability_cost_is_only_if_marker(
 /// CR 118.9 + CR 607.1 + CR 608.2c: an alternative-cost rider on a cast
 /// permission represents its linked "if you cast a spell this way, pay …"
 /// clause. Additional-cost riders deliberately remain outside this exemption.
+/// Also stays visible when a SECOND sentence in the unit syntactically
+/// matches the rider's own shape — see `alt_cost_rider_residual_sentences`
+/// for why cardinality (not just presence) of the carrier evidence matters.
 fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvidence) -> bool {
     if !evidence.any_static_mode(|mode| {
         matches!(
@@ -3439,17 +3496,10 @@ fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvide
         return false;
     }
 
-    let residual: String = stripped
-        .split('.')
-        .filter(|sentence| {
-            let sentence = sentence.trim_start();
-            let is_rider = (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
-                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
-                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some();
-            !is_rider
-        })
-        .collect::<Vec<_>>()
-        .join(".");
+    let Some(residual_sentences) = alt_cost_rider_residual_sentences(stripped) else {
+        return false;
+    };
+    let residual = residual_sentences.join(".");
     let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -10248,6 +10298,98 @@ mod detect_condition_if_replacement_exemption_tests {
              still be flagged as a swallowed Condition_If — a cardinality-blind carrier \
              exemption strips BOTH matching sentences and reports nothing; \
              diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Second maintainer finding on PR #8007 (review submitted 2026-08-28,
+    /// following the earlier cost-pipeline + card-wide-exemption fix in
+    /// `42137f9f5`): `play_from_exile_alt_ability_cost_is_only_if_marker`
+    /// proved only that the unit's `parsed.abilities` tree contains SOME
+    /// `PlayFromExile { alt_ability_cost: Some(_), .. }` carrier, then
+    /// stripped EVERY sentence matching `try_parse_alt_cost_rider`'s syntactic
+    /// shape from the residual scan — exactly the same cardinality blindness
+    /// `enters_with_counter_rider_residual_sentences` fixed for the
+    /// Hundred-Battle Veteran carrier shape in PR #7970 (`95df03a75`,
+    /// mirrored here as `alt_cost_rider_residual_sentences`). Structural
+    /// `evidence` proves "at least one" carrier exists but carries no
+    /// sentence-level provenance, so a unit with ONE typed carrier and TWO
+    /// syntactically matching "cast ... this way, pay ..." sentences must not
+    /// have BOTH stripped — the second, unlinked rider must keep raising its
+    /// `Condition_If` diagnostic.
+    #[test]
+    fn play_from_exile_alt_cost_carrier_scoping_does_not_swallow_a_second_matching_rider_in_the_same_unit(
+    ) {
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, PlayFromExileProvenance, QuantityExpr,
+        };
+        use crate::types::player::PlayerId;
+        use crate::types::statics::CastFrequency;
+        use crate::types::zones::EtbTapState;
+
+        let permission = CastingPermission::PlayFromExile {
+            provenance: PlayFromExileProvenance::Impulse,
+            duration: Duration::UntilEndOfTurn,
+            granted_to: PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_raise: None,
+            alt_ability_cost: Some(AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 0 },
+            }),
+            land_enter_tapped: EtbTapState::Unspecified,
+            invalidation: None,
+        };
+        let ability = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GrantCastingPermission {
+                permission,
+                target: crate::types::ability::default_target_filter_any(),
+                grantee: crate::types::ability::PermissionGrantee::AbilityController,
+            },
+        );
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: vec![ability],
+            triggers: Vec::new(),
+            statics: Vec::new(),
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+
+        // The unit's text carries TWO sentences that both match
+        // `try_parse_alt_cost_rider`'s syntactic shape ("if you cast a spell
+        // this way, pay ... rather than pay its mana cost"), but only the
+        // FIRST corresponds to the single typed `PlayFromExile.alt_ability_cost`
+        // carrier above — the second is a rider on a batch this fixture's
+        // `parsed.abilities` never produced a carrier for (e.g. a second
+        // exile-and-play grant the parser failed to lower).
+        let text = "exile the top three cards of target opponent's library. you may play those \
+                     cards this turn. if you cast a spell this way, pay life equal to its mana \
+                     value rather than pay its mana cost. exile the top two cards of your own \
+                     library. you may play those cards this turn. if you cast a spell this way, \
+                     pay life equal to its mana value rather than pay its mana cost.";
+        let cleaned = text.to_ascii_lowercase();
+        let mut diagnostics = Vec::new();
+        detect_condition_if(&cleaned, text, &evidence, &parsed, &mut diagnostics);
+
+        assert!(
+            has_condition_if_swallow(&diagnostics),
+            "the second, unlinked \"if you cast a spell this way, pay life equal to its mana \
+             value\" rider must still be flagged as a swallowed Condition_If — a \
+             cardinality-blind carrier exemption strips BOTH matching sentences and reports \
+             nothing; diagnostics: {diagnostics:?}"
         );
     }
 
