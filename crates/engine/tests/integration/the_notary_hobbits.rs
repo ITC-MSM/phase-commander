@@ -38,6 +38,8 @@ use engine::types::game_state::GameState;
 use engine::types::mana::ManaType;
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+use engine::types::triggers::TriggerMode;
+use engine::types::zone::Zone;
 
 const NOTARY_HOBBITS_ORACLE: &str = "When The Notary Hobbits enter, if they're not a token, \
     create two tokens that are copies of them, except the tokens aren't legendary.\n\
@@ -123,6 +125,16 @@ fn the_notary_hobbits_etb_creates_two_nonlegendary_tokens_without_recursion() {
         assert!(
             token.card_types.subtypes.iter().any(|s| s == "Halfling"),
             "token copy must keep the Halfling subtype from the copied source"
+        );
+        // CR 707.2: a copied token retains the source's copiable rules text,
+        // including the original ETB trigger. Its intervening-if condition is
+        // what prevents that retained trigger from creating more tokens.
+        assert!(
+            token.base_triggers.iter().any(|trigger| {
+                trigger.mode == TriggerMode::ChangesZone
+                    && trigger.destination == Some(Zone::Battlefield)
+            }),
+            "token copy must retain The Notary Hobbits's enters-the-battlefield trigger"
         );
     }
 }
