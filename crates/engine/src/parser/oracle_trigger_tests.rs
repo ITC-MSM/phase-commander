@@ -20,7 +20,7 @@ use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::game_state::WaitingFor;
 use crate::types::keywords::Keyword;
-use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
+use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::{CastFrequency, StaticMode};
 
@@ -16539,6 +16539,13 @@ fn anthropede_and_isu_unlock_without_sacrifice_leak() {
         (costs, execute)
     }
 
+    fn mana_cost(cost: &AbilityCost) -> &ManaCost {
+        let AbilityCost::Mana { cost } = cost else {
+            panic!("expected Mana cost, got {cost:?}");
+        };
+        cost
+    }
+
     let anthropede = parse_trigger_line(
         "When this creature enters, you may discard a card or pay {2}. When you do, destroy target Room.",
         "Anthropede",
@@ -16547,6 +16554,7 @@ fn anthropede_and_isu_unlock_without_sacrifice_leak() {
     assert_eq!(costs.len(), 2);
     assert!(matches!(costs[0], AbilityCost::Discard { .. }));
     assert!(matches!(costs[1], AbilityCost::Mana { .. }));
+    assert_eq!(mana_cost(&costs[1]), &ManaCost::generic(2));
     assert_eq!(
         execute
             .sub_ability
@@ -16564,6 +16572,24 @@ fn anthropede_and_isu_unlock_without_sacrifice_leak() {
         let (costs, execute) = root_cost(&isu);
         assert_eq!(costs.len(), 3);
         assert!(costs.iter().all(|cost| matches!(cost, AbilityCost::Mana { .. })));
+        assert_eq!(
+            costs.iter().map(mana_cost).cloned().collect::<Vec<_>>(),
+            vec![
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 0,
+                },
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::White],
+                    generic: 0,
+                },
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 0,
+                },
+            ],
+            "Isu must preserve the printed {{G}}/{{W}}/{{U}} branch order"
+        );
         assert_eq!(
             execute.sub_ability.as_ref().expect("If-you-do tail").condition,
             Some(AbilityCondition::effect_performed())
