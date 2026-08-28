@@ -682,15 +682,19 @@ fn rootha_mastering_the_moment() {
         "At the beginning of combat on your turn, if you've cast an instant or sorcery spell this turn, create an X/X blue and red Elemental creature token with flying and haste, where X is the greatest mana value among instant and sorcery spells you've cast this turn.",
         "Rootha, Mastering the Moment",
         &["Creature"],
-        &["Otter", "Wizard"],
+        &["Orc", "Sorcerer"],
     );
+    let trigger = lowered
+        .triggers
+        .first()
+        .expect("Rootha must lower its beginning-of-combat trigger");
+    let execute = trigger
+        .execute
+        .as_deref()
+        .expect("Rootha's trigger must retain its token execute tree");
     assert!(
-        lowered
-            .abilities
-            .iter()
-            .all(|ability| !ability_has_unimplemented(ability)),
-        "Rootha must lower without unsupported leaves: {:?}",
-        lowered.abilities
+        !ability_has_unimplemented(execute),
+        "Rootha's trigger execute tree must lower without unsupported leaves: {execute:?}",
     );
     insta::assert_json_snapshot!("rootha_mastering_the_moment_ir", &ir);
     insta::assert_json_snapshot!("rootha_mastering_the_moment_lowered", &lowered);

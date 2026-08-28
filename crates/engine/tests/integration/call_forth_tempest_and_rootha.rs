@@ -3,8 +3,9 @@
 use engine::game::restrictions::record_spell_cast_from_zone;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
+use engine::types::ability::Effect;
 use engine::types::actions::{CastChoice, GameAction};
-use engine::types::game_state::{CastingVariant, WaitingFor};
+use engine::types::game_state::{CastingVariant, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
@@ -115,6 +116,39 @@ fn call_forth_zero_prior_spells_resolves_with_zero_damage() {
     );
     assert_eq!(state.objects[&opponent].damage_marked, 0);
     assert_eq!(state.objects[&call_forth].zone, Zone::Graveyard);
+}
+
+#[test]
+fn call_forth_real_card_cast_puts_two_cascade_triggers_on_the_stack() {
+    let db = crate::support::shared_card_db().expect("integration card fixture must load");
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let call_forth = add_call_forth(&mut scenario, db);
+    scenario.with_mana_pool(P0, call_forth_pool(5));
+
+    let mut runner = build_rehydrated(scenario, db);
+    {
+        let _committed = runner.cast(call_forth).commit();
+    }
+    let state = runner.state();
+    assert_eq!(
+        state.spells_cast_this_turn_by_player[&P0].len(),
+        1,
+        "the real Call Forth card must complete the production cast ledger"
+    );
+    assert_eq!(
+        state
+            .stack
+            .iter()
+            .filter(|entry| matches!(
+                &entry.kind,
+                StackEntryKind::TriggeredAbility { ability, .. }
+                    if matches!(ability.effect, Effect::Cascade)
+            ))
+            .count(),
+        2,
+        "CR 702.85c: the real card's two Cascade instances must trigger separately"
+    );
 }
 
 #[test]
