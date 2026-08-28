@@ -103,10 +103,10 @@
 use crate::types::ability::FilterProp;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, CardTypeSetSource, ContinuousModification, ControllerRef,
-    Duration, Effect, GuessSubject, ModalChoice, MultiTargetSpec, ObjectScope, PlayerFilter,
-    PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation, ReplacementDefinition,
-    ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter, TriggerCondition,
-    TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
+    Duration, Effect, GuessSubject, ModalChoice, MultiTargetSpec, ObjectProperty, ObjectScope,
+    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, RepeatContinuation,
+    ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter,
+    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -6222,9 +6222,14 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
             );
             if reads_live_object {
                 profile.merge(reads_board_of(StateKind::ObjectPt));
-                // CR 613.4: live-object property aggregates read current P/T,
-                // so +1/+1-counter writes can feed the aggregate read.
-                profile.current_pt_reads.add(PtReadScope::Board);
+                // CR 613.4: +1/+1-counter writes feed live current-P/T
+                // aggregates, but not intrinsic mana-value/symbol reads.
+                if matches!(
+                    aggregate.property(),
+                    ObjectProperty::Power | ObjectProperty::Toughness
+                ) {
+                    profile.current_pt_reads.add(PtReadScope::Board);
+                }
             }
             if reads_tracked {
                 profile.reads_member_bound = true;
@@ -7098,8 +7103,8 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, ObjectProperty,
-        PropertyAggregate, PtValue, TargetSelectionMode,
+        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, PropertyAggregate,
+        PtValue, TargetSelectionMode,
     };
 
     use crate::game::test_fixtures::mana_fixture_roles;
@@ -7130,7 +7135,6 @@ mod tests {
             });
             if live {
                 profile.merge(reads_board_of(StateKind::ObjectPt));
-                profile.current_pt_reads.add(PtReadScope::Board);
             }
             if tracked {
                 profile.reads_member_bound = true;
@@ -7911,6 +7915,18 @@ mod tests {
             qcheck(QuantityRef::PropertyAggregate(aggregate), 6),
         );
         assert!(conflicts(&a, &batch()));
+
+        let mana_value = PropertyAggregate::new(
+            AggregateFunction::Max,
+            ObjectProperty::ManaValue,
+            CardTypeSetSource::Objects { filter: creature() },
+        )
+        .expect("live-object mana-value aggregate");
+        let control = cond(
+            ra(put_counter_all(qfix(1), creature())),
+            qcheck(QuantityRef::PropertyAggregate(mana_value), 6),
+        );
+        assert!(!conflicts(&control, &batch()));
     }
 
     #[test]
