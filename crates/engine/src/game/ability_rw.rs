@@ -4033,6 +4033,7 @@ fn walk_ability(
         mode_abilities,
         targets: _,
         source_id: _,
+        cast_occurrence: _,    // finalized-cast provenance, no read/write effect
         source_incarnation: _, // self-transform epoch latch, no read/write effect
         trigger_source: _,     // exact triggered-source authority, no read/write effect
         trigger_definition_ref: _, // exact trigger occurrence, no read/write effect
