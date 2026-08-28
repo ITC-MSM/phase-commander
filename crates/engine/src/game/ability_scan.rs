@@ -1895,11 +1895,17 @@ fn scan_property_aggregate_source(source: &CardTypeSetSource, mode: ScanMode) ->
                     set: TrackedAnaphorSource::ChainSet,
                     ..
                 } => Axes::NONE,
-                CardTypeSetSource::TurnJournal { .. } => Axes {
+                // CR 603.3b: the journal population is projected turn state,
+                // while an optional event-relative filter still reads the
+                // triggering event and must participate in trigger ordering.
+                CardTypeSetSource::TurnJournal { filter, .. } => Axes {
                     event: false,
                     sibling: false,
                     projected: true,
-                },
+                }
+                .or(filter.as_ref().map_or(Axes::NONE, |filter| {
+                    scan_target_filter(filter, FilterReadContext::SnapshotOrEvent, mode)
+                })),
                 CardTypeSetSource::Zone { .. } | CardTypeSetSource::ExiledBySource => {
                     Axes::CONSERVATIVE
                 }
@@ -6468,6 +6474,11 @@ mod tests {
             scope: CountScope::Controller,
             filter: None,
         };
+        let event_filtered_journal = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: Some(TargetFilter::TriggeringSource),
+        };
         let rows = vec![
             (
                 CardTypeSetSource::Objects {
@@ -6495,6 +6506,14 @@ mod tests {
                 journal.clone(),
                 Axes {
                     event: false,
+                    sibling: false,
+                    projected: true,
+                },
+            ),
+            (
+                event_filtered_journal,
+                Axes {
+                    event: true,
                     sibling: false,
                     projected: true,
                 },

@@ -6222,6 +6222,9 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
             );
             if reads_live_object {
                 profile.merge(reads_board_of(StateKind::ObjectPt));
+                // CR 613.4: live-object property aggregates read current P/T,
+                // so +1/+1-counter writes can feed the aggregate read.
+                profile.current_pt_reads.add(PtReadScope::Board);
             }
             if reads_tracked {
                 profile.reads_member_bound = true;
@@ -7095,8 +7098,8 @@ fn rw_controller_ref(x: &ControllerRef) -> RwProfile {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, PtValue,
-        TargetSelectionMode,
+        AbilityKind, AggregateFunction, ChoiceType, Comparator, CountScope, ObjectProperty,
+        PropertyAggregate, PtValue, TargetSelectionMode,
     };
 
     use crate::game::test_fixtures::mana_fixture_roles;
@@ -7127,6 +7130,7 @@ mod tests {
             });
             if live {
                 profile.merge(reads_board_of(StateKind::ObjectPt));
+                profile.current_pt_reads.add(PtReadScope::Board);
             }
             if tracked {
                 profile.reads_member_bound = true;
@@ -7892,6 +7896,21 @@ mod tests {
             qcheck(power_src(), 6),
         );
         assert!(conflicts(&a, &se()));
+    }
+
+    #[test]
+    fn property_aggregate_live_power_read_vs_board_counter_write_conflict() {
+        let aggregate = PropertyAggregate::new(
+            AggregateFunction::Max,
+            ObjectProperty::Power,
+            CardTypeSetSource::Objects { filter: creature() },
+        )
+        .expect("live-object power aggregate");
+        let a = cond(
+            ra(put_counter_all(qfix(1), creature())),
+            qcheck(QuantityRef::PropertyAggregate(aggregate), 6),
+        );
+        assert!(conflicts(&a, &batch()));
     }
 
     #[test]

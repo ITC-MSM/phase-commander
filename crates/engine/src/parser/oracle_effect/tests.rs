@@ -86,18 +86,30 @@ fn nested_triggering_batch_aggregate_is_rebound_through_the_source_visitor() {
     };
     let mut batch = 0;
     let mut chain = 0;
+    let mut objects = 0;
+    let mut graveyard = 0;
+    let mut leaves = 0;
     assert!(aggregate.source().try_for_each_member(
         crate::types::ability::UNION_DEPTH_BUDGET,
         &mut |leaf| {
-            if let CardTypeSetSource::TrackedSet { set, .. } = leaf {
-                match set {
+            leaves += 1;
+            match leaf {
+                CardTypeSetSource::TrackedSet { set, .. } => match set {
                     TrackedAnaphorSource::TriggeringBatch => batch += 1,
                     TrackedAnaphorSource::ChainSet => chain += 1,
-                }
+                },
+                CardTypeSetSource::Objects {
+                    filter: TargetFilter::Any,
+                } => objects += 1,
+                CardTypeSetSource::Zone {
+                    zone: ZoneRef::Graveyard,
+                    scope: CountScope::Controller,
+                } => graveyard += 1,
+                _ => {}
             }
         },
     ));
-    assert_eq!((batch, chain), (0, 1));
+    assert_eq!((batch, chain, objects, graveyard, leaves), (0, 1, 1, 1, 3));
 }
 
 #[test]
@@ -115,6 +127,34 @@ fn nested_triggering_batch_in_non_trigger_chain_is_demoted_honestly() {
     demote_unbindable_batch_aggregate(&mut def, "their total mana value");
 
     assert!(matches!(def.effect.as_ref(), Effect::Unimplemented { .. }));
+
+    let source = CardTypeSetSource::any_of(vec![
+        CardTypeSetSource::Objects {
+            filter: TargetFilter::Any,
+        },
+        CardTypeSetSource::Zone {
+            zone: ZoneRef::Graveyard,
+            scope: CountScope::Controller,
+        },
+    ])
+    .expect("non-batch source union");
+    let aggregate =
+        PropertyAggregate::new(AggregateFunction::Sum, ObjectProperty::ManaValue, source)
+            .expect("valid non-batch aggregate");
+    let mut control = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::LoseLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            },
+            target: None,
+        },
+    );
+    demote_unbindable_batch_aggregate(&mut control, "their total mana value");
+    assert!(!matches!(
+        control.effect.as_ref(),
+        Effect::Unimplemented { .. }
+    ));
 }
 
 #[test]

@@ -4388,7 +4388,9 @@ fn substitute_another_in_aggregate_source(source: &CardTypeSetSource) -> CardTyp
                 .collect(),
         )
         .expect("rewriting preserves union arity"),
-        other => other.clone(),
+        CardTypeSetSource::TrackedSet { .. }
+        | CardTypeSetSource::Zone { .. }
+        | CardTypeSetSource::ExiledBySource => source.clone(),
     }
 }
 
