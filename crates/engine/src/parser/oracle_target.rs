@@ -752,6 +752,15 @@ pub fn parse_target_with_syntax<'a>(
     if let Some((filter, rest)) = nom_on_lower(text, &lower, |input| {
         alt((
             |i| parse_cost_paid_object_reference(i, ctx),
+            // CR 701.47c: "the amassed Army" / "the Army you amassed" — the
+            // Army creature the current amass instruction chose. A
+            // resolution-local reference (mirrors `CostPaidObject` above),
+            // used by "amass Goblins 1, then attach this Equipment to the
+            // amassed Army" (Goblin Plate Mail).
+            value(
+                TargetFilter::AmassedArmy,
+                alt((tag("the amassed army"), tag("the army you amassed"))),
+            ),
             value(
                 TargetFilter::TriggeringSource,
                 (

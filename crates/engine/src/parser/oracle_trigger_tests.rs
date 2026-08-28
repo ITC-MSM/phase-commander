@@ -9642,6 +9642,75 @@ fn dreadhorde_invasion_upkeep_lose_life_and_amass() {
     }
 }
 
+/// CR 701.47a + CR 701.47c + CR 301.5a (Goblin Plate Mail, HOB): "When this
+/// Equipment enters, amass Goblins 1, then attach this Equipment to the
+/// amassed Army." Amass is the `execute` head; the attach rides as its
+/// `SequentialSibling` sub_ability with `attachment: SelfRef` (the default —
+/// "this Equipment") and `target: AmassedArmy` — the CR 701.47c binding to
+/// the EXACT Army object amass just touched, not a re-scan of the
+/// battlefield for "an Army you control". Zero `Effect::Unimplemented` nodes.
+#[test]
+fn goblin_plate_mail_amass_then_attach_to_amassed_army() {
+    let def = parse_trigger_line(
+        "When this Equipment enters, amass Goblins 1, then attach this Equipment to the amassed \
+         Army.",
+        "Goblin Plate Mail",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.destination, Some(Zone::Battlefield));
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+
+    let execute = def.execute.expect("execute");
+    match *execute.effect {
+        Effect::Amass {
+            ref subtype,
+            ref count,
+        } => {
+            assert_eq!(subtype, "Goblin");
+            assert!(
+                matches!(count, QuantityExpr::Fixed { value: 1 }),
+                "expected Amass count 1, got {count:?}"
+            );
+        }
+        ref other => panic!("expected Amass{{Goblin, 1}} head, got {other:?}"),
+    }
+
+    let sub = execute
+        .sub_ability
+        .expect("attach conjunct must survive as a sub_ability");
+    assert_eq!(
+        sub.sub_link,
+        SubAbilityLink::ContinuationStep,
+        "\"amass X, then attach ~\" is a within-sentence continuation (comma/\"then\" joined), \
+         the same shape as Squadron Hawk's \"...then shuffle\""
+    );
+    match *sub.effect {
+        Effect::Attach {
+            ref attachment,
+            ref target,
+        } => {
+            assert_eq!(
+                *attachment,
+                TargetFilter::SelfRef,
+                "attach \"this Equipment\" to the amassed Army — attachment is the source"
+            );
+            assert_eq!(
+                *target,
+                TargetFilter::AmassedArmy,
+                "must bind to the EXACT Army amass just touched, not a battlefield re-scan"
+            );
+        }
+        ref other => panic!("expected Attach{{SelfRef, AmassedArmy}}, got {other:?}"),
+    }
+
+    // No parse gap: neither clause fell back to `Effect::Unimplemented`.
+    assert!(
+        !matches!(*execute.effect, Effect::Unimplemented { .. })
+            && !matches!(*sub.effect, Effect::Unimplemented { .. }),
+        "expected zero Unimplemented nodes"
+    );
+}
+
 /// CR 603.4 + CR 122.1: "at the beginning of your end step, if there are
 /// thirty or more counters among artifacts and creatures you control, ..."
 /// — intervening-if with counter-count condition that sums across every

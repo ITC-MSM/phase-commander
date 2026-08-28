@@ -5976,6 +5976,21 @@ pub enum TargetFilter {
     /// resolving spell or ability. Used by effects such as "the exiled card"
     /// after an exile-as-cost clause.
     CostPaidObject,
+    /// CR 701.47c + CR 608.2c: "the amassed Army" / "the Army you amassed" —
+    /// the Army creature chosen by the current amass instruction, whether or
+    /// not it received counters. A resolution-local, non-targeted object
+    /// reference (the `TargetFilter` object-target counterpart of
+    /// [`ObjectScope::AmassedArmy`], which reads the same
+    /// `ResolvedAbility.amassed_army_object` snapshot for QuantityRef
+    /// properties like "the amassed Army's power"). Used by
+    /// `Effect::Attach.target` for "amass Goblins 1, then attach this
+    /// Equipment to the amassed Army" (Goblin Plate Mail): the sub-ability
+    /// chain walker in `game/effects/mod.rs` stamps `amassed_army_object`
+    /// from the `Amass` effect's resolution onto this sub-ability before it
+    /// resolves, so the attach binds to the EXACT Army amass just touched —
+    /// the newly created token, or an existing Army — never re-derived by
+    /// rescanning the battlefield for "an Army you control".
+    AmassedArmy,
     /// CR 613.1f + CR 611.2c + CR 400.7: Resolves to the single card most recently
     /// recorded on the FILTER's source object via `ChosenAttribute::Card` (written
     /// by `Effect::RememberCard`). Models "the last chosen card" — Koh, the Face
@@ -16888,6 +16903,16 @@ impl TargetFilter {
                 | TargetFilter::Neighbor { .. }
                 | TargetFilter::AttachedTo
                 | TargetFilter::CostPaidObject
+                // CR 701.47c: "the amassed Army" / "the Army you amassed" is
+                // resolved from `ResolvedAbility.amassed_army_object` after
+                // the current amass instruction runs — never declared as a
+                // target slot. Mirrors `CostPaidObject` immediately above:
+                // without this arm, the targeting layer treats it as a CR 115
+                // target needing legal candidates BEFORE amass has created or
+                // chosen the Army, so it always finds zero legal targets and
+                // the whole ability (Amass head included) is removed from the
+                // stack for lack of a legal target before it ever resolves.
+                | TargetFilter::AmassedArmy
                 | TargetFilter::ParentTarget
                 | TargetFilter::ParentTargetSlot { .. }
                 | TargetFilter::ParentTargetController

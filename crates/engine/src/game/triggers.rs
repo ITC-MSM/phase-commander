@@ -10977,6 +10977,7 @@ fn filter_binding_diverges(filter: &TargetFilter) -> bool {
         // `ResolvedAbility`, so this matches nothing at fire time. The
         // population-level counterpart of `ObjectScope::CostPaidObject`.
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
 
         // ---- RESOLUTION-PUBLISHED LEDGERS (CR 608.2c): established BY a
         // ---- resolution, so the fire-time read is a different moment's set.

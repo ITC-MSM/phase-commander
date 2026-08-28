@@ -2103,6 +2103,9 @@ fn object_scope_for_linked_reference(reference: &TargetFilter) -> Option<ObjectS
         TargetFilter::CostPaidObject => Some(ObjectScope::CostPaidObject),
         TargetFilter::ParentTarget => Some(ObjectScope::Target),
         TargetFilter::TriggeringSource => Some(ObjectScope::EventSource),
+        // CR 701.47c: "shares a creature type with the amassed Army" — bridge
+        // to the QuantityRef-side scope that already carries the same referent.
+        TargetFilter::AmassedArmy => Some(ObjectScope::AmassedArmy),
         _ => None,
     }
 }

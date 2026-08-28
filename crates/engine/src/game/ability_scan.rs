@@ -3084,6 +3084,9 @@ fn scan_target_filter(x: &TargetFilter, ctx: FilterReadContext, mode: ScanMode) 
         TargetFilter::AttachedTo => Axes::NONE,
         TargetFilter::LastCreated => Axes::NONE,
         TargetFilter::LastRevealed | TargetFilter::LastZoneChanged => Axes::NONE,
+        // CR 701.47c: per-resolution local (the Army amass just touched) — no
+        // event/sibling/projected axis, mirroring `ObjectScope::AmassedArmy`.
+        TargetFilter::AmassedArmy => Axes::NONE,
         TargetFilter::CostPaidObject => Axes {
             event: true,
             sibling: false,

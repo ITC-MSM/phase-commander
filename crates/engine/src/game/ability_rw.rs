@@ -1448,6 +1448,7 @@ fn scope_of(target: &TargetFilter, chain_root: Option<WriteScope>) -> WriteScope
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -2406,6 +2407,9 @@ fn legacy_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
+        // CR 701.47c: not one of the 12 frozen event-context tags, mirroring
+        // `ObjectScope::AmassedArmy`'s `legacy_object_scope` classification.
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -2647,6 +2651,10 @@ fn member_bound_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::ParentTargetOwner
         | TargetFilter::StackSpell
         | TargetFilter::CostPaidObject
+        // CR 701.47c: resolution-local, carried per-ability like `CostPaidObject`
+        // (`ResolvedAbility.amassed_army_object`), not per-source storage keyed
+        // by object id — not per-member-bound.
+        | TargetFilter::AmassedArmy
         | TargetFilter::ScopedPlayer
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
@@ -6912,6 +6920,9 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         | TargetFilter::LastCreated
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
+        // CR 701.47c: not one of the 12 D5/legacy tags — a read-free selector
+        // (mirrors `ObjectScope::AmassedArmy`, which carries no event axis).
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource

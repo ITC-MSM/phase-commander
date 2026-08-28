@@ -591,6 +591,8 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::LastRevealed => "last revealed".into(),
         TargetFilter::LastZoneChanged => "last zone changed".into(),
         TargetFilter::CostPaidObject => "cost-paid object".into(),
+        // CR 701.47c: matches `ObjectScope::AmassedArmy`'s description string.
+        TargetFilter::AmassedArmy => "amassed Army".into(),
         TargetFilter::ChosenCard => "last chosen card".into(),
         TargetFilter::TriggeringSpellController => "triggering spell's controller".into(),
         TargetFilter::TriggeringSpellOwner => "triggering spell's owner".into(),
