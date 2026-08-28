@@ -310,3 +310,193 @@ fn part_in_friendship_token_death_does_not_trigger() {
          above was a real filter miss, not an already-spent once-per-turn trigger"
     );
 }
+
+/// T5/T6 (PR #8008 review — matthewevans): a chained production consumer
+/// targeting the reveal's `TrackedSet` — the same runtime construct a printed
+/// "…put a +1/+1 counter on each of those creatures" continuation would
+/// compile to — must resolve against whichever hit actually landed: the
+/// conditional (Battlefield) branch AND the otherwise (Hand) branch alike.
+/// Before the `affected_objects_from_events` fix, the tracked set published
+/// after `RevealUntil` was scoped ONLY to `kept_destination` (Hand here), so a
+/// hit that resolved through the CONDITIONAL branch (Battlefield) was
+/// silently omitted — a chained tracked-set consumer would see an
+/// empty/incomplete set and grant nothing to the battlefield-entering
+/// creature.
+///
+/// Rather than depend on the parser's (separate, unrelated) anaphora
+/// resolution for a brand-new "put a counter on it/that creature" phrase —
+/// which is its own architectural question outside this fix's scope — this
+/// rewires the REAL parsed ability's chain to insert a
+/// `TargetFilter::TrackedSet(0)`-targeting sub-ability directly between the
+/// `RevealUntil` root and its existing "put the rest on the bottom" tail, so
+/// it consumes EXACTLY the set `RevealUntil`'s own resolution publishes
+/// (before the tail's unrelated library-position step runs and republishes
+/// its own, different, affected set for anything chained after it).
+/// Exercises the real runtime mechanism (`affected_objects_from_events` →
+/// `publish_tracked_set_with_causes` → `TargetFilter::TrackedSet` resolution)
+/// end-to-end through the real `apply` pipeline.
+fn insert_tracked_set_counter_after_reveal_until(
+    runner: &mut super::rules::GameRunner,
+    source: ObjectId,
+) {
+    use engine::types::ability::{AbilityDefinition, AbilityKind, Effect, TargetFilter};
+    use engine::types::identifiers::TrackedSetId;
+
+    fn splice(root: &mut AbilityDefinition) {
+        assert!(
+            matches!(&*root.effect, Effect::RevealUntil { .. }),
+            "the trigger's root effect must be the RevealUntil this fix concerns"
+        );
+        // Detach whatever the parser chained after RevealUntil (the "put the
+        // rest on the bottom" tail) and splice our TrackedSet-consuming node
+        // in between, so OUR node sees RevealUntil's own published set first.
+        let existing_tail = root.sub_ability.take();
+        let mut counter_node = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                counter_type: engine::types::counter::CounterType::Plus1Plus1,
+                count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+            },
+        );
+        counter_node.sub_ability = existing_tail;
+        root.sub_ability = Some(Box::new(counter_node));
+    }
+
+    let obj = runner.state_mut().objects.get_mut(&source).unwrap();
+    assert_eq!(
+        obj.trigger_definitions.len(),
+        1,
+        "Part in Friendship must parse exactly one triggered ability"
+    );
+    // Every layer recompute resets the LIVE `trigger_definitions` field from
+    // `base_trigger_definitions` (see `expand_granted_triggered_abilities`'s
+    // doc comment: "each provider's LIVE `trigger_definitions` is read — reset
+    // from `base_trigger_definitions` every layer pass"). Editing only the
+    // live copy is inert past the next layer evaluation (which the burn
+    // spell's resolution triggers) — both copies must carry the same splice.
+    {
+        let trigger_entry = &mut obj.trigger_definitions[0];
+        let root = trigger_entry
+            .definition
+            .execute
+            .as_deref_mut()
+            .expect("the dies trigger must have an executable ability chain");
+        splice(root);
+    }
+    {
+        let base = std::sync::Arc::make_mut(&mut obj.base_trigger_definitions);
+        let base_trigger = base
+            .first_mut()
+            .expect("Part in Friendship's printed trigger must be in base_trigger_definitions");
+        let root = base_trigger
+            .execute
+            .as_deref_mut()
+            .expect("the dies trigger must have an executable ability chain");
+        splice(root);
+    }
+    // `obj.trigger_definitions` is the object's own payload, but the actual
+    // firing path consults `state.trigger_index` — a separate lookup
+    // structure snapshotted (cloned) from `trigger_definitions` at
+    // battlefield-entry time. Editing the object's field alone is inert;
+    // re-run the same reindex the entry pipeline uses so the mutated chain is
+    // what actually fires.
+    engine::game::trigger_index::reindex_object_triggers(runner.state_mut(), source);
+}
+
+/// T5 — the conditional (Battlefield) branch: the hit creature enters the
+/// battlefield AND receives the tracked-set-sourced +1/+1 counter, proving
+/// the tracked set published after the conditional branch is non-empty and
+/// correctly scoped to the actual landed object.
+#[test]
+fn part_in_friendship_battlefield_hit_receives_chained_tracked_set_counter() {
+    use engine::types::counter::CounterType;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_enchantment_from_oracle(P0, "Part in Friendship", PART_IN_FRIENDSHIP)
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Green);
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let fodder = scenario.add_creature(P0, "Fodder Bear", 2, 2).id();
+    let burn = scenario
+        .add_spell_to_hand_from_oracle(P0, "Zap", true, BURN)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let cheap_creature = scenario.add_card_to_library_top(P0, "Library Cheap Bear");
+
+    let mut runner = scenario.build();
+    make_library_creature(runner.state_mut(), cheap_creature, 2);
+    insert_tracked_set_counter_after_reveal_until(&mut runner, source);
+
+    kill_via_burn(&mut runner, burn, fodder);
+
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&cheap_creature].zone,
+        Zone::Battlefield,
+        "reach guard: mana value 2 <= 2 lands controlled must enter the battlefield"
+    );
+    assert_eq!(
+        s.objects[&cheap_creature]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the chained TrackedSet-targeting consumer must resolve against the conditional \
+         (battlefield) branch's hit — the tracked set must not have dropped it"
+    );
+}
+
+/// T6 — the otherwise (Hand) branch: the hit creature goes to hand AND still
+/// receives the tracked-set-sourced +1/+1 counter, proving the otherwise-
+/// branch hit remains tracked exactly as it did before this fix (regression
+/// guard against the fix accidentally narrowing coverage instead of
+/// widening it).
+#[test]
+fn part_in_friendship_hand_hit_receives_chained_tracked_set_counter() {
+    use engine::types::counter::CounterType;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source = scenario
+        .add_enchantment_from_oracle(P0, "Part in Friendship", PART_IN_FRIENDSHIP)
+        .id();
+    scenario.add_basic_land(P0, ManaColor::Green);
+    scenario.add_basic_land(P0, ManaColor::Green);
+    let fodder = scenario.add_creature(P0, "Fodder Bear", 2, 2).id();
+    let burn = scenario
+        .add_spell_to_hand_from_oracle(P0, "Zap", true, BURN)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let expensive_creature = scenario.add_card_to_library_top(P0, "Library Expensive Wurm");
+
+    let mut runner = scenario.build();
+    make_library_creature(runner.state_mut(), expensive_creature, 4);
+    insert_tracked_set_counter_after_reveal_until(&mut runner, source);
+
+    kill_via_burn(&mut runner, burn, fodder);
+
+    let s = runner.state();
+    assert_eq!(
+        s.objects[&expensive_creature].zone,
+        Zone::Hand,
+        "reach guard: mana value 4 > 2 lands controlled must go to hand instead of the battlefield"
+    );
+    assert_eq!(
+        s.objects[&expensive_creature]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the chained TrackedSet-targeting consumer must resolve against the otherwise \
+         (hand) branch's hit"
+    );
+}
