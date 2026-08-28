@@ -9745,9 +9745,9 @@ impl StaticCondition {
     pub(crate) fn contains_unrecognized(&self) -> bool {
         match self {
             StaticCondition::Unrecognized { .. } => true,
-            StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
-                conditions.iter().any(StaticCondition::contains_unrecognized)
-            }
+            StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+                .iter()
+                .any(StaticCondition::contains_unrecognized),
             StaticCondition::Not { condition } => condition.contains_unrecognized(),
             _ => false,
         }
