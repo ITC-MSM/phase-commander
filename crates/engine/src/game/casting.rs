@@ -20571,13 +20571,14 @@ pub fn handle_cancel_cast(
 
     if let Some(source_id) = pending.cancel_restore_prepared_source {
         // CR 601.2i + CR 722.3c: Prepare-copy cast cancellation must restore
-        // the source's prepared marker and clear the synthetic copy object.
+        // the source's prepared marker and leave its linked copy in exile.
+        // Announcement never committed the Exile -> Stack zone change, so the
+        // same copy remains the CR 722.3c object authorized for a later cast.
         if let Some(source) = state.objects.get_mut(&source_id) {
             if source.zone == Zone::Battlefield {
                 source.prepared = Some(PreparedState);
             }
         }
-        state.objects.remove(&pending.object_id);
     }
 }
 
