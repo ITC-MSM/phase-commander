@@ -33501,7 +33501,7 @@ pub(crate) fn parse_effect_chain_ir(
             // creature you control. Its base power and toughness become equal
             // to ~'s power and toughness". Gated on `ctx.subject` being only
             // the generic default (not a real typed trigger subject, which
-            // stays authoritative — CR 608.2k), on `if_you_do_anchor` being
+            // stays authoritative), on `if_you_do_anchor` being
             // absent (an "if you do" anchor to the source, as in The
             // Irencrag's "you may have ~ become ... . If you do, it gains
             // ...", is itself the correct nearest antecedent and must not be

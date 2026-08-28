@@ -1466,7 +1466,7 @@ fn try_parse_subject_base_pt_set_clause_ast(
 /// Call site: `parse_effect_chain_ir`'s `prior_typed_referent` chunk-subject
 /// rebind (oracle_effect/mod.rs) must fire ONLY for this class of clause — an
 /// earlier sibling's chosen typed target outranking a trigger's watched-source
-/// default is correct here because CR 608.2c/608.2k read "its" as referring to
+/// default is correct here because CR 608.2c reads "its" as referring to
 /// the target just chosen two words earlier, but the same rebind applied to an
 /// unrelated clause shape (`DealDamage`, `CantUntap`, `Discard`, `GiveControl`,
 /// `Shuffle`, ...) would silently reassign THEIR bare "it"/"its" subject too,
