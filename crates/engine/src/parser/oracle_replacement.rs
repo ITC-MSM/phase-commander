@@ -17971,7 +17971,7 @@ mod tests {
                     matches!(
                         count,
                         QuantityExpr::Ref {
-                            qty: QuantityRef::Aggregate { .. }
+                            qty: QuantityRef::PropertyAggregate(_)
                         }
                     ),
                     "count should be Aggregate quantity, got {count:?}"
