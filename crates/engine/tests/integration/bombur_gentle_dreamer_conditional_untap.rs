@@ -103,3 +103,79 @@ fn bombur_untaps_normally_with_enduring_story() {
         "with an enduring story, Bombur must untap normally during its controller's untap step"
     );
 }
+
+/// Runtime regression for PR #8012 maintainer review round 5 (HIGH).
+///
+/// CR 118.12a: "unless [a player] pays [cost]" is an OPTIONAL cost — the
+/// player must actually be offered the choice. The engine offers it exactly
+/// once, at attack/block declaration (`WaitingFor::CombatTaxPayment`). CR 502.3
+/// untapping is a turn-based action: the untap loop in `game::turns` only skips
+/// permanents that have `CantUntap`, it has no payment prompt or continuation,
+/// and `game::layers::evaluate_condition` accordingly hard-codes `UnlessPay` to
+/// `false`. Attaching such a condition to a `CantUntap` static therefore
+/// produces a restriction no player can ever satisfy, while the parser reports
+/// the card as fully supported.
+///
+/// Both halves are asserted through the real production path — the parsed
+/// static definitions carried on the live game object, and an actual untap step
+/// driven by `GameRunner::advance_to_phase`:
+///
+/// 1. the condition is the honest `Not(Unrecognized { .. })` deferral shape,
+///    NOT a typed `UnlessPay` that would be a false green; and
+/// 2. no unpayable lock is silently imposed — the permanent untaps.
+///
+/// Synthetic Oracle text: this probes the engine's acceptance boundary, not a
+/// printed card. No printed card pairs an untap-step restriction with a payment
+/// gate today, which is exactly why the false green survived four review
+/// rounds. Bombur's own controller-scoped gate above is unaffected and must
+/// keep working — that pairing is the point of this file.
+const PAYMENT_GATED_UNTAP: &str = "Bombur doesn't untap during your untap step unless you pay {2}.";
+
+#[test]
+fn payment_gated_untap_restriction_is_deferred_not_falsely_supported() {
+    use engine::types::ability::StaticCondition;
+    use engine::types::statics::StaticMode;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bombur = scenario
+        .add_creature_from_oracle(P1, "Bombur, Gentle Dreamer", 5, 3, PAYMENT_GATED_UNTAP)
+        .as_legendary()
+        .id();
+
+    let mut runner = scenario.build();
+    runner.state_mut().objects.get_mut(&bombur).unwrap().tapped = true;
+
+    // 1. AST honesty, read off the live object's parsed static definitions.
+    let cant_untap: Vec<_> = runner.state().objects[&bombur]
+        .static_definitions
+        .iter_unchecked()
+        .filter(|d| matches!(d.mode, StaticMode::CantUntap))
+        .collect();
+    assert_eq!(
+        cant_untap.len(),
+        1,
+        "expected exactly one CantUntap static, got {cant_untap:#?}"
+    );
+    match cant_untap[0].condition.as_ref() {
+        Some(StaticCondition::Not { condition }) => assert!(
+            matches!(**condition, StaticCondition::Unrecognized { .. }),
+            "the payment gate must be deferred as Not(Unrecognized), got {condition:?}"
+        ),
+        other => panic!(
+            "a payment-based untap gate has no untap-step continuation and must              be deferred as Not(Unrecognized), not accepted as a typed condition;              got {other:?}"
+        ),
+    }
+
+    // 2. Runtime: no unpayable lock is silently imposed.
+    runner.advance_to_phase(Phase::Upkeep);
+    assert_eq!(
+        runner.state().active_player,
+        P1,
+        "should now be P1's turn (their untap step has processed)"
+    );
+    assert!(
+        !runner.state().objects[&bombur].tapped,
+        "CR 502.3 + CR 118.12a: the untap step never offers the optional payment,          so the engine must NOT hold the permanent tapped on a condition the          controller has no way to satisfy"
+    );
+}

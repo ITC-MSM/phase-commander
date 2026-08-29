@@ -1182,7 +1182,15 @@ pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinit
     let affected = defs[0].affected.clone()?;
     // CR 502.3: a trailing "as long as …"/"if …" rider on the untap clause
     // belongs on the CantUntap companion; otherwise inherit the grant's gate.
-    let condition = extract_cant_untap_condition(&lower).or_else(|| defs[0].condition.clone());
+    // An inherited gate has to clear the same untap-step enforceability bar as a
+    // rider — the first conjunct's own enforcement point may supply a binding
+    // authority (a recipient, a combat anchor) that CR 502.3's turn-based untap
+    // never does, so it cannot be copied onto a CantUntap unchecked.
+    let condition = extract_cant_untap_condition(&lower).or_else(|| {
+        defs[0].condition.clone().map(|inherited| {
+            gate_cant_untap_condition(inherited, text, UntapGatePolarity::Positive)
+        })
+    });
     let mut companion = StaticDefinition::new(StaticMode::CantUntap)
         .affected(affected)
         .description(text.to_string());
