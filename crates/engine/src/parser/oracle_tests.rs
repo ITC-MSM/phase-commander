@@ -18312,21 +18312,37 @@ fn glamdring_foe_hammer_equipped_power_cost_reduction_and_equip_parse() {
         mode: CostModifyMode::Reduce,
         amount: ManaCost::Cost { generic: 1, .. },
         spell_filter: Some(TargetFilter::Or { ref filters }),
-        dynamic_count:
-            Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::Typed(ref tf),
-            }),
+        dynamic_count: Some(QuantityRef::PropertyAggregate(ref aggregate)),
     } = &r.statics[0].mode
     else {
         panic!(
             "expected ModifyCost{{Reduce, amount: generic 1, spell_filter: Or[Instant,Sorcery], \
-             dynamic_count: Aggregate(Sum, Power, Typed(Creature, EquippedBy))}}, got {:?}",
+             dynamic_count: PropertyAggregate(Sum, Power, Objects(Typed(Creature, EquippedBy)))}}, got {:?}",
             r.statics[0].mode
         );
     };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(aggregate.property(), ObjectProperty::Power);
+    let crate::types::ability::CardTypeSetSource::Objects {
+        filter: TargetFilter::Typed(ref tf),
+    } = aggregate.source()
+    else {
+        panic!(
+            "expected aggregate source Objects(Typed(Creature, EquippedBy)), got {:?}",
+            aggregate.source()
+        );
+    };
     assert_eq!(filters.len(), 2, "expected Instant + Sorcery");
+    assert!(
+        filters.iter().any(|filter| {
+            matches!(filter, TargetFilter::Typed(tf)
+                if tf.type_filters == vec![TypeFilter::Instant])
+        }) && filters.iter().any(|filter| {
+            matches!(filter, TargetFilter::Typed(tf)
+                if tf.type_filters == vec![TypeFilter::Sorcery])
+        }),
+        "expected spell_filter = Or[Instant, Sorcery], got {filters:?}"
+    );
     assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
     assert_eq!(tf.properties, vec![FilterProp::EquippedBy]);
     // Board-wide — NOT the self-spell SelfRef scope (contrast Drag to the

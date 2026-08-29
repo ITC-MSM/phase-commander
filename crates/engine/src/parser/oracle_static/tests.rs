@@ -5566,25 +5566,32 @@ fn static_glamdring_foe_hammer_cost_reduction_is_live_equipped_power() {
         "Instant and sorcery spells you cast cost {X} less to cast, where X is equipped creature's power.",
     )
     .expect("Glamdring, Foe-hammer's cost reduction should parse");
-    assert!(
-        matches!(
-            def.mode,
-            StaticMode::ModifyCost {
-                mode: CostModifyMode::Reduce,
-                amount: ManaCost::Cost { generic: 1, .. },
-                dynamic_count: Some(QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::Power,
-                    filter: TargetFilter::Typed(ref tf),
-                }),
-                ..
-            } if tf.type_filters == vec![TypeFilter::Creature]
-                && tf.properties == vec![FilterProp::EquippedBy]
-        ),
-        "expected ModifyCost{{Reduce, amount: generic 1, dynamic_count: Aggregate(Sum, Power, \
-         Typed(Creature, EquippedBy))}}, got {:?}",
-        def.mode
-    );
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount: ManaCost::Cost { generic: 1, .. },
+        dynamic_count: Some(QuantityRef::PropertyAggregate(ref aggregate)),
+        ..
+    } = &def.mode
+    else {
+        panic!(
+            "expected ModifyCost{{Reduce, amount: generic 1, dynamic_count: \
+             PropertyAggregate(Sum, Power, Objects(Typed(Creature, EquippedBy)))}}, got {:?}",
+            def.mode
+        );
+    };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(aggregate.property(), ObjectProperty::Power);
+    let crate::types::ability::CardTypeSetSource::Objects {
+        filter: TargetFilter::Typed(ref tf),
+    } = aggregate.source()
+    else {
+        panic!(
+            "expected aggregate source Objects(Typed(Creature, EquippedBy)), got {:?}",
+            aggregate.source()
+        );
+    };
+    assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+    assert_eq!(tf.properties, vec![FilterProp::EquippedBy]);
     // Board-wide reduction on other spells — NOT a self-spell SelfRef scope.
     assert!(
         matches!(&def.affected, Some(TargetFilter::Typed(tf)) if tf.controller == Some(crate::types::ability::ControllerRef::You)),

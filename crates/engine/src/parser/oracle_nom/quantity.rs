@@ -3455,8 +3455,9 @@ fn parse_self_characteristic_ref(input: &str) -> OracleResult<'_, QuantityRef> {
 /// creature's power"). CR 301.5f / CR 303.4m: "equipped creature" / "enchanted
 /// creature" refers to whatever creature the permanent is attached to.
 ///
-/// Modeled as `Aggregate` over a `FilterProp::EquippedBy`/`EnchantedBy`-filtered
-/// creature population, not a dedicated `ObjectScope` — CR 301.5f / CR 303.4m
+/// Modeled as `PropertyAggregate` over a `CardTypeSetSource::Objects` population
+/// filtered by `FilterProp::EquippedBy`/`EnchantedBy`, not a dedicated
+/// `ObjectScope` — CR 301.5f / CR 303.4m
 /// define "equipped"/"enchanted creature" only in terms of an attachment, so
 /// there is no such creature when the source is unattached, and `Sum` over
 /// that empty population is 0 by definition, exactly the "no reduction"
@@ -3479,11 +3480,18 @@ fn parse_attached_creature_pt_ref(input: &str) -> OracleResult<'_, QuantityRef> 
     .parse(rest)?;
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property,
-            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![attachment_prop])),
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(
+                AggregateFunction::Sum,
+                property,
+                CardTypeSetSource::Objects {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![attachment_prop]),
+                    ),
+                },
+            )
+            .expect("object populations support every aggregate property"),
+        ),
     ))
 }
 
