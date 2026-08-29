@@ -1683,6 +1683,56 @@ pub enum CastFromZoneDriver {
     /// last-time-counter trigger (CR 702.62a) so a suspended sorcery recast at
     /// upkeep is not blocked by the sorcery-speed gate (issue #1520).
     DuringResolution,
+    /// CR 608.2g: Open a RESOLUTION-SCOPED free-cast window over the batch of
+    /// cards the same resolution just produced ("… from among them") — the
+    /// controller casts up to `bounds.max_casts` of them, one at a time, while
+    /// the granting spell/ability is still resolving, and the window closes when
+    /// that resolution finishes. CR 608.2g is explicit that the currently
+    /// resolving object "continues to resolve, which may include casting other
+    /// spells this way" and that "no other spells can normally be cast … during
+    /// resolution": there is no later priority window in which to exercise this
+    /// permission, which is why the WotC rulings for every card in this class
+    /// say "you can't wait to cast them later in the turn" (Villainous Wealth,
+    /// Hazoret's Undying Fury, Kotis the Fangkeeper, Collected Conjuring,
+    /// Improvisation Capstone, Jace's Mindseeker).
+    ///
+    /// This PARAMETERIZES the during-resolution mechanism rather than
+    /// duplicating it: `DuringResolution` casts exactly the one resolved target,
+    /// while this variant casts a bounded selection from a batch and therefore
+    /// carries the two bounds the batch form needs (CR 601.2 cast count, CR
+    /// 202.3 running-total mana-value budget). Both are "cast as the granting
+    /// ability resolves"; neither is a lingering `CastingPermission`.
+    ///
+    /// A stated durational scope (CR 611.2a — Apex of Power's "Until end of
+    /// turn, you may cast spells from among them") is a DIFFERENT class: it
+    /// really does grant a permission exercised at a later priority window, so
+    /// `with_lingering_duration` degrades this variant back to
+    /// `LingeringPermission` when the parser stamps a duration on the grant.
+    ResolutionWindow { bounds: ResolutionCastWindow },
+}
+
+/// CR 601.2 + CR 202.3: The two bounds a resolution-scoped free-cast window
+/// (`CastFromZoneDriver::ResolutionWindow`) enforces on the batch it offers.
+///
+/// Both axes are `Option` because Oracle text states them independently:
+/// "you may cast ANY NUMBER of spells" leaves `max_casts` unbounded, "you may
+/// cast UP TO TWO sorcery spells" bounds it at 2, and a singular "you may cast
+/// AN instant or sorcery spell" bounds it at 1. `max_total_mv` is the CR 202.3
+/// cross-selection running total ("with TOTAL mana value 10 or less" — Primeval
+/// Spawn), which is a different axis from the PER-SPELL ceiling ("with mana
+/// value 5 or less" — Hazoret's Undying Fury); the per-spell ceiling stays on
+/// `Effect::CastFromZone::constraint`, where every other cast permission already
+/// carries it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ResolutionCastWindow {
+    /// CR 601.2: Maximum number of spells castable this way; `None` is the
+    /// "any number of spells" form (bounded in practice only by the batch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_casts: Option<u8>,
+    /// CR 202.3: Running-total mana-value budget shared across every spell cast
+    /// this way; `None` when the clause states no total cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_mv: Option<u32>,
 }
 
 impl CastFromZoneDriver {
@@ -1692,11 +1742,44 @@ impl CastFromZoneDriver {
         matches!(self, CastFromZoneDriver::LingeringPermission)
     }
 
-    /// CR 608.2g: true iff this effect casts the card as the granting ability
-    /// resolves (Suspend's last-counter cast), rather than granting a lingering
-    /// permission.
+    /// CR 608.2g: true iff this effect casts the SINGLE resolved target as the
+    /// granting ability resolves (Suspend's last-counter cast), rather than
+    /// granting a lingering permission.
+    ///
+    /// Deliberately false for `ResolutionWindow`: that variant is also a
+    /// during-resolution cast, but it drives the bounded multi-cast window
+    /// (`window_bounds`) instead of the single-target routes this predicate
+    /// gates, and every existing caller of this predicate assumes exactly one
+    /// resolved target.
     pub fn is_during_resolution(&self) -> bool {
         matches!(self, CastFromZoneDriver::DuringResolution)
+    }
+
+    /// CR 608.2g + CR 601.2 + CR 202.3: The bounds of the resolution-scoped
+    /// free-cast window this driver opens, or `None` for the two single-card
+    /// mechanisms. The single authority the `cast_from_zone` router reads to
+    /// decide whether to convert the grant into an `Effect::FreeCastFromZones`
+    /// window over the batch.
+    pub fn window_bounds(&self) -> Option<ResolutionCastWindow> {
+        match self {
+            CastFromZoneDriver::ResolutionWindow { bounds } => Some(*bounds),
+            _ => None,
+        }
+    }
+
+    /// CR 611.2a: Reconcile this driver with a durational scope the parser
+    /// stamped on the grant AFTER the clause body was lowered (a leading
+    /// "Until end of turn, …" via `with_clause_duration`, or a stripped trailing
+    /// "… this turn"). A stated duration means the controller casts at a LATER
+    /// priority window, which is the defining property of a lingering
+    /// permission — so a resolution-scoped window degrades to one. The two
+    /// single-card mechanisms are unchanged here; the paid-cast downgrade has
+    /// its own narrower guard at the clause seam.
+    pub fn with_lingering_duration(self) -> Self {
+        match self {
+            CastFromZoneDriver::ResolutionWindow { .. } => CastFromZoneDriver::LingeringPermission,
+            other => other,
+        }
     }
 }
 

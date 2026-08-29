@@ -470,13 +470,6 @@ fn portent_full_resolution_exiles_picks_to_hand_and_unselected_reveal_to_graveya
         4,
         "must exile exactly one card per distinct revealed type"
     );
-    for id in &exiled {
-        assert_eq!(
-            runner.state().objects[id].zone,
-            Zone::Exile,
-            "exiled picks must remain in Exile through the revealed rest cleanup"
-        );
-    }
 
     let unselected_creature = if exiled.contains(&creature_a) {
         creature_b
@@ -489,22 +482,28 @@ fn portent_full_resolution_exiles_picks_to_hand_and_unselected_reveal_to_graveya
         "the revealed-but-unselected duplicate creature must go to the graveyard"
     );
 
-    // Decline the optional free cast, then drive the final hand cleanup.
-    while !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
-        match &runner.state().waiting_for {
-            WaitingFor::OptionalEffectChoice { .. } => {
-                runner
-                    .act(GameAction::DecideOptionalEffect { accept: false })
-                    .expect("decline optional free cast");
-            }
-            WaitingFor::CastOffer { .. } => {
-                runner
-                    .act(GameAction::PassPriority)
-                    .expect("decline cast offer");
-            }
-            other => panic!("unexpected prompt before final cleanup: {other:?}"),
-        }
-    }
+    // CR 608.2g + CR 608.2d: the last `SelectCards` now carries the chain all the
+    // way to the end in one action, so there is no intermediate observation point
+    // between "Put the rest into your graveyard" and "Then put the rest of the
+    // exiled cards into your hand". Portent's free-cast instruction is a
+    // resolution-scoped window (`CastFromZoneDriver::ResolutionWindow`) and no
+    // longer parks a redundant generic `OptionalEffectChoice` in front of itself —
+    // its accept/decline IS the printed "may". The window itself does not open
+    // here because Portent's per-type `ChooseFromZone` exile publishes no
+    // source-exile link, so `TargetFilter::ExiledBySource` resolves to an empty
+    // batch and the established no-target tail runs; that gap predates the
+    // resolution-scoped lowering (the lingering path reached the same tail and
+    // granted nothing either) and is tracked separately.
+    //
+    // The issue #6498 invariant this test exists for is unchanged and still fully
+    // asserted below: the exiled picks must NOT be swept up by the revealed-rest
+    // graveyard cleanup — they must reach hand through the trailing
+    // `TrackedSetFiltered(Exiled)` instruction.
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "the whole chain must have resolved, parked at {:?}",
+        runner.state().waiting_for
+    );
 
     for id in &exiled {
         assert_eq!(

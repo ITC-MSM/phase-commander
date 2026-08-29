@@ -9,14 +9,14 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::visibility::filter_state_for_viewer;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityDefinition, CastFromZoneDriver, CastPermissionConstraint, Comparator, ControllerRef,
-    Effect, FilterProp, ObjectScope, QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter,
-    TypeFilter, TypedFilter,
+    AbilityDefinition, CastFromZoneDriver, CastPermissionConstraint, ChoiceType, Comparator,
+    ControllerRef, Duration, Effect, FilterProp, ObjectScope, QuantityExpr, QuantityRef,
+    ResolutionCastWindow, ResolvedAbility, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::format::FormatConfig;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastOfferKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -30,18 +30,66 @@ const SVELLA: &str = "{6}{R}{G}, {T}: Look at the top four cards of your library
 const VELOMACHUS: &str = "Flying, vigilance, haste\nWhenever Velomachus Lorehold attacks, look at the top seven cards of your library. You may cast an instant or sorcery spell with mana value less than or equal to Velomachus Lorehold's power from among them without paying its mana cost. Put the rest on the bottom of your library in a random order.";
 const APEX: &str = "Exile the top seven cards of your library. Until end of turn, you may cast spells from among them.\nIf this spell was cast from your hand, add ten mana of any one color.";
 const TALENT: &str = "Target opponent reveals the top seven cards of their library. You may cast an instant or sorcery spell from among them without paying its mana cost. Then that player puts the rest into their graveyard.\nSpell mastery — If there are two or more instant and/or sorcery cards in your graveyard, you may cast up to two instant and/or sorcery spells from among the revealed cards instead of one.";
-const JACE: &str = "Flying\nWhen Jace's Mindseeker enters, target opponent mills five cards. You may cast an instant or sorcery spell from among them without paying its mana cost.";
+const JACE: &str = "Flying\nWhen this creature enters, target opponent mills five cards. You may cast an instant or sorcery spell from among them without paying its mana cost.";
 const SILENT_BLADE: &str = "Ninjutsu {4}{U}{B} ({4}{U}{B}, Return an unblocked attacker you control to hand: Put this card onto the battlefield from your hand tapped and attacking.)\nWhenever this creature deals combat damage to a player, look at that player's hand. You may cast a spell from among those cards without paying its mana cost.";
 const MINDCLAW_SHAMAN: &str = "When this creature enters, target opponent reveals their hand. You may cast an instant or sorcery spell from among those cards without paying its mana cost.";
 const MINDLEECH_MASS: &str = "Trample\nWhenever this creature deals combat damage to a player, you may look at that player's hand. If you do, you may cast a spell from among those cards without paying its mana cost.";
 const EPIC_EXPERIMENT: &str = "Exile the top X cards of your library. You may cast instant and sorcery spells with mana value X or less from among them without paying their mana costs. Then put all cards exiled this way that weren't cast into your graveyard.";
 const COLLECTED_CONJURING: &str = "Exile the top six cards of your library. You may cast up to two sorcery spells with mana value 3 or less from among them without paying their mana costs. Put the exiled cards not cast this way on the bottom of your library in a random order.";
 const HAZORET: &str = "Shuffle your library, then exile the top four cards. You may cast any number of spells with mana value 5 or less from among them without paying their mana costs. Lands you control don't untap during your next untap step.";
-const PRIMEVAL_SPAWN: &str = "Vigilance, trample, lifelink\nWhen Primeval Spawn leaves the battlefield, exile the top ten cards of your library. You may cast any number of spells with total mana value 10 or less from among them without paying their mana costs.";
-const CAPSTONE: &str = "Exile cards from the top of your library until you exile cards with total mana value 4 or greater. You may cast any number of spells from among them without paying their mana costs.";
+const PRIMEVAL_SPAWN: &str = "If this creature would enter and it wasn't cast or no mana was spent to cast it, exile it instead.\nVigilance, trample, lifelink\nWhen this creature leaves the battlefield, exile the top ten cards of your library. You may cast any number of spells with total mana value 10 or less from among them without paying their mana costs.";
+const CAPSTONE: &str = "Exile cards from the top of your library until you exile cards with total mana value 4 or greater. You may cast any number of spells from among them without paying their mana costs.\nParadigm (Then exile this spell. After you first resolve a spell with this name, you may cast a copy of it from exile without paying its mana cost at the beginning of each of your first main phases.)";
+const VILLAINOUS_WEALTH: &str = "Target opponent exiles the top X cards of their library. You may cast any number of spells with mana value X or less from among them without paying their mana costs.";
 const FOUNDING: &str = "Read ahead (Choose a chapter and start with that many lore counters. Add one after your draw step. Skipped chapters don't trigger. Sacrifice after III.)\nI — You may cast an instant or sorcery spell with mana value 1 or 2 from your hand without paying its mana cost.\nII — Target player mills four cards.\nIII — Exile target instant or sorcery card from your graveyard. Copy it. You may cast the copy.";
 
 const MEETING_OF_THE_FIVE: &str = "Exile the top ten cards of your library. You may cast spells with exactly three colors from among them this turn. Add {W}{W}{U}{U}{B}{B}{R}{R}{G}{G}. Spend this mana only to cast spells with exactly three colors.";
+
+/// Verbatim Scryfall Oracle text. LEADING duration + a free cast — the
+/// non-vacuous leading-position control for `a_stated_duration_keeps_the_grant_a_lingering_permission`.
+/// Ruling: "Any exiled cards you don't cast remain in exile."
+const NARSET_ENLIGHTENED_MASTER: &str = "First strike, hexproof\nWhenever Narset attacks, exile the top four cards of your library. Until end of turn, you may cast noncreature spells from among those cards without paying their mana costs.";
+/// Verbatim Scryfall Oracle text. A LEADING duration that scopes a COORDINATED
+/// pair ("you may play lands AND cast spells …"), so the duration is stripped off
+/// the sentence head and the cast half becomes a sibling clause that never sees
+/// it. Rulings: "You must follow the normal timing permissions and restrictions
+/// for cards you cast this way." + "Any of the cards you don't play will remain
+/// in exile." — the lingering signature, not the resolution-scoped one.
+const MAGUS_OF_THE_MIND: &str = "{U}, {T}, Sacrifice this creature: Shuffle your library, then exile the top X cards, where X is one plus the number of spells cast this turn. Until end of turn, you may play lands and cast spells from among cards exiled this way without paying their mana costs.";
+/// Verbatim Scryfall Oracle text. The same coordinated "play lands and cast
+/// spells from among cards exiled this way" grammar with NO duration, whose own
+/// ruling is the resolution-scoped one: "You must play the cards as you resolve
+/// the last ability. You can't wait and play them later."
+const GIX_YAWGMOTH_PRAETOR: &str = "Whenever a creature deals combat damage to one of your opponents, its controller may pay 1 life. If they do, they draw a card.\n{4}{B}{B}{B}, Discard X cards: Exile the top X cards of target opponent's library. You may play lands and cast spells from among cards exiled this way without paying their mana costs.";
+// Verbatim Scryfall Oracle text. The COORDINATED leading-duration collateral
+// class: "Until end of turn, you may play lands **and** cast spells from …".
+// Not "from among them" batch grants — they never reach
+// `from_among_batch_cast_driver` — but they share the sentence-grouping pass
+// `compute_sentence_leading_duration`, and before it the cast conjunct was
+// lowered with no duration at all.
+const YAWGMOTHS_WILL: &str = "Until end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+const GAEAS_WILL: &str = "Suspend 4—{G}\nUntil end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+const MAGUS_OF_THE_WILL: &str = "{2}{B}, {T}, Exile this creature: Until end of turn, you may play lands and cast spells from your graveyard. If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+/// A THREE-way coordination ("look at the top card …, and you may play lands and
+/// cast spells from the top of your library") over a library pool.
+const THE_BELLIGERENT: &str = "Whenever The Belligerent attacks, create a Treasure token. Until end of turn, you may look at the top card of your library any time, and you may play lands and cast spells from the top of your library.\nCrew 3";
+/// The duration sits after the trigger condition rather than at the very head of
+/// the line, and the grant is a PAID one (the trailing sentence replaces the
+/// mana cost with a life payment) — so this row also proves the sentence binding
+/// is not accidentally scoped to free casts.
+const GWENOM_REMORSELESS: &str = "Deathtouch, lifelink\nWhenever Gwenom attacks, until end of turn, you may look at the top card of your library any time and you may play cards from the top of your library. If you cast a spell this way, pay life equal to its mana value rather than pay its mana cost.";
+/// A duration whose printed scope is a CONJUNCTION — "Until end of turn, for as
+/// long as that card remains on top of your library". Only the first half is
+/// modelled; see the note on the test row.
+const TEMPORAL_APERTURE: &str = "{5}, {T}: Shuffle your library, then reveal the top card. Until end of turn, for as long as that card remains on top of your library, play with the top card of your library revealed and you may play that card without paying its mana cost. (If it has X in its mana cost, X is 0.)";
+
+/// Verbatim Scryfall Oracle text. The class member whose "may" is a
+/// SUBJECT-PHRASE modal ("then THEY may cast a spell from among those cards"),
+/// not the leading "you may …" every other member prints. That phrasing reaches
+/// `AbilityDefinition::optional` through a second, independent seam in
+/// `oracle_effect/assembly.rs` (`clause_ir.parsed.optional`), so it is the
+/// discriminating case for
+/// `resolution_window_grants_are_never_double_wrapped_in_an_optional_choice`.
+const ITAZURA: &str = "At the beginning of your upkeep, exile the top three cards of your library. Each opponent secretly chooses a number 0 or greater. Then those numbers are revealed. Choose an opponent with the highest number. Itazura deals that much damage to them, then they may cast a spell from among those cards without paying its mana cost. You put a card from among them that wasn't cast this way into your hand.";
 
 fn parse(oracle: &str, name: &str, types: &[&str]) -> engine::parser::oracle::ParsedAbilities {
     parse_oracle_text(
@@ -53,29 +101,39 @@ fn parse(oracle: &str, name: &str, types: &[&str]) -> engine::parser::oracle::Pa
     )
 }
 
-fn cast_from_zone_in(definition: &AbilityDefinition) -> Option<&Effect> {
+/// The `AbilityDefinition` that *carries* the `CastFromZone`, not just its
+/// effect — the optionality flag under test in
+/// `resolution_window_grants_are_never_double_wrapped_in_an_optional_choice`
+/// lives on the definition, one level above the effect.
+fn cast_from_zone_def_in(definition: &AbilityDefinition) -> Option<&AbilityDefinition> {
     if matches!(definition.effect.as_ref(), Effect::CastFromZone { .. }) {
-        return Some(definition.effect.as_ref());
+        return Some(definition);
     }
     definition
         .sub_ability
         .as_deref()
-        .and_then(cast_from_zone_in)
+        .and_then(cast_from_zone_def_in)
 }
 
-fn parsed_cast_from_zone(parsed: &engine::parser::oracle::ParsedAbilities) -> &Effect {
+fn parsed_cast_from_zone_def(
+    parsed: &engine::parser::oracle::ParsedAbilities,
+) -> &AbilityDefinition {
     parsed
         .abilities
         .iter()
-        .find_map(cast_from_zone_in)
+        .find_map(cast_from_zone_def_in)
         .or_else(|| {
             parsed
                 .triggers
                 .iter()
                 .filter_map(|trigger| trigger.execute.as_deref())
-                .find_map(cast_from_zone_in)
+                .find_map(cast_from_zone_def_in)
         })
         .expect("exact Oracle text must parse a real CastFromZone effect")
+}
+
+fn parsed_cast_from_zone(parsed: &engine::parser::oracle::ParsedAbilities) -> &Effect {
+    parsed_cast_from_zone_def(parsed).effect.as_ref()
 }
 
 fn has_self_library_peek(definition: &AbilityDefinition) -> bool {
@@ -186,22 +244,404 @@ fn self_library_peek_constraints_are_retained() {
     }
 }
 
+/// CR 611.2a: a stated duration keeps the grant a lingering permission at EVERY
+/// position the printed grammar puts it in.
+///
+/// Three genuinely distinct seams, one row each:
+/// * MID-clause (Ral, Leyline Prodigy) — "… from among them THIS TURN without
+///   paying their mana costs" sits between the anaphor and the free-cast rider,
+///   so neither the leading-duration pass (`with_clause_duration`) nor the
+///   trailing-duration fixup ever sees it; only the in-clause scan can catch it.
+/// * LEADING (Narset, Enlightened Master) — "Until end of turn, you may cast
+///   noncreature spells from among those cards without paying their mana costs"
+///   is stripped off the head and reconciled by `with_clause_duration`.
+/// * LEADING across a COORDINATED pair (Magus of the Mind) — "Until end of turn,
+///   you may play lands AND cast spells from among cards exiled this way without
+///   paying their mana costs". The stripped duration lands on the FIRST
+///   coordinated clause ("play lands"); the cast half is a sibling clause whose
+///   own fragment contains no duration token at all. This row is the reason
+///   `from_among_batch_cast_driver` takes a sentence-level `scope`.
+///
+/// The `without paying` reach guard is load-bearing, not decoration. This test
+/// previously used Apex of Power and Meeting of the Five as its leading /
+/// trailing controls; NEITHER card says "without paying their mana costs", so
+/// `from_among_batch_cast_driver` rejected both at its `without_paying` gate
+/// before any duration logic ran. Both rows passed without ever exercising the
+/// code they were supposed to pin. (Their lingering classification is still
+/// covered — Apex by `duration_and_hand_anaphors_stay_lingering_permissions`,
+/// Meeting by `untyped_from_among_them_cast_stays_a_bare_exile_anaphor`.)
 #[test]
-fn non_library_peek_anaphors_stay_lingering_permissions() {
+fn a_stated_duration_keeps_the_grant_a_lingering_permission() {
+    for (name, oracle, types) in [
+        (
+            "Ral, Leyline Prodigy",
+            RAL_LEYLINE_PRODIGY,
+            &["Planeswalker"][..],
+        ),
+        (
+            "Narset, Enlightened Master",
+            NARSET_ENLIGHTENED_MASTER,
+            &["Creature"][..],
+        ),
+        ("Magus of the Mind", MAGUS_OF_THE_MIND, &["Creature"][..]),
+    ] {
+        assert!(
+            oracle
+                .to_lowercase()
+                .contains("without paying their mana costs"),
+            "reach guard: {name} must be a FREE cast, otherwise \
+             `from_among_batch_cast_driver` short-circuits at its `without_paying` \
+             gate and this row proves nothing about the duration seam"
+        );
+        let parsed = parse(oracle, name, types);
+        let Effect::CastFromZone { driver, .. } = parsed_cast_from_zone(&parsed) else {
+            unreachable!("helper returns CastFromZone")
+        };
+        assert_eq!(
+            driver.window_bounds(),
+            None,
+            "{name} states a duration, so it must NOT become a resolution-scoped window"
+        );
+        assert_eq!(*driver, CastFromZoneDriver::LingeringPermission, "{name}");
+    }
+}
+
+/// KNOWN RESIDUAL, recorded as an executable note rather than left implicit.
+///
+/// The Ral row above pins that a MID-clause duration keeps the grant a lingering
+/// permission — `clause_states_a_duration` sees "… from among them THIS TURN …"
+/// and declines the window. But nothing then STAMPS that duration onto the
+/// lowered effect, so Ral's permission is currently lingering AND indefinite
+/// (`duration: None`) when CR 611.2a says it should expire at end of turn.
+///
+/// This predates the resolution-window change (the old lowering produced the
+/// same indefinite grant); the new detector is merely what makes the gap
+/// visible. It is NOT fixed here on purpose: `clause_states_a_duration`'s
+/// word-boundary scan is documented as safe under false positives *precisely
+/// because* its only consumer is a boolean that falls back to the pre-existing
+/// path. Feeding its result into `duration` would make a false positive
+/// actively wrong — it would time-bound a permission the card prints as
+/// indefinite — so promoting the detector needs its own corpus evidence, not a
+/// closing-pass one-liner.
+///
+/// Fail-on-fix: when the stamping lands, this assertion flips and the row moves
+/// to `coordinated_leading_durations_bind_to_the_cast_half` below.
+#[test]
+fn ral_leyline_prodigy_mid_clause_duration_is_detected_but_not_yet_stamped() {
+    let parsed = parse(
+        RAL_LEYLINE_PRODIGY,
+        "Ral, Leyline Prodigy",
+        &["Planeswalker"],
+    );
+    let Effect::CastFromZone { duration, .. } = parsed_cast_from_zone(&parsed) else {
+        unreachable!("helper returns CastFromZone")
+    };
+    assert_eq!(
+        *duration, None,
+        "known residual: Ral's mid-clause \"this turn\" is detected by \
+         `clause_states_a_duration` (which is why the grant stays lingering) but \
+         is never stamped onto the effect. If this now reads \
+         `Some(UntilEndOfTurn)`, the residual is fixed — move the row."
+    );
+}
+
+/// CR 611.2a: a duration printed at the HEAD of a sentence scopes the WHOLE
+/// coordinated predicate, not just the conjunct it sits next to.
+///
+/// `split_clause_sequence` cuts "Until end of turn, you may play lands **and**
+/// cast spells from your graveyard" into two chunks and only the first still
+/// carries the stripped prefix, so the cast half was previously lowered from a
+/// fragment containing no duration token at any position — an INDEFINITE
+/// graveyard-cast permission on some of the most powerful cards in the game.
+/// `compute_sentence_leading_duration` re-binds the head duration across the
+/// sentence, on the same sentence grouping CR 107.3i's `where X is` binding
+/// already uses.
+///
+/// These six are the collateral beneficiaries of that fix — they are NOT
+/// "from among them" batch grants and never reach `from_among_batch_cast_driver`
+/// at all, so nothing else in this file covers them. They are pinned here
+/// because the sentence-grouping pass is shared: a regression in it would
+/// silently restore an unbounded Yawgmoth's Will.
+#[test]
+fn coordinated_leading_durations_bind_to_the_cast_half() {
+    for (name, oracle, types) in [
+        // "Until end of turn, you may play lands and cast spells from your
+        // graveyard." — the canonical coordinated pair.
+        ("Yawgmoth's Will", YAWGMOTHS_WILL, &["Sorcery"][..]),
+        ("Gaea's Will", GAEAS_WILL, &["Sorcery"][..]),
+        ("Magus of the Will", MAGUS_OF_THE_WILL, &["Creature"][..]),
+        // The same shape with a three-way coordination and a top-of-library
+        // pool instead of a graveyard.
+        ("The Belligerent", THE_BELLIGERENT, &["Artifact"][..]),
+        ("Gwenom, Remorseless", GWENOM_REMORSELESS, &["Creature"][..]),
+        // A duration whose PRINTED scope is a conjunction ("Until end of turn,
+        // for as long as that card remains on top of your library"); only the
+        // first half is modelled. `UntilEndOfTurn` is a correct upper bound —
+        // the permission cannot outlive the turn — but it is a PARTIAL model:
+        // shuffling the library mid-turn should end the permission early and
+        // currently does not. Asserted at the bound the engine does model.
+        ("Temporal Aperture", TEMPORAL_APERTURE, &["Artifact"][..]),
+    ] {
+        let parsed = parse(oracle, name, types);
+        let Effect::CastFromZone { duration, .. } = parsed_cast_from_zone(&parsed) else {
+            unreachable!("helper returns CastFromZone")
+        };
+        assert_eq!(
+            *duration,
+            Some(Duration::UntilEndOfTurn),
+            "{name}: the sentence-leading \"Until end of turn\" must reach the \
+             cast conjunct, not just the conjunct it sits next to — an unbound \
+             graveyard/library cast permission is the failure mode"
+        );
+    }
+}
+
+/// The paired positive for the Magus of the Mind row above: Gix, Yawgmoth
+/// Praetor prints the IDENTICAL coordinated grammar ("you may play lands and
+/// cast spells from among cards exiled this way without paying their mana
+/// costs") with NO duration, and its own ruling is the resolution-scoped one —
+/// "You must play the cards as you resolve the last ability. You can't wait and
+/// play them later."
+///
+/// Without this row, "make Magus lingering" could be satisfied by a fix that
+/// simply excluded the whole coordinated `play lands and cast spells` shape,
+/// silently regressing Gix back to the indefinite permission this change exists
+/// to remove.
+#[test]
+fn an_undated_coordinated_play_and_cast_grant_stays_a_resolution_window() {
+    let parsed = parse(
+        GIX_YAWGMOTH_PRAETOR,
+        "Gix, Yawgmoth Praetor",
+        &["Creature", "Legendary"],
+    );
+    let Effect::CastFromZone { driver, .. } = parsed_cast_from_zone(&parsed) else {
+        unreachable!("helper returns CastFromZone")
+    };
+    assert!(
+        driver.window_bounds().is_some(),
+        "Gix states no duration, so its cast half must stay resolution-scoped, got {driver:?}"
+    );
+}
+
+/// CR 611.2a + CR 118.9: the anaphors that legitimately stay lingering
+/// permissions.
+///
+/// Apex of Power states a DURATION ("Until end of turn, you may cast spells from
+/// among them"), and its own ruling confirms the permission outlives the
+/// resolution: "Apex of Power doesn't change WHEN you can cast the exiled cards
+/// … if you exile a sorcery card, you can cast it only during your main phase
+/// when the stack is empty." Silent-Blade Oni binds a hand pool rather than an
+/// exile batch and is routed by `open_private_zone_cast_selection`, whose
+/// resolution-time hand pick already casts during resolution.
+#[test]
+fn duration_and_hand_anaphors_stay_lingering_permissions() {
     for (name, oracle, types) in [
         ("Apex of Power", APEX, &["Sorcery"][..]),
-        ("Talent of the Telepath", TALENT, &["Sorcery"][..]),
-        ("Jace's Mindseeker", JACE, &["Creature"][..]),
         ("Silent-Blade Oni", SILENT_BLADE, &["Creature"][..]),
     ] {
         let parsed = parse(oracle, name, types);
-        assert!(matches!(
-            parsed_cast_from_zone(&parsed),
-            Effect::CastFromZone {
-                driver: CastFromZoneDriver::LingeringPermission,
-                ..
-            }
-        ));
+        assert!(
+            matches!(
+                parsed_cast_from_zone(&parsed),
+                Effect::CastFromZone {
+                    driver: CastFromZoneDriver::LingeringPermission,
+                    ..
+                }
+            ),
+            "{name} must keep the lingering permission mechanism"
+        );
+    }
+}
+
+/// CR 608.2g: the singular non-exile batch anaphors ("target opponent mills five
+/// cards / reveals the top seven cards of their library. You may cast an instant
+/// or sorcery spell from among them without paying its mana cost") are
+/// resolution-scoped one-shot windows bounded at ONE cast, not lingering
+/// permissions.
+///
+/// Jace's Mindseeker ruling: "If you cast an instant or sorcery card this way,
+/// you do so while the ability of Jace's Mindseeker is resolving. If you choose
+/// not to (or can't), you won't get a chance to cast one later."
+/// Talent of the Telepath ruling: "You cast the instant and/or sorcery card(s)
+/// from your opponent's library as Talent of the Telepath is resolving."
+#[test]
+fn singular_batch_anaphors_are_one_shot_resolution_windows() {
+    for (name, oracle, types) in [
+        ("Talent of the Telepath", TALENT, &["Sorcery"][..]),
+        ("Jace's Mindseeker", JACE, &["Creature"][..]),
+    ] {
+        let parsed = parse(oracle, name, types);
+        assert!(
+            matches!(
+                parsed_cast_from_zone(&parsed),
+                Effect::CastFromZone {
+                    driver: CastFromZoneDriver::ResolutionWindow {
+                        bounds: ResolutionCastWindow {
+                            max_casts: Some(1),
+                            max_total_mv: None,
+                        },
+                    },
+                    ..
+                }
+            ),
+            "{name} must be a one-shot resolution-scoped window"
+        );
+    }
+}
+
+/// CR 608.2g + CR 601.2 + CR 202.3: the exile-batch class and the two bound axes
+/// its Oracle grammar states independently.
+///
+/// Every card here has a published WotC ruling saying the casts happen during
+/// the source's resolution and cannot be deferred (Hazoret's Undying Fury: "you
+/// do so as part of the resolution … You can't wait to cast them later in the
+/// turn"; Collected Conjuring: "You must cast any of the exiled cards you wish
+/// to cast while Collected Conjuring is resolving"; Improvisation Capstone: "You
+/// cast the spells while Improvisation Capstone is resolving and still on the
+/// stack"; Villainous Wealth: "You can't wait to cast them later in the turn";
+/// Primeval Spawn: "The spells are cast one after the other during the
+/// resolution of Primeval Spawn's last ability").
+#[test]
+fn exile_batch_anaphors_are_resolution_windows_with_their_stated_bounds() {
+    for (name, oracle, types, expected) in [
+        (
+            "Hazoret's Undying Fury",
+            HAZORET,
+            &["Sorcery"][..],
+            ResolutionCastWindow::default(),
+        ),
+        (
+            "Improvisation Capstone",
+            CAPSTONE,
+            &["Sorcery"][..],
+            ResolutionCastWindow::default(),
+        ),
+        (
+            "Epic Experiment",
+            EPIC_EXPERIMENT,
+            &["Sorcery"][..],
+            ResolutionCastWindow::default(),
+        ),
+        (
+            "Villainous Wealth",
+            VILLAINOUS_WEALTH,
+            &["Sorcery"][..],
+            ResolutionCastWindow::default(),
+        ),
+        // CR 601.2: an explicit cast cap.
+        (
+            "Collected Conjuring",
+            COLLECTED_CONJURING,
+            &["Sorcery"][..],
+            ResolutionCastWindow {
+                max_casts: Some(2),
+                max_total_mv: None,
+            },
+        ),
+        // CR 202.3: a running TOTAL budget, a different axis from the per-spell
+        // ceiling the other rows carry as a `CastPermissionConstraint`.
+        (
+            "Primeval Spawn",
+            PRIMEVAL_SPAWN,
+            &["Creature"][..],
+            ResolutionCastWindow {
+                max_casts: None,
+                max_total_mv: Some(10),
+            },
+        ),
+        // CR 601.2: "a spell" is an implicit cap of one, reached through the
+        // subject-phrase "may" seam rather than the leading "you may".
+        (
+            "Itazura, Lingering Wick",
+            ITAZURA,
+            &["Creature"][..],
+            ResolutionCastWindow {
+                max_casts: Some(1),
+                max_total_mv: None,
+            },
+        ),
+    ] {
+        let parsed = parse(oracle, name, types);
+        let Effect::CastFromZone { driver, .. } = parsed_cast_from_zone(&parsed) else {
+            unreachable!("helper returns CastFromZone")
+        };
+        assert_eq!(
+            driver.window_bounds(),
+            Some(expected),
+            "{name} must lower to a resolution-scoped window with its stated bounds"
+        );
+    }
+}
+
+/// CR 608.2d: the printed "may" on a resolution-scoped batch grant IS the
+/// window's own accept/decline, so the grant must never ALSO be lowered as an
+/// optional `AbilityDefinition`.
+///
+/// `cast_from_zone::resolve` turns a `ResolutionWindow` driver into a
+/// `CastOfferKind::FreeCastWindow`, whose decline option ("cast nothing") is
+/// exactly the choice the printed "may" describes. A surviving
+/// `def.optional = true` wraps that offer in a generic `OptionalEffectChoice`,
+/// so the controller answers the same question twice — and, worse, an
+/// automated/declining actor answers the OUTER prompt and never sees the
+/// window at all.
+///
+/// The class reaches `def.optional` through **two independent seams**, and both
+/// are pinned here because a carve-out added to one silently leaves the other
+/// broken (this is exactly how Itazura survived the first pass):
+///
+/// 1. The chunk-level flag (`oracle_effect/mod.rs`) — the leading "**You may**
+///    cast …" every other member prints.
+/// 2. The subject-phrase modal (`oracle_effect/assembly.rs`,
+///    `clause_ir.parsed.optional`) — Itazura's "…, then **they may** cast a
+///    spell from among those cards".
+///
+/// Fail-on-revert: drop either carve-out and the corresponding rows flip to
+/// `optional == true`.
+#[test]
+fn resolution_window_grants_are_never_double_wrapped_in_an_optional_choice() {
+    for (name, oracle, types) in [
+        // Seam 1: leading "you may".
+        ("Epic Experiment", EPIC_EXPERIMENT, &["Sorcery"][..]),
+        ("Hazoret's Undying Fury", HAZORET, &["Sorcery"][..]),
+        ("Collected Conjuring", COLLECTED_CONJURING, &["Sorcery"][..]),
+        ("Villainous Wealth", VILLAINOUS_WEALTH, &["Sorcery"][..]),
+        ("Improvisation Capstone", CAPSTONE, &["Sorcery"][..]),
+        ("Primeval Spawn", PRIMEVAL_SPAWN, &["Creature"][..]),
+        ("Talent of the Telepath", TALENT, &["Sorcery"][..]),
+        ("Jace's Mindseeker", JACE, &["Creature"][..]),
+        (
+            "Gix, Yawgmoth Praetor",
+            GIX_YAWGMOTH_PRAETOR,
+            &["Creature"][..],
+        ),
+        // Seam 2: subject-phrase "they may".
+        ("Itazura, Lingering Wick", ITAZURA, &["Creature"][..]),
+    ] {
+        let parsed = parse(oracle, name, types);
+        let def = parsed_cast_from_zone_def(&parsed);
+        // Reach guard: only assert optionality for grants that actually became
+        // resolution-scoped windows, so a driver regression can't make this test
+        // pass vacuously.
+        assert!(
+            matches!(
+                def.effect.as_ref(),
+                Effect::CastFromZone {
+                    driver: CastFromZoneDriver::ResolutionWindow { .. },
+                    ..
+                }
+            ),
+            "reach guard: {name} must lower to a resolution-scoped window"
+        );
+        assert!(
+            !def.optional,
+            "{name}: the printed \"may\" belongs to the free-cast window's own \
+             accept/decline (CR 608.2d); an OptionalEffectChoice wrapper would \
+             prompt twice for one choice and let a decline swallow the window"
+        );
+        assert_eq!(
+            def.optional_for, None,
+            "{name}: an unwrapped grant carries no optional actor scope"
+        );
     }
 }
 
@@ -224,11 +664,15 @@ fn dig_peek_suffix_constraints_and_negative_siblings() {
         ));
     }
 
+    // CR 202.3 + CR 608.2g: the PER-SPELL ceiling rides on the grant's
+    // constraint ("with mana value X or less"), while the resolution-scoped
+    // mechanism rides on the driver. Both axes are asserted together so neither
+    // can regress silently.
     let epic = parse(EPIC_EXPERIMENT, "Epic Experiment", &["Sorcery"]);
     assert!(matches!(
         parsed_cast_from_zone(&epic),
         Effect::CastFromZone {
-            driver: CastFromZoneDriver::LingeringPermission,
+            driver: CastFromZoneDriver::ResolutionWindow { .. },
             constraint: Some(CastPermissionConstraint::ManaValue {
                 comparator: Comparator::LE,
                 value: QuantityExpr::Ref {
@@ -668,8 +1112,16 @@ fn velomachus_power_constraint_is_frozen_before_the_library_choice() {
     );
 }
 
+/// CR 608.2h + CR 608.2g: Epic Experiment freezes X once as it resolves, offers
+/// the within-ceiling exiled card through its resolution-scoped window, and then
+/// runs its own trailing "Then put all cards exiled this way that weren't cast
+/// into your graveyard" instruction in the SAME resolution.
+///
+/// The continuation half is the load-bearing part: converting the grant into a
+/// free-cast window must not swallow the chain's remaining sub-ability, or every
+/// uncast card would be stranded in exile forever.
 #[test]
-fn epic_experiment_freezes_x_for_the_lingering_cast_permission() {
+fn epic_experiment_window_casts_within_x_then_runs_its_uncast_cleanup() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let epic = scenario
@@ -697,28 +1149,332 @@ fn epic_experiment_freezes_x_for_the_lingering_cast_permission() {
     );
 
     let mut runner = scenario.build();
-    let outcome = runner
-        .cast(epic)
-        .x(2)
-        .accept_optional()
-        .effect_zone(&[mana_value_two])
-        .resolve();
+    let outcome = runner.cast(epic).x(2).accept_optional().resolve();
 
+    // CR 608.2h: X was determined once, as Epic Experiment resolved, and bounds
+    // the offer. Both exiled cards are instants/sorceries, so only the frozen
+    // ceiling can separate them.
+    let WaitingFor::CastOffer {
+        kind: CastOfferKind::FreeCastWindow { candidates, .. },
+        ..
+    } = outcome.final_waiting_for().clone()
+    else {
+        panic!(
+            "Epic Experiment must park its resolution-scoped window, got {:?}",
+            outcome.final_waiting_for()
+        )
+    };
     assert!(
-        !matches!(
-            outcome.final_waiting_for(),
-            WaitingFor::EffectZoneChoice { .. }
-        ),
-        "Epic's selected MV 2 spell must be accepted rather than leaving the cast choice parked"
+        candidates.contains(&mana_value_two),
+        "mana value 2 <= X = 2 must be offered; offered = {candidates:?}"
     );
+    assert!(
+        !candidates.contains(&mana_value_three),
+        "mana value 3 > X = 2 must not be offered; offered = {candidates:?}"
+    );
+
+    // CR 608.2g: the chosen card is cast as Epic Experiment resolves.
+    runner
+        .act(GameAction::FreeCastWindowChoice {
+            selection: Some(mana_value_two),
+        })
+        .expect("free-casting the within-ceiling card must succeed");
     assert_eq!(
         runner.state().objects[&mana_value_two].zone,
-        Zone::Graveyard
+        Zone::Stack,
+        "the chosen card goes onto the stack during Epic Experiment's resolution"
     );
+
+    // Declining the rest closes the window; Epic Experiment then finishes
+    // resolving and runs its own trailing instruction.
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow { .. },
+            ..
+        }
+    ) {
+        runner
+            .act(GameAction::FreeCastWindowChoice { selection: None })
+            .expect("declining the remaining casts must succeed");
+    }
+
+    // CR 608.2c: "Then put all cards exiled this way that weren't cast into your
+    // graveyard" — the continuation must survive the window conversion.
     assert_eq!(
         runner.state().objects[&mana_value_three].zone,
-        Zone::Graveyard
+        Zone::Graveyard,
+        "the uncast exiled card must be swept to the graveyard by the trailing \
+         instruction, not stranded in exile"
     );
+
+    for _ in 0..24 {
+        if runner.state().stack.is_empty() {
+            break;
+        }
+        if runner.act(GameAction::PassPriority).is_err() {
+            break;
+        }
+    }
+    assert_eq!(
+        runner.state().objects[&mana_value_two].zone,
+        Zone::Graveyard,
+        "the free-cast spell resolves and goes to its owner's graveyard"
+    );
+}
+
+/// CR 608.2d + CR 608.2c: DECLINING the whole window must still run the
+/// mandatory trailing cleanup.
+///
+/// Two things are pinned here, both on the production cast path:
+///
+/// 1. **One prompt, not two.** This test deliberately does NOT call
+///    `accept_optional()`, so the driver's default `OptionalPolicy::Decline`
+///    answers any `OptionalEffectChoice` it meets. If the resolution-scoped
+///    driver were still wrapped in a generic "you may cast…?" prompt (the
+///    optionality-reconciliation entry removed), that prompt would be declined
+///    and NO window would ever open — the `WaitingFor::CastOffer` assertion below
+///    fails. The printed "may" belongs to the window's own accept/decline.
+/// 2. **Cleanup on total decline.** "Then put all cards exiled this way that
+///    weren't cast into your graveyard" is a separate, MANDATORY instruction
+///    (CR 608.2c in-order instructions); it is not conditioned on any card having
+///    been cast. Declining every cast must still sweep the whole batch, not
+///    strand it in exile.
+///
+/// The sibling test above covers the accept-then-decline path; this one covers
+/// decline-everything, which was previously unexercised.
+#[test]
+fn epic_experiment_decline_still_runs_its_uncast_cleanup() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let epic = scenario
+        .add_spell_to_hand_from_oracle(P0, "Epic Experiment", false, EPIC_EXPERIMENT)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::X],
+            generic: 0,
+        })
+        .id();
+    let mana_value_two = scenario
+        .add_spell_to_library_top(P0, "Epic Decline MV2", false)
+        .with_mana_cost(ManaCost::generic(2))
+        .from_oracle_text("You gain 1 life.")
+        .id();
+    let mana_value_one = scenario
+        .add_spell_to_library_top(P0, "Epic Decline MV1", false)
+        .with_mana_cost(ManaCost::generic(1))
+        .from_oracle_text("You gain 1 life.")
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        (0..2)
+            .map(|_| ManaUnit::new(ManaType::Colorless, epic, false, vec![]))
+            .collect(),
+    );
+
+    let mut runner = scenario.build();
+    let outcome = runner.cast(epic).x(2).resolve();
+
+    let WaitingFor::CastOffer {
+        kind: CastOfferKind::FreeCastWindow { candidates, .. },
+        ..
+    } = outcome.final_waiting_for().clone()
+    else {
+        panic!(
+            "Epic Experiment must park its resolution-scoped window as the SOLE \
+             \"you may\" prompt, got {:?}",
+            outcome.final_waiting_for()
+        )
+    };
+    // Reach guard: both exiled cards are within X = 2 and are legal offers, so the
+    // decline below is a real decision rather than an empty prompt.
+    assert!(
+        candidates.contains(&mana_value_one) && candidates.contains(&mana_value_two),
+        "reach guard: both exiled cards must be offered; offered = {candidates:?}"
+    );
+
+    runner
+        .act(GameAction::FreeCastWindowChoice { selection: None })
+        .expect("declining the whole window must succeed");
+
+    for card in [mana_value_one, mana_value_two] {
+        assert_eq!(
+            runner.state().objects[&card].zone,
+            Zone::Graveyard,
+            "CR 608.2c: the mandatory trailing cleanup must sweep every uncast \
+             exiled card even when the window is declined outright, not strand \
+             it in exile"
+        );
+        assert!(
+            runner.state().objects[&card].casting_permissions.is_empty(),
+            "declining the resolution-scoped window must leave no standing \
+             casting permission behind"
+        );
+    }
+}
+
+/// CR 608.2d, the SUBJECT-PHRASE "may" seam at runtime.
+///
+/// Itazura, Lingering Wick's upkeep trigger reaches its cast grant through the
+/// second optionality seam (`clause_ir.parsed.optional` in
+/// `oracle_effect/assembly.rs`) because its "may" sits on a subject phrase —
+/// "…, then **they** may cast a spell from among those cards without paying its
+/// mana cost" — rather than leading the clause. The chunk-level carve-out that
+/// covers every other member of the class does not reach it.
+///
+/// What this pins, on verbatim Oracle text driven end to end through the real
+/// upkeep trigger: **no `OptionalEffectChoice` is ever raised.** The printed
+/// "may" belongs to the free-cast window's own accept/decline, so a surviving
+/// `def.optional = true` shows up here as a generic "do you want to do this?"
+/// prompt in front of the grant — both a second prompt for one choice and, for
+/// any declining actor, a prompt that swallows the window outright. The loop
+/// below treats that prompt as a failure.
+///
+/// It also pins that the trigger runs to completion: the damage lands
+/// (CR 120.3a — proof the chain reached the cast clause) and the MANDATORY
+/// trailing instruction, "You put a card from among them that wasn't cast this
+/// way into your hand", still moves the batch out of exile (CR 608.2c).
+///
+/// KNOWN RESIDUALS, deliberately asserted *around* rather than locked in:
+///
+/// * Itazura's window does not currently open at all, for a reason that
+///   predates this change and is independent of the driver: the cast clause's
+///   anaphor lowers to `TargetFilter::ExiledBySource`, which resolves from the
+///   trigger's CR 608.2h LKI `linked_exile_snapshot` — captured when the trigger
+///   was put on the stack, i.e. BEFORE this same trigger's own `ExileTop`
+///   instruction ran — so the batch reads as empty and `cast_from_zone::resolve`
+///   takes its no-targets exit. The trailing cleanup gets the batch right
+///   because it binds to the resolution's tracked set (`TrackedSetFiltered`)
+///   instead. Under the previous lowering the clause was equally dead (an empty
+///   target list reached `grant_lingering_permissions` and stamped nothing) — it
+///   merely also cost the controller a meaningless prompt, which is what this
+///   change removes. Binding the cast anaphor to the tracked set is a separate
+///   fix; the assertions below say the batch leaves exile without saying WHICH
+///   mechanism offered it, so they will not need rewriting when that lands.
+/// * `free_cast_from_zones::resolve` would offer the window to the ability's
+///   controller, not to the damaged opponent the card names ("**they** may
+///   cast"). Also pre-existing, also untouched here.
+#[test]
+fn itazura_raises_no_redundant_optional_prompt_and_still_runs_its_hand_instruction() {
+    let mut scenario = GameScenario::new();
+    scenario.with_life(P0, 20);
+    scenario.with_life(P1, 20);
+    scenario.add_creature_from_oracle(P0, "Itazura, Lingering Wick", 3, 3, ITAZURA);
+
+    // Keep P0's library non-empty through the draw step (CR 104.3c). Seeded
+    // FIRST so the three cards below sit above it and are the ones exiled.
+    scenario.with_library_top(P0, &["Itazura Filler"]);
+    // The three cards the trigger exiles. Real castable spells, so a surviving
+    // permission would be observable rather than vacuous. Instants, because the
+    // trigger resolves in the upkeep step and the offer would still enforce the
+    // card's own timing (CR 307.1).
+    let exiled: Vec<ObjectId> = ["Itazura Top 1", "Itazura Top 2", "Itazura Top 3"]
+        .into_iter()
+        .map(|name| {
+            scenario
+                .add_spell_to_library_top(P0, name, true)
+                .with_mana_cost(ManaCost::generic(1))
+                .from_oracle_text("You gain 1 life.")
+                .id()
+        })
+        .collect();
+
+    let mut runner = scenario.build();
+    // A pre-existing permanent whose upkeep trigger fires on the coming turn.
+    runner.state_mut().turn_number = 2;
+    runner.state_mut().phase = Phase::Untap;
+    runner.state_mut().active_player = P0;
+    runner.state_mut().priority_player = P0;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    runner.auto_advance_to_main_phase();
+
+    let mut chose_a_number = false;
+    for _ in 0..256 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::NamedChoice {
+                player,
+                options,
+                choice_type,
+                ..
+            } => {
+                let choice = match choice_type {
+                    // "Each opponent secretly chooses a number 0 or greater."
+                    ChoiceType::NumberRange { .. } => {
+                        assert_eq!(player, P1, "only opponents choose a number");
+                        chose_a_number = true;
+                        "3".to_string()
+                    }
+                    // "Choose an opponent with the highest number." — P1 is the
+                    // only opponent, so trivially the highest.
+                    ChoiceType::Opponent { .. } => options
+                        .first()
+                        .cloned()
+                        .expect("an opponent must be offered"),
+                    other => panic!("unexpected choice {other:?}"),
+                };
+                runner
+                    .act(GameAction::ChooseOption { choice })
+                    .unwrap_or_else(|e| panic!("answering {player:?} must succeed: {e:?}"));
+            }
+            // Should the anaphor residual documented above be fixed, the window
+            // opens here. Casting nothing keeps this test about the prompt shape
+            // while still exercising the trailing instruction.
+            WaitingFor::CastOffer {
+                kind: CastOfferKind::FreeCastWindow { .. },
+                ..
+            } => {
+                runner
+                    .act(GameAction::FreeCastWindowChoice { selection: None })
+                    .expect("declining the window must succeed");
+            }
+            WaitingFor::OptionalEffectChoice { .. } => panic!(
+                "CR 608.2d: the printed \"then they may cast\" is the free-cast \
+                 window's own accept/decline, not a separate OptionalEffectChoice. \
+                 This prompt is the double prompt the ResolutionWindow carve-out in \
+                 `assembly.rs` removes — and a declining actor answering it would \
+                 never reach the grant at all."
+            ),
+            WaitingFor::Priority { .. } => {
+                if runner.state().stack.is_empty() && runner.state().phase != Phase::Upkeep {
+                    break;
+                }
+                if runner.act(GameAction::PassPriority).is_err() {
+                    break;
+                }
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+
+    // Reach guard: the trigger really did resolve, rather than never firing and
+    // making the "no OptionalEffectChoice" assertion vacuous.
+    assert!(
+        chose_a_number,
+        "the trigger must reach its secret-number choice"
+    );
+    // CR 120.3a: "Itazura deals that much damage to them" — the instruction
+    // immediately before the cast clause, so the chain reached that clause.
+    assert_eq!(
+        runner.life(P1),
+        17,
+        "P1 chose 3 and takes exactly that much"
+    );
+
+    // CR 608.2c: the mandatory trailing instruction runs whether or not anything
+    // was cast.
+    for card in &exiled {
+        let object = &runner.state().objects[card];
+        assert_ne!(
+            object.zone,
+            Zone::Exile,
+            "the mandatory \"put a card from among them … into your hand\" \
+             instruction must move the batch out of exile"
+        );
+        assert!(
+            object.casting_permissions.is_empty(),
+            "a resolution-scoped grant must leave no standing casting permission \
+             behind once the trigger has finished resolving"
+        );
+    }
 }
 
 /// Issue #6880: the "from among them" cast anaphor must carry the clause's
@@ -1488,10 +2244,18 @@ fn no_card_is_both_instant_and_sorcery() {
 // The runtime shape of this site is NOT the private-library `EffectZoneChoice`
 // used by Kiora/Velomachus/Svella. Those cards LOOK at library cards and pick
 // one during resolution (CR 608.2g). The cards below EXILE first, and their
-// "you may cast ..." instruction grants a lingering
-// `CastingPermission::ExileWithAltCost` (CR 118.9) on the exiled cards, then
-// hands the controller priority — so the observable is which exiled cards
-// carry a cast permission and appear on the legal-action surface.
+// "you may cast ..." instruction then offers that batch.
+//
+// CR 608.2g: for the FREE form (Epic Experiment, Collected Conjuring) the offer
+// is a resolution-scoped `CastOfferKind::FreeCastWindow` opened while the source
+// is still resolving — no casting permission is granted and no priority window
+// is handed back, because "no other spells can normally be cast … during
+// resolution" and the WotC rulings say the controller "can't wait to cast them
+// later in the turn". For the PAID form (Sanwell, Avenger Ace) the controller
+// must still be able to pay, so it stays a lingering
+// `CastingPermission::ExileWithAltCost` (CR 118.9) observable on the
+// legal-action surface at the next priority window. `free_cast_offers` reads
+// whichever surface the card's own mechanism produced.
 // ---------------------------------------------------------------------------
 
 /// CR 608.2c: "Then put all cards exiled this way that weren't cast into your
@@ -1593,10 +2357,40 @@ fn exile_set_cast_ability(
     resolved
 }
 
+/// Resolve the chain and leave the runner at the ONE prompt the cast instruction
+/// presents.
+///
+/// CR 608.2d: the printed "you may" is a single choice, so it must produce a
+/// single prompt. Which prompt depends on the mechanism the card's own grammar
+/// selected, and the two are mutually exclusive:
+/// * FREE batch (`CastFromZoneDriver::ResolutionWindow`) — the interactive
+///   `CastOfferKind::FreeCastWindow` IS the "may": accepting is selecting a card,
+///   declining is `FreeCastWindowChoice { selection: None }`. A generic
+///   `OptionalEffectChoice` wrapper in front of it would ask the same question
+///   twice, which is why `parse_effect_chain_ir` lowers this driver as mandatory
+///   (mirroring `Effect::FreeCastFromZones`).
+/// * PAID batch (Sanwell, Avenger Ace) — no window exists; the "may" is the
+///   generic `OptionalEffectChoice`, and accepting it installs a lingering
+///   permission (CR 118.9) observable at the following priority window.
+///
+/// The `assert!` on the free branch is the anti-double-prompt regression pin: it
+/// fails if the `ResolutionWindow` arm is dropped from the optionality
+/// reconciliation and the redundant wrapper comes back.
 fn resolve_and_accept_exile_set_cast(runner: &mut GameRunner, resolved: &ResolvedAbility) {
     let mut events = Vec::new();
     engine::game::effects::resolve_ability_chain(runner.state_mut(), resolved, &mut events, 0)
         .expect("the exile-then-cast chain must resolve");
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow { .. },
+            ..
+        }
+    ) {
+        // CR 608.2g: the free batch opened its resolution-scoped window directly.
+        // No `OptionalEffectChoice` was ever parked in front of it.
+        return;
+    }
     assert!(
         matches!(
             runner.state().waiting_for,
@@ -1610,16 +2404,32 @@ fn resolve_and_accept_exile_set_cast(runner: &mut GameRunner, resolved: &Resolve
         .expect("accepting the optional cast must succeed");
     assert!(
         matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
-        "CR 118.9: this site grants a lingering permission and hands back \
-         priority, parked at {:?}",
+        "CR 118.9: the PAID batch grants a lingering permission and hands back \
+         priority; a free-cast window here would mean the resolution-scoped \
+         driver was double-prompted behind an `OptionalEffectChoice`, parked at {:?}",
         runner.state().waiting_for
     );
 }
 
-/// CR 601.3: the cards the granted permission actually authorizes, read off the
-/// engine's own legal-action surface rather than off the raw permission list, so
-/// a permission the casting pipeline would refuse cannot count as "offered".
+/// CR 601.3: the cards the cast instruction actually authorizes.
+///
+/// Two surfaces, one per mechanism, because the two mechanisms are genuinely
+/// different: a FREE batch anaphor ("… from among them without paying their mana
+/// costs") is a resolution-scoped window (CR 608.2g) whose offer IS its
+/// candidate list, while a PAID batch anaphor (Sanwell, Avenger Ace) still
+/// grants a lingering permission (CR 118.9) that shows up on the legal-action
+/// surface at the following priority window. Reading the window's candidates
+/// rather than `legal_actions` for the former is required, not a convenience:
+/// during a resolution-scoped window no player has priority, so no
+/// `CastSpell` action exists to inspect.
 fn free_cast_offers(runner: &GameRunner) -> Vec<ObjectId> {
+    if let WaitingFor::CastOffer {
+        kind: CastOfferKind::FreeCastWindow { candidates, .. },
+        ..
+    } = &runner.state().waiting_for
+    {
+        return candidates.clone();
+    }
     engine::ai_support::legal_actions(runner.state())
         .iter()
         .filter_map(|action| match action {
@@ -1632,21 +2442,35 @@ fn free_cast_offers(runner: &GameRunner) -> Vec<ObjectId> {
 
 /// Positive reach guard: take the offer and prove the card reaches the stack.
 fn take_offer_onto_the_stack(runner: &mut GameRunner, card: ObjectId) {
-    let action = engine::ai_support::legal_actions(runner.state())
-        .into_iter()
-        .find(|action| {
-            matches!(
-                action,
-                GameAction::CastSpell { object_id, .. }
-                | GameAction::CastSpellForFree { object_id, .. } if *object_id == card
-            )
-        })
-        .unwrap_or_else(|| panic!("{card:?} must be castable from the granted permission"));
-    runner.act(action).expect("casting the offered card");
-    if matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow { .. },
+            ..
+        }
+    ) {
         runner
-            .act(GameAction::PassPriority)
-            .expect("finalizing the cast's mana payment");
+            .act(GameAction::FreeCastWindowChoice {
+                selection: Some(card),
+            })
+            .unwrap_or_else(|e| panic!("{card:?} must be free-castable from the window: {e:?}"));
+    } else {
+        let action = engine::ai_support::legal_actions(runner.state())
+            .into_iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    GameAction::CastSpell { object_id, .. }
+                    | GameAction::CastSpellForFree { object_id, .. } if *object_id == card
+                )
+            })
+            .unwrap_or_else(|| panic!("{card:?} must be castable from the granted permission"));
+        runner.act(action).expect("casting the offered card");
+        if matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+            runner
+                .act(GameAction::PassPriority)
+                .expect("finalizing the cast's mana payment");
+        }
     }
     assert_eq!(
         runner.state().objects[&card].zone,
@@ -1715,6 +2539,17 @@ fn epic_experiment_does_not_offer_a_creature_inside_its_mana_value_ceiling() {
             .is_empty(),
         "the ineligible creature must not receive a casting permission"
     );
+    // CR 608.2g: the free form grants NO lingering permission at all — the offer
+    // exists only for as long as Epic Experiment is resolving. Reverting the
+    // resolution-scoped lowering flips this: the offered sorcery would carry a
+    // standing `ExileWithAltCost` grant instead.
+    assert!(
+        runner.state().objects[&legal_sorcery]
+            .casting_permissions
+            .is_empty(),
+        "even the OFFERED card must carry no standing permission — the window is \
+         resolution-scoped, not a lingering grant"
+    );
 
     take_offer_onto_the_stack(&mut runner, legal_sorcery);
 }
@@ -1778,6 +2613,23 @@ fn collected_conjuring_does_not_offer_an_instant() {
             .casting_permissions
             .is_empty(),
         "the ineligible instant must not receive a casting permission"
+    );
+    // CR 601.2: "up to two" is a hard cap the window's stop-early loop owns.
+    let WaitingFor::CastOffer {
+        kind: CastOfferKind::FreeCastWindow {
+            remaining_casts, ..
+        },
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "Collected Conjuring must open its resolution-scoped window, parked at {:?}",
+            runner.state().waiting_for
+        )
+    };
+    assert_eq!(
+        remaining_casts, 2,
+        "\"up to two sorcery spells\" must bound the window at two casts"
     );
 
     take_offer_onto_the_stack(&mut runner, legal_sorcery);
@@ -1944,4 +2796,193 @@ fn sanwell_fixture() -> SanwellFixture {
         plain_creature,
         instant,
     }
+}
+
+/// CR 607.2a + CR 608.2c: "them" is THIS resolution's batch, never the source's
+/// lifetime exile pile.
+///
+/// Jace's Mindseeker's ruling states the scoping rule in as many words: "'From
+/// among them' means the five cards put into the graveyard, not all cards in
+/// that graveyard." The same holds for every exile-batch member of this class —
+/// a card a PREVIOUS resolution of the same source left sitting in exile is not
+/// part of "them".
+///
+/// The fixture resolves the SAME Epic Experiment chain twice from the same
+/// source object with X = 1, using the uncast-cleanup-detached harness so the
+/// first batch's card is still linked and still in exile when the second window
+/// opens. Both cards are mana-value-1 sorceries, so the mana-value ceiling and
+/// the type gate admit both — only the per-resolution batch binding can exclude
+/// the stale one.
+#[test]
+fn a_second_resolution_offers_only_its_own_exile_batch() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let epic = scenario
+        .add_spell_to_hand_from_oracle(P0, "Epic Experiment", false, EPIC_EXPERIMENT)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::X],
+            generic: 0,
+        })
+        .id();
+    // Seeded top-down: second batch's card on top, first batch's beneath it.
+    let second_batch = scenario
+        .add_spell_to_library_top(P0, "Epic Second Batch", false)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+    let first_batch = scenario
+        .add_spell_to_library_top(P0, "Epic First Batch", false)
+        .with_mana_cost(ManaCost::generic(1))
+        .id();
+
+    let mut runner = scenario.build();
+    let execute = exile_then_cast_chain_without_uncast_cleanup(EPIC_EXPERIMENT);
+
+    // First resolution: exiles `first_batch` and offers exactly it.
+    accept_exile_set_cast(&mut runner, epic, &execute, Some(1));
+    let first_offers = free_cast_offers(&runner);
+    assert_eq!(
+        first_offers,
+        vec![first_batch],
+        "reach guard: the first resolution must offer its own batch, otherwise \
+         the negative below is vacuous"
+    );
+    // Decline, leaving the card linked and still in exile.
+    runner
+        .act(GameAction::FreeCastWindowChoice { selection: None })
+        .expect("declining the first window must succeed");
+    assert_eq!(
+        runner.state().objects[&first_batch].zone,
+        Zone::Exile,
+        "the declined card stays in exile (its cleanup instruction is detached \
+         by this harness), which is exactly the stale-pile hazard under test"
+    );
+
+    // Second resolution from the SAME source: exiles `second_batch`.
+    accept_exile_set_cast(&mut runner, epic, &execute, Some(1));
+    let second_offers = free_cast_offers(&runner);
+    assert!(
+        second_offers.contains(&second_batch),
+        "reach guard: the second resolution must offer its own batch; \
+         offered = {second_offers:?}"
+    );
+    assert!(
+        !second_offers.contains(&first_batch),
+        "CR 607.2a: a card left in exile by a PREVIOUS resolution of this source \
+         is not part of \"them\" and must not be re-offered; offered = {second_offers:?}"
+    );
+}
+
+const PRIMEVAL_SPAWN_TRIGGER_BODY: &str = "exile the top ten cards of your library. You may cast any number of spells with total mana value 10 or less from among them without paying their mana costs.";
+
+/// CR 202.3 + CR 608.2g: Primeval Spawn's "TOTAL mana value 10 or less" is a
+/// running cross-selection budget, a different axis from the per-spell ceiling
+/// every other card in this class states.
+///
+/// Its ruling confirms both halves: "The spells are cast one after the other
+/// during the resolution of Primeval Spawn's last ability", and "you may cast
+/// the back face of a modal double-faced card or either face of a split card as
+/// long as the spells you are casting together have a total mana value of 10 or
+/// less."
+///
+/// Before this change the budget was parsed nowhere at all (the constraint
+/// combinators anchor on "with mana value ", which "with total mana value" never
+/// matches), so an unbounded lingering permission was granted instead — both the
+/// MV 7 and the MV 4 spell would have been castable.
+#[test]
+fn primeval_spawn_enforces_its_running_total_mana_value_budget() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let spawn = scenario
+        .add_creature(P0, "Primeval Spawn", 7, 7)
+        .from_oracle_text_with_keywords(&["vigilance", "trample", "lifelink"], PRIMEVAL_SPAWN)
+        .id();
+    // Seeded top-down. Total across all three is 13 > 10, so the budget must
+    // start refusing selections partway through.
+    let mv_two = scenario
+        .add_spell_to_library_top(P0, "Spawn MV2", false)
+        .with_mana_cost(ManaCost::generic(2))
+        .from_oracle_text("You gain 1 life.")
+        .id();
+    let mv_four = scenario
+        .add_spell_to_library_top(P0, "Spawn MV4", false)
+        .with_mana_cost(ManaCost::generic(4))
+        .from_oracle_text("You gain 1 life.")
+        .id();
+    let mv_seven = scenario
+        .add_spell_to_library_top(P0, "Spawn MV7", false)
+        .with_mana_cost(ManaCost::generic(7))
+        .from_oracle_text("You gain 1 life.")
+        .id();
+
+    let mut runner = scenario.build();
+    let execute = engine::parser::oracle_effect::parse_effect_chain(
+        PRIMEVAL_SPAWN_TRIGGER_BODY,
+        engine::types::ability::AbilityKind::Spell,
+    );
+    accept_exile_set_cast(&mut runner, spawn, &execute, None);
+
+    let WaitingFor::CastOffer {
+        kind:
+            CastOfferKind::FreeCastWindow {
+                candidates,
+                remaining_mv_budget,
+                ..
+            },
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "Primeval Spawn must open its resolution-scoped window, parked at {:?}",
+            runner.state().waiting_for
+        )
+    };
+    assert_eq!(
+        remaining_mv_budget,
+        Some(10),
+        "CR 202.3: the stated total-mana-value budget must reach the window"
+    );
+    for card in [mv_seven, mv_four, mv_two] {
+        assert!(
+            candidates.contains(&card),
+            "every exiled spell fits the full 10 budget on the first offer; \
+             offered = {candidates:?}"
+        );
+    }
+
+    // Spend 7 of the 10.
+    runner
+        .act(GameAction::FreeCastWindowChoice {
+            selection: Some(mv_seven),
+        })
+        .expect("free-casting the MV 7 spell must succeed");
+
+    let WaitingFor::CastOffer {
+        kind:
+            CastOfferKind::FreeCastWindow {
+                candidates,
+                remaining_mv_budget,
+                ..
+            },
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "the window must re-offer with a shrunken budget, parked at {:?}",
+            runner.state().waiting_for
+        )
+    };
+    assert_eq!(
+        remaining_mv_budget,
+        Some(3),
+        "CR 202.3: the running total shrinks by the cast spell's mana value"
+    );
+    assert!(
+        candidates.contains(&mv_two),
+        "the MV 2 spell still fits the remaining 3; offered = {candidates:?}"
+    );
+    assert!(
+        !candidates.contains(&mv_four),
+        "CR 202.3: the MV 4 spell no longer fits the remaining 3 and must be \
+         withdrawn from the offer; offered = {candidates:?}"
+    );
 }
