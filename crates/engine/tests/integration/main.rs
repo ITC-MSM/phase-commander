@@ -74,6 +74,7 @@ mod bishop_of_binding_where_x_exiled_card_power;
 mod black_bolt_lethal_voice_destroys_triggering_opponents_permanent;
 mod blessed_orator_other_anthem;
 mod bolas_citadel_regression;
+mod bombur_gentle_dreamer_conditional_untap;
 mod boneyard_parley_pile_separation;
 mod boon_reflection_gain_life_drain;
 mod borg_queen_assimilate;
