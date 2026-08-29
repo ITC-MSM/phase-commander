@@ -3886,12 +3886,9 @@ fn dragon_man_cda_power_is_greatest_mana_value_across_zones() {
             matches!(
                 arm,
                 QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    }
-                }
+                    qty: QuantityRef::PropertyAggregate(aggregate),
+                } if aggregate.function() == AggregateFunction::Max
+                    && aggregate.property() == ObjectProperty::ManaValue
             ),
             "each arm must be a Max/ManaValue Aggregate, got {arm:?}"
         );
@@ -5692,12 +5689,7 @@ fn visions_of_ruin_cast_this_way_cost_reduction_binds_commander_mv() {
 
     let StaticMode::ModifyCost {
         mode: CostModifyMode::Reduce,
-        dynamic_count:
-            Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::ManaValue,
-                ..
-            }),
+        dynamic_count: Some(QuantityRef::PropertyAggregate(aggregate)),
         ..
     } = def.mode
     else {
@@ -5706,6 +5698,8 @@ fn visions_of_ruin_cast_this_way_cost_reduction_binds_commander_mv() {
             def.mode
         );
     };
+    assert_eq!(aggregate.function(), AggregateFunction::Max);
+    assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
     assert!(matches!(
         def.condition,
         Some(StaticCondition::CastingAsVariant {
@@ -5885,17 +5879,14 @@ fn ghalta_self_cost_reduction_is_active_from_command_zone() {
 
     let StaticMode::ModifyCost {
         mode: CostModifyMode::Reduce,
-        dynamic_count:
-            Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                ..
-            }),
+        dynamic_count: Some(QuantityRef::PropertyAggregate(aggregate)),
         ..
     } = def.mode
     else {
         panic!("expected dynamic self-spell ReduceCost, got {:?}", def.mode);
     };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(aggregate.property(), ObjectProperty::Power);
     assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
     assert_eq!(
         def.active_zones,
@@ -9491,18 +9482,23 @@ fn static_umbra_stalker_graveyard_chroma_cda() {
     );
 
     let expected_qty = QuantityExpr::Ref {
-        qty: QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
-            filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::You,
+        qty: QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                crate::types::ability::CardTypeSetSource::Objects {
+                    filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::You,
+                        },
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                    ])),
                 },
-                FilterProp::InZone {
-                    zone: Zone::Graveyard,
-                },
-            ])),
-        },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
 
     for m in &def.modifications {
@@ -10403,6 +10399,136 @@ fn static_as_long_as_enchanted_creature_is_attacking_gate_binds_to_host() {
                 TypedFilter::creature().properties(vec![FilterProp::Attacking { defender: None }])
             ),
         }),
+    );
+}
+
+/// CR 506.5 + CR 509.1b + CR 611.3a: Security Bypass's evasion applies to the
+/// enchanted host only while that recipient is the sole attacker. The Aura is
+/// not the affected object and its combat state is irrelevant.
+#[test]
+fn security_bypass_attacking_alone_evasion_binds_to_enchanted_host() {
+    let line = "As long as enchanted creature is attacking alone, it can't be blocked.";
+    let defs = parse_static_line_multi(line);
+    assert_eq!(defs.len(), 1, "expected one typed restriction: {defs:?}");
+    assert_eq!(defs[0].mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])
+        ))
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+}
+
+/// The generic route also covers Equipment and the curly apostrophe used by
+/// some Oracle sources; neither variation may fall back to source/self binding.
+#[test]
+fn equipped_attacking_alone_evasion_accepts_curly_apostrophe() {
+    let defs = parse_static_line_multi(
+        "As long as equipped creature is attacking alone, it can’t be blocked.",
+    );
+    assert_eq!(defs.len(), 1, "expected one typed restriction: {defs:?}");
+    assert_eq!(defs[0].mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EquippedBy])
+        ))
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+}
+
+/// The attached-combat consumer is all-consuming. A longer, unsupported
+/// condition must not be silently truncated into the supported Security
+/// Bypass shape.
+#[test]
+fn attached_attacking_alone_rejects_hostile_trailing_condition() {
+    let defs = parse_static_line_multi(
+        "As long as enchanted creature is attacking alone during your turn, it can't be blocked.",
+    );
+    assert!(
+        !defs.iter().any(|def| {
+            def.mode == StaticMode::CantBeBlocked
+                && def.affected
+                    == Some(TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                    ))
+                && def.condition
+                    == Some(StaticCondition::RecipientMatchesFilter {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().properties(vec![FilterProp::AttackingAlone]),
+                        ),
+                    })
+        }),
+        "hostile trailing text must not be swallowed into the exact typed shape: {defs:?}"
+    );
+}
+
+/// Full production Oracle for Security Bypass: the evasion condition, attached
+/// host binding, granted combat-damage trigger, and Connive effect must all be
+/// typed with no permissive fallback or unsupported residual.
+#[test]
+fn security_bypass_full_oracle_is_fully_typed() {
+    const ORACLE: &str = "Enchant creature\nAs long as enchanted creature is attacking alone, it can't be blocked.\nEnchanted creature has \"Whenever this creature deals combat damage to a player, it connives.\" (Its controller draws a card, then discards a card. If they discarded a nonland card, they put a +1/+1 counter on this creature.)";
+
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        ORACLE,
+        "Security Bypass",
+        &["Enchant".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    let evasion = parsed
+        .statics
+        .iter()
+        .find(|def| def.mode == StaticMode::CantBeBlocked)
+        .expect("full Oracle must contain the typed evasion static");
+    assert_eq!(
+        evasion.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])
+        ))
+    );
+    assert_eq!(
+        evasion.condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+
+    let serialized = serde_json::to_string(&parsed).expect("parsed card must serialize");
+    for expected in ["DamageDone", "Connive"] {
+        assert!(
+            serialized.contains(expected),
+            "full Oracle must retain typed {expected}: {parsed:?}"
+        );
+    }
+    for forbidden in ["Unrecognized", "Unimplemented"] {
+        assert!(
+            !serialized.contains(forbidden),
+            "full Oracle must not contain {forbidden}: {parsed:?}"
+        );
+    }
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "full Oracle must not emit parser warnings: {:?}",
+        parsed.parse_warnings
     );
 }
 
