@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import { LimitedDeckBuilder } from "../LimitedDeckBuilder";
+import { createDefaultDraftWorkspacePreferences } from "../workspace/workspacePreferences";
 
 afterEach(cleanup);
 
@@ -124,7 +125,7 @@ vi.mock("../../../viewmodel/limitedPoolFilter", async (importOriginal) => {
 // per-test controllable fakes. Every other engineRuntime export stays real.
 const engineEligible = vi.fn(async (_name: string, _format: string) => false);
 const enginePartnerCandidates = vi.fn(
-  async (_first: string, _candidates: string[], _draftSetCode: string | null) =>
+  async (_first: string, _candidates: string[], _draftSetCodes: readonly string[]) =>
     [] as string[],
 );
 vi.mock("../../../services/engineRuntime", async (importOriginal) => {
@@ -136,8 +137,8 @@ vi.mock("../../../services/engineRuntime", async (importOriginal) => {
     commanderPartnerCandidates: (
       first: string,
       candidates: string[],
-      draftSetCode: string | null,
-    ) => enginePartnerCandidates(first, candidates, draftSetCode),
+      draftSetCodes: readonly string[],
+    ) => enginePartnerCandidates(first, candidates, draftSetCodes),
   };
 });
 
@@ -188,9 +189,14 @@ const TEST_VIEW: BuilderView = {
     type_filter_options: [],
     color_filter_options: [],
     color_counts: { white: 0, blue: 1, black: 0, red: 0, green: 0 },
+    workspace_capabilities: { rarity_group_order: [] },
+    workspace_row_classification: { creature_instance_ids: [], noncreature_instance_ids: [] },
   },
   seats: [],
   cards_per_pack: 14,
+  pack_sizes: [14, 14, 14],
+  pack_set_codes: ["TST", "TST", "TST"],
+  pack_pick_steps: [14, 14, 14],
   pick_steps_per_pack: 14,
   pack_count: 3,
   min_deck_size: 40,
@@ -274,6 +280,392 @@ describe("LimitedDeckBuilder", () => {
     );
 
     expect(screen.queryByRole("button", { name: "Add Plains" })).not.toBeInTheDocument();
+  });
+
+  it("adds_basic_lands_through_the_phone_compact_lands_picker", () => {
+    const onAddBasicLand = vi.fn();
+    const onAutoSuggestLands = vi.fn();
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: TEST_VIEW,
+          workspace: {
+            schemaVersion: 1,
+            placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand,
+          onRemoveBasicLand: () => {},
+          onAutoSuggestLands,
+        }}
+        responsiveLayout="phone-portrait"
+        showSuggestions
+      />,
+    );
+
+    const addLands = screen.getByRole("button", { name: "Add Lands" });
+    fireEvent.click(addLands);
+    expect(addLands).toHaveClass("min-h-11");
+    const picker = screen.getByRole("dialog", { name: "Add Lands" });
+    expect(within(picker).getByRole("button", { name: "Auto Lands" })).toHaveClass("min-h-11");
+    expect(screen.queryAllByRole("button", { name: "Auto Lands" })).toHaveLength(1);
+    fireEvent.click(within(picker).getByRole("button", { name: "Auto Lands" }));
+    expect(onAutoSuggestLands).toHaveBeenCalledOnce();
+    fireEvent.click(within(picker).getByRole("button", { name: "Add Plains" }));
+    fireEvent.click(within(picker).getByRole("button", { name: "Add Lands" }));
+    expect(onAddBasicLand).toHaveBeenCalledWith("Plains");
+  });
+
+  it.each(["tablet-portrait", "tablet-landscape"] as const)(
+    "uses Add lands in %s compact builder",
+    (responsiveLayout) => {
+      const onAutoSuggestLands = vi.fn();
+      render(
+        <LimitedDeckBuilder
+          local={{
+            view: TEST_VIEW,
+            workspace: {
+              schemaVersion: 1,
+              placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+              virtualBasics: [],
+            },
+            preferences: { ...createDefaultDraftWorkspacePreferences(), explicitView: "compact" },
+            interactionLocked: false,
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: () => {},
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+            onAutoSuggestLands,
+          }}
+          responsiveLayout={responsiveLayout}
+        />,
+      );
+
+      const addLands = screen.getByRole("button", { name: "Add Lands" });
+      expect(addLands).toHaveClass("min-h-11");
+      expect(screen.queryByRole("button", { name: "Lands" })).not.toBeInTheDocument();
+      fireEvent.click(addLands);
+      const picker = screen.getByRole("dialog", { name: "Add Lands" });
+      const autoLands = within(picker).getByRole("button", { name: "Auto Lands" });
+      expect(autoLands).toHaveClass("min-h-11");
+      fireEvent.click(autoLands);
+      expect(onAutoSuggestLands).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("keeps the tablet portrait generic summary and actions docked while leaving statistics tables on desktop", async () => {
+      const suggestDeck = vi.fn();
+      const rejectSubmission = vi.fn(async () => {
+        throw new Error("submission rejected");
+      });
+      const land = {
+        instance_id: "land-1",
+        name: "Island",
+        set_code: "dmu",
+        collector_number: "259",
+        rarity: "common" as const,
+        colors: [],
+        cmc: 0,
+        type_line: "Basic Land - Island",
+      };
+      const view = {
+        ...TEST_VIEW,
+        min_deck_size: 1,
+        pool: [...TEST_VIEW.pool, land],
+      };
+      const { container } = render(
+        <LimitedDeckBuilder
+          local={{
+            view,
+            workspace: {
+              schemaVersion: 1,
+              placements: {
+                "card-1": { zone: "deck", row: 0, column: 0, order: 0 },
+                "land-1": { zone: "deck", row: 0, column: 1, order: 0 },
+              },
+              virtualBasics: [],
+            },
+            preferences: { ...createDefaultDraftWorkspacePreferences(), explicitView: "compact" },
+            interactionLocked: false,
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: rejectSubmission,
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+            onAutoSuggestDeck: suggestDeck,
+          }}
+          responsiveLayout="tablet-portrait"
+          showSuggestions={false}
+        />,
+      );
+
+      const dock = container.querySelector<HTMLElement>("[data-tablet-builder-dock]")!;
+      expect(container.querySelector("[data-responsive-builder-layout='tablet-portrait']"))
+        .toHaveClass("h-[calc(100dvh_-_4rem)]");
+      expect(container.querySelector("[data-tablet-builder-board]")).toHaveClass("flex-1");
+      expect(dock).toHaveClass("shrink-0");
+      expect(container.querySelector("[data-tablet-builder-summary]")).toHaveClass("grid-cols-4");
+      expect(within(dock).getByText("Mana Curve").closest("section")).toHaveClass("col-span-3");
+      expect(within(dock).getByText("Average Mana Cost").closest("section")).toHaveClass("col-span-1");
+      expect(within(dock).getByText("3.00")).toBeInTheDocument();
+      expect(container.querySelectorAll("table")).toHaveLength(0);
+
+      const suggest = within(dock).getByRole("button", { name: "Suggest Deck" });
+      expect(suggest).toBeDisabled();
+      fireEvent.click(suggest);
+      expect(suggestDeck).not.toHaveBeenCalled();
+
+      const actions = container.querySelector<HTMLElement>("[data-tablet-builder-actions]")!;
+      fireEvent.click(within(actions).getByRole("button", { name: "Submit Deck" }));
+      expect(await screen.findByRole("alert")).toHaveTextContent("submission rejected");
+      expect(container.querySelector("[data-tablet-builder-actions]")).toBe(actions);
+      expect(container.querySelector("[data-tablet-landscape-builder-row]")).not.toBeInTheDocument();
+    });
+
+  it("uses container height unchanged for embedded tablet builders", () => {
+    const { container } = render(
+      <LimitedDeckBuilder
+        local={{
+          view: TEST_VIEW,
+          workspace: { schemaVersion: 1, placements: {}, virtualBasics: [] },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="tablet-landscape"
+        responsiveHeightMode="container"
+      />,
+    );
+
+    expect(container.querySelector("[data-responsive-builder-layout='tablet-landscape']"))
+      .toHaveClass("h-full");
+    expect(container.querySelector("[data-responsive-builder-layout='tablet-landscape']"))
+      .not.toHaveClass("h-[calc(100dvh_-_4rem)]");
+  });
+
+  it("uses one ordered four-cell dock row for the tablet landscape compact and visual builders", async () => {
+    const suggestDeck = vi.fn();
+    const rejectSubmission = vi.fn(async () => {
+      throw new Error("submission rejected");
+    });
+    const preferences = { ...createDefaultDraftWorkspacePreferences(), explicitView: "compact" as const };
+    const onPreferencesChange = vi.fn();
+    const local = {
+      view: { ...TEST_VIEW, min_deck_size: 1 },
+      workspace: {
+        schemaVersion: 1 as const,
+        placements: { "card-1": { zone: "deck" as const, row: 0, column: 0, order: 0 } },
+        virtualBasics: [],
+      },
+      preferences,
+      interactionLocked: false,
+      onWorkspaceChange: () => {},
+      onPreferencesChange,
+      onSubmitDeck: rejectSubmission,
+      onAddBasicLand: () => {},
+      onRemoveBasicLand: () => {},
+      onAutoSuggestDeck: suggestDeck,
+    };
+    const { container, rerender } = render(
+      <LimitedDeckBuilder local={local} responsiveLayout="tablet-landscape" showSuggestions />,
+    );
+
+    const board = container.querySelector<HTMLElement>("[data-tablet-landscape-builder-board]")!;
+    const dock = container.querySelector<HTMLElement>("[data-tablet-landscape-builder-dock]")!;
+    const row = container.querySelector<HTMLElement>("[data-tablet-landscape-builder-row]")!;
+    expect(board).toHaveClass("flex-1");
+    expect(dock).toHaveClass("shrink-0");
+    expect(row).toHaveClass(
+      "grid-cols-[minmax(0,45fr)_minmax(0,15fr)_minmax(0,20fr)_minmax(0,20fr)]",
+    );
+    expect(row).not.toHaveClass("overflow-hidden");
+    expect(Array.from(row.children).map((slot) => slot.getAttribute("data-tablet-landscape-builder-slot")))
+      .toEqual(["curve", "average", "suggest", "submit"]);
+    for (const slot of Array.from(row.children)) expect(slot).toHaveClass("min-w-0");
+    const compactCurve = row.querySelector<HTMLElement>("[data-mana-curve-presentation='compact']")!;
+    expect(compactCurve).toBeInTheDocument();
+    expect(compactCurve.querySelectorAll("[data-mana-curve-count]")).toHaveLength(7);
+    expect(Array.from(compactCurve.querySelectorAll("[data-mana-curve-bucket]"), (bucket) => bucket.textContent))
+      .toEqual(["0", "1", "2", "3", "4", "5", "6+"]);
+    expect(container.querySelector("[data-tablet-builder-summary]")).not.toBeInTheDocument();
+    expect(container.querySelector("[data-tablet-builder-actions]")).not.toBeInTheDocument();
+
+    const compactControls = container.querySelector<HTMLElement>("[data-compact-pool-primary-controls]")!;
+    fireEvent.click(within(compactControls).getByRole("button", { name: "Visual builder" }));
+    expect(onPreferencesChange).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "board" }));
+
+    rerender(
+      <LimitedDeckBuilder
+        local={{ ...local, preferences: { ...preferences, explicitView: "board" } }}
+        responsiveLayout="tablet-landscape"
+        showSuggestions
+      />,
+    );
+    expect(container.querySelector("[data-board-columns]")).toBeInTheDocument();
+    expect(container.querySelectorAll("[data-mana-curve-presentation='compact'] [data-mana-curve-bucket]")).toHaveLength(7);
+    fireEvent.click(screen.getByRole("button", { name: "Text builder" }));
+    expect(onPreferencesChange).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "compact" }));
+
+    const suggest = within(row).getByRole("button", { name: "Suggest Deck" });
+    expect(suggest).toHaveClass("min-h-11", "px-4", "py-2", "text-sm");
+    fireEvent.click(suggest);
+    expect(suggestDeck).toHaveBeenCalledOnce();
+    const submit = within(row).getByRole("button", { name: "Submit Deck" });
+    expect(submit).toHaveClass("min-h-11", "px-4", "py-2", "text-sm");
+    fireEvent.click(submit);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("submission rejected");
+    expect(row.compareDocumentPosition(alert) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it("prevents concurrent workspace deck submissions", async () => {
+    let resolveSubmission!: () => void;
+    const submitDeck = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSubmission = resolve;
+    }));
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, min_deck_size: 1 },
+          workspace: {
+            schemaVersion: 1,
+            placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: submitDeck,
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="tablet-landscape"
+        showSuggestions={false}
+      />,
+    );
+
+    const submit = screen.getByRole("button", { name: "Submit Deck" });
+    fireEvent.click(submit);
+    expect(submitDeck).toHaveBeenCalledOnce();
+    expect(submit).toBeDisabled();
+    fireEvent.click(submit);
+    expect(submitDeck).toHaveBeenCalledOnce();
+
+    await act(async () => resolveSubmission());
+    expect(submit).not.toBeDisabled();
+  });
+
+  it.each(["tablet-portrait", "phone-portrait", "phone-landscape", "desktop"] as const)(
+    "does not emit tablet landscape markers in %s",
+    (responsiveLayout) => {
+      const { container } = render(
+        <LimitedDeckBuilder
+          local={{
+            view: TEST_VIEW,
+            workspace: {
+              schemaVersion: 1,
+              placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+              virtualBasics: [],
+            },
+            preferences: createDefaultDraftWorkspacePreferences(),
+            interactionLocked: false,
+            onWorkspaceChange: () => {},
+            onPreferencesChange: () => {},
+            onSubmitDeck: () => {},
+            onAddBasicLand: () => {},
+            onRemoveBasicLand: () => {},
+          }}
+          responsiveLayout={responsiveLayout}
+        />,
+      );
+
+      expect(container.querySelector("[data-tablet-landscape-builder-board]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-tablet-landscape-builder-dock]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-tablet-landscape-builder-row]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-tablet-landscape-builder-slot]")).not.toBeInTheDocument();
+      expect(container.querySelector("[data-mana-curve-presentation='compact']")).not.toBeInTheDocument();
+      for (const curve of container.querySelectorAll("[data-mana-curve-presentation]")) {
+        expect(curve).toHaveAttribute("data-mana-curve-presentation", "default");
+      }
+    },
+  );
+
+  it("keeps the desktop DeckStatistics average nonland-only for the spell-and-land fixture", () => {
+    const land = {
+      instance_id: "land-1",
+      name: "Island",
+      set_code: "dmu",
+      collector_number: "259",
+      rarity: "common" as const,
+      colors: [],
+      cmc: 0,
+      type_line: "Basic Land - Island",
+    };
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, min_deck_size: 1, pool: [...TEST_VIEW.pool, land] },
+          workspace: {
+            schemaVersion: 1,
+            placements: {
+              "card-1": { zone: "deck", row: 0, column: 0, order: 0 },
+              "land-1": { zone: "deck", row: 0, column: 1, order: 0 },
+            },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+        }}
+        responsiveLayout="desktop"
+      />,
+    );
+
+    expect(screen.getByText("Average Mana Cost")).toBeInTheDocument();
+    expect(screen.getByText("3.00")).toBeInTheDocument();
+  });
+
+  it("disables the tablet suggestion button when the workspace cannot suggest", () => {
+    render(
+      <LimitedDeckBuilder
+        local={{
+          view: { ...TEST_VIEW, min_deck_size: 1 },
+          workspace: {
+            schemaVersion: 1,
+            placements: { "card-1": { zone: "deck", row: 0, column: 0, order: 0 } },
+            virtualBasics: [],
+          },
+          preferences: createDefaultDraftWorkspacePreferences(),
+          interactionLocked: false,
+          onWorkspaceChange: () => {},
+          onPreferencesChange: () => {},
+          onSubmitDeck: () => {},
+          onAddBasicLand: () => {},
+          onRemoveBasicLand: () => {},
+          capabilities: { kind: "editable-pool", suggestions: false },
+          onAutoSuggestDeck: vi.fn(),
+        }}
+        responsiveLayout="tablet-portrait"
+        showSuggestions
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Suggest Deck" })).toBeDisabled();
   });
 
   it("opens a preview on touch long press without moving the card", () => {
@@ -746,9 +1138,9 @@ const COMMANDER_VIEW: BuilderView = {
   ...TEST_VIEW,
   kind: "CommanderDraft",
   min_deck_size: 60,
-  // CR 903.13f(3): the ENGINE-latched token. Every pool card below is printed
+  // CR 903.13f(3): the ENGINE-latched tokens. Every pool card below is printed
   // in "dmu", so an implementation reading a card's printing gets "dmu" here.
-  draft_set_code: "CMM",
+  draft_set_codes: ["CMM"],
   pool: [
     ...TEST_VIEW.pool,
     VEHICLE_COMMANDER,
@@ -925,17 +1317,17 @@ describe("LimitedDeckBuilder — CR 903.3 commander designation", () => {
   });
 
   /**
-   * V5 — CR 903.13f(3): the partner query receives the VIEW's latched set code,
-   * never a pool card's printing. Every pool card is printed in "dmu" while the
-   * view says "CMM", so the two authorities disagree on purpose.
+   * V5 — CR 903.13f(3): the partner query receives the VIEW's latched set
+   * codes, never a pool card's printing. Every pool card is printed in "dmu"
+   * while the view says "CMM", so the two authorities disagree on purpose.
    */
   it("pairs a second commander under the drafted set's CR 903.13f(3) grant", async () => {
     engineEligible.mockImplementation(
       async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
     );
     enginePartnerCandidates.mockImplementation(
-      async (_first: string, candidates: string[], draftSetCode: string | null) =>
-        draftSetCode === "CMM" ? candidates : [],
+      async (_first: string, candidates: string[], draftSetCodes: readonly string[]) =>
+        draftSetCodes.includes("CMM") ? candidates : [],
     );
 
     render(
@@ -960,27 +1352,27 @@ describe("LimitedDeckBuilder — CR 903.3 commander designation", () => {
     expect(enginePartnerCandidates).toHaveBeenCalledWith(
       "Vehicle Commander",
       ["Second Commander"],
-      "CMM",
+      ["CMM"],
     );
   });
 
   /**
-   * V5's paired sibling. With no latched set code the engine grants no partner,
-   * so the second designation SWAPS. Neither row discriminates alone: without
-   * this one a hard-coded "CMM" passes the row above.
+   * V5's paired sibling. With no latched set codes the engine grants no
+   * partner, so the second designation SWAPS. Neither row discriminates alone:
+   * without this one a hard-coded `["CMM"]` passes the row above.
    */
   it("swaps rather than pairs when the draft grants no partner ability", async () => {
     engineEligible.mockImplementation(
       async (name: string) => name === "Vehicle Commander" || name === "Second Commander",
     );
     enginePartnerCandidates.mockImplementation(
-      async (_first: string, candidates: string[], draftSetCode: string | null) =>
-        draftSetCode === "CMM" ? candidates : [],
+      async (_first: string, candidates: string[], draftSetCodes: readonly string[]) =>
+        draftSetCodes.includes("CMM") ? candidates : [],
     );
 
     render(
       <LimitedDeckBuilder
-        view={{ ...COMMANDER_VIEW, draft_set_code: null }}
+        view={{ ...COMMANDER_VIEW, draft_set_codes: [] }}
         mainDeck={["Vehicle Commander", "Second Commander"]}
         landCounts={NO_LANDS}
         onAddToDeck={() => {}}
@@ -1001,7 +1393,7 @@ describe("LimitedDeckBuilder — CR 903.3 commander designation", () => {
     expect(enginePartnerCandidates).toHaveBeenCalledWith(
       "Vehicle Commander",
       ["Second Commander"],
-      null,
+      [],
     );
   });
 
@@ -1047,7 +1439,7 @@ describe("LimitedDeckBuilder — CR 903.3 commander designation", () => {
       <LimitedDeckBuilder
         view={{
           ...COMMANDER_VIEW,
-          grantable_commander_filler: { card_name: "Faceless One", max_copies: 2 },
+          grantable_commander_fillers: [{ card_name: "Faceless One", max_copies: 2 }],
         }}
         mainDeck={["Vehicle Commander"]}
         landCounts={NO_LANDS}
@@ -1326,7 +1718,7 @@ describe("LimitedDeckBuilder — CR 903.3 commander designation", () => {
       <LimitedDeckBuilder
         view={{
           ...COMMANDER_VIEW,
-          grantable_commander_filler: { card_name: "The Prismatic Piper", max_copies: 1 },
+          grantable_commander_fillers: [{ card_name: "The Prismatic Piper", max_copies: 1 }],
         }}
         mainDeck={["Vehicle Commander", "The Prismatic Piper"]}
         // The granted copy, taken: the same name from the OTHER source.
