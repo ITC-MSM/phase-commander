@@ -1187,9 +1187,10 @@ pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinit
     // authority (a recipient, a combat anchor) that CR 502.3's turn-based untap
     // never does, so it cannot be copied onto a CantUntap unchecked.
     let condition = extract_cant_untap_condition(&lower).or_else(|| {
-        defs[0].condition.clone().map(|inherited| {
-            gate_cant_untap_condition(inherited, text, ConditionGatePolarity::Positive)
-        })
+        defs[0]
+            .condition
+            .clone()
+            .map(|inherited| gate_cant_untap_condition(inherited, text))
     });
     let mut companion = StaticDefinition::new(StaticMode::CantUntap)
         .affected(affected)
@@ -2270,20 +2271,20 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
                 .affected(affected.clone())
                 .description(text.to_string());
             if let Some(c) = condition {
-                // NEGATIVE polarity, deliberately, even though the classifier
-                // returns the condition to store rather than an `unless` wrapper:
-                // `cant_be_blocked_mode`'s fallthrough runs the whole tail through
-                // `nom_condition::parse_condition`, whose `"unless "` branch can
-                // yield a raw CR 118.12a `UnlessPay` (a subject-led Awesome
-                // Presence phrasing reaches here). A positive gap marker would
-                // evaluate `true` forever and make the creature UNCONDITIONALLY
-                // unblockable — stripping the defending player's printed escape
-                // hatch, not inventing an evasion out of nothing: the card DOES
-                // grant this evasion, but only while the tax goes unpaid. The
-                // negative marker evaluates `false`, which is exactly what the
-                // ungated raw `UnlessPay` already does at runtime, so deferring
-                // the gate leaves rules-visible behavior unchanged.
-                attach_gated_condition(&mut def, c, clause, ConditionGatePolarity::Negative);
+                // `cant_be_blocked_mode`'s fallthrough runs the whole tail
+                // through `nom_condition::parse_condition`, whose `"unless "`
+                // branch can yield a raw CR 118.12a `UnlessPay` (a subject-led
+                // Awesome Presence phrasing reaches here). `CantBeBlocked` has no
+                // block-declaration payment prompt, so the gate defers it to the
+                // inert marker: a gap that evaluated `true` forever would make
+                // the creature UNCONDITIONALLY unblockable — stripping the
+                // defending player's printed escape hatch, not inventing an
+                // evasion out of nothing (the card DOES grant this evasion, but
+                // only while the tax goes unpaid). The inert marker evaluates
+                // `false`, which is exactly what the ungated raw `UnlessPay`
+                // already does at runtime, so deferring the gate leaves
+                // rules-visible behavior unchanged.
+                attach_gated_condition(&mut def, c, clause);
             }
             return Some(def);
         }
@@ -2318,7 +2319,6 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
                     condition: Box::new(control),
                 },
                 unless.original.trim().trim_end_matches('.'),
-                ConditionGatePolarity::Negative,
             );
             return Some(def);
         }
@@ -2436,7 +2436,6 @@ pub(crate) fn parse_combat_tax_static(tp: &TextPair<'_>, text: &str) -> Option<S
             defended,
         },
         original,
-        ConditionGatePolarity::Negative,
     );
     Some(def)
 }
@@ -2502,12 +2501,7 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
             || trailing.to_string(),
             |(_, after)| after.original.trim().trim_end_matches('.').to_string(),
         );
-        attach_gated_condition(
-            &mut def,
-            unless_cond,
-            &gap_text,
-            ConditionGatePolarity::Negative,
-        );
+        attach_gated_condition(&mut def, unless_cond, &gap_text);
         return Some(def);
     }
     None
@@ -2623,12 +2617,8 @@ fn parse_forced_attack_defender_static_body(text: &str) -> Option<StaticDefiniti
     // gate first turns such a leaf into the same `Not(Unrecognized)` shape, so
     // the `contains_unrecognized` decline below catches both classes with one
     // check instead of letting the un-satisfiable one through.
-    let condition = gate_static_condition(
-        &def.mode,
-        condition,
-        gap_text.trim().trim_end_matches('.'),
-        ConditionGatePolarity::Negative,
-    );
+    let condition =
+        gate_static_condition(&def.mode, condition, gap_text.trim().trim_end_matches('.'));
     if condition.contains_unrecognized() {
         return None;
     }

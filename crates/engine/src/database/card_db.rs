@@ -318,9 +318,10 @@ impl CardDatabase {
     /// drift apart.
     ///
     /// Reported as an integrity error rather than repaired in place on purpose:
-    /// the honest repair needs the clause's Oracle text and its polarity, which
-    /// only the parser has (see `unenforceable_gate_condition`). Silently
-    /// substituting a marker here would hide the bypass instead of surfacing it.
+    /// the honest repair needs the clause's Oracle text, which only the parser
+    /// has (see `unenforceable_gate_marker`, which labels the gap with it).
+    /// Silently substituting a marker here would hide the bypass instead of
+    /// surfacing it.
     fn unenforceable_static_condition_errors(&self) -> Vec<String> {
         let mut errors: Vec<String> = self
             .face_index

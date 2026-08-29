@@ -9685,6 +9685,18 @@ fn static_cant_untap_unless_payment_condition_is_unrecognized() {
 /// contract directly, including the NESTED Boolean forms the maintainer called
 /// out (`And`/`Or` wrapping the unsupported leaf), which no current Oracle
 /// phrasing produces but a future combinator extension would.
+///
+/// The marker is INERT for every leaf and every grammatical direction. This
+/// assertion previously required the `"as long as"` / `"if"` direction to yield
+/// a BARE `Unrecognized`, which `layers::evaluate_condition` reads as `true`
+/// forever — a permanently-ON static behind a gate the engine cannot evaluate.
+/// That was the defect, not the contract: see
+/// `static_helpers::unenforceable_gate_marker` for why the rejected leaves all
+/// already evaluate `false` at their enforcement point, so a `true` marker
+/// inverts the truth value that justified rejecting them. The property #8012
+/// actually shipped — EVERY unenforceable leaf, at ANY nesting depth, becomes a
+/// coverage-visible marker rather than a fully-typed condition — is unchanged
+/// and asserted below alongside the runtime value.
 #[test]
 fn cant_untap_gate_rejects_every_unenforceable_leaf_at_any_depth() {
     use crate::types::ability::{PlayerScope, UnlessPayScaling};
@@ -9726,21 +9738,19 @@ fn cant_untap_gate_rejects_every_unenforceable_leaf_at_any_depth() {
         },
     ];
     for condition in unenforceable {
+        let marker = gate_cant_untap_condition(condition.clone(), "gap text");
         assert_eq!(
-            gate_cant_untap_condition(condition.clone(), "gap text", ConditionGatePolarity::Negative),
+            marker,
             StaticCondition::Not {
                 condition: Box::new(StaticCondition::Unrecognized {
                     text: "gap text".to_string(),
                 }),
             },
-            "{condition:?} is not enforceable at the untap step and must be              replaced by the negative-polarity gap marker"
+            "{condition:?} is not enforceable at the untap step and must be              replaced by the inert gap marker, whichever grammatical direction              the clause was written in"
         );
-        assert_eq!(
-            gate_cant_untap_condition(condition.clone(), "gap text", ConditionGatePolarity::Positive),
-            StaticCondition::Unrecognized {
-                text: "gap text".to_string(),
-            },
-            "{condition:?} must be replaced by the positive-polarity gap marker              on the 'as long as'/'if' branch — the fallback polarity must match              how the branch stores its condition, or the restriction's sense flips"
+        assert!(
+            marker.contains_unrecognized(),
+            "{condition:?}'s deferral must stay visible to every              coverage-honesty gate"
         );
     }
 }
@@ -9783,11 +9793,7 @@ fn cant_untap_gate_passes_through_every_enforceable_leaf() {
     ];
     for condition in enforceable {
         assert_eq!(
-            gate_cant_untap_condition(
-                condition.clone(),
-                "gap text",
-                ConditionGatePolarity::Negative
-            ),
+            gate_cant_untap_condition(condition.clone(), "gap text"),
             condition,
             "{condition:?} is fully evaluable at the untap step and must pass through unchanged"
         );
@@ -9809,9 +9815,7 @@ fn cant_untap_gate_passes_through_every_enforceable_leaf() {
 /// card at a time.
 #[test]
 fn payment_gate_acceptance_follows_the_mode_that_owns_the_prompt() {
-    use crate::parser::oracle_static::static_helpers::{
-        gate_static_condition, ConditionGatePolarity,
-    };
+    use crate::parser::oracle_static::static_helpers::gate_static_condition;
     use crate::types::ability::{ConditionContinuation, UnlessPayScaling};
     use crate::types::statics::StaticMode;
 
@@ -9841,12 +9845,7 @@ fn payment_gate_acceptance_follows_the_mode_that_owns_the_prompt() {
             "{mode:?} is walked by combat_tax_mode_matches and must report the continuation"
         );
         assert_eq!(
-            gate_static_condition(
-                &mode,
-                unless_pay.clone(),
-                "gap text",
-                ConditionGatePolarity::Negative
-            ),
+            gate_static_condition(&mode, unless_pay.clone(), "gap text"),
             unless_pay,
             "{mode:?} prompts for the payment — the gate must not defer a satisfiable leaf"
         );
@@ -9885,12 +9884,7 @@ fn payment_gate_acceptance_follows_the_mode_that_owns_the_prompt() {
             "{mode:?} has no payment prompt and must not claim the continuation"
         );
         assert_eq!(
-            gate_static_condition(
-                &mode,
-                unless_pay.clone(),
-                "gap text",
-                ConditionGatePolarity::Negative
-            ),
+            gate_static_condition(&mode, unless_pay.clone(), "gap text"),
             deferred,
             "{mode:?} can never prompt for the payment, so the gate must defer it \
              to a labelled gap rather than accept a condition no player can satisfy"
@@ -9904,23 +9898,13 @@ fn payment_gate_acceptance_follows_the_mode_that_owns_the_prompt() {
         variant: crate::types::game_state::CastingVariant::Flashback,
     };
     assert_eq!(
-        gate_static_condition(
-            &StaticMode::Continuous,
-            cast_variant.clone(),
-            "gap text",
-            ConditionGatePolarity::Negative
-        ),
+        gate_static_condition(&StaticMode::Continuous, cast_variant.clone(), "gap text"),
         cast_variant,
         "narrowing the PendingCast axis without a per-mode audit would demote working \
          cost-modifier cards to unsupported"
     );
     assert_eq!(
-        gate_static_condition(
-            &StaticMode::CantUntap,
-            cast_variant,
-            "gap text",
-            ConditionGatePolarity::Negative
-        ),
+        gate_static_condition(&StaticMode::CantUntap, cast_variant, "gap text"),
         deferred,
         "the untap step runs no cast, so a cast-variant gate is unsatisfiable there"
     );
@@ -27499,9 +27483,7 @@ fn parse_unless_condition_excludes_unless_pay_from_not_wrap() {
 /// it just has no enforcement point on this mode.
 #[test]
 fn awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt() {
-    use crate::parser::oracle_static::static_helpers::{
-        gate_static_condition, ConditionGatePolarity,
-    };
+    use crate::parser::oracle_static::static_helpers::gate_static_condition;
     use crate::types::ability::UnlessPayScaling;
 
     let text = "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.";
@@ -27542,12 +27524,7 @@ fn awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt() {
     // And the gate is enforcement-point-aware, not a blanket ban on UnlessPay:
     // the very same condition is accepted unchanged on a taxed combat mode.
     assert_eq!(
-        gate_static_condition(
-            &StaticMode::CantBlock,
-            parsed.clone(),
-            "gap",
-            ConditionGatePolarity::Negative
-        ),
+        gate_static_condition(&StaticMode::CantBlock, parsed.clone(), "gap"),
         parsed,
         "UnlessPay must still pass through on a mode WaitingFor::CombatTaxPayment covers"
     );
@@ -34104,11 +34081,13 @@ fn alt_cost_as_foretold_stays_zone_free() {
 /// yields a raw CR 118.12a `UnlessPay`. `CantBeBlocked` has no block-declaration
 /// payment prompt (`combat::combat_tax_mode_matches` covers only
 /// `CantAttack`/`CantBlock`/`CantAttackOrBlock`), so the gate must defer it — and
-/// specifically in NEGATIVE polarity. A positive gap marker would be a bare
-/// `Unrecognized`, which evaluates `true` forever and would make every affected
-/// creature UNCONDITIONALLY unblockable: an evasion ability the card does not
-/// have. The negative marker matches what the ungated raw `UnlessPay` already
-/// did at runtime (`false`), so the deferral changes reporting only.
+/// specifically to an INERT marker. A marker that evaluated `true` forever would
+/// make every affected creature UNCONDITIONALLY unblockable: an evasion ability
+/// the card does not have. `Not(Unrecognized)` matches what the ungated raw
+/// `UnlessPay` already did at runtime (`false`), so the deferral changes
+/// reporting only. `unenforceable_gate_marker` now emits that shape for every
+/// enforcement-point rejection, in either grammatical direction, so this route
+/// can no longer regress by picking the wrong polarity at the call site.
 #[test]
 fn subject_led_cant_be_blocked_payment_gate_defers_without_inventing_evasion() {
     let def = parse_static_line(
@@ -34199,6 +34178,25 @@ fn attached_conditional_grant_payment_gate_is_deferred_not_accepted() {
             "{line}: no continuation-backed leaf may survive on a mode whose \
              enforcement point never runs it, got {:?}",
             def.condition
+        );
+        // And the marker must be the INERT shape. A bare `Unrecognized` reads
+        // `true` forever in `layers::evaluate_condition`, which would turn a
+        // conditional grant into an UNCONDITIONAL +2/+2 or flying grant — a buff
+        // the printed card confers only on payment. `Not`-wrapping pins the gate
+        // `false` while `contains_unrecognized` (asserted above) still walks
+        // through the `Not` and reports the gap. Runtime proof lives in
+        // `game::layers`'s
+        // `conditional_grant_with_unenforceable_payment_gate_does_not_apply`.
+        let Some(StaticCondition::Not { condition }) = def.condition.as_ref() else {
+            panic!(
+                "{line}: the gap marker MUST be Not-wrapped — a bare Unrecognized \
+                 evaluates true and would apply the grant unconditionally, got {:?}",
+                def.condition
+            );
+        };
+        assert!(
+            matches!(condition.as_ref(), StaticCondition::Unrecognized { .. }),
+            "{line}: expected a labelled gap inside the Not, got {condition:?}"
         );
     }
 }

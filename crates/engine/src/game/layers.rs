@@ -10845,6 +10845,104 @@ mod tests {
         );
     }
 
+    /// Attach `line`'s parsed static to a fresh Aura on a fresh 2/2, run the real
+    /// layer pipeline, and hand back the enchanted creature's post-layer state.
+    ///
+    /// Shared by the pair of tests below so the gated and ungated cases differ in
+    /// exactly one thing — the Oracle text — rather than in test scaffolding.
+    fn apply_aura_static(line: &str) -> (GameState, ObjectId, StaticDefinition) {
+        let mut state = setup();
+        let bear = make_creature(&mut state, "Bear", 2, 2, PlayerId(0));
+        let def = crate::parser::oracle_static::parse_static_line(line)
+            .unwrap_or_else(|| panic!("{line} should parse to a static"));
+        let aura = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Test Aura".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let ts = state.next_timestamp();
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".into());
+            obj.base_card_types = obj.card_types.clone();
+            obj.attached_to = Some(bear.into());
+            obj.timestamp = ts;
+            obj.static_definitions.push(def.clone());
+        }
+        state.objects.get_mut(&bear).unwrap().attachments.push(aura);
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        (state, bear, def)
+    }
+
+    /// CR 118.12a + CR 611.3a + CR 613.1c: an "as long as <payment>" gate on a
+    /// continuous GRANT must leave the grant off at runtime, because the CR 613
+    /// layer pipeline offers no optional-payment round-trip and the player is
+    /// therefore never given the "may".
+    ///
+    /// This is the runtime half of
+    /// `oracle_static::tests::attached_conditional_grant_payment_gate_is_deferred_not_accepted`,
+    /// and it exists because the parser assertion alone cannot see the defect it
+    /// guards: the deferral marker's SHAPE decides whether the grant applies.
+    /// `evaluate_condition` reads `StaticCondition::Unrecognized` as `true`, so a
+    /// bare marker would have made `"Enchanted creature gets +2/+2 as long as you
+    /// pay {1}"` an UNCONDITIONAL +2/+2 — a buff the printed card never grants for
+    /// free — while the coverage gap marker still looked correct.
+    /// `static_helpers::unenforceable_gate_marker` emits the `Not`-wrapped inert
+    /// shape instead, which pins the gate `false` and keeps the grant off.
+    ///
+    /// Both grant shapes the branch serves are exercised (P/T and keyword),
+    /// because the gate is shared by the class, not by one Oracle phrasing.
+    #[test]
+    fn conditional_grant_with_unenforceable_payment_gate_does_not_apply() {
+        let (state, bear, def) =
+            apply_aura_static("Enchanted creature gets +2/+2 as long as you pay {1}.");
+        assert!(
+            def.condition
+                .as_ref()
+                .is_some_and(StaticCondition::contains_unrecognized),
+            "the coverage marker must survive alongside the fail-closed runtime, got {:?}",
+            def.condition
+        );
+        let enchanted = state.objects.get(&bear).unwrap();
+        assert_eq!(
+            (enchanted.power, enchanted.toughness),
+            (Some(2), Some(2)),
+            "an unofferable CR 118.12a payment gate must leave the grant INACTIVE — \
+             the creature must stay 2/2, not become 4/4"
+        );
+
+        let (state, bear, _) =
+            apply_aura_static("Enchanted creature has flying as long as you pay {1}.");
+        assert!(
+            !state
+                .objects
+                .get(&bear)
+                .unwrap()
+                .has_keyword(&Keyword::Flying),
+            "the keyword shape of the same branch must also stay inactive"
+        );
+    }
+
+    /// Non-vacuity control for the test above: the identical scaffolding DOES
+    /// apply an ungated grant. Without this, a harness that silently failed to
+    /// wire the Aura's static into the layer pipeline would make the fail-closed
+    /// assertion pass for the wrong reason.
+    #[test]
+    fn unconditional_aura_grant_applies_through_the_same_harness() {
+        let (state, bear, def) = apply_aura_static("Enchanted creature gets +2/+2.");
+        assert_eq!(def.condition, None, "control line must carry no gate");
+        let enchanted = state.objects.get(&bear).unwrap();
+        assert_eq!(
+            (enchanted.power, enchanted.toughness),
+            (Some(4), Some(4)),
+            "the harness must actually apply an ungated Aura grant"
+        );
+    }
+
     /// CR 613.1f + CR 702: End-to-end confirmation that the Theros Archetype cycle /
     /// Arcane Lighthouse "can't have or gain [keyword]" denial wins in Layer 6 over a
     /// concurrent keyword grant. A creature given Flying by an anthem must NOT keep

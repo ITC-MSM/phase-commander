@@ -2331,11 +2331,12 @@ pub(crate) fn parse_static_line_inner(
         // attach whichever is present. "as long as" is tried before "if" to match
         // `split_trailing_gate_condition`'s precedence. (CR 509.1b is the block
         // *restriction* rule — "a creature can't block" — not 509.1c, which is
-        // block *requirements*.) The polarity travels with the branch that
-        // produced the condition so `attach_gated_condition`'s fallback keeps the
-        // restriction's sense (see `static_helpers::ConditionGatePolarity`).
-        if let Some((condition, polarity)) = parse_trailing_gate_with_polarity(&tp) {
-            attach_gated_condition(&mut def, condition, tp.original, polarity);
+        // block *requirements*.) Whichever branch produced the condition, an
+        // unenforceable one is deferred to the inert gap marker
+        // (`static_helpers::unenforceable_gate_marker`), so the restriction is
+        // never switched on by a gate the engine cannot evaluate.
+        if let Some(condition) = parse_trailing_gate_condition(&tp) {
+            attach_gated_condition(&mut def, condition, tp.original);
         }
         return Some(def);
     }
@@ -2379,8 +2380,8 @@ pub(crate) fn parse_static_line_inner(
         // attach whichever is present. "as long as" is tried before "if" to match
         // `split_trailing_gate_condition`'s precedence (Seer of the Bright Side:
         // "... can't attack or block as long as it has a stun counter on it.").
-        if let Some((condition, polarity)) = parse_trailing_gate_with_polarity(&tp) {
-            attach_gated_condition(&mut def, condition, tp.original, polarity);
+        if let Some(condition) = parse_trailing_gate_condition(&tp) {
+            attach_gated_condition(&mut def, condition, tp.original);
         }
         return Some(def);
     }
@@ -2472,12 +2473,7 @@ pub(crate) fn parse_static_line_inner(
             // activated" — a legality check at activation, which runs no
             // CR 118.12a payment round-trip. So an `UnlessPay` gate here is
             // deferred rather than accepted (see `attach_gated_condition`).
-            attach_gated_condition(
-                &mut def,
-                condition,
-                tp.original,
-                ConditionGatePolarity::Negative,
-            );
+            attach_gated_condition(&mut def, condition, tp.original);
         }
         return Some(def);
     }
