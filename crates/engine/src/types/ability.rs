@@ -4126,7 +4126,12 @@ pub enum ResolutionCastSuccessAction {
     /// recomputed from the controller's current graveyard/hand.
     FreeCastOfferRemaining {
         controller: PlayerId,
-        remaining_casts: u8,
+        /// CR 601.2: Casts still available in the window, or `None` for the
+        /// unbounded "any number of spells" form — the same encoding as
+        /// `Effect::FreeCastFromZones::count`, carried unchanged through every
+        /// re-offer so an unbounded window never acquires an artificial cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_casts: Option<u8>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remaining_mv_budget: Option<u32>,
         filter: TargetFilter,
@@ -15040,7 +15045,8 @@ pub enum Effect {
     },
     /// CR 608.2g + CR 601.2 + CR 118.9: Open an interactive "free-cast window"
     /// during this spell/ability's resolution: the controller may cast up to
-    /// `count` spells matching `filter` from any of `zones` (their own
+    /// `count` spells (or ANY NUMBER when `count` is `None`) matching `filter`
+    /// from any of `zones` (their own
     /// graveyard and/or hand), each without paying its mana cost, casting them
     /// one at a time during resolution (CR 608.2g — "casting other spells this
     /// way"). When `max_total_mv` is `Some(n)`, the *running total* mana value
@@ -15058,8 +15064,23 @@ pub enum Effect {
     /// is no target slot; candidates are gathered by `filter` across `zones` at
     /// resolution time. Invoke Calamity is the type specimen.
     FreeCastFromZones {
-        /// CR 601.2: Maximum number of spells the controller may cast this way.
-        count: u8,
+        /// CR 601.2: Maximum number of spells the controller may cast this way,
+        /// or `None` for the UNBOUNDED "any number of spells" form.
+        ///
+        /// The encoding is deliberately identical to
+        /// `ResolutionCastWindow::max_casts`, the parsed bound this field is
+        /// populated from: `None` there already means "any number of spells",
+        /// so carrying `Option<u8>` end-to-end makes the conversion a
+        /// pass-through instead of a lossy `unwrap_or(pool.len() as u8)`. The
+        /// previous `u8` had no unbounded value, so an unbounded window over a
+        /// pool larger than 255 silently truncated to 255 casts and stranded
+        /// every eligible card past the cap — a cap CR 601.2 does not state.
+        ///
+        /// Serde: a bare number still deserializes as `Some(n)` (`Option`'s
+        /// `visit_some`), so pre-existing serialized `"count": 2` bodies and
+        /// generated card data keep their meaning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count: Option<u8>,
         /// CR 202.3: Optional running-total mana-value budget shared across all
         /// spells cast this way. `None` means no MV cap.
         #[serde(default, skip_serializing_if = "Option::is_none")]

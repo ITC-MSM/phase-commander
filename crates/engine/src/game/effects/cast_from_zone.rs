@@ -840,7 +840,13 @@ pub fn resolve(
     {
         let mut window = ability.clone();
         window.effect = Effect::FreeCastFromZones {
-            count: target_ids.len().try_into().unwrap_or(u8::MAX),
+            // CR 601.2: one cast per surviving pair. `u8::try_from(..).ok()`
+            // is not a lossy truncation here: a pool that does not fit a `u8`
+            // maps to `None`, the unbounded form, whose only bound is the pool
+            // itself — exactly the intended "cast one from each opponent"
+            // semantics. The old `unwrap_or(u8::MAX)` would instead have capped
+            // such a fanout at 255 casts.
+            count: u8::try_from(target_ids.len()).ok(),
             max_total_mv: None,
             filter: target_filter.clone(),
             zones: vec![Zone::Graveyard],
@@ -964,10 +970,16 @@ fn open_resolution_cast_window(
         .collect();
 
     // CR 601.2: "any number of spells" has no printed cap, so the batch itself is
-    // the bound; "up to two" / a singular "a spell" carry their own.
-    let count = bounds
-        .max_casts
-        .unwrap_or_else(|| pool.len().try_into().unwrap_or(u8::MAX));
+    // the bound; "up to two" / a singular "a spell" carry their own. Both forms
+    // share `Effect::FreeCastFromZones::count`'s encoding (`None` = unbounded),
+    // so the parsed bound passes straight through.
+    //
+    // This used to substitute `pool.len()` for the unbounded case and clamp it
+    // with `unwrap_or(u8::MAX)`, which silently capped an unbounded window over
+    // a 256+ card pool at 255 casts. CR 601.2 states no such cap; the window's
+    // real bound is candidate exhaustion, which `eligible_candidates` enforces
+    // on every re-offer.
+    let count = bounds.max_casts;
 
     // The anaphor leg is discharged (see the doc comment); what remains is the
     // clause's own type gate, which `eligible_candidates` re-applies to the pool.

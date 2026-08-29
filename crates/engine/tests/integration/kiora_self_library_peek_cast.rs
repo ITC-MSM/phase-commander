@@ -2628,11 +2628,154 @@ fn collected_conjuring_does_not_offer_an_instant() {
         )
     };
     assert_eq!(
-        remaining_casts, 2,
+        remaining_casts,
+        Some(2),
         "\"up to two sorcery spells\" must bound the window at two casts"
     );
 
     take_offer_onto_the_stack(&mut runner, legal_sorcery);
+}
+
+/// R12b — RUNTIME. CR 601.2: an UNBOUNDED window ("you may cast any number of
+/// spells … from among them") has no printed cast cap, so a batch larger than
+/// 255 must stay fully castable.
+///
+/// Epic Experiment is the type specimen for a batch whose size is chosen at
+/// announcement (`Exile the top X cards`), which is exactly how this bound is
+/// crossed in play: X is only limited by available mana, and the same window
+/// shape carries Villainous Wealth ("the top X cards of their library") and
+/// Hazoret's Undying Fury.
+///
+/// REVERT GUARD — this test crosses the cap through the production pipeline
+/// rather than unit-testing the conversion. `open_resolution_cast_window`
+/// previously lowered `ResolutionCastWindow { max_casts: None }` to
+/// `Effect::FreeCastFromZones { count: pool.len().try_into().unwrap_or(u8::MAX) }`,
+/// which for a 258-card pool produced a HARD 255-cast window. Under that code
+/// both halves of this test fail: `remaining_casts` reads `Some(255)` instead of
+/// `None`, and the 256th `FreeCastWindowChoice` has no window left to answer,
+/// because the offer loop closed after the 255th cast decremented the count to
+/// zero. CR 608.2g authorizes these casts during the granting resolution; it
+/// supplies no 255-spell limit.
+#[test]
+fn unbounded_resolution_window_casts_past_the_former_255_cap() {
+    // 258 > `u8::MAX`, so the old `try_into().unwrap_or(u8::MAX)` truncated.
+    const POOL: usize = 258;
+    // The first cast the old cap could not have serviced.
+    const CASTS_CROSSING_THE_CAP: usize = 256;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let epic = scenario
+        .add_spell_to_hand_from_oracle(P0, "Epic Experiment", false, EPIC_EXPERIMENT)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::X],
+            generic: 0,
+        })
+        .id();
+    for i in 0..POOL {
+        scenario.add_spell_to_library_top(P0, &format!("Cantrip {i}"), true);
+    }
+    let mut runner = scenario.build();
+
+    let execute = exile_then_cast_chain_without_uncast_cleanup(EPIC_EXPERIMENT);
+    accept_exile_set_cast(&mut runner, epic, &execute, Some(POOL as u32));
+
+    let WaitingFor::CastOffer {
+        kind:
+            CastOfferKind::FreeCastWindow {
+                candidates,
+                remaining_casts,
+                ..
+            },
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "Epic Experiment must open its resolution-scoped window, parked at {:?}",
+            runner.state().waiting_for
+        )
+    };
+    assert_eq!(
+        candidates.len(),
+        POOL,
+        "reach guard: every exiled card is inside the mana-value ceiling and must be offered"
+    );
+    // CR 601.2: "any number of spells" — the window carries NO cast bound. This
+    // is the typed encoding of unbounded, not a 255 sentinel.
+    assert_eq!(
+        remaining_casts, None,
+        "an unbounded window must carry no cast cap; a `Some(_)` here is the \
+         truncation this test guards against"
+    );
+
+    // Drive the real accept loop past the old cap. Each iteration goes through
+    // `GameAction::FreeCastWindowChoice` → `initiate_cast_during_resolution` →
+    // `FreeCastOfferRemaining`, i.e. the production re-offer path.
+    let mut cast_ids = Vec::with_capacity(CASTS_CROSSING_THE_CAP);
+    for nth in 1..=CASTS_CROSSING_THE_CAP {
+        let WaitingFor::CastOffer {
+            kind:
+                CastOfferKind::FreeCastWindow {
+                    candidates,
+                    remaining_casts,
+                    ..
+                },
+            ..
+        } = runner.state().waiting_for.clone()
+        else {
+            panic!(
+                "the unbounded window must still be open for cast #{nth}, parked at {:?}",
+                runner.state().waiting_for
+            )
+        };
+        assert_eq!(
+            remaining_casts, None,
+            "the unbounded bound must survive every re-offer (cast #{nth})"
+        );
+        let chosen = candidates[0];
+        runner
+            .act(GameAction::FreeCastWindowChoice {
+                selection: Some(chosen),
+            })
+            .unwrap_or_else(|e| panic!("cast #{nth} must be accepted: {e:?}"));
+        assert_eq!(
+            runner.state().objects[&chosen].zone,
+            Zone::Stack,
+            "cast #{nth} must reach the stack"
+        );
+        cast_ids.push(chosen);
+    }
+
+    assert_eq!(
+        cast_ids.len(),
+        CASTS_CROSSING_THE_CAP,
+        "every cast past the old cap must have gone through"
+    );
+    // The batch is not exhausted, so the window must still be offering the rest.
+    let WaitingFor::CastOffer {
+        kind:
+            CastOfferKind::FreeCastWindow {
+                candidates,
+                remaining_casts,
+                ..
+            },
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "the unbounded window must remain open while candidates remain, parked at {:?}",
+            runner.state().waiting_for
+        )
+    };
+    assert_eq!(
+        candidates.len(),
+        POOL - CASTS_CROSSING_THE_CAP,
+        "exactly the uncast remainder must still be offered"
+    );
+    assert_eq!(
+        remaining_casts, None,
+        "the window is still unbounded after crossing the former cap"
+    );
 }
 
 /// R13 — RUNTIME. Sanwell's `Or`-shaped gate has TWO legs from two different CR

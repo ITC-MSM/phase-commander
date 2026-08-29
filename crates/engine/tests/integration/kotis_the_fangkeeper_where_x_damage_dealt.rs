@@ -275,16 +275,36 @@ fn kotis_declining_leaves_no_lingering_cast_permission() {
 
     // Return to a priority window — the point at which a lingering permission
     // would have become exercisable.
+    //
+    // REACH GUARD: the loop below has two exits — the intended empty-stack
+    // `WaitingFor::Priority`, and a `PassPriority` rejection. Only the first one
+    // proves the decline actually carried the resolution chain to completion, so
+    // record it and require it BEFORE reading `spell_objects_available_to_cast`.
+    // Without this, a continuation that stalls after
+    // `FreeCastWindowChoice { selection: None }` (leaving the engine parked on
+    // some non-priority `WaitingFor`) would fall out of the loop on the error
+    // arm and still satisfy the two "no permission" assertions vacuously — the
+    // permission scan is trivially empty in a state that never reached a
+    // priority window at all.
+    let mut reached_empty_stack_priority = false;
     for _ in 0..24 {
         if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
             && runner.state().stack.is_empty()
         {
+            reached_empty_stack_priority = true;
             break;
         }
         if runner.act(GameAction::PassPriority).is_err() {
             break;
         }
     }
+    assert!(
+        reached_empty_stack_priority,
+        "declining the window must let the rest of the resolution chain finish and hand \
+         priority back with an empty stack; parked at {:?} with stack {:?}",
+        runner.state().waiting_for,
+        runner.state().stack.len(),
+    );
 
     let state = runner.state();
     assert_eq!(

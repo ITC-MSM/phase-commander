@@ -120,7 +120,7 @@ fn invoke_calamity_opens_free_cast_window_and_exiles_cast_spells() {
                 },
         } => {
             assert_eq!(player, P0);
-            assert_eq!(remaining_casts, 2, "up to two casts");
+            assert_eq!(remaining_casts, Some(2), "up to two casts");
             assert_eq!(remaining_mv_budget, Some(6));
             assert_eq!(
                 graveyard_replacement,
@@ -178,7 +178,7 @@ fn invoke_calamity_opens_free_cast_window_and_exiles_cast_spells() {
                 },
             ..
         } => {
-            assert_eq!(remaining_casts, 1, "one free cast must remain");
+            assert_eq!(remaining_casts, Some(1), "one free cast must remain");
             assert_eq!(
                 remaining_mv_budget,
                 Some(4),

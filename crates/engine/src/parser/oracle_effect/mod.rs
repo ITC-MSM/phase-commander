@@ -24320,7 +24320,10 @@ fn try_parse_counted_free_cast_from_exiled_this_way(rest: &str) -> Option<Effect
     rewrite_target_filter_another_to_tracked_set(&mut filter);
 
     Some(Effect::FreeCastFromZones {
-        count: count as u8,
+        // CR 601.2: this arm parsed a printed "up to N", so the bound is
+        // stated — `Some`. `None` is reserved for the unbounded "any number of
+        // spells" form, which does not reach this combinator.
+        count: Some(count as u8),
         max_total_mv: None,
         filter,
         zones: vec![Zone::Exile],
@@ -24475,7 +24478,10 @@ fn try_parse_free_cast_from_zones(lower: &str) -> Option<Effect> {
         .parse(lower)
         .ok()?;
     let (rest, count) = nom_primitives::parse_number.parse(rest).ok()?;
-    let count = count as u8;
+    // CR 601.2: this arm matched a printed "up to N", so the bound is stated —
+    // `Some`. `None` (unbounded "any number of spells") is produced only by the
+    // `ResolutionCastWindow` route, which does not pass through here.
+    let count = Some(count as u8);
     // `parse_number` leaves the trailing word boundary; consume the space
     // before the candidate type phrase.
     let (rest, _) = tag::<_, _, E>(" ").parse(rest).ok()?;

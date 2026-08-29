@@ -45392,7 +45392,8 @@ fn plargg_and_nassari_full_trigger_chain_choose_then_cast_others() {
         panic!("expected FreeCastFromZones tail, got {:?}", cast.effect);
     };
     assert_eq!(
-        cast_count, 2,
+        cast_count,
+        Some(2),
         "CR 601.2 + ruling 2021-04-16: the \"up to two\" bound must be carried"
     );
     assert_eq!(*zones, vec![Zone::Exile]);
