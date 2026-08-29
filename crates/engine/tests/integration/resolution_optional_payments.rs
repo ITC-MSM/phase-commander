@@ -487,6 +487,7 @@ fn kun_lun_warrior_decline_discard_and_sacrifice_paths() {
         ));
         cast.act(GameAction::PassPriority).unwrap();
     }
+    assert_eq!(cast.state().objects[&warrior].zone, Zone::Battlefield);
     assert_eq!(cast.state().objects[&top].zone, Zone::Library);
 }
 
@@ -590,6 +591,7 @@ fn bullseye_when_you_do_creates_reflexive_trigger_then_targets() {
                 ));
                 cast.act(GameAction::PassPriority).unwrap();
             }
+            assert_eq!(cast.state().objects[&bullseye].zone, Zone::Battlefield);
             drop(cast);
             drain_without_reflexive_target(&mut runner);
             assert_eq!(runner.state().players[P1.0 as usize].life, 20);

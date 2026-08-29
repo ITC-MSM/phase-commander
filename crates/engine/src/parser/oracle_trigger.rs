@@ -3516,18 +3516,15 @@ fn reflexive_optional_cost_payable_by_resolution_prompt(cost: &AbilityCost) -> b
 /// a typed permanent population. This excludes self/granting-object/any
 /// targets, aggregate requirements, and the `u32::MAX` X/any-number sentinel.
 fn reflexive_optional_direct_cost(cost: &AbilityCost) -> bool {
-    use crate::types::ability::SacrificeRequirement;
-
     crate::game::costs::is_direct_resolution_optional_payment_branch(cost)
         || matches!(
             cost,
             AbilityCost::Sacrifice(cost)
                 if matches!(cost.target, TargetFilter::Typed(_))
-                    && matches!(
-                        cost.requirement,
-                        SacrificeRequirement::Count { count }
-                            if count > 0 && count != u32::MAX
-                    )
+                    && cost
+                        .requirement
+                        .fixed_count()
+                        .is_some_and(|count| count > 0 && count != u32::MAX)
         )
 }
 

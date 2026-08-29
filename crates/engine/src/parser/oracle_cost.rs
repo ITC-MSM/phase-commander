@@ -2895,12 +2895,27 @@ mod tests {
             )));
         }
 
+        fn mentions(filter: &TargetFilter, expected: &TypeFilter) -> bool {
+            match filter {
+                TargetFilter::Typed(typed) => typed.type_filters.iter().any(|candidate| {
+                    candidate == expected
+                        || matches!(candidate, TypeFilter::AnyOf(filters) if filters.contains(expected))
+                }),
+                TargetFilter::Or { filters } => filters.iter().any(|filter| mentions(filter, expected)),
+                _ => false,
+            }
+        }
+
+        let noun_level = parse_oracle_cost("Sacrifice an artifact or creature");
+        let AbilityCost::Sacrifice(cost) = noun_level else {
+            panic!("noun-level 'or' must remain one sacrifice cost, got {noun_level:#?}");
+        };
+        assert_eq!(cost.requirement.fixed_count(), Some(1));
         assert!(
-            !matches!(
-                parse_oracle_cost("Sacrifice an artifact or creature"),
-                AbilityCost::OneOf { .. }
-            ),
-            "noun-level 'or' must remain one sacrifice filter"
+            mentions(&cost.target, &TypeFilter::Artifact)
+                && mentions(&cost.target, &TypeFilter::Creature),
+            "noun-level 'or' must retain both type legs: {:#?}",
+            cost.target
         );
     }
     #[test]

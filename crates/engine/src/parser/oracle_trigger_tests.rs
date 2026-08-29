@@ -16808,6 +16808,13 @@ fn resolution_optional_payment_sacrifice_allowlist_fails_closed() {
 
     use crate::types::ability::{SacrificeAggregateStat, SacrificeCost, SacrificeRequirement};
     let typed = TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact));
+    assert!(
+        reflexive_optional_direct_cost(&AbilityCost::Sacrifice(SacrificeCost::count(
+            typed.clone(),
+            1,
+        ))),
+        "the fixed typed count-1 sacrifice must be admitted by the structural allowlist"
+    );
     for forbidden in [
         AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
         AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::GrantingObject, 1)),

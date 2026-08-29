@@ -122,7 +122,6 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
         AbilityCondition, AbilityCost, AbilityDefinition, TargetFilter, TypeFilter,
     };
     use engine::types::mana::{ManaCost, ManaCostShard};
-    use std::collections::BTreeSet;
 
     fn has_strict_gap(ability: &AbilityDefinition) -> bool {
         matches!(
@@ -132,16 +131,19 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
             || ability.else_ability.as_deref().is_some_and(has_strict_gap)
     }
 
-    fn typed_leaf(cost: &AbilityCost, sacrifice: bool, expected: &TypeFilter) -> bool {
-        let filter = match cost {
-            AbilityCost::Sacrifice(cost) if sacrifice => &cost.target,
-            AbilityCost::Discard {
-                filter: Some(filter),
-                ..
-            } if !sacrifice => filter,
-            _ => return false,
-        };
+    fn has_type(filter: &TargetFilter, expected: &TypeFilter) -> bool {
         matches!(filter, TargetFilter::Typed(typed) if typed.type_filters.contains(expected))
+    }
+
+    fn sacrifice_leaf(cost: &AbilityCost, expected: &TypeFilter) -> bool {
+        matches!(cost, AbilityCost::Sacrifice(cost) if has_type(&cost.target, expected))
+    }
+
+    fn discard_leaf(cost: &AbilityCost, expected: &TypeFilter) -> bool {
+        matches!(
+            cost,
+            AbilityCost::Discard { filter: Some(filter), .. } if has_type(filter, expected)
+        )
     }
 
     const CARDS: [(&str, &str); 12] = [
@@ -158,9 +160,6 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
         ("Bullseye, Death Dealer", "When Bullseye enters, you may sacrifice an artifact or discard a nonland card. When you do, Bullseye deals 2 damage to any target.\n{3}, {T}, Sacrifice an artifact or discard a nonland card: Bullseye deals 2 damage to any target."),
         ("Curious Forager", "When this creature enters, you may forage. When you do, return target permanent card from your graveyard to your hand. (To forage, exile three cards from your graveyard or sacrifice a Food.)"),
     ];
-    let expected: BTreeSet<_> = CARDS.iter().map(|(name, _)| *name).collect();
-    let mut supported = BTreeSet::new();
-
     for (name, oracle) in CARDS {
         let parsed = parse(oracle, name, &[], &["Creature"], &[]);
         assert!(
@@ -206,7 +205,7 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
         );
         match name {
             "Contract Hero" | "K'un-Lun Warrior" | "Reckless Detective" => {
-                assert!(typed_leaf(&costs[0], true, &TypeFilter::Artifact), "{name}");
+                assert!(sacrifice_leaf(&costs[0], &TypeFilter::Artifact), "{name}");
                 assert!(matches!(
                     costs[1],
                     AbilityCost::Discard { filter: None, .. }
@@ -238,9 +237,8 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
                         ..
                     }
                 ));
-                assert!(typed_leaf(
+                assert!(sacrifice_leaf(
                     &costs[1],
-                    true,
                     &TypeFilter::Subtype("Food".into())
                 ));
                 assert_eq!(
@@ -249,9 +247,8 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
                 );
             }
             "Nimble Hobbit" => {
-                assert!(typed_leaf(
+                assert!(sacrifice_leaf(
                     &costs[0],
-                    true,
                     &TypeFilter::Subtype("Food".into())
                 ));
                 assert!(matches!(
@@ -283,28 +280,21 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
                 assert!(!when_you_do);
             }
             "Crypt Lurker" => {
-                assert!(typed_leaf(&costs[0], true, &TypeFilter::Creature));
-                assert!(typed_leaf(&costs[1], false, &TypeFilter::Creature));
+                assert!(sacrifice_leaf(&costs[0], &TypeFilter::Creature));
+                assert!(discard_leaf(&costs[1], &TypeFilter::Creature));
                 assert!(!when_you_do);
             }
             "Bullseye, Death Dealer" => {
-                assert!(typed_leaf(&costs[0], true, &TypeFilter::Artifact));
-                assert!(typed_leaf(
+                assert!(sacrifice_leaf(&costs[0], &TypeFilter::Artifact));
+                assert!(discard_leaf(
                     &costs[1],
-                    false,
                     &TypeFilter::Non(Box::new(TypeFilter::Land))
                 ));
                 assert!(when_you_do);
             }
             _ => unreachable!(),
         }
-        supported.insert(name);
     }
-
-    assert_eq!(
-        supported, expected,
-        "the claimed corpus must be exactly 12 cards"
-    );
 }
 
 #[test]
