@@ -12,7 +12,7 @@ use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermi
 use crate::types::ability::{
     AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric,
     CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction, ModalChoice,
-    PerpetualModification, SeatDirection,
+    PerpetualModification, SeatDirection, TurnJournalKind,
 };
 use crate::types::card_type::CoreType;
 use crate::types::mana::{ManaCost, ManaCostShard};
@@ -2069,7 +2069,7 @@ fn reveal_the_card_backref_does_not_hijack_compound_clauses() {
     }
 }
 
-// CR 603.7b + CR 603.7c: a "whenever <trigger>, <effect>" delayed trigger
+// CR 603.7b: a "whenever <trigger>, <effect>" delayed trigger
 // with NO "this turn"/"this combat" infix window (the duration was a consumed
 // prefix) must still split on the trigger-clause comma and produce a
 // CreateDelayedTrigger. Building block for The Sea Devils III.
@@ -2082,7 +2082,7 @@ fn delayed_trigger_no_infix_window_splits_on_comma() {
         panic!("expected CreateDelayedTrigger, got {effect:?}");
     };
 
-    // CR 603.7c: the trigger condition introduces the damaged player as
+    // CR 120.3 + CR 109.4: the trigger condition introduces the damaged player as
     // TriggeringPlayer; the inner effect's "target creature that player
     // controls" must bind its controller to that player — NOT the controller
     // (ControllerRef::You). This is the rules-correctness assertion for The
@@ -5037,6 +5037,49 @@ fn effect_damage_to_each_opponent_uses_player_scope() {
     ));
 }
 
+#[test]
+fn parse_total_mana_value_of_other_spells_cast_this_turn() {
+    let oracle = "Call Forth the Tempest deals damage to each creature your opponents control equal to the total mana value of other spells you've cast this turn";
+    let def = parse_effect_chain(oracle, AbilityKind::Spell);
+    assert!(
+        !ability_chain_has_unimplemented(&def),
+        "the exact Call Forth clause must lower completely: {def:#?}"
+    );
+    let Effect::DamageAll {
+        amount:
+            QuantityExpr::Ref {
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            },
+        target: TargetFilter::Typed(target),
+        player_filter: None,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected journal-sized DamageAll, got {:#?}", def.effect);
+    };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+    assert!(matches!(
+        aggregate.source(),
+        CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: Some(filter),
+        } if filter.contains_other_than_trigger_object()
+    ));
+    assert_eq!(target.controller, Some(ControllerRef::Opponent));
+    assert!(target.type_filters.contains(&TypeFilter::Creature));
+
+    // The typed DamageAll assertions above are the reach guard: the near miss
+    // changes only the unsupported journal suffix of that recognized clause.
+    let near_miss_oracle = oracle.replacen("this turn", "this game", 1);
+    let near_miss = parse_effect_chain(&near_miss_oracle, AbilityKind::Spell);
+    assert!(
+        ability_chain_has_unimplemented(&near_miss),
+        "a different journal suffix must remain unsupported"
+    );
+}
+
 /// Issue #3293: Joyful Stormsculptor — "each opponent and each battle they
 /// protect" must damage players and protected battles, not all opponent
 /// creatures.
@@ -5421,7 +5464,7 @@ fn effect_damage_compound_creature_planeswalker_they_control() {
     }
 }
 
-/// CR 120.3 + CR 119.3a: Pyrohemia / Pestilence class — "each creature and
+/// CR 120.1 + CR 120.3: Pyrohemia / Pestilence class — "each creature and
 /// each player" must emit a unified `DamageAll` carrying both the creature
 /// filter and `player_filter: Some(PlayerFilter::All)`. Previously the
 /// "and each player" half was silently dropped.
@@ -24255,6 +24298,7 @@ fn exiled_cause_publishers_all_stamp_exiled_at_runtime() {
             enters_attacking: false,
             kept_optional_to: None,
             enters_under: None,
+            kept_destination_if: None,
         },
     ];
     for effect in &uncaused_exilers {
@@ -56946,4 +56990,101 @@ fn replacement_shield_between_installer_and_continuation_stays_a_sibling() {
         ClausePlacement::Sibling,
         "an emitted replacement shield breaks the relocation run"
     );
+}
+
+/// CR 700.4 + CR 701.20a + CR 202.3 + CR 608.2c + CR 603.3b: Part in
+/// Friendship (HOB) — "Whenever a nontoken creature you control dies, reveal
+/// cards from the top of your library until you reveal a creature card. If
+/// its mana value is less than or equal to the number of lands you control,
+/// put it onto the battlefield. Otherwise, put it into your hand. Put the
+/// rest on the bottom of your library in a random order. This ability
+/// triggers only once each turn."
+///
+/// Asserts the full typed AST: the dies trigger watches a nontoken creature
+/// you control (CR 111.1), the RevealUntil digs to a creature card (CR
+/// 701.20a) with a card-property-driven `kept_destination_if` branch (CR
+/// 202.3 + CR 608.2c: mana value <= the number of lands you control ->
+/// battlefield, otherwise -> hand), and zero `Effect::Unimplemented` residue
+/// anywhere in the chain.
+#[test]
+fn part_in_friendship_conditional_kept_destination_shape() {
+    let trigger = crate::parser::oracle_trigger::parse_trigger_line(
+        "Whenever a nontoken creature you control dies, reveal cards from the top of your library until you reveal a creature card. If its mana value is less than or equal to the number of lands you control, put it onto the battlefield. Otherwise, put it into your hand. Put the rest on the bottom of your library in a random order. This ability triggers only once each turn.",
+        "Part in Friendship",
+    );
+
+    let execute = trigger
+        .execute
+        .as_deref()
+        .expect("Part in Friendship must lower to an executable ability");
+
+    assert!(
+        !ability_chain_has_unimplemented(execute),
+        "Part in Friendship must not lower to any Effect::Unimplemented node: {execute:#?}"
+    );
+
+    let Effect::RevealUntil {
+        player,
+        filter,
+        kept_destination,
+        rest_destination,
+        kept_destination_if,
+        ..
+    } = execute.effect.as_ref()
+    else {
+        panic!("expected RevealUntil, got {:?}", execute.effect);
+    };
+
+    assert_eq!(*player, TargetFilter::Controller);
+    let TargetFilter::Typed(until_filter) = filter else {
+        panic!("expected Typed creature filter, got {filter:?}");
+    };
+    assert!(
+        until_filter.type_filters.contains(&TypeFilter::Creature),
+        "reveal-until filter must dig for a creature card, got {:?}",
+        until_filter.type_filters
+    );
+
+    // CR 701.20a: kept_destination is repurposed as the "otherwise" branch —
+    // "put it into your hand".
+    assert_eq!(*kept_destination, Zone::Hand);
+    // CR 701.20a: the non-matching rest pile bottoms in a random order.
+    assert_eq!(*rest_destination, Zone::Library);
+
+    // CR 202.3 + CR 608.2c: the card-property branch — "if its mana value is
+    // less than or equal to the number of lands you control" routes to the
+    // battlefield.
+    let (cond_filter, if_true_zone) = kept_destination_if
+        .as_ref()
+        .expect("Part in Friendship must carry a kept_destination_if conditional branch");
+    assert_eq!(*if_true_zone, Zone::Battlefield);
+    let TargetFilter::Typed(cond_typed) = cond_filter.as_ref() else {
+        panic!("expected Typed condition filter, got {cond_filter:?}");
+    };
+    let cmc_prop = cond_typed
+        .properties
+        .iter()
+        .find(|p| matches!(p, FilterProp::Cmc { .. }))
+        .unwrap_or_else(|| panic!("expected a Cmc property, got {:?}", cond_typed.properties));
+    let FilterProp::Cmc { comparator, value } = cmc_prop else {
+        unreachable!()
+    };
+    assert_eq!(*comparator, Comparator::LE);
+    // The dynamic RHS quantity is "the number of lands you control" —
+    // ObjectCount over a land filter controlled by You. This is also the
+    // typed carrier that discharges the DynamicQty swallow detector: the "the
+    // number of" marker text now has a real `QuantityExpr` representation.
+    let QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: lands_filter,
+        },
+    } = value
+    else {
+        panic!("expected ObjectCount quantity, got {value:?}");
+    };
+    let TargetFilter::Typed(lands_typed) = lands_filter else {
+        panic!("expected Typed lands filter, got {lands_filter:?}");
+    };
+    assert!(lands_typed.type_filters.contains(&TypeFilter::Land));
+    assert_eq!(lands_typed.controller, Some(ControllerRef::You));
 }

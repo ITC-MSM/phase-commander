@@ -564,7 +564,7 @@ fn detect_replacement_instead(
 
 // ── Detector B: ActivateOnlyDuring ──────────────────────────────────────
 
-/// CR 605.1c: "Activate only during X" — restricted activation timing.
+/// CR 602.5: "Activate only during X" — restricted activation timing.
 /// Must be represented as an activation constraint on the parsed ability.
 fn detect_activate_only_during(
     cleaned: &str,
@@ -3425,8 +3425,9 @@ fn detect_condition_if(
     // Strip CR-implicit "if" phrases that aren't real conditional gates
     // before scanning. These are built-in rules of their parent effect, not
     // separate conditions:
-    //   CR 701.19f: "If you search your library this way, shuffle." — search
-    //               always-shuffles is built into the search effect.
+    //   "If you search your library this way, shuffle." — no CR makes this
+    //   implicit; the engine's SearchLibrary effect auto-shuffles, so the
+    //   "if" gates nothing.
     //   CR 305.9 :  "If you don't, [it/this/this land] enters tapped." — the
     //               mana-payment alternative is encoded as a replacement
     //               with `ReplacementMode::Optional { decline: Tap(SelfRef) }`,
@@ -3669,12 +3670,14 @@ fn detect_condition_if(
     // conditional representation.
     //   CR 305.9   on_decline                        — "if you don't" alternative
     //   CR 701.20a kept_optional_to                  — RevealUntil decline branch
+    //   CR 202.3 + CR 608.2c kept_destination_if     — RevealUntil card-property destination branch
     //   CR 614.1a  graveyard_destination_replacement — "exile it instead" rider
     //   CR 705     win_effect / lose_effect          — flip branches
     //   CR 701.6   source_rider                      — "if countered this way, ..."
     //   CR 701.6a  countered_spell_zone              — countered-spell destination
     if evidence.has_slot("on_decline")
         || evidence.has_slot("kept_optional_to")
+        || evidence.has_slot("kept_destination_if")
         || evidence.has_slot("graveyard_destination_replacement")
         || evidence.has_slot("win_effect")
         || evidence.has_slot("lose_effect")
@@ -3702,7 +3705,8 @@ fn strip_cr_implicit_if_phrases(cleaned: &str) -> String {
         if s.is_empty() {
             continue;
         }
-        // CR 701.19f: search-shuffle implicit.
+        // Search-shuffle implicit: SearchLibrary auto-shuffles (engine
+        // convention, no CR).
         // allow-noncombinator: swallow detector phrase scan on classified text
         if s.contains("if you search your library this way") {
             continue;
@@ -4448,7 +4452,7 @@ fn detect_duration_this_turn(
     //       CR 615.1   PreventDamage / CreateDamageReplacement — prevention shields
     //       CR 614.11  CreateDrawReplacement — "next time you would draw ... instead"
     //       CR 614.1a  AddTargetReplacement
-    //       CR 603.7c  CreateDelayedTrigger — delayed triggers from spells expire at EOT
+    //       CR 603.7b  CreateDelayedTrigger — delayed triggers from spells expire at EOT
     //       CR 601.2f  ReduceNextSpellCost — consumed by the next cast
     //       CR 509.1c  ForceBlock — a one-turn combat requirement
     //       CR 601.2   CastFromZone — a cast permission, not a duration
@@ -4467,7 +4471,7 @@ fn detect_duration_this_turn(
     }) {
         return;
     }
-    // (j) CR 603.7c: a `WhenNextEvent` delayed-trigger condition IS the "next [event] this
+    // (j) CR 603.7b: a `WhenNextEvent` delayed-trigger condition IS the "next [event] this
     //     turn" scope (Chandra, the Firebrand -2; Doublecast).
     if evidence.any::<DelayedTriggerCondition>(|c| {
         matches!(c, DelayedTriggerCondition::WhenNextEvent { .. })
