@@ -9727,7 +9727,7 @@ fn cant_untap_gate_rejects_every_unenforceable_leaf_at_any_depth() {
     ];
     for condition in unenforceable {
         assert_eq!(
-            gate_cant_untap_condition(condition.clone(), "gap text", UntapGatePolarity::Negative),
+            gate_cant_untap_condition(condition.clone(), "gap text", ConditionGatePolarity::Negative),
             StaticCondition::Not {
                 condition: Box::new(StaticCondition::Unrecognized {
                     text: "gap text".to_string(),
@@ -9736,7 +9736,7 @@ fn cant_untap_gate_rejects_every_unenforceable_leaf_at_any_depth() {
             "{condition:?} is not enforceable at the untap step and must be              replaced by the negative-polarity gap marker"
         );
         assert_eq!(
-            gate_cant_untap_condition(condition.clone(), "gap text", UntapGatePolarity::Positive),
+            gate_cant_untap_condition(condition.clone(), "gap text", ConditionGatePolarity::Positive),
             StaticCondition::Unrecognized {
                 text: "gap text".to_string(),
             },
@@ -9783,11 +9783,147 @@ fn cant_untap_gate_passes_through_every_enforceable_leaf() {
     ];
     for condition in enforceable {
         assert_eq!(
-            gate_cant_untap_condition(condition.clone(), "gap text", UntapGatePolarity::Negative),
+            gate_cant_untap_condition(
+                condition.clone(),
+                "gap text",
+                ConditionGatePolarity::Negative
+            ),
             condition,
             "{condition:?} is fully evaluable at the untap step and must pass through unchanged"
         );
     }
+}
+
+/// The generalization of the two tests above, and the fix for the follow-up
+/// audit finding on PR #8012: the acceptance boundary is a property of the
+/// static's ENFORCEMENT POINT, not of the condition alone.
+///
+/// The untap-step gate landed in round 5 as `CantUntap`-specific, but CR 118.12a
+/// `UnlessPay` is decided by exactly one continuation
+/// (`WaitingFor::CombatTaxPayment`) that `combat::combat_tax_mode_matches`
+/// offers for exactly three modes. Every OTHER mode that can carry an
+/// `UnlessPay` was false-green in precisely the way `CantUntap` had been — and
+/// unlike `CantUntap`, two of them are live on printed cards (Awesome Presence →
+/// `CantBeBlocked`, Hipparion → `BlockRestriction`). This pins both directions of
+/// the axis at the gate level, where one table covers every mode rather than one
+/// card at a time.
+#[test]
+fn payment_gate_acceptance_follows_the_mode_that_owns_the_prompt() {
+    use crate::parser::oracle_static::static_helpers::{
+        gate_static_condition, ConditionGatePolarity,
+    };
+    use crate::types::ability::{ConditionContinuation, UnlessPayScaling};
+    use crate::types::statics::StaticMode;
+
+    let unless_pay = StaticCondition::UnlessPay {
+        cost: ManaCost::Cost {
+            shards: vec![],
+            generic: 1,
+        },
+        scaling: UnlessPayScaling::Flat,
+        defended: None,
+    };
+    let deferred = StaticCondition::Not {
+        condition: Box::new(StaticCondition::Unrecognized {
+            text: "gap text".to_string(),
+        }),
+    };
+
+    // The three modes `compute_combat_tax` actually walks: the payment IS
+    // offered, so the leaf is enforceable and must survive untouched.
+    for mode in [
+        StaticMode::CantAttack,
+        StaticMode::CantBlock,
+        StaticMode::CantAttackOrBlock,
+    ] {
+        assert!(
+            mode.provides_continuation(ConditionContinuation::OptionalCostPayment),
+            "{mode:?} is walked by combat_tax_mode_matches and must report the continuation"
+        );
+        assert_eq!(
+            gate_static_condition(
+                &mode,
+                unless_pay.clone(),
+                "gap text",
+                ConditionGatePolarity::Negative
+            ),
+            unless_pay,
+            "{mode:?} prompts for the payment — the gate must not defer a satisfiable leaf"
+        );
+    }
+
+    // Every other mode has no prompt anywhere in the engine, so the same leaf is
+    // unsatisfiable by construction and must be deferred. The first two are the
+    // printed cards; the rest are the other modes reachable from an `unless`
+    // tail, pinned so a future parser arm cannot re-open the hole.
+    for mode in [
+        // Awesome Presence.
+        StaticMode::CantBeBlocked,
+        // Hipparion (via `lower_rule_static`'s "can't block <object>" lowering).
+        StaticMode::BlockRestriction {
+            filter: TargetFilter::Any,
+        },
+        StaticMode::CantUntap,
+        StaticMode::CantBeBlockedBy {
+            filter: TargetFilter::Any,
+        },
+        StaticMode::CantBeActivated {
+            who: ProhibitionScope::AllPlayers,
+            source_filter: TargetFilter::SelfRef,
+            exemption: ActivationExemption::None,
+            kind: None,
+        },
+        StaticMode::MustAttackDefender {
+            defender: RequiredDefender::Fixed {
+                player: crate::types::player::PlayerId(0),
+            },
+        },
+        StaticMode::Continuous,
+    ] {
+        assert!(
+            !mode.provides_continuation(ConditionContinuation::OptionalCostPayment),
+            "{mode:?} has no payment prompt and must not claim the continuation"
+        );
+        assert_eq!(
+            gate_static_condition(
+                &mode,
+                unless_pay.clone(),
+                "gap text",
+                ConditionGatePolarity::Negative
+            ),
+            deferred,
+            "{mode:?} can never prompt for the payment, so the gate must defer it \
+             to a labelled gap rather than accept a condition no player can satisfy"
+        );
+    }
+
+    // The CR 601.2f axis is orthogonal and must NOT be swept up by the payment
+    // fix: a cast-variant gate stays enforceable everywhere except the untap
+    // step (CR 502.3 — a turn-based action, so no cast is ever in flight).
+    let cast_variant = StaticCondition::CastingAsVariant {
+        variant: crate::types::game_state::CastingVariant::Flashback,
+    };
+    assert_eq!(
+        gate_static_condition(
+            &StaticMode::Continuous,
+            cast_variant.clone(),
+            "gap text",
+            ConditionGatePolarity::Negative
+        ),
+        cast_variant,
+        "narrowing the PendingCast axis without a per-mode audit would demote working \
+         cost-modifier cards to unsupported"
+    );
+    assert_eq!(
+        gate_static_condition(
+            &StaticMode::CantUntap,
+            cast_variant,
+            "gap text",
+            ConditionGatePolarity::Negative
+        ),
+        deferred,
+        "the untap step runs no cast, so a cast-variant gate is unsatisfiable there"
+    );
 }
 
 #[test]
@@ -27343,21 +27479,77 @@ fn parse_unless_condition_excludes_unless_pay_from_not_wrap() {
     );
 }
 
-/// CR 509.1c: Awesome Presence — block tax with defending-player payer and
-/// per-blocking-creature scaling.
+/// CR 509.1c + CR 118.12a: Awesome Presence — the block-side sibling of the
+/// PR #8012 round-5 payment-continuation blocker, found by a follow-up audit of
+/// the SAME defect class rather than by review.
+///
+/// The clause parses to `CantBeBlocked` + `UnlessPay { PerAffectedCreature }`,
+/// and this test used to assert exactly that — a false green. CR 509.1c makes
+/// "unless [a player] pays [cost]" an OPTIONAL cost that must actually be
+/// offered, and the engine offers it in exactly one place:
+/// `WaitingFor::CombatTaxPayment`, driven by `combat::combat_tax_mode_matches`,
+/// which inspects only `CantAttack` / `CantBlock` / `CantAttackOrBlock`.
+/// `CantBeBlocked` is not in that set, so the defending player is NEVER prompted
+/// and `game::layers::evaluate_condition` hard-codes the leaf to `false` — the
+/// evasion static silently never applies. The parser now defers the gate to the
+/// honest `Not(Unrecognized)` shape so coverage tooling sees the gap.
+///
+/// The scaling combinator that produced `PerAffectedCreature` is still exercised
+/// below, at the building-block level where it belongs: the shape is correct,
+/// it just has no enforcement point on this mode.
 #[test]
-fn awesome_presence_block_tax_unless_pay() {
-    let def = parse_static_line(
-        "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.",
-    )
-    .expect("Awesome Presence should parse");
-    assert_eq!(def.mode, StaticMode::CantBeBlocked);
-    let Some(StaticCondition::UnlessPay { scaling, .. }) = def.condition.as_ref() else {
-        panic!("expected UnlessPay, got {:?}", def.condition);
+fn awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt() {
+    use crate::parser::oracle_static::static_helpers::{
+        gate_static_condition, ConditionGatePolarity,
     };
+    use crate::types::ability::UnlessPayScaling;
+
+    let text = "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.";
+    let def = parse_static_line(text).expect("Awesome Presence should parse");
+    assert_eq!(def.mode, StaticMode::CantBeBlocked);
     assert_eq!(
-        *scaling,
-        crate::types::ability::UnlessPayScaling::PerAffectedCreature
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "defending player pays {3} for each creature they control that's blocking it"
+                    .to_string(),
+            }),
+        }),
+        "a payment gate on CantBeBlocked has no prompt at block declaration and must \
+         NOT be reported as a fully supported UnlessPay condition, got {:?}",
+        def.condition
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized),
+        "the deferral must be visible to every coverage-honesty gate"
+    );
+
+    // Building-block half: the "unless <player> pays <cost> for each …" clause
+    // still parses to the right typed shape with the right scaling axis. Nothing
+    // about the scaling combinator regressed — only the ACCEPTANCE decision for
+    // a mode whose enforcement point can't run the payment changed.
+    let lower = text.to_lowercase();
+    let tp = TextPair::new(text, &lower);
+    let parsed = super::shared::parse_unless_static_condition(&tp)
+        .expect("the unless clause itself must still parse");
+    let StaticCondition::UnlessPay { scaling, .. } = &parsed else {
+        panic!("expected UnlessPay from the clause parser, got {parsed:?}");
+    };
+    assert_eq!(*scaling, UnlessPayScaling::PerAffectedCreature);
+
+    // And the gate is enforcement-point-aware, not a blanket ban on UnlessPay:
+    // the very same condition is accepted unchanged on a taxed combat mode.
+    assert_eq!(
+        gate_static_condition(
+            &StaticMode::CantBlock,
+            parsed.clone(),
+            "gap",
+            ConditionGatePolarity::Negative
+        ),
+        parsed,
+        "UnlessPay must still pass through on a mode WaitingFor::CombatTaxPayment covers"
     );
 }
 
@@ -33664,7 +33856,17 @@ fn subject_cant_block_object_keeps_both_halves() {
 /// The object composes with the shared trailing-condition handling, because it
 /// is consumed inside `parse_subject_combat_rule_static` rather than by a
 /// parallel arm that would never reach that code. Hipparion keeps BOTH its
-/// object and its cost condition; previously the object was dropped.
+/// object and its cost gate; previously the object was dropped.
+///
+/// CR 509.1b + CR 118.12a (PR #8012 follow-up audit): the gate is now DEFERRED
+/// rather than accepted. `lower_rule_static` turns "can't block <object>" into
+/// `BlockRestriction { Not(<object>) }` — a whitelist mode that
+/// `combat::combat_tax_mode_matches` does not inspect, so
+/// `WaitingFor::CombatTaxPayment` never prompts for the {1} and
+/// `game::layers::evaluate_condition` hard-codes the leaf `false`, leaving the
+/// restriction permanently off. This test still pins the composition (the object
+/// survives, and the trailing clause is still reached and consumed) while
+/// asserting the honest gap shape instead of a condition no player can satisfy.
 #[test]
 fn object_composes_with_a_trailing_unless_condition() {
     use crate::types::StaticCondition;
@@ -33673,10 +33875,22 @@ fn object_composes_with_a_trailing_unless_condition() {
         parse_static_line("~ can't block creatures with power 3 or greater unless you pay {1}.")
             .expect("Hipparion's clause");
     block_restriction_object(&def);
-    assert!(
-        matches!(def.condition, Some(StaticCondition::UnlessPay { .. })),
-        "the unless-cost condition must survive alongside the object: {:?}",
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "you pay {1}".to_string(),
+            }),
+        }),
+        "the trailing clause must still be reached alongside the object, and — having \
+         no payment prompt on BlockRestriction — must be deferred as a labelled gap: {:?}",
         def.condition
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized),
+        "the deferral must be visible to every coverage-honesty gate"
     );
 }
 
@@ -33879,4 +34093,61 @@ fn alt_cost_as_foretold_stays_zone_free() {
         }
         other => panic!("expected Typed(any spell), got {other:?}"),
     }
+}
+
+/// The THIRD route into the same defect class, found while self-reviewing the
+/// Awesome Presence / Hipparion fix — and the one that would have been a
+/// behavior regression, not just a reporting one.
+///
+/// `parse_subject_rule_static`'s `cant_be_blocked_mode` fallthrough runs the
+/// whole tail through `nom_condition::parse_condition`, whose `"unless "` branch
+/// yields a raw CR 118.12a `UnlessPay`. `CantBeBlocked` has no block-declaration
+/// payment prompt (`combat::combat_tax_mode_matches` covers only
+/// `CantAttack`/`CantBlock`/`CantAttackOrBlock`), so the gate must defer it — and
+/// specifically in NEGATIVE polarity. A positive gap marker would be a bare
+/// `Unrecognized`, which evaluates `true` forever and would make every affected
+/// creature UNCONDITIONALLY unblockable: an evasion ability the card does not
+/// have. The negative marker matches what the ungated raw `UnlessPay` already
+/// did at runtime (`false`), so the deferral changes reporting only.
+#[test]
+fn subject_led_cant_be_blocked_payment_gate_defers_without_inventing_evasion() {
+    let def = parse_static_line(
+        "Creatures you control can't be blocked unless defending player pays {2}.",
+    )
+    .expect("subject-led evasion line should parse");
+    assert_eq!(def.mode, StaticMode::CantBeBlocked);
+    let Some(StaticCondition::Not { condition }) = def.condition.as_ref() else {
+        panic!(
+            "the gap marker MUST be Not-wrapped — a bare Unrecognized evaluates true              and would grant unconditional evasion, got {:?}",
+            def.condition
+        );
+    };
+    assert!(
+        matches!(condition.as_ref(), StaticCondition::Unrecognized { .. }),
+        "expected a labelled gap inside the Not, got {condition:?}"
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized),
+        "the deferral must be visible to every coverage-honesty gate"
+    );
+}
+
+/// Guard for the complement of the test above: an enforceable positive gate on
+/// the SAME route must still pass through untouched. Without this, the fix could
+/// silently degrade into "defer every conditional evasion static", which would be
+/// a far larger coverage loss than the false green it replaces.
+#[test]
+fn subject_led_cant_be_blocked_state_backed_gate_still_passes_through() {
+    let def = parse_static_line(
+        "Creatures you control can't be blocked as long as you control a Forest.",
+    )
+    .expect("subject-led conditional evasion should parse");
+    assert_eq!(def.mode, StaticMode::CantBeBlocked);
+    assert!(
+        matches!(def.condition, Some(StaticCondition::IsPresent { .. })),
+        "a board-state gate is a pure function of game state and must survive the          enforcement-point gate unchanged, got {:?}",
+        def.condition
+    );
 }

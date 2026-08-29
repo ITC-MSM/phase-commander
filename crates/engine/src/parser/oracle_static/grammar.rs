@@ -795,13 +795,13 @@ pub(crate) fn parse_enchanted_equipped_predicate(
                                 gate_cant_untap_condition(
                                     condition,
                                     condition_text,
-                                    UntapGatePolarity::Positive,
+                                    ConditionGatePolarity::Positive,
                                 )
                             })
                             .unwrap_or_else(|| {
-                                unenforceable_cant_untap_condition(
+                                unenforceable_gate_condition(
                                     condition_text,
-                                    UntapGatePolarity::Positive,
+                                    ConditionGatePolarity::Positive,
                                 )
                             }),
                     );
@@ -867,24 +867,42 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     let unless_split = pred_tp
         .split_around(" unless ")
         .filter(|(body, _)| body.original.chars().filter(|&c| c == '"').count() % 2 == 0);
-    let (body_tp, suffix_condition) = if let Some((body_tp, _)) = unless_split {
-        (
-            body_tp,
-            super::shared::parse_unless_static_condition(&pred_tp),
-        )
-    } else if let Some((body_tp, condition_tp)) = pred_tp.split_around(" as long as ") {
-        let condition_text = condition_tp.original.trim().trim_end_matches('.');
-        (
-            body_tp,
-            Some(parse_attached_static_condition(condition_text).unwrap_or(
-                StaticCondition::Unrecognized {
-                    text: condition_text.to_string(),
-                },
-            )),
-        )
-    } else {
-        (pred_tp, None)
-    };
+    // The gap text and polarity travel with the condition so any acceptance gate
+    // downstream can emit a fallback that keeps the clause's sense: `"unless X"`
+    // stores `Not(X)` (Negative), `"as long as X"` stores `X` (Positive). See
+    // `static_helpers::ConditionGatePolarity`.
+    let (body_tp, suffix_condition, gap_text, gap_polarity) =
+        if let Some((body_tp, condition_tp)) = unless_split {
+            (
+                body_tp,
+                super::shared::parse_unless_static_condition(&pred_tp),
+                condition_tp
+                    .original
+                    .trim()
+                    .trim_end_matches('.')
+                    .to_string(),
+                ConditionGatePolarity::Negative,
+            )
+        } else if let Some((body_tp, condition_tp)) = pred_tp.split_around(" as long as ") {
+            let condition_text = condition_tp.original.trim().trim_end_matches('.');
+            (
+                body_tp,
+                Some(parse_attached_static_condition(condition_text).unwrap_or(
+                    StaticCondition::Unrecognized {
+                        text: condition_text.to_string(),
+                    },
+                )),
+                condition_text.to_string(),
+                ConditionGatePolarity::Positive,
+            )
+        } else {
+            (
+                pred_tp,
+                None,
+                String::new(),
+                ConditionGatePolarity::Positive,
+            )
+        };
     let body_lower = body_tp.lower;
 
     if nom_tag_lower(body_lower, body_lower, "can't be blocked").is_some() {
@@ -896,14 +914,15 @@ pub(crate) fn parse_enchanted_equipped_predicate(
             .affected(affected.clone())
             .description(description.to_string());
             if let Some(condition) = &suffix_condition {
-                def.condition = Some(condition.clone());
+                attach_gated_condition(&mut def, condition.clone(), &gap_text, gap_polarity);
             }
+            let companion_condition = def.condition.clone();
             return with_keyword_companion(
                 def,
                 body_tp.original,
                 &affected,
                 description,
-                suffix_condition.as_ref(),
+                companion_condition.as_ref(),
             );
         }
         // CR 509.1b: "can't be blocked by <filter>" → CantBeBlockedBy
@@ -921,29 +940,41 @@ pub(crate) fn parse_enchanted_equipped_predicate(
                     .affected(affected.clone())
                     .description(description.to_string());
                 if let Some(condition) = &suffix_condition {
-                    def.condition = Some(condition.clone());
+                    attach_gated_condition(&mut def, condition.clone(), &gap_text, gap_polarity);
                 }
+                let companion_condition = def.condition.clone();
                 return with_keyword_companion(
                     def,
                     body_tp.original,
                     &affected,
                     description,
-                    suffix_condition.as_ref(),
+                    companion_condition.as_ref(),
                 );
             }
         }
+        // CR 509.1b + CR 118.12a: the blanket evasion form. Awesome Presence
+        // ("Enchanted creature can't be blocked unless defending player pays {3}
+        // for each creature they control that's blocking it") lands here with an
+        // `UnlessPay` gate, and `CantBeBlocked` is NOT in the combat-tax
+        // enforcement set — CR 509.1c's payment is offered only for
+        // `CantAttack`/`CantBlock`/`CantAttackOrBlock` (see
+        // `combat::combat_tax_mode_matches`), never at block declaration against
+        // an evasion static. The gate therefore defers it to an honest gap
+        // instead of a condition the defending player is never prompted to
+        // satisfy.
         let mut def = StaticDefinition::new(StaticMode::CantBeBlocked)
             .affected(affected.clone())
             .description(description.to_string());
         if let Some(condition) = &suffix_condition {
-            def.condition = Some(condition.clone());
+            attach_gated_condition(&mut def, condition.clone(), &gap_text, gap_polarity);
         }
+        let companion_condition = def.condition.clone();
         return with_keyword_companion(
             def,
             body_tp.original,
             &affected,
             description,
-            suffix_condition.as_ref(),
+            companion_condition.as_ref(),
         );
     }
 
@@ -979,7 +1010,10 @@ pub(crate) fn parse_enchanted_equipped_predicate(
             parse_continuous_gets_has(body_tp.original, affected.clone(), description)
         {
             if let Some(condition) = &suffix_condition {
-                def.condition = Some(condition.clone());
+                // Same enforcement-point bar as the evasion branches above: a
+                // CR 118.12a payment gate on a `Continuous` grant has no prompt
+                // anywhere in the engine, so it is deferred rather than accepted.
+                attach_gated_condition(&mut def, condition.clone(), &gap_text, gap_polarity);
             }
             defs.push(def);
         }

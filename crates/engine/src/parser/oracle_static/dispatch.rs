@@ -2331,12 +2331,11 @@ pub(crate) fn parse_static_line_inner(
         // attach whichever is present. "as long as" is tried before "if" to match
         // `split_trailing_gate_condition`'s precedence. (CR 509.1b is the block
         // *restriction* rule — "a creature can't block" — not 509.1c, which is
-        // block *requirements*.)
-        if let Some(condition) = parse_unless_static_condition(&tp)
-            .or_else(|| parse_as_long_as_static_condition(&tp))
-            .or_else(|| parse_if_static_condition(&tp))
-        {
-            def.condition = Some(condition);
+        // block *requirements*.) The polarity travels with the branch that
+        // produced the condition so `attach_gated_condition`'s fallback keeps the
+        // restriction's sense (see `static_helpers::ConditionGatePolarity`).
+        if let Some((condition, polarity)) = parse_trailing_gate_with_polarity(&tp) {
+            attach_gated_condition(&mut def, condition, tp.original, polarity);
         }
         return Some(def);
     }
@@ -2380,11 +2379,8 @@ pub(crate) fn parse_static_line_inner(
         // attach whichever is present. "as long as" is tried before "if" to match
         // `split_trailing_gate_condition`'s precedence (Seer of the Bright Side:
         // "... can't attack or block as long as it has a stun counter on it.").
-        if let Some(condition) = parse_unless_static_condition(&tp)
-            .or_else(|| parse_as_long_as_static_condition(&tp))
-            .or_else(|| parse_if_static_condition(&tp))
-        {
-            def.condition = Some(condition);
+        if let Some((condition, polarity)) = parse_trailing_gate_with_polarity(&tp) {
+            attach_gated_condition(&mut def, condition, tp.original, polarity);
         }
         return Some(def);
     }
@@ -2471,7 +2467,17 @@ pub(crate) fn parse_static_line_inner(
         .affected(TargetFilter::SelfRef)
         .description(text.to_string());
         if let Some(condition) = parse_unless_static_condition(&tp) {
-            def.condition = Some(condition);
+            // CR 602.5 + CR 118.12a: the prohibition is enforced when a player
+            // "can't begin to activate an ability that's prohibited from being
+            // activated" — a legality check at activation, which runs no
+            // CR 118.12a payment round-trip. So an `UnlessPay` gate here is
+            // deferred rather than accepted (see `attach_gated_condition`).
+            attach_gated_condition(
+                &mut def,
+                condition,
+                tp.original,
+                ConditionGatePolarity::Negative,
+            );
         }
         return Some(def);
     }
