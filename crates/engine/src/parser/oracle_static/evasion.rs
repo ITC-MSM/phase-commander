@@ -1188,7 +1188,7 @@ pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinit
     // never does, so it cannot be copied onto a CantUntap unchecked.
     let condition = extract_cant_untap_condition(&lower).or_else(|| {
         defs[0].condition.clone().map(|inherited| {
-            gate_cant_untap_condition(inherited, text, UntapGatePolarity::Positive)
+            gate_cant_untap_condition(inherited, text, ConditionGatePolarity::Positive)
         })
     });
     let mut companion = StaticDefinition::new(StaticMode::CantUntap)
@@ -2270,7 +2270,18 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
                 .affected(affected.clone())
                 .description(text.to_string());
             if let Some(c) = condition {
-                def.condition = Some(c);
+                // NEGATIVE polarity, deliberately, even though the classifier
+                // returns the condition to store rather than an `unless` wrapper:
+                // `cant_be_blocked_mode`'s fallthrough runs the whole tail through
+                // `nom_condition::parse_condition`, whose `"unless "` branch can
+                // yield a raw CR 118.12a `UnlessPay` (a subject-led Awesome
+                // Presence phrasing reaches here). A positive gap marker would
+                // evaluate `true` forever and make the creature UNCONDITIONALLY
+                // unblockable — inventing an evasion the card doesn't have. The
+                // negative marker evaluates `false`, which is exactly what the
+                // ungated raw `UnlessPay` already does at runtime, so deferring
+                // the gate changes reporting only, never behavior.
+                attach_gated_condition(&mut def, c, clause, ConditionGatePolarity::Negative);
             }
             return Some(def);
         }
@@ -2290,9 +2301,23 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
         ) {
             let predicate = parse_rule_static_predicate(base.original)?;
             let mut def = lower_rule_static(predicate, None, affected, text);
-            def.condition = Some(StaticCondition::Not {
-                condition: Box::new(control),
-            });
+            // `parse_rule_static_predicate` can yield `RuleStaticPredicate::CantUntap`,
+            // and this branch runs BEFORE the dedicated `CantUntap` arm below —
+            // so for `"doesn't untap … unless you control X"` phrasing it is the
+            // site that decides the gate. It therefore has to clear the same
+            // enforcement-point bar as every other attachment site rather than
+            // assigning straight through. `parse_control_conditions` only ever
+            // emits enforceable leaves today, so the gate is inert here; routing
+            // it anyway is what keeps `attach_gated_condition` an actual single
+            // authority instead of a documented-but-bypassed one.
+            attach_gated_condition(
+                &mut def,
+                StaticCondition::Not {
+                    condition: Box::new(control),
+                },
+                unless.original.trim().trim_end_matches('.'),
+                ConditionGatePolarity::Negative,
+            );
             return Some(def);
         }
     }
@@ -2446,11 +2471,28 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
     if trailing.is_empty() {
         return Some(def);
     }
-    if let Some(unless_cond) = {
-        let tp = TextPair::new(text, &lower);
-        super::shared::parse_unless_static_condition(&tp)
-    } {
-        def.condition = Some(unless_cond);
+    let tp = TextPair::new(text, &lower);
+    if let Some(unless_cond) = super::shared::parse_unless_static_condition(&tp) {
+        // CR 118.12a: `parse_unless_static_condition` passes an `UnlessPay` leaf
+        // through RAW (no `Not` wrapper), so this site can attach a payment gate
+        // to whatever mode the predicate lowered to — including `BlockRestriction`
+        // (Hipparion: "This creature can't block creatures with power 3 or
+        // greater unless you pay {1}", which `lower_rule_static` turns into
+        // `BlockRestriction { Not(power>=3) }`) and `CantBeBlockedBy`. Neither is
+        // in the combat-tax enforcement set (CR 509.1c is offered only for
+        // `CantAttack`/`CantBlock`/`CantAttackOrBlock`; see
+        // `combat::combat_tax_mode_matches`), so the gate defers those to an
+        // honest gap instead of a condition no player can ever satisfy.
+        let gap_text = tp.split_around(" unless ").map_or_else(
+            || trailing.to_string(),
+            |(_, after)| after.original.trim().trim_end_matches('.').to_string(),
+        );
+        attach_gated_condition(
+            &mut def,
+            unless_cond,
+            &gap_text,
+            ConditionGatePolarity::Negative,
+        );
         return Some(def);
     }
     None
@@ -2545,7 +2587,7 @@ fn parse_forced_attack_defender_static_body(text: &str) -> Option<StaticDefiniti
     // between the recurring-combat suffix and `unless` from being silently
     // swallowed — e.g. "... each combat if able <rider> unless <cond>" must decline,
     // not parse as if the rider were absent.
-    tag::<_, _, OracleError<'_>>("unless ").parse(rest).ok()?;
+    let (gap_text, _) = tag::<_, _, OracleError<'_>>("unless ").parse(rest).ok()?;
     let tp = TextPair::new(text, &lower);
     let condition = super::shared::parse_unless_static_condition(&tp)?;
     // Coverage-honesty gate (CR 604.1): only emit the forced-attack static when the
@@ -2559,6 +2601,19 @@ fn parse_forced_attack_defender_static_body(text: &str) -> Option<StaticDefiniti
     // single shared authority for this recursive check — every coverage/support
     // gate in the codebase (`game::coverage`) delegates to the same method so this
     // parser-time decline and the coverage report can never disagree.
+    // The same decline must cover a gate that PARSES cleanly but has no
+    // enforcement-point continuation on `MustAttackDefender` (CR 118.12a
+    // `UnlessPay`: the payment prompt exists only for
+    // `CantAttack`/`CantBlock`/`CantAttackOrBlock`). Routing through the shared
+    // gate first turns such a leaf into the same `Not(Unrecognized)` shape, so
+    // the `contains_unrecognized` decline below catches both classes with one
+    // check instead of letting the un-satisfiable one through.
+    let condition = gate_static_condition(
+        &def.mode,
+        condition,
+        gap_text.trim().trim_end_matches('.'),
+        ConditionGatePolarity::Negative,
+    );
     if condition.contains_unrecognized() {
         return None;
     }

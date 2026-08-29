@@ -11867,6 +11867,56 @@ mod tests {
         );
     }
 
+    /// The same outcome check for the two PRINTED cards a follow-up audit of PR
+    /// #8012 found carrying the identical defect on non-`CantUntap` modes.
+    ///
+    /// CR 118.12a / CR 509.1c: the payment prompt
+    /// (`WaitingFor::CombatTaxPayment`) exists only for `CantAttack` /
+    /// `CantBlock` / `CantAttackOrBlock` (`combat::combat_tax_mode_matches`).
+    /// Awesome Presence lowers to `CantBeBlocked` and Hipparion to
+    /// `BlockRestriction`, so neither gate can ever be satisfied and both were
+    /// being reported as fully supported. Driving the real Oracle lines through
+    /// the parser and then the card-face coverage entry points is the end-to-end
+    /// half: the AST proofs live in
+    /// `oracle_static::tests::awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt`
+    /// and `object_composes_with_a_trailing_unless_condition`.
+    #[test]
+    fn block_side_payment_gated_statics_are_not_fully_supported() {
+        for (name, line, gap_needle) in [
+            (
+                "Awesome Presence",
+                "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.",
+                "defending player pays {3}",
+            ),
+            (
+                "Hipparion",
+                "~ can't block creatures with power 3 or greater unless you pay {1}.",
+                "you pay {1}",
+            ),
+        ] {
+            let def = crate::parser::oracle_static::parse_static_line(line)
+                .unwrap_or_else(|| panic!("{name} should still parse to a static"));
+            let face = CardFace {
+                name: name.to_string(),
+                static_abilities: vec![def],
+                ..Default::default()
+            };
+
+            assert!(
+                super::card_face_has_unimplemented_parts(&face),
+                "{name}: a payment gate on a mode with no combat-tax prompt must be \
+                 flagged as having unimplemented parts, not reported as fully supported"
+            );
+
+            let gaps = super::card_face_gaps(&face);
+            assert!(
+                gaps.iter().any(|gap| gap.contains(gap_needle)),
+                "{name}: card_face_gaps must name the deferred payment clause so the \
+                 gap is actionable in coverage tooling, got {gaps:?}"
+            );
+        }
+    }
+
     /// CR 113.3b / CR 113.3c + CR 109.4: the ability-kind and controller axes
     /// are independent, so `fmt_target` must render BOTH. Enumerated per-product
     /// arms could not: the trailing kind-only catch-all swallowed
