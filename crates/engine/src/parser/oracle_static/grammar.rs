@@ -980,6 +980,11 @@ pub(crate) fn parse_enchanted_equipped_predicate(
 
     // --- Conditional grants: split "as long as" before passing to continuous parser ---
     // Handles both "gets +1/+1 as long as ..." and "has flying as long as ..."
+    //
+    // This branch re-splits `pred_tp` rather than reusing the `suffix_condition`
+    // computed above, because the `" unless "` split is tried FIRST: a predicate
+    // carrying BOTH riders reaches here with `body_tp` cut at the `"unless"` seam,
+    // and only this second split isolates the grant from the `"as long as"` tail.
     if let Some((before_cond, after_cond)) = pred_tp.split_around(" as long as ") {
         let continuous_text = before_cond.original;
         let condition_text = after_cond.original.trim().trim_end_matches('.');
@@ -991,7 +996,21 @@ pub(crate) fn parse_enchanted_equipped_predicate(
                     text: condition_text.to_string(),
                 },
             );
-            def.condition = Some(condition);
+            // CR 611.3a + CR 118.12a: same enforcement-point bar as the evasion
+            // branches above and the whole-predicate default below. `StaticMode::
+            // Continuous` runs in the layer pipeline (CR 613), which offers no
+            // optional-payment round-trip, so a CR 118.12a `UnlessPay` leaf —
+            // which `parse_attached_static_condition` accepts from a bare
+            // `"you pay {N}"` tail with no `"unless"` prefix — is unsatisfiable
+            // here and is deferred to the honest gap marker instead of being
+            // reported as a supported gate. `Positive` because `"as long as X"`
+            // stores `X` (see `ConditionGatePolarity`).
+            attach_gated_condition(
+                &mut def,
+                condition,
+                condition_text,
+                ConditionGatePolarity::Positive,
+            );
             return vec![def];
         }
     }

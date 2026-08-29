@@ -294,6 +294,54 @@ impl CardDatabase {
                 ));
             }
         }
+        errors.extend(self.unenforceable_static_condition_errors());
+        errors
+    }
+
+    /// CR 118.12a + CR 601.2f: no exported static ability may carry a condition
+    /// whose truth is decided by a round-trip its OWN mode's enforcement point
+    /// never runs (`StaticCondition::is_unenforceable_on`).
+    ///
+    /// Such a condition is a false green, not a bug the player can see: the
+    /// layer pipeline hard-codes those leaves to `false`, so the static silently
+    /// never applies while coverage reports the gate fully supported. Awesome
+    /// Presence (CR 509.1b `CantBeBlocked` + an `UnlessPay` no block-declaration
+    /// prompt ever offers) and Hipparion (`BlockRestriction`, same) shipped that
+    /// way for exactly as long as the parser-side gate was the only check.
+    ///
+    /// This is the CORPUS-WIDE half of that gate, and it exists because the
+    /// parser-side half is a call-site discipline that has been breached three
+    /// times. `oracle_static::static_helpers::gate_static_condition` fires only
+    /// where a parser route calls it; this fires on the shipped export no matter
+    /// which route built the definition, so a fourth bypass fails CI on the
+    /// first card that reaches it. Both read the same predicate, so they cannot
+    /// drift apart.
+    ///
+    /// Reported as an integrity error rather than repaired in place on purpose:
+    /// the honest repair needs the clause's Oracle text and its polarity, which
+    /// only the parser has (see `unenforceable_gate_condition`). Silently
+    /// substituting a marker here would hide the bypass instead of surfacing it.
+    fn unenforceable_static_condition_errors(&self) -> Vec<String> {
+        let mut errors: Vec<String> = self
+            .face_index
+            .values()
+            .flat_map(|face| {
+                face.static_abilities.iter().filter_map(move |def| {
+                    let condition = def.condition.as_ref()?;
+                    condition.is_unenforceable_on(&def.mode).then(|| {
+                        format!(
+                            "{}: static {:?} carries a condition its enforcement point can \
+                             never satisfy ({:?}) — it must be routed through \
+                             oracle_static::static_helpers::gate_static_condition",
+                            face.name, def.mode, condition
+                        )
+                    })
+                })
+            })
+            .collect();
+        // `face_index` is a HashMap, so the natural order is nondeterministic;
+        // a CI failure list that reshuffles between runs is unreadable.
+        errors.sort();
         errors
     }
 
@@ -660,6 +708,66 @@ mod tests {
             rarities: Default::default(),
             attraction_lights: vec![],
         }
+    }
+
+    /// CR 118.12a: the corpus-wide half of the unenforceable-gate authority.
+    ///
+    /// Both directions matter and neither is exercised by the shipped export
+    /// today (the parser gate defers every such condition before it reaches
+    /// here), so this is the only thing that proves the gate is not vacuous:
+    /// the ACCEPT direction pins that a legitimate `UnlessPay` on a combat-taxed
+    /// mode — Ghostly Prison, the card the whole enforcement-point axis exists
+    /// to keep working — is not swept up, and the REJECT direction pins that the
+    /// same leaf on a mode with no payment prompt fails the export.
+    #[test]
+    fn export_integrity_rejects_only_conditions_their_mode_can_never_satisfy() {
+        use crate::types::ability::{StaticCondition, UnlessPayScaling};
+        use crate::types::mana::ManaCost;
+        use crate::types::statics::StaticMode;
+
+        let pay_gate = || StaticCondition::UnlessPay {
+            cost: ManaCost::NoCost,
+            scaling: UnlessPayScaling::default(),
+            defended: None,
+        };
+        let face_with = |name: &str, mode: StaticMode| {
+            let mut face = test_face(name);
+            let mut def = StaticDefinition::new(mode);
+            def.condition = Some(pay_gate());
+            face.static_abilities = vec![def];
+            face
+        };
+
+        // ACCEPT: CR 508.1h — `WaitingFor::CombatTaxPayment` prompts the
+        // attacking player at declaration, so the gate is satisfiable.
+        let mut taxed = HashMap::new();
+        taxed.insert(
+            "ghostly prison".to_string(),
+            face_with("Ghostly Prison", StaticMode::CantAttack),
+        );
+        let db =
+            CardDatabase::from_json_str(&serde_json::to_string(&taxed).unwrap()).expect("parses");
+        assert!(
+            db.export_integrity_errors().is_empty(),
+            "a payment gate on a combat-taxed mode is enforceable and must pass: {:?}",
+            db.export_integrity_errors()
+        );
+
+        // REJECT: CR 509.1b — no prompt exists at block declaration against an
+        // evasion static, so the layer pipeline hard-codes the leaf `false`.
+        let mut untaxed = HashMap::new();
+        untaxed.insert(
+            "probe".to_string(),
+            face_with("Untaxed Probe", StaticMode::CantBeBlocked),
+        );
+        let db =
+            CardDatabase::from_json_str(&serde_json::to_string(&untaxed).unwrap()).expect("parses");
+        let errors = db.export_integrity_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("Untaxed Probe")),
+            "a payment gate on a mode with no payment prompt must fail the export \
+             no matter which parser route built it, got {errors:?}"
+        );
     }
 
     #[test]

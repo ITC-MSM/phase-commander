@@ -11917,6 +11917,47 @@ mod tests {
         }
     }
 
+    /// The same end-to-end check for the POSITIVE-tail route the maintainer
+    /// review of this PR found still bypassing the acceptance authority:
+    /// `grammar::parse_enchanted_equipped_predicate`'s `"as long as"`
+    /// conditional continuous grant.
+    ///
+    /// CR 118.12a + CR 613: `oracle_nom::condition::parse_unless_pay_condition`
+    /// accepts a bare `"you pay {N}"` with no `"unless"` prefix, so an
+    /// `"as long as"` tail can carry a payment gate onto a
+    /// `StaticMode::Continuous` — a mode whose enforcement point is the layer
+    /// pipeline, which offers no payment round-trip. Coverage reported such a
+    /// grant fully supported. The AST proof is
+    /// `oracle_static::tests::attached_conditional_grant_payment_gate_is_deferred_not_accepted`;
+    /// this is the half that pins what `coverage-report` actually consumes.
+    ///
+    /// No printed card matches this shape today — which is exactly why it needs
+    /// a regression test rather than a corpus entry: the route is live, so the
+    /// first card printed into it must not be silently green.
+    #[test]
+    fn attached_conditional_grant_payment_gate_is_not_fully_supported() {
+        let line = "Enchanted creature gets +2/+2 as long as you pay {1}.";
+        let def = crate::parser::oracle_static::parse_static_line(line)
+            .expect("the conditional attached grant should still parse to a static");
+        let face = CardFace {
+            name: "Conditional Grant Probe".to_string(),
+            static_abilities: vec![def],
+            ..Default::default()
+        };
+
+        assert!(
+            super::card_face_has_unimplemented_parts(&face),
+            "a payment gate on a Continuous grant has no enforcement point anywhere \
+             in the engine and must not be reported as fully supported"
+        );
+
+        let gaps = super::card_face_gaps(&face);
+        assert!(
+            gaps.iter().any(|gap| gap.contains("you pay {1}")),
+            "card_face_gaps must name the deferred payment clause, got {gaps:?}"
+        );
+    }
+
     /// CR 113.3b / CR 113.3c + CR 109.4: the ability-kind and controller axes
     /// are independent, so `fmt_target` must render BOTH. Enumerated per-product
     /// arms could not: the trailing kind-only catch-all swallowed

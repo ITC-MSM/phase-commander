@@ -9921,6 +9921,33 @@ impl StaticCondition {
         })
     }
 
+    /// Engine limitation, not CR-mandated: the ACCEPTANCE PREDICATE — can this
+    /// condition ever be satisfied at `mode`'s enforcement point?
+    ///
+    /// The union of the two rejection classes, and the single authority both
+    /// consumers read:
+    ///
+    /// - `oracle_static::static_helpers::gate_static_condition` — the PARSER
+    ///   gate, which substitutes the honest gap marker when this is true.
+    /// - `database::CardDatabase::export_integrity_errors` — the corpus-wide
+    ///   CI gate, which fails the shipped export when any face still carries
+    ///   one.
+    ///
+    /// Having both read ONE predicate is the point. The parser gate is a
+    /// call-site discipline — it only fires where a call site routes through it
+    /// — and that discipline has now been breached three separate times
+    /// (PR #8012's `CantUntap`-only gate; the `" unless "` split in
+    /// `evasion::parse_subject_rule_static`; the `"as long as"` conditional
+    /// continuous grant in `grammar::parse_enchanted_equipped_predicate`). A
+    /// predicate the export must satisfy no matter WHICH parser route built the
+    /// definition converts that discipline into an invariant: a fourth bypass
+    /// fails CI on the card that reaches it instead of shipping as a false
+    /// green.
+    pub(crate) fn is_unenforceable_on(&self, mode: &StaticMode) -> bool {
+        self.requires_unavailable_continuation(mode)
+            || (!mode.binds_scoped_player_anchor() && self.has_unbindable_designation_anchor())
+    }
+
     /// True when this condition (or a Boolean sub-condition of it, at ANY
     /// nesting depth) is an [`StaticCondition::Unrecognized`] leaf.
     ///

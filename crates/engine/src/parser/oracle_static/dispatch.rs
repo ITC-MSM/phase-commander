@@ -3299,8 +3299,16 @@ pub(crate) fn parse_static_line_inner(
         // gates the restriction. If the rider is present but its condition is
         // NOT recognized, leave the whole line unsupported (return None) rather
         // than marking it a CantPlayLand enforced unconditionally.
+        // CR 118.12a: an unenforceable gate declines the same way an unparsed
+        // one does — `accept_enforceable_condition` is the fail-closed sibling
+        // of the deferral gate, for exactly this "positive gap marker would
+        // enforce unconditionally" reason.
         return match split_trailing_gate_condition(tp.lower) {
-            Some(condition_text) => Some(def.condition(parse_static_condition(condition_text)?)),
+            Some(condition_text) => {
+                let condition = parse_static_condition(condition_text)?;
+                let condition = accept_enforceable_condition(&def.mode, condition)?;
+                Some(def.condition(condition))
+            }
             None => Some(def),
         };
     }
@@ -3372,7 +3380,12 @@ pub(crate) fn parse_static_line_inner(
     }
     if let Some((body, condition_text)) = split_trailing_gate_condition_with_body(&tp) {
         if let Some(mut def) = parse_extra_blockers_static(body) {
-            def.condition = Some(parse_static_condition(condition_text)?);
+            // CR 118.12a: same fail-closed acceptance bar as the `CantPlayLand`
+            // arm above — a gate this mode's enforcement point can never satisfy
+            // declines the line rather than granting the extra block behind an
+            // always-true marker.
+            let condition = parse_static_condition(condition_text)?;
+            def.condition = Some(accept_enforceable_condition(&def.mode, condition)?);
             return Some(def);
         }
     }

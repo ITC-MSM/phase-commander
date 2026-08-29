@@ -1610,13 +1610,22 @@ pub(crate) fn apply_raw_parenthetical_cant_cast_gate(
 /// CR 611.3a: Attach an optional parsed static gate to a prohibition static.
 /// When `gate_condition_text` is present but `parse_static_condition` declines,
 /// return `None` so the caller does not enforce the restriction unconditionally.
+///
+/// CR 118.12a: a condition this static's ENFORCEMENT POINT can never satisfy
+/// declines the same way — `parse_static_condition` accepts a bare
+/// `"you pay {N}"` as `UnlessPay`, and the prohibition modes this helper serves
+/// have no payment prompt (see [`accept_enforceable_condition`]).
 pub(crate) fn attach_parsed_static_gate(
     def: StaticDefinition,
     gate_condition_text: Option<&str>,
 ) -> Option<StaticDefinition> {
     match gate_condition_text {
         None => Some(def),
-        Some(text) => Some(def.condition(parse_static_condition(text)?)),
+        Some(text) => {
+            let condition = parse_static_condition(text)?;
+            let condition = accept_enforceable_condition(&def.mode, condition)?;
+            Some(def.condition(condition))
+        }
     }
 }
 
@@ -1755,6 +1764,17 @@ pub(crate) enum ConditionGatePolarity {
 /// it today (the corpus delta for this change is exactly two cards, both on the
 /// `Negative` route), so it is latent, not live.
 ///
+/// It is latent on a REACHABLE route, not an unreachable one, and the
+/// distinction matters when weighing the follow-up. `grammar::
+/// parse_enchanted_equipped_predicate`'s `"as long as"` conditional-grant branch
+/// hands a `Positive` tail straight to a `StaticMode::Continuous`, so a printed
+/// `"… gets +2/+2 as long as you pay {1}"` would take the permanently-ON marker
+/// the moment such a card is printed. The gate's job here is coverage honesty —
+/// `contains_unrecognized` sees the gap, so the card is reported unsupported
+/// rather than green — and it discharges that on every route. Getting the
+/// runtime truth value right for an unofferable payment is the separate,
+/// reviewed change described below.
+///
 /// It is NOT fixed here because forcing `Negative` on the continuation branch
 /// would reverse a decision PR #8012 shipped and pinned: the `Positive`
 /// assertion in `cant_untap_gate_rejects_every_unenforceable_leaf_at_any_depth`
@@ -1831,12 +1851,38 @@ pub(crate) fn gate_static_condition(
     gap_text: &str,
     polarity: ConditionGatePolarity,
 ) -> StaticCondition {
-    if condition.requires_unavailable_continuation(mode)
-        || (!mode.binds_scoped_player_anchor() && condition.has_unbindable_designation_anchor())
-    {
+    if condition.is_unenforceable_on(mode) {
         return unenforceable_gate_condition(gap_text, polarity);
     }
     condition
+}
+
+/// CR 611.3a: the fail-CLOSED sibling of [`gate_static_condition`], for sites
+/// whose honesty policy is to DECLINE the whole static rather than keep it
+/// behind a gap marker.
+///
+/// Same acceptance predicate ([`StaticCondition::is_unenforceable_on`]),
+/// different remedy — and the difference is forced, not stylistic. These sites
+/// already return `None` when `parse_static_condition` declines, precisely
+/// because their gates are all POSITIVE (`"as long as X"` / `"if X"`) and a
+/// positive gap marker is a bare `Unrecognized`, which
+/// `layers::evaluate_condition` reads as `true` forever. Substituting one here
+/// would enforce the restriction UNCONDITIONALLY — the exact outcome those
+/// sites' comments say they refuse. `evasion::parse_forced_attack_defender_static`
+/// is the existing precedent: gate first, decline if a gap resulted.
+///
+/// Call sites (all fail-closed prohibition/permission gates):
+///
+/// - [`attach_parsed_static_gate`] (this module) — the shared trailing-gate
+///   attach for prohibition statics.
+/// - `oracle_static::dispatch`'s `"can't play lands … as long as X"` arm.
+/// - `oracle_static::dispatch`'s `"can block an additional creature … as long
+///   as X"` arm.
+pub(crate) fn accept_enforceable_condition(
+    mode: &StaticMode,
+    condition: StaticCondition,
+) -> Option<StaticCondition> {
+    (!condition.is_unenforceable_on(mode)).then_some(condition)
 }
 
 /// Attach `condition` to `def`, deferring it to the honest gap marker when
@@ -1881,6 +1927,10 @@ pub(crate) fn gate_static_condition(
 /// - `oracle_static::grammar::parse_enchanted_equipped_predicate`'s three
 ///   `"can't be blocked …"` branches, whose gated condition is also what the
 ///   granted-keyword companion inherits (Awesome Presence).
+/// - `oracle_static::grammar::parse_enchanted_equipped_predicate`'s conditional
+///   `"gets +N/+M as long as X"` / `"has <keyword> as long as X"` grant branch,
+///   and the whole-predicate `Continuous` default beneath it that carries the
+///   trailing `"unless"` rider (Heroic Defiance).
 pub(crate) fn attach_gated_condition(
     def: &mut StaticDefinition,
     condition: StaticCondition,

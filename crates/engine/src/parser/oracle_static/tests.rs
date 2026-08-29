@@ -34151,3 +34151,76 @@ fn subject_led_cant_be_blocked_state_backed_gate_still_passes_through() {
         def.condition
     );
 }
+
+/// The FOURTH route into the same defect class (maintainer review of this PR),
+/// and the first one on a POSITIVE tail.
+///
+/// `grammar::parse_enchanted_equipped_predicate`'s `"as long as"`
+/// conditional-grant branch assigned `def.condition` directly after
+/// `parse_attached_static_condition`, bypassing `attach_gated_condition`
+/// entirely. That matters because a positive tail is NOT restricted to
+/// board-state gates: `oracle_nom::condition::parse_unless_pay_condition`
+/// accepts a bare `"you pay {N}"` with no `"unless"` prefix, so
+/// `"… as long as you pay {1}"` produced a CR 118.12a `UnlessPay` on a
+/// `StaticMode::Continuous`. `Continuous` runs in the CR 613 layer pipeline,
+/// which offers no payment round-trip, so `game::layers::evaluate_condition`
+/// hard-codes that leaf `false` and the grant silently never applies — while
+/// coverage reported the condition fully supported.
+///
+/// Parameterized over the two grant shapes the branch serves (`"gets +N/+M"`
+/// and `"has <keyword>"`) because the bypass was in the shared branch, not in
+/// either shape: the class is "every conditional continuous grant", not one
+/// Oracle phrasing.
+#[test]
+fn attached_conditional_grant_payment_gate_is_deferred_not_accepted() {
+    for line in [
+        "Enchanted creature gets +2/+2 as long as you pay {1}.",
+        "Enchanted creature has flying as long as you pay {1}.",
+        "Equipped creature gets +1/+1 as long as its controller pays {2}.",
+    ] {
+        let def = parse_static_line(line).unwrap_or_else(|| panic!("{line} should parse"));
+        assert!(
+            matches!(def.mode, StaticMode::Continuous),
+            "{line}: expected a Continuous grant, got {:?}",
+            def.mode
+        );
+        assert!(
+            def.condition
+                .as_ref()
+                .is_some_and(StaticCondition::contains_unrecognized),
+            "{line}: an unofferable CR 118.12a payment gate must be deferred to the \
+             honest gap marker so every coverage-honesty gate sees it, got {:?}",
+            def.condition
+        );
+        assert!(
+            !def.condition
+                .as_ref()
+                .is_some_and(|c| c.requires_unavailable_continuation(&def.mode)),
+            "{line}: no continuation-backed leaf may survive on a mode whose \
+             enforcement point never runs it, got {:?}",
+            def.condition
+        );
+    }
+}
+
+/// Complement of the test above, and the reason it is not "defer everything":
+/// an enforceable positive gate on the SAME conditional-grant branch must still
+/// be accepted verbatim. A board-state condition is a pure function of game
+/// state, so the layer pipeline resolves it on its own with no round-trip.
+#[test]
+fn attached_conditional_grant_state_backed_gate_still_passes_through() {
+    let def = parse_static_line("Enchanted creature gets +2/+2 as long as you control a Forest.")
+        .expect("conditional attached grant should parse");
+    assert!(
+        matches!(def.mode, StaticMode::Continuous),
+        "expected a Continuous grant, got {:?}",
+        def.mode
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(|c| !c.contains_unrecognized()),
+        "a board-state gate must survive the enforcement-point gate unchanged, got {:?}",
+        def.condition
+    );
+}

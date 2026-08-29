@@ -2305,6 +2305,86 @@ fn twice_is_activation_limit(cleaned: &str, evidence: &UnitEvidence) -> bool {
         && !cleaned.contains("twice x")
 }
 
+/// The dynamic-quantity markers this line actually raises an expectation for.
+///
+/// Shared by the detector's own gate and by
+/// [`dynamic_markers_are_all_recorded_unrecognized`] so the two can never
+/// disagree about which occurrences count: a " twice " that
+/// [`twice_is_activation_limit`] classifies as a fixed-count activation limit
+/// raises no dynamic expectation and must not appear in either view.
+fn active_dynamic_markers(cleaned: &str, evidence: &UnitEvidence) -> Vec<&'static str> {
+    let mut markers: Vec<&'static str> = OTHER_DYNAMIC_MARKERS
+        .iter()
+        .copied()
+        // allow-noncombinator: swallow detector marker scan on classified text
+        .filter(|m| cleaned.contains(m))
+        .collect();
+    // CR 702.142a + CR 602.5b: "Activate ... twice each turn" / "can [keyword]
+    // twice ... rather than once" is a fixed-count activation limit (handled by
+    // ActivateLimit / ModifyActivationLimit), not a dynamic quantity.
+    // allow-noncombinator: swallow detector marker scan on classified text
+    if cleaned.contains(" twice ") && !twice_is_activation_limit(cleaned, evidence) {
+        markers.push(" twice ");
+    }
+    markers
+}
+
+/// CR 604.1 + CR 611.3: true when every dynamic-quantity marker this line raises
+/// sits inside text the parser EXPLICITLY recorded as unparsed.
+///
+/// `StaticCondition::Unrecognized { text }` in a `condition` slot is the
+/// static-ability twin of `Effect::Unimplemented`: the parser routed the clause
+/// into a condition slot and preserved the source it could not model, coverage
+/// demotes the card on it (`StaticCondition::contains_unrecognized`), and the
+/// text is reported verbatim. Re-reporting the same span as a *swallowed* clause
+/// double-counts one defect — the identical rule the card-wide
+/// `any_ability_has_unimplemented` guard in [`check_swallowed_clauses`] applies,
+/// and the same `Unrecognized`-condition leg `detect_duration_this_turn`
+/// already carries.
+///
+/// The live producer is `oracle_static::static_helpers::gate_static_condition`:
+/// when a CR 118.12a `UnlessPay` gate lands on a mode whose enforcement point
+/// never offers the payment, the whole condition is deferred to this marker.
+/// Awesome Presence is the printed case — its "pays {3} **for each** creature
+/// they control that's blocking it" scaling used to be carried by
+/// `UnlessPayScaling::PerAffectedCreature` (the suppression leg below), and once
+/// the gate defers the condition that carrier is gone by design, not by
+/// accident.
+///
+/// MARKER-level, not span-level, so it is robust to the punctuation and
+/// case normalization between the raw audit text and the recorded condition
+/// text. The residual it accepts is bounded and one-directional: a line with two
+/// independent clauses sharing a marker, only one of which is inside the
+/// recorded text, stays silent. That card is already reported unsupported by the
+/// `Unrecognized` gap itself, so the residual costs detail, never a false green
+/// — and it is strictly tighter than `detect_duration_this_turn`'s precedent,
+/// which suppresses on the mere presence of an `Unrecognized` condition slot.
+fn dynamic_markers_are_all_recorded_unrecognized(
+    markers: &[&'static str],
+    evidence: &UnitEvidence,
+) -> bool {
+    if markers.is_empty() {
+        return false;
+    }
+    let recorded: Vec<String> = evidence
+        .collect_at::<StaticCondition>(&["condition"])
+        .into_iter()
+        .filter_map(|condition| match condition {
+            StaticCondition::Unrecognized { text } => Some(text.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    if recorded.is_empty() {
+        return false;
+    }
+    markers.iter().all(|marker| {
+        recorded
+            .iter()
+            // allow-noncombinator: swallow detector marker scan on classified text
+            .any(|text| text.contains(marker))
+    })
+}
+
 /// Oracle text contains dynamic-quantity grammar ("equal to", "for each",
 /// "twice", "where x is", "the number of", "half [poss]") but the parsed
 /// AST contains no dynamic carrier (Ref, Multiply, DivideRounded, Offset,
@@ -2318,12 +2398,14 @@ fn detect_dynamic_qty(
     evidence: &UnitEvidence,
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
-    // CR 702.142a + CR 602.5b: "Activate ... twice each turn" / "can [keyword]
-    // twice ... rather than once" is a fixed-count activation limit (handled by
-    // ActivateLimit / ModifyActivationLimit), not a dynamic quantity.
-    let has_marker = (cleaned.contains(" twice ") && !twice_is_activation_limit(cleaned, evidence)) // allow-noncombinator: swallow detector marker scan on classified text
-        || OTHER_DYNAMIC_MARKERS.iter().any(|m| cleaned.contains(m));
-    if !has_marker {
+    let markers = active_dynamic_markers(cleaned, evidence);
+    if markers.is_empty() {
+        return;
+    }
+    // Not swallowed — explicitly recorded. Checked before the carrier probes
+    // because it is a claim about REPORTING (the defect is already on the card),
+    // not about representation.
+    if dynamic_markers_are_all_recorded_unrecognized(&markers, evidence) {
         return;
     }
     // ── Typed dynamic-quantity carriers ─────────────────────────────────
@@ -4802,14 +4884,15 @@ mod tests {
 
     use super::{
         any_ability_has_unimplemented, def_tree_has_optional, def_tree_has_unimplemented,
-        detect_replacement, effect_has_internal_optionality, trigger_tree_has_optional,
-        twice_is_activation_limit,
+        detect_replacement, dynamic_markers_are_all_recorded_unrecognized,
+        effect_has_internal_optionality, trigger_tree_has_optional, twice_is_activation_limit,
     };
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ContinuousModification, DamageModification, Effect,
-        OutsideGameSourcePool, PlayerFilter, QuantityExpr, TargetFilter, TriggerCondition,
+        OutsideGameSourcePool, PlayerFilter, QuantityExpr, StaticCondition, StaticDefinition,
+        TargetFilter, TriggerCondition,
     };
     use crate::types::identifiers::TrackedSetId;
     use crate::types::keywords::Keyword;
@@ -7868,6 +7951,105 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             has_swallowed_detector(&parsed, "Optional_YouMay"),
             "pre-existing gap: the per-card-type 'you may put' optionality is not typed. \
              Warnings: {:?}",
+            parsed.parse_warnings
+        );
+    }
+
+    /// Evidence carrying exactly one static whose condition is the honest gap
+    /// marker `gate_static_condition` produces, `Not`-wrapped the way the
+    /// `"unless"` polarity stores it. Mirrors the hand-built evidence helpers
+    /// above; the `Not` wrapper is deliberate, because the recorded text must be
+    /// found at any nesting depth, not only at the root.
+    fn recorded_unrecognized_evidence(text: &str) -> UnitEvidence {
+        let mut def = StaticDefinition::new(StaticMode::CantBeBlocked);
+        def.condition = Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: text.to_string(),
+            }),
+        });
+        UnitEvidence::of(&crate::parser::oracle::ParsedAbilities {
+            abilities: Vec::new(),
+            triggers: Vec::new(),
+            statics: vec![def],
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        })
+    }
+
+    /// CR 604.1 + CR 611.3: text the parser explicitly recorded as unparsed is
+    /// reported, not swallowed — the same architectural rule the card-wide
+    /// `Effect::Unimplemented` guard applies, expressed for the static-ability
+    /// twin `StaticCondition::Unrecognized`.
+    ///
+    /// Pinned at the predicate rather than only end-to-end, because all three
+    /// answers matter and only the first has a printed card behind it today.
+    #[test]
+    fn recorded_unrecognized_text_discharges_only_the_markers_it_contains() {
+        let recorded =
+            recorded_unrecognized_evidence("defending player pays {3} for each creature blocking");
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(&["for each "], &recorded),
+            "a marker INSIDE the recorded text is already reported by the gap itself"
+        );
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(&[" equal to "], &recorded),
+            "a marker the recorded text does NOT contain is still a live swallow: \
+             suppressing it would hide an unrelated dropped quantity on the same line"
+        );
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(&["for each ", " equal to "], &recorded),
+            "ALL markers must be accounted for — one recorded marker must not excuse \
+             an unrecorded sibling"
+        );
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                &["for each "],
+                &no_activation_limit_evidence()
+            ),
+            "with no Unrecognized condition anywhere, nothing was recorded and the \
+             marker is a genuine swallow"
+        );
+    }
+
+    /// End-to-end half of the predicate test above, on the printed card that
+    /// produced the CI diagnostic delta this PR had to explain.
+    ///
+    /// CR 118.12a: Awesome Presence's "for each creature they control that's
+    /// blocking it" scaling used to be carried by
+    /// `UnlessPayScaling::PerAffectedCreature`. Once
+    /// `gate_static_condition` defers the whole unofferable payment gate (no
+    /// block-declaration prompt exists for `CantBeBlocked`), that carrier is
+    /// gone BY DESIGN and the clause is instead reported verbatim on the
+    /// `Unrecognized` node. Emitting a `DynamicQty` swallow on top of it would
+    /// report one defect twice — the card is already demoted from "supported" by
+    /// the gap itself.
+    #[test]
+    fn dynamic_qty_not_double_reported_when_the_gate_recorded_the_whole_clause() {
+        let parsed = parse_named(
+            "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.",
+            "Awesome Presence",
+            &["Enchantment"],
+        );
+        assert!(
+            parsed.statics.iter().any(|def| def
+                .condition
+                .as_ref()
+                .is_some_and(StaticCondition::contains_unrecognized)),
+            "reach guard: the gate must have deferred the payment condition, else this \
+             test proves nothing. Statics: {:?}",
+            parsed.statics
+        );
+        assert!(
+            !has_swallowed_detector(&parsed, "DynamicQty"),
+            "the 'for each' scaling lives inside the clause the parser already reported \
+             as unrecognized; re-reporting it double-counts one defect. Warnings: {:?}",
             parsed.parse_warnings
         );
     }

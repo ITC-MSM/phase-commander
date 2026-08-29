@@ -609,6 +609,27 @@ impl UnitEvidence {
     ) -> bool {
         self.any_at(STATIC_MODE_KEYS, pred)
     }
+
+    /// Every node stored at one of `keys` that deserializes as `T`, in walk order.
+    ///
+    /// The collecting sibling of [`Self::any_at`], with the identical key-anchoring
+    /// contract — use it when a detector needs the carrier's *payload* rather than
+    /// just its presence. The only such fact today is the recorded text on a
+    /// `StaticCondition::Unrecognized`: "which source text did the parser explicitly
+    /// admit it could not parse?" cannot be answered by a boolean.
+    pub(super) fn collect_at<T: DeserializeOwned>(&self, keys: &[&str]) -> Vec<T> {
+        let mut found = Vec::new();
+        Self::visit(&self.root, None, &mut |node, key| {
+            if key.is_some_and(|k| keys.contains(&k)) {
+                if let Ok(value) = T::deserialize(node) {
+                    found.push(value);
+                }
+            }
+            // Never short-circuit: this is a full walk, not a search.
+            false
+        });
+        found
+    }
 }
 
 #[cfg(test)]
