@@ -197,6 +197,7 @@ fn msh_resolution_optional_payment_family_has_no_strict_gaps() {
         else {
             unreachable!();
         };
+        assert!(root.optional, "{name} must preserve its printed may");
         let when_you_do = matches!(
             root.sub_ability
                 .as_deref()
