@@ -4,11 +4,12 @@
 //! have an enduring story."
 //!
 //! CR 502.3 (an effect can keep a permanent from untapping during the untap
-//! step) + CR 611.3a ("unless" is a negative-polarity conditional gate — the
-//! restriction applies precisely when the trailing condition is false) +
-//! CR 702.195a-b (Storied grants the "enduring story" designation once its
-//! controller controls the Storied permanent plus three or more historic
-//! permanents; the designation persists for the rest of the game).
+//! step) + CR 702.195a-b (Storied grants the "enduring story" designation once
+//! its controller controls the Storied permanent plus three or more historic
+//! permanents; the designation persists for the rest of the game). "Unless" is
+//! a negative-polarity conditional gate — the restriction applies precisely
+//! when the trailing condition is false — and per CR 611.3a that condition is
+//! re-evaluated dynamically at every untap step rather than "locked in" once.
 //!
 //! Two-sided regression: "doesn't untap ... unless [condition]" is a negative
 //! conditional — the restriction (staying tapped) is the DEFAULT, and the

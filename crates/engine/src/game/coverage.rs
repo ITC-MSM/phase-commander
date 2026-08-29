@@ -6419,10 +6419,11 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
 }
 
 fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
-    // CR 611.3a: recurse through And/Or/Not — a parser fallback that wraps an
-    // unparsed `unless` clause as `Not(Unrecognized)` is a top-level `Not`, not
-    // a top-level `Unrecognized`, and must still be flagged (`contains_unrecognized`
-    // is the single authority; see its doc comment in `types/ability.rs`).
+    // Coverage-tooling detail (not a game rule): recurse through And/Or/Not —
+    // a parser fallback that wraps an unparsed `unless` clause as
+    // `Not(Unrecognized)` is a top-level `Not`, not a top-level `Unrecognized`,
+    // and must still be flagged (`contains_unrecognized` is the single
+    // authority; see its doc comment in `types/ability.rs`).
     def.condition
         .as_ref()
         .is_some_and(StaticCondition::contains_unrecognized)

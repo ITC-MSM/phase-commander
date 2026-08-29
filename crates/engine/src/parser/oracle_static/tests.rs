@@ -9551,10 +9551,12 @@ fn static_enchanted_creature_doesnt_untap_if_sleep_counter() {
 }
 
 /// CR 502.3 + CR 702.195b (Bombur, Gentle Dreamer): "~ doesn't untap during your
-/// untap step unless you have an enduring story." "Unless" is negative polarity
-/// (CR 611.3a) — the restriction applies precisely when the trailing condition is
+/// untap step unless you have an enduring story." "Unless" is a negative-polarity
+/// conditional — the restriction applies precisely when the trailing condition is
 /// FALSE, so the parsed condition must be `Not(HasEnduringStory)`, not the bare
-/// positive condition `parse_as_long_as`/`parse_if` would attach.
+/// positive condition `parse_as_long_as`/`parse_if` would attach. CR 611.3a:
+/// because this is a continuous effect from a static ability, it isn't "locked
+/// in" — the condition is re-evaluated dynamically at every untap step.
 #[test]
 fn static_bombur_doesnt_untap_unless_enduring_story() {
     let def = parse_static_line(
@@ -9573,8 +9575,36 @@ fn static_bombur_doesnt_untap_unless_enduring_story() {
     );
 }
 
-/// CR 109.4 + CR 725.5 (maintainer-flagged blocker on PR #8012): a
-/// recipient-scoped `unless` tail — "unless that player is the monarch" —
+/// Maintainer-flagged HIGH blocker on PR #8012 (round 4): `extract_cant_untap_condition`
+/// accepted a recognized `unless` prefix (e.g. "you have an enduring story") without
+/// requiring `parse_unless_condition`'s returned remainder to be fully consumed, so
+/// trailing unsupported text after a valid prefix was silently discarded and the
+/// incomplete condition was reported as fully supported. The fix requires
+/// `rest.trim().is_empty()` before accepting the parsed condition; otherwise it must
+/// fall back to the same `Not(Unrecognized)` shape a genuine parse failure produces.
+#[test]
+fn static_cant_untap_unless_trailing_garbage_is_unrecognized() {
+    let def = parse_static_line(
+        "Bombur doesn't untap during your untap step unless you have an enduring story and also something extra.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::CantUntap);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "you have an enduring story and also something extra".to_string(),
+            }),
+        }),
+        "an 'unless' prefix that parses but leaves unconsumed trailing text must NOT be \
+         accepted as a fully supported HasEnduringStory condition, got {:?}",
+        def.condition
+    );
+}
+
+/// Engine limitation, not CR-mandated (maintainer-flagged blocker on PR
+/// #8012): a recipient-scoped `unless` tail — "unless that player is the monarch" —
 /// parses to `Not(IsMonarch { player: ScopedPlayer })` via the same generic
 /// `parse_unless_condition` route Bombur uses, but `ScopedPlayer` has no
 /// runtime binding authority for a `CantUntap` static (no triggering event or

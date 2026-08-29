@@ -9593,8 +9593,8 @@ pub enum StaticCondition {
 }
 
 impl StaticCondition {
-    /// CR 109.4 + CR 725.5: the player whose DESIGNATION this leaf tests, when
-    /// the leaf is a designation predicate at all.
+    /// Engine limitation, not CR-mandated: the player whose DESIGNATION this
+    /// leaf tests, when the leaf is a designation predicate at all.
     ///
     /// Exhaustive by design — there is deliberately no wildcard arm. This is
     /// the guard that makes the static-side polarity boundary gate in
@@ -9671,11 +9671,12 @@ impl StaticCondition {
         }
     }
 
-    /// CR 109.4 + CR 725.5: true when this condition (or a Boolean sub-condition
-    /// of it) tests a [`PlayerScope`] designation anchor other than `Controller`
-    /// — a "that player" / "that opponent" / other scoped-player reference that
-    /// has no runtime binding authority outside a triggering event or combat
-    /// context (a recipient id, a combat-tax defender, etc.).
+    /// Engine limitation (not CR-mandated): true when this condition (or a
+    /// Boolean sub-condition of it) tests a [`PlayerScope`] designation anchor
+    /// other than `Controller` — a "that player" / "that opponent" / other
+    /// scoped-player reference that has no runtime binding authority outside a
+    /// triggering event or combat context (a recipient id, a combat-tax
+    /// defender, etc.).
     ///
     /// Single authority shared by the runtime layer evaluator
     /// (`game::layers::evaluate_condition`, which has no triggering event to
