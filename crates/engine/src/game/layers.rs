@@ -952,22 +952,12 @@ pub(crate) fn evaluate_condition_with_recipient(
 ///
 /// Purely structural (no `GameState` needed), mirroring the shape of
 /// `condition_uses_recipient_context` and `static_condition_uses_object_population`
-/// in this module. The `_ => false` leaf arm is safe because the leaf question
-/// is delegated to the compiler-forced
-/// [`StaticCondition::designation_player_anchor`] accessor.
+/// in this module. Delegates the leaf question and the Boolean-combinator walk
+/// to [`StaticCondition::has_unbindable_designation_anchor`] — the single
+/// authority shared with any parser-time gate that must decline to mark such a
+/// condition "supported" when it can never bind at runtime.
 fn static_condition_has_unresolvable_designation_anchor(condition: &StaticCondition) -> bool {
-    if let Some(scope) = condition.designation_player_anchor() {
-        return !matches!(scope, PlayerScope::Controller);
-    }
-    match condition {
-        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
-            .iter()
-            .any(static_condition_has_unresolvable_designation_anchor),
-        StaticCondition::Not { condition } => {
-            static_condition_has_unresolvable_designation_anchor(condition)
-        }
-        _ => false,
-    }
+    condition.has_unbindable_designation_anchor()
 }
 
 /// Selects the controller that supplies "you" for an active effect's
@@ -2862,8 +2852,9 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         // (an `ObjectCount` filter can carry `FilterProp::InZone { zone }`).
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
-        | QuantityRef::ObjectCountBySharedQuality { filter, .. }
-        | QuantityRef::Aggregate { filter, .. } => target_filter_reads_zone(filter, zone),
+        | QuantityRef::ObjectCountBySharedQuality { filter, .. } => {
+            target_filter_reads_zone(filter, zone)
+        }
         // CR 613.4a: A distinct-characteristic count reads `zone` only when its
         // population is sourced from that zone's cards (Tarmogoyf: card types
         // among cards in all graveyards; Subgoyf: different subtypes among the
@@ -2874,6 +2865,9 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_reads_zone(source, zone)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_reads_zone(aggregate.source(), zone)
         }
         // Everything else reads player-level state, single-object state, battle-
         // field-only population, history records, choices, or tracked sets — none
@@ -2916,7 +2910,6 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -3148,7 +3141,6 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
@@ -3193,6 +3185,9 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             characteristic_source_reads_life_total(source)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_reads_life_total(aggregate.source())
         }
 
         // CR 601.2h: `ManaSpentToCast` carries no direct `TargetFilter`, but its
@@ -3247,7 +3242,6 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::TrackedSetSize
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
         | QuantityRef::PreviousEffectCount
@@ -3510,6 +3504,7 @@ fn target_filter_reads_life_total(filter: &TargetFilter) -> bool {
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -5359,6 +5354,7 @@ fn gather_active_effects_for_layer(state: &GameState, layer: Layer) -> Vec<Activ
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn has_active_copy_layer_effects(state: &GameState) -> bool {
     !gather_active_effects_for_layer(state, Layer::Copy).is_empty()
 }

@@ -3886,12 +3886,9 @@ fn dragon_man_cda_power_is_greatest_mana_value_across_zones() {
             matches!(
                 arm,
                 QuantityExpr::Ref {
-                    qty: QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    }
-                }
+                    qty: QuantityRef::PropertyAggregate(aggregate),
+                } if aggregate.function() == AggregateFunction::Max
+                    && aggregate.property() == ObjectProperty::ManaValue
             ),
             "each arm must be a Max/ManaValue Aggregate, got {arm:?}"
         );
@@ -5640,12 +5637,7 @@ fn visions_of_ruin_cast_this_way_cost_reduction_binds_commander_mv() {
 
     let StaticMode::ModifyCost {
         mode: CostModifyMode::Reduce,
-        dynamic_count:
-            Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::ManaValue,
-                ..
-            }),
+        dynamic_count: Some(QuantityRef::PropertyAggregate(aggregate)),
         ..
     } = def.mode
     else {
@@ -5654,6 +5646,8 @@ fn visions_of_ruin_cast_this_way_cost_reduction_binds_commander_mv() {
             def.mode
         );
     };
+    assert_eq!(aggregate.function(), AggregateFunction::Max);
+    assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
     assert!(matches!(
         def.condition,
         Some(StaticCondition::CastingAsVariant {
@@ -5833,17 +5827,48 @@ fn ghalta_self_cost_reduction_is_active_from_command_zone() {
 
     let StaticMode::ModifyCost {
         mode: CostModifyMode::Reduce,
-        dynamic_count:
-            Some(QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                ..
-            }),
+        dynamic_count: Some(QuantityRef::PropertyAggregate(aggregate)),
         ..
     } = def.mode
     else {
         panic!("expected dynamic self-spell ReduceCost, got {:?}", def.mode);
     };
+    assert_eq!(aggregate.function(), AggregateFunction::Sum);
+    assert_eq!(aggregate.property(), ObjectProperty::Power);
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        crate::types::zones::self_spell_cost_mod_active_zones()
+    );
+}
+
+#[test]
+fn cavern_hoard_dragon_reduction_uses_greatest_opponent_artifact_count() {
+    let def = parse_static_line(
+        "This spell costs {X} less to cast, where X is the greatest number of artifacts an opponent controls.",
+    )
+    .expect("Cavern-Hoard Dragon cost reduction must parse");
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount,
+        dynamic_count:
+            Some(QuantityRef::ControlledByEachPlayer {
+                filter: TargetFilter::Typed(filter),
+                aggregate: AggregateFunction::Max,
+                relation: PlayerRelation::Opponent,
+            }),
+        ..
+    } = def.mode
+    else {
+        panic!(
+            "expected opponent-scoped dynamic self-cost reduction, got {:?}",
+            def.mode
+        );
+    };
+    assert_eq!(amount, ManaCost::generic(1));
+    assert_eq!(filter.type_filters, vec![TypeFilter::Artifact]);
+    assert_eq!(filter.controller, None);
     assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
     assert_eq!(
         def.active_zones,
@@ -9405,18 +9430,23 @@ fn static_umbra_stalker_graveyard_chroma_cda() {
     );
 
     let expected_qty = QuantityExpr::Ref {
-        qty: QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
-            filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::You,
+        qty: QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                crate::types::ability::CardTypeSetSource::Objects {
+                    filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::You,
+                        },
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                    ])),
                 },
-                FilterProp::InZone {
-                    zone: Zone::Graveyard,
-                },
-            ])),
-        },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     };
 
     for m in &def.modifications {
@@ -9518,6 +9548,246 @@ fn static_enchanted_creature_doesnt_untap_if_sleep_counter() {
         def.condition.is_some(),
         "if-clause must become a static condition"
     );
+}
+
+/// CR 502.3 + CR 702.195b (Bombur, Gentle Dreamer): "~ doesn't untap during your
+/// untap step unless you have an enduring story." "Unless" is a negative-polarity
+/// conditional — the restriction applies precisely when the trailing condition is
+/// FALSE, so the parsed condition must be `Not(HasEnduringStory)`, not the bare
+/// positive condition `parse_as_long_as`/`parse_if` would attach. CR 611.3a:
+/// because this is a continuous effect from a static ability, it isn't "locked
+/// in" — the condition is re-evaluated dynamically at every untap step.
+#[test]
+fn static_bombur_doesnt_untap_unless_enduring_story() {
+    let def = parse_static_line(
+        "Bombur doesn't untap during your untap step unless you have an enduring story.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::CantUntap);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::HasEnduringStory),
+        }),
+        "'unless you have an enduring story' must negate HasEnduringStory, got {:?}",
+        def.condition
+    );
+}
+
+/// Maintainer-flagged HIGH blocker on PR #8012 (round 4): `extract_cant_untap_condition`
+/// accepted a recognized `unless` prefix (e.g. "you have an enduring story") without
+/// requiring `parse_unless_condition`'s returned remainder to be fully consumed, so
+/// trailing unsupported text after a valid prefix was silently discarded and the
+/// incomplete condition was reported as fully supported. The fix requires
+/// `rest.trim().is_empty()` before accepting the parsed condition; otherwise it must
+/// fall back to the same `Not(Unrecognized)` shape a genuine parse failure produces.
+#[test]
+fn static_cant_untap_unless_trailing_garbage_is_unrecognized() {
+    let def = parse_static_line(
+        "Bombur doesn't untap during your untap step unless you have an enduring story and also something extra.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::CantUntap);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "you have an enduring story and also something extra".to_string(),
+            }),
+        }),
+        "an 'unless' prefix that parses but leaves unconsumed trailing text must NOT be \
+         accepted as a fully supported HasEnduringStory condition, got {:?}",
+        def.condition
+    );
+}
+
+/// Engine limitation, not CR-mandated (maintainer-flagged blocker on PR
+/// #8012): a recipient-scoped `unless` tail — "unless that player is the monarch" —
+/// parses to `Not(IsMonarch { player: ScopedPlayer })` via the same generic
+/// `parse_unless_condition` route Bombur uses, but `ScopedPlayer` has no
+/// runtime binding authority for a `CantUntap` static (no triggering event or
+/// combat context to resolve "that player" against —
+/// `game::layers::evaluate_condition` rejects it outright). The parser must
+/// NOT report this line as a fully supported `CantUntap` with that condition
+/// attached; it must fall back to the same honest `Unrecognized` shape a
+/// genuine parse failure produces, so coverage tooling sees the gap instead
+/// of a false green. Ordinary controller-scoped `unless` conditions (the test
+/// above) must continue to bind and parse normally.
+#[test]
+fn static_cant_untap_unless_recipient_scoped_designation_is_unrecognized() {
+    let def = parse_static_line(
+        "Bombur doesn't untap during your untap step unless that player is the monarch.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::CantUntap);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "that player is the monarch".to_string(),
+            }),
+        }),
+        "recipient-scoped 'unless' tail with no runtime binding authority must \
+         be marked Unrecognized, not silently accepted as IsMonarch{{ScopedPlayer}}, got {:?}",
+        def.condition
+    );
+}
+
+/// Maintainer-flagged HIGH blocker on PR #8012 (round 5): the generic `unless`
+/// route accepted `StaticCondition::UnlessPay` for a `CantUntap` static even
+/// though no untap-step payment continuation exists.
+///
+/// CR 118.12a defines "[do something] unless [a player] pays [cost]" as an
+/// OPTIONAL cost the player may choose to pay. The engine offers that choice
+/// exactly once — via `WaitingFor::CombatTaxPayment` at attack/block
+/// declaration. CR 502.3 untapping is a turn-based action: the untap loop in
+/// `game::turns` only skips `CantUntap` permanents, it has no payment prompt,
+/// and `game::layers::evaluate_condition` accordingly hard-codes `UnlessPay` to
+/// `false`. So the parser was marking a condition "supported" that no player
+/// could ever satisfy. It must fall back to the same honest `Not(Unrecognized)`
+/// shape a genuine parse failure produces.
+///
+/// Synthetic Oracle text: this probes the PARSER'S acceptance boundary, not a
+/// printed card — no printed card currently pairs an untap-step restriction
+/// with a payment gate, which is precisely why the false green went unnoticed.
+#[test]
+fn static_cant_untap_unless_payment_condition_is_unrecognized() {
+    let def = parse_static_line("Bombur doesn't untap during your untap step unless you pay {2}.")
+        .unwrap();
+    assert_eq!(def.mode, StaticMode::CantUntap);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::Unrecognized {
+                text: "you pay {2}".to_string(),
+            }),
+        }),
+        "a payment-based 'unless' gate has no untap-step continuation and must NOT          be accepted as a fully supported UnlessPay condition, got {:?}",
+        def.condition
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized),
+        "the fallback must be visible to every coverage-honesty gate"
+    );
+}
+
+/// Building-block test for the acceptance boundary itself, at the level the
+/// gate operates on rather than through one card's Oracle text.
+///
+/// The Oracle-text test above can only reach whatever shapes
+/// `parse_unless_condition` happens to emit today; this pins the gate's
+/// contract directly, including the NESTED Boolean forms the maintainer called
+/// out (`And`/`Or` wrapping the unsupported leaf), which no current Oracle
+/// phrasing produces but a future combinator extension would.
+#[test]
+fn cant_untap_gate_rejects_every_unenforceable_leaf_at_any_depth() {
+    use crate::types::ability::{PlayerScope, UnlessPayScaling};
+    use crate::types::mana::ManaCost;
+
+    let unless_pay = StaticCondition::UnlessPay {
+        cost: ManaCost::Cost {
+            shards: vec![],
+            generic: 2,
+        },
+        scaling: UnlessPayScaling::Flat,
+        defended: None,
+    };
+    let unenforceable = [
+        // CR 118.12a: payment continuation, offered only at combat declaration.
+        unless_pay.clone(),
+        // CR 601.2f: decided by the in-flight cast, absent at the untap step.
+        StaticCondition::AdditionalCostPaid,
+        StaticCondition::CastingAsVariant {
+            variant: crate::types::game_state::CastingVariant::Flashback,
+        },
+        // CR 725.1: scoped-player designation with no binding authority here.
+        StaticCondition::IsMonarch {
+            player: PlayerScope::ScopedPlayer,
+        },
+        // Nested Boolean forms — the specific escape route flagged in round 5.
+        StaticCondition::And {
+            conditions: vec![StaticCondition::HasEnduringStory, unless_pay.clone()],
+        },
+        StaticCondition::Or {
+            conditions: vec![unless_pay.clone(), StaticCondition::HasEnduringStory],
+        },
+        StaticCondition::Not {
+            condition: Box::new(StaticCondition::And {
+                conditions: vec![StaticCondition::Or {
+                    conditions: vec![unless_pay],
+                }],
+            }),
+        },
+    ];
+    for condition in unenforceable {
+        assert_eq!(
+            gate_cant_untap_condition(condition.clone(), "gap text", UntapGatePolarity::Negative),
+            StaticCondition::Not {
+                condition: Box::new(StaticCondition::Unrecognized {
+                    text: "gap text".to_string(),
+                }),
+            },
+            "{condition:?} is not enforceable at the untap step and must be              replaced by the negative-polarity gap marker"
+        );
+        assert_eq!(
+            gate_cant_untap_condition(condition.clone(), "gap text", UntapGatePolarity::Positive),
+            StaticCondition::Unrecognized {
+                text: "gap text".to_string(),
+            },
+            "{condition:?} must be replaced by the positive-polarity gap marker              on the 'as long as'/'if' branch — the fallback polarity must match              how the branch stores its condition, or the restriction's sense flips"
+        );
+    }
+}
+
+/// The complement: everything the untap step CAN actually evaluate must pass
+/// through the gate untouched. Without this, the fix above could silently
+/// regress into "reject all conditional CantUntap statics", which would be a
+/// far bigger coverage loss than the false green it replaces. Bombur, Gentle
+/// Dreamer's own controller-scoped gate is the first entry.
+#[test]
+fn cant_untap_gate_passes_through_every_enforceable_leaf() {
+    use crate::types::ability::PlayerScope;
+
+    let enforceable = [
+        // CR 702.195b: Bombur's own gate — must keep working.
+        StaticCondition::Not {
+            condition: Box::new(StaticCondition::HasEnduringStory),
+        },
+        // CR 725.1: controller-scoped designations DO bind.
+        StaticCondition::IsMonarch {
+            player: PlayerScope::Controller,
+        },
+        // CR 122.1: recipient counters — the untap loop supplies the affected
+        // permanent as recipient, so this is answerable.
+        StaticCondition::RecipientHasCounters {
+            counters: CounterMatch::Any,
+            minimum: 1,
+            maximum: None,
+        },
+        // Combat-scoped leaves are computed from `state.combat` and are
+        // legitimately false outside combat — a rules-correct answer, not a
+        // missing continuation.
+        StaticCondition::SourceIsAttacking,
+        StaticCondition::And {
+            conditions: vec![
+                StaticCondition::HasEnduringStory,
+                StaticCondition::SourceIsTapped,
+            ],
+        },
+    ];
+    for condition in enforceable {
+        assert_eq!(
+            gate_cant_untap_condition(condition.clone(), "gap text", UntapGatePolarity::Negative),
+            condition,
+            "{condition:?} is fully evaluable at the untap step and must pass through unchanged"
+        );
+    }
 }
 
 #[test]
@@ -10317,6 +10587,136 @@ fn static_as_long_as_enchanted_creature_is_attacking_gate_binds_to_host() {
                 TypedFilter::creature().properties(vec![FilterProp::Attacking { defender: None }])
             ),
         }),
+    );
+}
+
+/// CR 506.5 + CR 509.1b + CR 611.3a: Security Bypass's evasion applies to the
+/// enchanted host only while that recipient is the sole attacker. The Aura is
+/// not the affected object and its combat state is irrelevant.
+#[test]
+fn security_bypass_attacking_alone_evasion_binds_to_enchanted_host() {
+    let line = "As long as enchanted creature is attacking alone, it can't be blocked.";
+    let defs = parse_static_line_multi(line);
+    assert_eq!(defs.len(), 1, "expected one typed restriction: {defs:?}");
+    assert_eq!(defs[0].mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])
+        ))
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+}
+
+/// The generic route also covers Equipment and the curly apostrophe used by
+/// some Oracle sources; neither variation may fall back to source/self binding.
+#[test]
+fn equipped_attacking_alone_evasion_accepts_curly_apostrophe() {
+    let defs = parse_static_line_multi(
+        "As long as equipped creature is attacking alone, it can’t be blocked.",
+    );
+    assert_eq!(defs.len(), 1, "expected one typed restriction: {defs:?}");
+    assert_eq!(defs[0].mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EquippedBy])
+        ))
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+}
+
+/// The attached-combat consumer is all-consuming. A longer, unsupported
+/// condition must not be silently truncated into the supported Security
+/// Bypass shape.
+#[test]
+fn attached_attacking_alone_rejects_hostile_trailing_condition() {
+    let defs = parse_static_line_multi(
+        "As long as enchanted creature is attacking alone during your turn, it can't be blocked.",
+    );
+    assert!(
+        !defs.iter().any(|def| {
+            def.mode == StaticMode::CantBeBlocked
+                && def.affected
+                    == Some(TargetFilter::Typed(
+                        TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                    ))
+                && def.condition
+                    == Some(StaticCondition::RecipientMatchesFilter {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature().properties(vec![FilterProp::AttackingAlone]),
+                        ),
+                    })
+        }),
+        "hostile trailing text must not be swallowed into the exact typed shape: {defs:?}"
+    );
+}
+
+/// Full production Oracle for Security Bypass: the evasion condition, attached
+/// host binding, granted combat-damage trigger, and Connive effect must all be
+/// typed with no permissive fallback or unsupported residual.
+#[test]
+fn security_bypass_full_oracle_is_fully_typed() {
+    const ORACLE: &str = "Enchant creature\nAs long as enchanted creature is attacking alone, it can't be blocked.\nEnchanted creature has \"Whenever this creature deals combat damage to a player, it connives.\" (Its controller draws a card, then discards a card. If they discarded a nonland card, they put a +1/+1 counter on this creature.)";
+
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        ORACLE,
+        "Security Bypass",
+        &["Enchant".to_string()],
+        &["Enchantment".to_string()],
+        &["Aura".to_string()],
+    );
+    let evasion = parsed
+        .statics
+        .iter()
+        .find(|def| def.mode == StaticMode::CantBeBlocked)
+        .expect("full Oracle must contain the typed evasion static");
+    assert_eq!(
+        evasion.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])
+        ))
+    );
+    assert_eq!(
+        evasion.condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::AttackingAlone])
+            ),
+        })
+    );
+
+    let serialized = serde_json::to_string(&parsed).expect("parsed card must serialize");
+    for expected in ["DamageDone", "Connive"] {
+        assert!(
+            serialized.contains(expected),
+            "full Oracle must retain typed {expected}: {parsed:?}"
+        );
+    }
+    for forbidden in ["Unrecognized", "Unimplemented"] {
+        assert!(
+            !serialized.contains(forbidden),
+            "full Oracle must not contain {forbidden}: {parsed:?}"
+        );
+    }
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "full Oracle must not emit parser warnings: {:?}",
+        parsed.parse_warnings
     );
 }
 
@@ -26408,6 +26808,123 @@ fn combat_tax_nils_per_affected_with_ref() {
             ));
         }
         other => panic!("expected PerAffectedWithRef, got {other:?}"),
+    }
+}
+
+/// CR 608.2h: bare "the amount of damage dealt" (no qualifier)
+/// through `parse_dynamic_x_clause` — the exact combat-tax dynamic-X entry
+/// point the maintainer cited on PR #7969 (`shared.rs`, reached via the
+/// `dynamic_qty` slot in `evasion.rs`'s combat-tax parser) — binds to
+/// `QuantityRef::EventContextAmount`. Positive control for the rejection
+/// tests below: proves the unqualified phrase still parses once that entry
+/// point requires full consumption.
+///
+/// Exercises `parse_dynamic_x_clause` directly rather than through
+/// `parse_static_line`: the full combat-tax dispatch chain has a deliberate,
+/// unrelated fallback (`parse_subject_combat_rule_static` →
+/// `parse_unless_static_condition`) that always succeeds with an honest
+/// `StaticCondition::Unrecognized` rider when the dedicated combat-tax
+/// combinator fails, so asserting `parse_static_line(..).is_none()` would
+/// not actually discriminate this fix from that pre-existing, correct
+/// fallback.
+#[test]
+fn dynamic_x_clause_damage_dealt_bare_binds_event_context_amount() {
+    let (rest, quantity) = parse_dynamic_x_clause(", where x is the amount of damage dealt")
+        .expect("bare damage-dealt dynamic-X clause should parse");
+    assert_eq!(rest, "");
+    assert!(matches!(quantity, QuantityRef::EventContextAmount));
+}
+
+/// CR 122.1: the untyped-counter dynamic-X anaphor still accepts the ordinary
+/// terminal sentence period after the complete-consumption hardening.
+#[test]
+fn dynamic_x_clause_untyped_counter_anaphor_accepts_terminal_period() {
+    let (rest, quantity) =
+        parse_dynamic_x_clause(", where x is the number of counters on that creature.")
+            .expect("terminal punctuation must not reject the untyped-counter anaphor");
+    assert_eq!(rest, "");
+    assert!(matches!(
+        quantity,
+        QuantityRef::CountersOn {
+            scope: ObjectScope::Target,
+            counter_type: None,
+        }
+    ));
+}
+
+/// Regression for the false-green the maintainer flagged on PR #7969, through
+/// the exact code path they cited (`shared.rs`'s `parse_dynamic_x_clause`):
+/// that function used to call the non-complete `parse_quantity_ref` and
+/// unconditionally discard its remainder, so "the amount of damage dealt
+/// this way" would match only the bare "damage dealt" prefix and silently
+/// lose the "this way" qualifier — misread as `EventContextAmount` instead
+/// of staying an honest unsupported gap (no arm spans the full qualified
+/// phrase). `parse_dynamic_x_clause` now requires full consumption via
+/// `parse_quantity_ref_complete`, so this must error rather than truncate.
+#[test]
+fn dynamic_x_clause_damage_dealt_this_way_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt this way").is_err(),
+        "qualified \"this way\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// Sibling of the "this way" regression above: a "to <object>" qualifier
+/// after "damage dealt" must not be dropped either.
+#[test]
+fn dynamic_x_clause_damage_dealt_to_continuation_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt to that player").is_err(),
+        "qualified \"to\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// Sibling of the "this way" regression above: a "by <object>" qualifier
+/// after "damage dealt" must not be dropped either.
+#[test]
+fn dynamic_x_clause_damage_dealt_by_continuation_stays_unsupported() {
+    assert!(
+        parse_dynamic_x_clause(", where x is the amount of damage dealt by that creature").is_err(),
+        "qualified \"by\" continuation must not truncate to EventContextAmount"
+    );
+}
+
+/// End-to-end companion to the direct `parse_dynamic_x_clause` tests above:
+/// through the full combat-tax dispatch (`parse_static_line`), a qualified
+/// "damage dealt this way" dynamic-X clause must not come back bound as
+/// `PerQuantityRef(EventContextAmount)` — the misparse the maintainer
+/// flagged. The dedicated combat-tax combinator honestly fails (proven
+/// directly above), so the unrelated `Unrecognized`-condition fallback in
+/// `parse_subject_combat_rule_static` takes over and preserves the raw
+/// unless-clause text instead of a wrong dynamic quantity binding.
+#[test]
+fn combat_tax_damage_dealt_this_way_does_not_bind_event_context_amount() {
+    let def = parse_static_line(
+        "Creatures can't attack you unless their controller pays {X}, where X is the amount of damage dealt this way.",
+    )
+    .expect("combat-tax line falls back to an Unrecognized unless-condition, not None");
+    assert_eq!(def.mode, StaticMode::CantAttack);
+    match def.condition {
+        // The dedicated combat-tax combinator honestly failed to bind {X}, so
+        // dispatch fell through to the generic unless-condition fallback,
+        // which preserves the raw clause text instead of a dynamic quantity.
+        Some(StaticCondition::Not { .. }) | None => {}
+        // If some other path DID produce a typed `UnlessPay`, it must not be
+        // the misparsed bare-`EventContextAmount` scaling — this is the
+        // concrete failure mode this regression guards against.
+        Some(ref cond) => {
+            if let Some((_, scaling)) = find_unless_pay(cond) {
+                assert!(
+                    !matches!(
+                        scaling,
+                        UnlessPayScaling::PerQuantityRef {
+                            quantity: QuantityRef::EventContextAmount
+                        }
+                    ),
+                    "qualified \"this way\" continuation must not truncate to EventContextAmount, got {scaling:?}"
+                );
+            }
+        }
     }
 }
 

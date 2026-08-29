@@ -28,9 +28,9 @@ use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, ControllerRef,
     CountScope, DamageChannel, DamageKindFilter, DevotionColors, FilterProp, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerScope, PtStat, QuantityExpr, QuantityRef, RoundingMode,
-    SharedQuality, SubtypeExclusion, TargetFilter, ThisWayCause, TurnJournalKind, TypeFilter,
-    TypedFilter, ZoneRef,
+    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate, PtStat,
+    QuantityExpr, QuantityRef, RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter,
+    ThisWayCause, TrackedAnaphorSource, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::keywords::Keyword;
@@ -956,15 +956,25 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             // "excess" channel wins over a plain damage reading.
             parse_excess_damage_ref,
         )),
-        // CR 701.22a: must precede the generic `parse_the_number_of` so the
-        // scry-context "number of cards looked at …" reading wins over a
-        // plain object-count reading.
-        parse_scry_look_count_ref,
-        // CR 702.33d: must precede the generic `parse_the_number_of` so kicker
-        // counts retain whether Oracle names this object or the triggering spell.
-        parse_kicker_count_expression,
+        // These specific "the number of" forms must precede the generic
+        // `parse_the_number_of` arm. Keep them nested so the outer nom `alt`
+        // remains below its 21-item tuple limit.
+        alt((
+            // CR 701.22a: the scry-context "number of cards looked at …"
+            // reading must win over a plain object-count reading.
+            parse_scry_look_count_ref,
+            // CR 702.33d: kicker counts retain whether Oracle names this
+            // object or the triggering spell.
+            parse_kicker_count_expression,
+            parse_controlled_object_count_extremum,
+        )),
         parse_the_number_of,
-        parse_object_property_aggregate_ref,
+        // The cast journal is an occurrence population, not a live-object type
+        // phrase, so it must win before the generic object aggregate arm.
+        alt((
+            parse_spell_history_property_aggregate_ref,
+            parse_object_property_aggregate_ref,
+        )),
         // Group mana-value aggregate parsers to reduce alt arity
         alt((
             parse_linked_exile_mana_value_ref,
@@ -1056,6 +1066,24 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // colors among ..." path; registering it here makes it reachable in the
         // bare-suffix context too.
         parse_distinct_colors_among_tail,
+        // CR 122.1: bare "different kind[s] of counters {on|among} <filter>" —
+        // reached after a parent has consumed "there are N [or more] " (Hundred-
+        // Battle Veteran: "as long as there are three or more different kinds of
+        // counters among creatures you control, ~ gets +2/+4"). CR 122.1 makes
+        // same-named counters interchangeable, which is the basis for
+        // de-duplicating counter *kinds* across the population before comparing
+        // against the threshold. Counter-side counterpart to
+        // `parse_distinct_colors_among_tail` immediately above: the tail
+        // combinator (`tag("different kind") + tag(" of counter") + "on"/"among"
+        // + parse_type_phrase`) is shared with the "the number of different kinds
+        // of counters among ..." path (`parse_number_of_inner`, used by Perrie,
+        // the Pulverizer); registering it here makes it reachable in the
+        // bare-suffix context too, so `parse_there_are_conditions` can build a
+        // `StaticCondition::QuantityComparison` instead of falling back to
+        // `StaticCondition::Unrecognized` (which `game/layers.rs` evaluates as
+        // unconditionally true — CR 611.3a requires the continuous effect to be
+        // re-evaluated live against the actual counter census, not locked in).
+        parse_distinct_counter_kinds_among_tail,
         // CR 402.1: "the player with the {most|fewest} cards in hand" — the
         // cross-player hand-size extremum, the hand-zone peer of the life
         // extremum. Distinctive "the player with the " prefix; no ordering
@@ -1197,11 +1225,16 @@ fn parse_linked_exile_mana_value_ref(input: &str) -> OracleResult<'_, QuantityRe
     let (rest, _) = opt(parse_craft_materials_suffix).parse(rest)?;
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::ManaValue,
-            filter: linked_exile_owned_filter(),
-        },
+        QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaValue,
+                crate::types::ability::CardTypeSetSource::Objects {
+                    filter: linked_exile_owned_filter(),
+                },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     ))
 }
 
@@ -1327,11 +1360,16 @@ fn parse_greatest_commander_mana_value_ref(input: &str) -> OracleResult<'_, Quan
 
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Max,
-            property,
-            filter: zone_filter,
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(
+                AggregateFunction::Max,
+                property,
+                CardTypeSetSource::Objects {
+                    filter: zone_filter,
+                },
+            )
+            .expect("object populations support every aggregate property"),
+        ),
     ))
 }
 
@@ -1637,6 +1675,65 @@ fn parse_object_property_aggregate_head(
     .parse(input)
 }
 
+/// CR 202.3 + CR 601.2i: Parse a mana-value reduction over the controller's
+/// per-turn spell-cast journal.
+///
+/// The aggregate head, current-cast exclusion, spell qualifier, and journal
+/// owner are independent grammar axes. Keeping them composed here avoids
+/// teaching the generic object-population parser that a past cast is a live
+/// battlefield object. `OtherThanTriggerObject` is the typed marker consumed
+/// by the cast-occurrence-aware journal evaluator; it does not compare names or
+/// storage object ids.
+fn parse_spell_history_property_aggregate_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, (function, property)) = parse_object_property_aggregate_head(input)?;
+    if property != ObjectProperty::ManaValue {
+        return Err(oracle_err(input));
+    }
+    let (rest, excludes_current) =
+        map(opt(tag("other ")), |prefix| prefix.is_some()).parse(rest)?;
+    // This card-family grammar uses the printed perfect-tense form. The
+    // shared journal parser intentionally accepts broader wording for older
+    // cards, so constrain this entry point before delegating to it.
+    peek(alt((
+        tag::<_, _, OracleError<'_>>("spells you've cast this turn"),
+        tag("instant and sorcery spells you've cast this turn"),
+    )))
+    .parse(rest)?;
+    let (rest, source) = parse_turn_journal_source(rest)?;
+    let source = match (source, excludes_current) {
+        (
+            CardTypeSetSource::TurnJournal {
+                journal,
+                scope,
+                filter,
+            },
+            true,
+        ) => {
+            let marker = TargetFilter::Typed(
+                TypedFilter::card().properties(vec![FilterProp::OtherThanTriggerObject]),
+            );
+            CardTypeSetSource::TurnJournal {
+                journal,
+                scope,
+                filter: Some(match filter {
+                    Some(filter) => TargetFilter::And {
+                        filters: vec![filter, marker],
+                    },
+                    None => marker,
+                }),
+            }
+        }
+        (source, _) => source,
+    };
+    Ok((
+        rest,
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(function, property, source)
+                .expect("spell journals support mana-value aggregates"),
+        ),
+    ))
+}
+
 /// Parse an object-property aggregate whose exact surface referent is bare
 /// "those cards", using a source proven by the caller's typed chain/trigger
 /// context. This is intentionally unavailable to the context-free quantity
@@ -1649,11 +1746,17 @@ pub(crate) fn parse_contextual_bare_card_aggregate_ref(
     let (rest, _) = parse_bare_card_set_anaphor(rest)?;
     Ok((
         rest,
-        QuantityRef::TrackedSetAggregate {
-            function,
-            property,
-            source,
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(
+                function,
+                property,
+                CardTypeSetSource::TrackedSet {
+                    set: source,
+                    caused_by: None,
+                },
+            )
+            .expect("tracked populations support every aggregate property"),
+        ),
     ))
 }
 
@@ -1688,11 +1791,17 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
         if let Ok((anaphor_rest, _)) = parse_this_way_anaphor(rest) {
             return Ok((
                 anaphor_rest,
-                QuantityRef::TrackedSetAggregate {
-                    function: AggregateFunction::Sum,
-                    property,
-                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                },
+                QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        property,
+                        CardTypeSetSource::TrackedSet {
+                            set: TrackedAnaphorSource::ChainSet,
+                            caused_by: None,
+                        },
+                    )
+                    .expect("tracked populations support every aggregate property"),
+                ),
             ));
         }
     }
@@ -1706,21 +1815,26 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
     if let Ok((craft_rest, filter)) = parse_craft_materials_filter(rest) {
         return Ok((
             craft_rest,
-            QuantityRef::Aggregate {
-                function,
-                property,
-                filter,
-            },
+            QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(function, property, CardTypeSetSource::Objects { filter })
+                    .expect("object populations support every aggregate property"),
+            ),
         ));
     }
     if let Ok((anaphor_rest, _)) = parse_tracked_set_anaphor(rest) {
         return Ok((
             anaphor_rest,
-            QuantityRef::TrackedSetAggregate {
-                function,
-                property,
-                source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-            },
+            QuantityRef::PropertyAggregate(
+                PropertyAggregate::new(
+                    function,
+                    property,
+                    CardTypeSetSource::TrackedSet {
+                        set: TrackedAnaphorSource::ChainSet,
+                        caused_by: None,
+                    },
+                )
+                .expect("tracked populations support every aggregate property"),
+            ),
         ));
     }
     let (filter, remainder) = parse_type_phrase(rest);
@@ -1736,11 +1850,10 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
     }
     Ok((
         final_remainder,
-        QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        },
+        QuantityRef::PropertyAggregate(
+            PropertyAggregate::new(function, property, CardTypeSetSource::Objects { filter })
+                .expect("object populations support every aggregate property"),
+        ),
     ))
 }
 
@@ -1995,7 +2108,7 @@ fn parse_distinct_named_objects(input: &str) -> OracleResult<'_, QuantityRef> {
 
 /// CR 107.1 + CR 700.1: Parse "[type-phrase] controlled by the player who
 /// controls the fewest" (and "… the most") after "the number of" →
-/// `QuantityRef::ControlledByEachPlayer { filter, aggregate }`.
+/// `QuantityRef::ControlledByEachPlayer { filter, aggregate, relation: All }`.
 ///
 /// Used by Balance / Restore Balance / Balancing Act for the equalization
 /// minimum ("a number of lands they control equal to the number of lands
@@ -2020,7 +2133,52 @@ fn parse_controlled_by_extremum_player(input: &str) -> OracleResult<'_, Quantity
     .parse(rest)?;
     Ok((
         rest,
-        QuantityRef::ControlledByEachPlayer { filter, aggregate },
+        QuantityRef::ControlledByEachPlayer {
+            filter,
+            aggregate,
+            relation: PlayerRelation::All,
+        },
+    ))
+}
+
+/// CR 107.1 + CR 102.1/102.2/102.3 + CR 109.5: Parse the greatest per-player
+/// controlled-object count: "the greatest number of artifacts an opponent
+/// controls" and "the greatest number of creatures a player controls".
+///
+/// This is the subject-after-extremum sibling of
+/// [`parse_controlled_by_extremum_player`]. Both lower to the same typed
+/// `ControlledByEachPlayer` authority; `relation` selects the player population
+/// before the per-player counts are reduced. The type phrase is kept bare
+/// because the resolver itself supplies each candidate player's controller gate.
+fn parse_controlled_object_count_extremum(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (input, _) = tag("the ").parse(input)?;
+    let (input, _) = parse_max_extremum_adjective(input)?;
+    let (input, _) = tag(" number of ").parse(input)?;
+    let (rest, (type_text, relation)) = alt((
+        map(
+            terminated(
+                take_until(" an opponent controls"),
+                tag(" an opponent controls"),
+            ),
+            |type_text| (type_text, PlayerRelation::Opponent),
+        ),
+        map(
+            terminated(take_until(" a player controls"), tag(" a player controls")),
+            |type_text| (type_text, PlayerRelation::All),
+        ),
+    ))
+    .parse(input)?;
+    let (filter, filter_remainder) = parse_type_phrase(type_text);
+    if !filter_remainder.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
+        return Err(oracle_err(input));
+    }
+    Ok((
+        rest,
+        QuantityRef::ControlledByEachPlayer {
+            filter,
+            aggregate: AggregateFunction::Max,
+            relation,
+        },
     ))
 }
 
@@ -2504,6 +2662,7 @@ fn filter_is_population_anchored(filter: &TargetFilter) -> bool {
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -2638,6 +2797,7 @@ pub(crate) fn objects_filter_zone_is_unambiguous(filter: &TargetFilter) -> bool 
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -2759,6 +2919,7 @@ fn parse_tracked_set_this_way_source(input: &str) -> OracleResult<'_, CardTypeSe
     Ok((
         rest,
         CardTypeSetSource::TrackedSet {
+            set: TrackedAnaphorSource::ChainSet,
             caused_by: Some(cause),
         },
     ))
@@ -4006,9 +4167,11 @@ pub fn parse_that_much_or_many(input: &str) -> OracleResult<'_, QuantityRef> {
 
 /// Parse event-context quantity references.
 ///
-/// CR 603.7c: "that {noun}" in a triggered ability refers to the object or
-/// value from the triggering event. The source-object variants resolve via
-/// `extract_source_from_event` → live object or LKI cache.
+/// Two referent kinds under two different rules. CR 608.2h governs the VALUE forms
+/// ("that much", "the damage dealt"): information from the game is determined once, when the
+/// effect applies. CR 608.2k governs the OBJECT forms ("that creature's power"): a specific
+/// untargeted object previously referred to by the trigger condition. The source-object
+/// variants resolve via `extract_source_from_event` → live object or LKI cache.
 fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
         // CR 608.2h: bare demonstrative amount — delegate to the shared
@@ -4016,11 +4179,36 @@ fn parse_event_context_refs(input: &str) -> OracleResult<'_, QuantityRef> {
         // counter-removal, and mana-production count-prefix slots).
         parse_that_much_or_many,
         value(QuantityRef::EventContextAmount, tag("that damage")),
-        // CR 120.1 + CR 603.7c: "the damage dealt" bare form in a triggered
-        // ability body — refers to the total from the triggering combat-damage
-        // event. Distinct from "that damage" (different article+verb) and
-        // "damage dealt this way" (PreviousEffectAmount).
-        value(QuantityRef::EventContextAmount, tag("the damage dealt")),
+        // CR 608.2h: "the damage dealt" bare form in a triggered ability
+        // body — refers to the total from the triggering damage event, an
+        // amount determined once when the effect is
+        // applied. Accepts an optional "the amount of " / "amount of " / bare
+        // "the " determiner prefix ahead of the "damage dealt" phrase, so
+        // both the original bare form ("the damage dealt" — Primo, the
+        // Unbounded) and the paraphrase "the amount of damage dealt" (Kotis,
+        // the Fangkeeper: "exile the top X cards of their library, where X
+        // is the amount of damage dealt") parse uniformly — the prefix is
+        // factored once ahead of the phrase via `preceded` + `opt(alt(...))`,
+        // mirroring `parse_life_lost_ref` / `parse_life_gained_ref`'s
+        // "(the) amount of " prefix handling for the analogous life-change
+        // quantities (the bare "the " arm has no counterpart there because
+        // those functions spell "the " into each downstream full-phrase tag
+        // instead of a single bare-phrase tag). Distinct from "that damage"
+        // (different article+verb) and "damage dealt this way"
+        // (PreviousEffectAmount). The longer qualified forms ("the amount of
+        // damage dealt to/by <object> this turn [by <source>]" — Blazing
+        // Effigy, Grothama, All-Devouring, Impact Resonance, Tangled Colony)
+        // are not swallowed here: `parse_quantity_ref_complete`
+        // (`oracle_effect/lower.rs`) requires the where-X expression to be
+        // fully consumed, and this arm only matches when nothing follows
+        // "damage dealt".
+        value(
+            QuantityRef::EventContextAmount,
+            preceded(
+                opt(alt((tag("the amount of "), tag("amount of "), tag("the ")))),
+                tag("damage dealt"),
+            ),
+        ),
         // CR 701.47c: amass-specific definite phrases name the Army chosen by
         // the current amass instruction, not the generic demonstrative referent.
         parse_amassed_army_property_ref,
@@ -4285,18 +4473,23 @@ fn parse_graveyard_chroma_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     // LKI-independent axis here.
     Ok((
         rest,
-        QuantityRef::Aggregate {
-            function: AggregateFunction::Sum,
-            property: ObjectProperty::ManaSymbolCount(color),
-            filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::You,
+        QuantityRef::PropertyAggregate(
+            crate::types::ability::PropertyAggregate::new(
+                AggregateFunction::Sum,
+                ObjectProperty::ManaSymbolCount(color),
+                crate::types::ability::CardTypeSetSource::Objects {
+                    filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                        FilterProp::Owned {
+                            controller: ControllerRef::You,
+                        },
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                    ])),
                 },
-                FilterProp::InZone {
-                    zone: Zone::Graveyard,
-                },
-            ])),
-        },
+            )
+            .expect("statically valid property aggregate"),
+        ),
     ))
 }
 
@@ -6443,6 +6636,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn property_aggregate_spell_history_suffix_and_punctuation_are_exact() {
+        let call_forth = "the total mana value of other spells you've cast this turn";
+        let (rest, qty) = parse_quantity_ref(call_forth).expect("Call Forth quantity must parse");
+        assert_eq!(rest, "");
+        let QuantityRef::PropertyAggregate(aggregate) = qty else {
+            panic!("expected property aggregate");
+        };
+        assert_eq!(aggregate.function(), AggregateFunction::Sum);
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+        assert!(matches!(
+            aggregate.source(),
+            CardTypeSetSource::TurnJournal {
+                journal: TurnJournalKind::SpellsCast,
+                scope: CountScope::Controller,
+                filter: Some(filter),
+            } if filter.contains_other_than_trigger_object()
+        ));
+
+        let rootha =
+            "the greatest mana value among instant and sorcery spells you've cast this turn";
+        let (rest, qty) = parse_quantity_ref(rootha).expect("Rootha quantity must parse");
+        assert_eq!(rest, "");
+        assert!(matches!(
+            qty,
+            QuantityRef::PropertyAggregate(ref aggregate)
+                if aggregate.function() == AggregateFunction::Max
+                    && aggregate.property() == ObjectProperty::ManaValue
+                    && matches!(
+                        aggregate.source(),
+                        CardTypeSetSource::TurnJournal {
+                            journal: TurnJournalKind::SpellsCast,
+                            scope: CountScope::Controller,
+                            filter: Some(filter),
+                        } if !filter.contains_other_than_trigger_object()
+                    )
+        ));
+
+        assert!(parse_quantity_ref_complete(&format!("{call_forth}.")).is_ok());
+        let comma_form = format!("{rootha},");
+        let (rest, comma_qty) =
+            parse_quantity_ref(&comma_form).expect("comma-delimited quantity must parse");
+        assert_eq!(rest, ",");
+        assert!(matches!(comma_qty, QuantityRef::PropertyAggregate(_)));
+
+        for near_miss in [
+            "the total mana value of other spells you cast this turn",
+            "the total mana value of other spells you've cast this game",
+            "the greatest mana value among creature spells you've cast this turn",
+            "the total mana value of other spells you've cast this turn except copies",
+        ] {
+            assert!(
+                parse_quantity_ref_complete(near_miss).is_err(),
+                "near-miss or semantic tail must remain unsupported: {near_miss}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // CR 109.2 population grammar — union tier, per-head grammar pinning, and
     // the guards that keep each hazard from becoming a silent misparse.
@@ -7097,11 +7348,9 @@ mod tests {
         assert_eq!(rest, "");
         assert!(matches!(
             q,
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Max,
-                property: ObjectProperty::Power,
-                ..
-            }
+            QuantityRef::PropertyAggregate(ref aggregate)
+                if aggregate.function() == AggregateFunction::Max
+                    && aggregate.property() == ObjectProperty::Power
         ));
     }
 
@@ -7137,11 +7386,17 @@ mod tests {
             parse_quantity_ref("the total power of the exiled cards used to craft it").unwrap();
         assert_eq!(rest, "");
         match q {
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter,
-            } => assert_eq!(filter, linked_exile_owned_filter()),
+            QuantityRef::PropertyAggregate(aggregate)
+                if aggregate.function() == AggregateFunction::Sum
+                    && aggregate.property() == ObjectProperty::Power =>
+            {
+                assert_eq!(
+                    aggregate.source(),
+                    &CardTypeSetSource::Objects {
+                        filter: linked_exile_owned_filter()
+                    }
+                )
+            }
             other => panic!("expected craft-material power aggregate, got {other:?}"),
         }
     }
@@ -7165,11 +7420,17 @@ mod tests {
             assert_eq!(rest, "", "tracked-set phrase {phrase:?} must fully consume");
             assert_eq!(
                 q,
-                QuantityRef::TrackedSetAggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::Power,
-                    source: TrackedAnaphorSource::ChainSet,
-                },
+                QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::Power,
+                        crate::types::ability::CardTypeSetSource::TrackedSet {
+                            set: TrackedAnaphorSource::ChainSet,
+                            caused_by: None
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                ),
                 "phrase {phrase:?}"
             );
         }
@@ -7204,11 +7465,9 @@ mod tests {
         assert_eq!(rest, "");
         assert!(matches!(
             q,
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaValue,
-                ..
-            }
+            QuantityRef::PropertyAggregate(ref aggregate)
+                if aggregate.function() == AggregateFunction::Sum
+                    && aggregate.property() == ObjectProperty::ManaValue
         ));
     }
 
@@ -7225,14 +7484,11 @@ mod tests {
         assert_eq!(exprs.len(), 2);
         assert!(matches!(exprs[0], QuantityExpr::Fixed { value: 2 }));
         assert!(matches!(
-            exprs[1],
+            &exprs[1],
             QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::Power,
-                    ..
-                }
-            }
+                qty: QuantityRef::PropertyAggregate(aggregate),
+            } if aggregate.function() == AggregateFunction::Max
+                && aggregate.property() == ObjectProperty::Power
         ));
     }
 
@@ -9113,6 +9369,7 @@ mod tests {
             QuantityRef::ControlledByEachPlayer {
                 filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             }
         );
         assert_eq!(rest, "");
@@ -9130,6 +9387,7 @@ mod tests {
             QuantityRef::ControlledByEachPlayer {
                 filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
                 aggregate: AggregateFunction::Max,
+                relation: PlayerRelation::All,
             }
         );
         assert_eq!(rest, "");
@@ -9147,9 +9405,51 @@ mod tests {
             QuantityRef::ControlledByEachPlayer {
                 filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent)),
                 aggregate: AggregateFunction::Min,
+                relation: PlayerRelation::All,
             }
         );
         assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn parse_controlled_count_extremum_preserves_player_population() {
+        for (text, expected_type, expected_relation) in [
+            (
+                "the greatest number of artifacts an opponent controls",
+                TypeFilter::Artifact,
+                PlayerRelation::Opponent,
+            ),
+            (
+                "the greatest number of creatures a player controls",
+                TypeFilter::Creature,
+                PlayerRelation::All,
+            ),
+        ] {
+            let (rest, qty) = parse_quantity_ref_complete(text).expect("extremum must parse");
+            assert_eq!(rest, "");
+            let QuantityRef::ControlledByEachPlayer {
+                filter: TargetFilter::Typed(filter),
+                aggregate: AggregateFunction::Max,
+                relation,
+            } = qty
+            else {
+                panic!("expected per-player controlled count for {text:?}, got {qty:?}");
+            };
+            assert_eq!(filter.type_filters, vec![expected_type]);
+            assert_eq!(filter.controller, None, "resolver owns controller binding");
+            assert_eq!(relation, expected_relation);
+        }
+    }
+
+    #[test]
+    fn parse_controlled_count_extremum_is_full_consuming() {
+        assert!(parse_quantity_ref_complete(
+            "the greatest number of artifacts an opponent controls and draws"
+        )
+        .is_err());
+        assert!(
+            parse_quantity_ref_complete("the greatest number of artifacts you control").is_err()
+        );
     }
 
     #[test]
@@ -9711,6 +10011,7 @@ mod tests {
             q,
             QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Discarded),
                 },
             }
@@ -9728,6 +10029,7 @@ mod tests {
             q,
             QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Exiled),
                 },
             }
@@ -9744,6 +10046,7 @@ mod tests {
             q,
             QuantityRef::DistinctCardTypes {
                 source: CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
                     caused_by: Some(ThisWayCause::Discarded),
                 },
             }
@@ -9867,7 +10170,7 @@ mod tests {
         assert_eq!(q, QuantityRef::EventContextAmount);
         assert_eq!(rest, "");
 
-        // CR 603.7c: bare "the damage dealt" form maps to EventContextAmount.
+        // CR 608.2h: bare "the damage dealt" form maps to EventContextAmount.
         let (rest, q) = parse_quantity_ref("the damage dealt").unwrap();
         assert_eq!(q, QuantityRef::EventContextAmount);
         assert_eq!(rest, "");
@@ -11057,18 +11360,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             q,
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
-                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-                    FilterProp::Owned {
-                        controller: ControllerRef::You,
-                    },
-                    FilterProp::InZone {
-                        zone: Zone::Graveyard,
-                    },
-                ])),
-            }
+            QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                            FilterProp::Owned {
+                                controller: ControllerRef::You,
+                            },
+                            FilterProp::InZone {
+                                zone: Zone::Graveyard,
+                            },
+                        ]))
+                    }
+                )
+                .expect("statically valid property aggregate")
+            )
         );
         assert_eq!(rest, "");
     }
@@ -11613,20 +11921,25 @@ mod tests {
             assert_eq!(rest, "");
             assert_eq!(
                 q,
-                QuantityRef::Aggregate {
-                    function: AggregateFunction::Sum,
-                    property: ObjectProperty::ManaValue,
-                    filter: TargetFilter::And {
-                        filters: vec![
-                            TargetFilter::ExiledBySource,
-                            TargetFilter::Typed(TypedFilter::default().properties(vec![
-                                FilterProp::Owned {
-                                    controller: ControllerRef::You,
-                                },
-                            ])),
-                        ],
-                    },
-                }
+                QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::ManaValue,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: TargetFilter::And {
+                                filters: vec![
+                                    TargetFilter::ExiledBySource,
+                                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                                        FilterProp::Owned {
+                                            controller: ControllerRef::You,
+                                        },
+                                    ])),
+                                ],
+                            }
+                        }
+                    )
+                    .expect("statically valid property aggregate")
+                )
             );
         }
     }
@@ -11639,17 +11952,15 @@ mod tests {
         assert_eq!(rest, "", "phrase should be fully consumed");
 
         // Verify it produces Aggregate with Max function
-        let QuantityRef::Aggregate {
-            function,
-            property,
-            filter,
-        } = q
-        else {
+        let QuantityRef::PropertyAggregate(aggregate) = q else {
             panic!("Expected Aggregate, got {q:?}");
         };
 
-        assert_eq!(function, AggregateFunction::Max);
-        assert_eq!(property, ObjectProperty::ManaValue);
+        assert_eq!(aggregate.function(), AggregateFunction::Max);
+        assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+        let CardTypeSetSource::Objects { filter } = aggregate.source() else {
+            panic!("Expected object source, got {:?}", aggregate.source());
+        };
 
         // Verify the filter uses InAnyZone for multi-zone disjunction
         let TargetFilter::Typed(tf) = filter else {
@@ -11801,12 +12112,16 @@ mod tests {
                 .unwrap();
         assert_eq!(rest, "");
         match q {
-            QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::ManaValue,
-                filter,
-            } => {
-                assert!(matches!(filter, TargetFilter::Typed(_)));
+            QuantityRef::PropertyAggregate(aggregate)
+                if aggregate.function() == AggregateFunction::Sum
+                    && aggregate.property() == ObjectProperty::ManaValue =>
+            {
+                assert!(matches!(
+                    aggregate.source(),
+                    CardTypeSetSource::Objects {
+                        filter: TargetFilter::Typed(_)
+                    }
+                ));
             }
             _ => panic!("expected Aggregate with Sum and ManaValue"),
         }
@@ -12264,11 +12579,9 @@ mod tests {
             assert!(
                 matches!(
                     q,
-                    QuantityRef::Aggregate {
-                        function: AggregateFunction::Max,
-                        property: ObjectProperty::ManaValue,
-                        ..
-                    }
+                    QuantityRef::PropertyAggregate(ref aggregate)
+                        if aggregate.function() == AggregateFunction::Max
+                            && aggregate.property() == ObjectProperty::ManaValue
                 ),
                 "{phrase:?} -> {q:?}"
             );
@@ -12309,13 +12622,21 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
             assert_eq!(rest, "", "{phrase:?} must fully consume");
             match q {
-                QuantityRef::TrackedSetAggregate {
-                    function: f,
-                    property: p,
-                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                } => {
-                    assert_eq!(f, function, "{phrase:?} aggregate function");
-                    assert_eq!(p, property, "{phrase:?} property");
+                QuantityRef::PropertyAggregate(aggregate)
+                    if matches!(
+                        aggregate.source(),
+                        CardTypeSetSource::TrackedSet {
+                            set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                            ..
+                        }
+                    ) =>
+                {
+                    assert_eq!(
+                        aggregate.function(),
+                        function,
+                        "{phrase:?} aggregate function"
+                    );
+                    assert_eq!(aggregate.property(), property, "{phrase:?} property");
                 }
                 other => panic!("{phrase:?} must be a ChainSet TrackedSetAggregate, got {other:?}"),
             }
@@ -12344,11 +12665,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{phrase:?} must bind: {e:?}"));
             assert_eq!(rest, "", "{phrase:?} must fully consume");
             match q {
-                QuantityRef::TrackedSetAggregate {
-                    function: AggregateFunction::Sum,
-                    property: p,
-                    source: crate::types::ability::TrackedAnaphorSource::ChainSet,
-                } => assert_eq!(p, property, "{phrase:?} property"),
+                QuantityRef::PropertyAggregate(aggregate)
+                    if aggregate.function() == AggregateFunction::Sum
+                        && matches!(
+                            aggregate.source(),
+                            CardTypeSetSource::TrackedSet {
+                                set: crate::types::ability::TrackedAnaphorSource::ChainSet,
+                                ..
+                            }
+                        ) =>
+                {
+                    assert_eq!(aggregate.property(), property, "{phrase:?} property")
+                }
                 other => panic!("{phrase:?} must be a ChainSet TrackedSetAggregate, got {other:?}"),
             }
         }

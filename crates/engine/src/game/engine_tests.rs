@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use super::*;
@@ -14,12 +15,14 @@ use crate::types::ability::{
 use crate::types::card_type::CardType;
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
-use crate::types::events::PlayerActionKind;
+use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::format::FormatConfig;
 use crate::types::game_state::{
-    CastPaymentMode, CastingVariant, PendingCast, ProductionOverride, TargetSelectionProgress,
+    ActionResult, CastPaymentMode, CastingVariant, PendingCast, ProductionOverride,
+    TargetSelectionProgress, WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
+use crate::types::log::{GameLogEntry, LogCategory, LogSegment};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use crate::types::statics::{CastFrequency, StaticMode};
 use crate::types::TriggerMode;
@@ -75,6 +78,153 @@ fn no_op_stack_entry(id: u64, controller: PlayerId) -> StackEntry {
             )),
         },
     }
+}
+
+fn restored_automation_log_entry(seq: u32) -> GameLogEntry {
+    GameLogEntry {
+        seq,
+        turn: 1,
+        phase: Phase::PreCombatMain,
+        category: LogCategory::Stack,
+        segments: vec![LogSegment::Text("automated stack resolution".to_string())],
+        presentation: Default::default(),
+    }
+}
+
+fn restored_automation_action_result(
+    events: Vec<GameEvent>,
+    log_entries: Vec<GameLogEntry>,
+) -> ActionResult {
+    ActionResult {
+        events,
+        waiting_for: WaitingFor::Priority { player: P0 },
+        log_entries,
+    }
+}
+
+#[test]
+fn restored_stack_automation_presentation_bounds_transport_but_retains_full_engine_events() {
+    let event_count = 2_001_u64;
+    let mut events: Vec<_> = (0..event_count - 1)
+        .map(|id| GameEvent::StackResolved {
+            object_id: ObjectId(id),
+        })
+        .collect();
+    events.push(GameEvent::GameOver { winner: Some(P0) });
+    let log_count = MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES as u32 + 7;
+    let logs: Vec<_> = (0..log_count).map(restored_automation_log_entry).collect();
+    let mut full_result = restored_automation_action_result(events, logs);
+    full_result.waiting_for = WaitingFor::GameOver { winner: Some(P0) };
+    let resumed = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::Progressed(full_result),
+    );
+
+    assert_eq!(
+        resumed.action_result().events.len(),
+        event_count as usize,
+        "the engine keeps every event needed for lifecycle bookkeeping"
+    );
+    assert!(matches!(
+        resumed.action_result().events.last(),
+        Some(GameEvent::GameOver { winner: Some(P0) })
+    ));
+    assert!(matches!(
+        resumed.action_result().waiting_for,
+        WaitingFor::GameOver { winner: Some(P0) }
+    ));
+    assert_eq!(
+        resumed.presentation.outcome,
+        RestoredStackAutomationOutcome::Progressed
+    );
+    assert_eq!(
+        resumed.presentation.automated_resolution_count,
+        event_count as u32 - 1
+    );
+    assert_eq!(resumed.presentation.omitted_event_count, event_count as u32);
+    assert_eq!(
+        resumed.presentation.log_entries.len(),
+        MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES
+    );
+    assert_eq!(
+        resumed
+            .presentation
+            .log_entries
+            .first()
+            .expect("bounded tail is non-empty")
+            .seq,
+        log_count - MAX_RESTORED_STACK_AUTOMATION_LOG_ENTRIES as u32
+    );
+    assert_eq!(
+        resumed
+            .presentation
+            .log_entries
+            .last()
+            .expect("bounded tail is non-empty")
+            .seq,
+        log_count - 1
+    );
+
+    let wire = serde_json::to_value(&resumed).expect("presentation serializes");
+    assert!(
+        wire.get("result").is_none(),
+        "the unbounded internal result must never serialize"
+    );
+    assert_eq!(
+        wire["presentation"]["omittedEventCount"],
+        serde_json::json!(event_count),
+        "the transport gets an explicit lossless count instead of the event burst"
+    );
+}
+
+#[test]
+fn restored_stack_automation_presentation_distinguishes_noop_progress_and_repair() {
+    let noop = RestoredStackAutomationResume::from_completed(RestoredStackAutomationResult::Noop(
+        restored_automation_action_result(Vec::new(), Vec::new()),
+    ));
+    let progressed = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::Progressed(restored_automation_action_result(
+            vec![
+                GameEvent::PriorityPassed { player_id: P0 },
+                GameEvent::StackResolved {
+                    object_id: ObjectId(1),
+                },
+            ],
+            vec![restored_automation_log_entry(1)],
+        )),
+    );
+    let repair = RestoredStackAutomationResume::from_completed(
+        RestoredStackAutomationResult::ZeroResolutionRepair(restored_automation_action_result(
+            vec![GameEvent::PriorityPassed { player_id: P0 }],
+            Vec::new(),
+        )),
+    );
+
+    assert_eq!(
+        noop.presentation.outcome,
+        RestoredStackAutomationOutcome::Noop
+    );
+    assert_eq!(noop.presentation.automated_resolution_count, 0);
+    assert_eq!(noop.presentation.omitted_event_count, 0);
+
+    assert_eq!(
+        progressed.presentation.outcome,
+        RestoredStackAutomationOutcome::Progressed
+    );
+    assert_eq!(progressed.presentation.automated_resolution_count, 1);
+    assert_eq!(progressed.presentation.omitted_event_count, 2);
+    assert_eq!(progressed.presentation.log_entries.len(), 1);
+    assert_eq!(
+        progressed.action_result().events.len(),
+        2,
+        "small results still retain their normal engine event slice"
+    );
+
+    assert_eq!(
+        repair.presentation.outcome,
+        RestoredStackAutomationOutcome::ZeroResolutionRepair
+    );
+    assert_eq!(repair.presentation.automated_resolution_count, 0);
+    assert_eq!(repair.presentation.omitted_event_count, 1);
 }
 
 #[test]
@@ -3520,6 +3670,191 @@ fn cancel_auto_pass_routes_by_actor() {
     assert!(
         !state.auto_pass.contains_key(&PlayerId(0)),
         "P0's auto-pass should have been cancelled"
+    );
+}
+
+#[test]
+fn cancelling_a_session_representative_restores_the_pre_overlay_preferences() {
+    use crate::types::game_state::{
+        AutoPassMode, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_777, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    let baseline = BTreeMap::from([(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    )]);
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    apply(&mut state, PlayerId(0), GameAction::CancelAutoPass)
+        .expect("the representative may cancel its own session");
+
+    assert!(state.stack_resolution_session.is_none());
+    assert_eq!(
+        state.auto_pass,
+        baseline.into_iter().collect::<HashMap<_, _>>()
+    );
+}
+
+#[test]
+fn representative_replacement_recaptures_the_restored_baseline() {
+    use crate::types::game_state::{
+        AutoPassMode, AutoPassRequest, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_779, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    let baseline = BTreeMap::from([(
+        PlayerId(1),
+        AutoPassMode::UntilTurnBoundary {
+            until: TurnBoundary::MyNextTurnStart,
+        },
+    )]);
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    let response_id = create_object(
+        &mut state,
+        CardId(7_780),
+        PlayerId(1),
+        "Priority Response".to_string(),
+        Zone::Battlefield,
+    );
+    let response = state
+        .objects
+        .get_mut(&response_id)
+        .expect("the response permanent was just created");
+    response.card_types.core_types.push(CoreType::Artifact);
+    Arc::make_mut(&mut response.abilities).push(AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    ));
+
+    apply(
+        &mut state,
+        PlayerId(0),
+        GameAction::SetAutoPass {
+            mode: AutoPassRequest::UntilStackEmpty,
+        },
+    )
+    .expect("the representative may replace its live session");
+
+    assert_eq!(
+        state
+            .stack_resolution_session
+            .as_ref()
+            .expect("replacement installs a fresh session")
+            .auto_pass_overlay
+            .baseline,
+        baseline,
+        "replacement must not capture the previous overlay as its new baseline"
+    );
+    apply(&mut state, PlayerId(0), GameAction::CancelAutoPass)
+        .expect("the representative may cancel the replacement");
+    assert_eq!(
+        state.auto_pass,
+        baseline.into_iter().collect::<HashMap<_, _>>()
+    );
+}
+
+#[test]
+fn elimination_restores_session_baseline_before_departing_preferences_are_cleaned() {
+    use crate::types::game_state::{
+        AutoPassMode, StackResolutionAutoPassOverlay, StackResolutionBudget,
+        StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, TurnBoundary,
+    };
+
+    let mut state = setup_game_at_main_phase();
+    let entry = no_op_stack_entry(7_778, PlayerId(0));
+    state.stack.push_back(entry.clone());
+    state.auto_pass.insert(
+        PlayerId(0),
+        AutoPassMode::UntilStackEmpty {
+            initial_stack_len: 1,
+            policy: StackResolutionPolicy::Committed,
+        },
+    );
+    let baseline = BTreeMap::from([
+        (
+            PlayerId(0),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::EndOfCurrentTurn,
+            },
+        ),
+        (
+            PlayerId(1),
+            AutoPassMode::UntilTurnBoundary {
+                until: TurnBoundary::MyNextTurnStart,
+            },
+        ),
+    ]);
+    state.stack_resolution_session = Some(StackResolutionSession {
+        entries: vec![StackResolutionEntryFence::capture(&entry)],
+        cursor: 0,
+        representatives: [PlayerId(0)].into_iter().collect(),
+        verified_pass_representatives: BTreeSet::new(),
+        budget: StackResolutionBudget::Unlimited,
+        policy: StackResolutionPolicy::Committed,
+        auto_pass_overlay: StackResolutionAutoPassOverlay {
+            baseline: baseline.clone(),
+        },
+    });
+
+    let mut events = Vec::new();
+    crate::game::elimination::eliminate_player(&mut state, PlayerId(0), &mut events);
+
+    assert!(state.stack_resolution_session.is_none());
+    assert!(
+        !state.auto_pass.contains_key(&PlayerId(0)),
+        "the departing seat is cleaned only after the baseline is restored"
+    );
+    assert_eq!(
+        state.auto_pass.get(&PlayerId(1)),
+        baseline.get(&PlayerId(1)),
+        "the survivor's pre-overlay preference is retained"
     );
 }
 
@@ -12160,56 +12495,172 @@ fn morph_casts_face_down_under_multiple_name_prohibitions() {
     );
 }
 
-/// LOW-2 (CR 732.2a / CR 111.10): `derived_fodder_class` is the single-new-object gate that
-/// guarantees the boundary Tokens mint's per-cycle fodder count k ≡ 1. It returns `Some(class)`
-/// for a period that reproduced EXACTLY one new battlefield object, and `None` for a period that
-/// reproduced two+ (a non-certifiable multi-fodder shape ⇒ no `Tokens` stash ⇒ no k·N undercount).
-/// This is the structural proof behind the k≡1 annotation at the boundary mint and on the
-/// `PersistentAxisMaterialization::Tokens` variant.
+/// Two new battlefield objects created identically (`name`, types, P/T, controller, zone), plus
+/// the `before` frame they are diffed against. The shared fixture of rows A-1 / A-2 / A-2b: every
+/// row starts from a HOMOGENEOUS pair and applies at most ONE post-construction mutation, so the
+/// field it moves is the only thing that can explain its verdict.
 ///
-/// REVERT-FAILING assertion: delete `if new_ids.next().is_some() { return None }` in
-/// `derived_fodder_class` (engine.rs) ⇒ the two-new-object case returns `Some(first)` ⇒ the
-/// `is_none()` assert below flips to FAIL. Non-vacuity: the paired one-new-object `Some` case is
-/// the positive reach-guard (the gate genuinely admits the k≡1 shape).
-#[test]
-fn derived_fodder_class_is_single_new_object_gate() {
+/// `create_object`'s name argument writes BOTH `name` and `base_name` (`game_object.rs`), so it
+/// can never be the discriminating knob — moving it moves `object_content_eq`'s `name` conjunct
+/// AND `CopiableValues.name` at once. Every row below mutates a field directly instead.
+fn fodder_multiset_frames(
+    mutate: impl FnOnce(&mut GameState, ObjectId, ObjectId),
+) -> (GameState, GameState) {
     let before = GameState::new_two_player(7);
-
-    // One new battlefield object across the period ⇒ Some(class) (the k≡1 certifiable shape).
-    let mut after_one = before.clone();
-    let saproling = create_object(
-        &mut after_one,
+    let mut after = before.clone();
+    let a = create_object(
+        &mut after,
         CardId(1),
         PlayerId(0),
         "Saproling".to_string(),
         Zone::Battlefield,
     );
-    let class = derived_fodder_class(&before, &after_one);
-    assert!(
-        class.as_ref().is_some_and(|o| o.id == saproling),
-        "reach-guard: one new battlefield object ⇒ the reproduced fodder class; got {class:?}"
-    );
-
-    // Two new battlefield objects across the period ⇒ None: a multi-fodder period is not this
-    // shape, so no `Tokens` stash is registered and the k>1 undercount is unreachable.
-    let mut after_two = before.clone();
-    create_object(
-        &mut after_two,
+    let b = create_object(
+        &mut after,
         CardId(1),
         PlayerId(0),
         "Saproling".to_string(),
         Zone::Battlefield,
     );
-    create_object(
-        &mut after_two,
-        CardId(2),
+    mutate(&mut after, a, b);
+    // Reach-guard, holding under EVERY revert probe: the fixture genuinely produced two new
+    // battlefield entries. Without it a fixture bug that created zero new objects would make
+    // every `is_none()` row below pass for the wrong reason.
+    assert_eq!(
+        after.battlefield.len(),
+        before.battlefield.len() + 2,
+        "reach-guard: the fixture must produce exactly two new battlefield objects"
+    );
+    (before, after)
+}
+
+/// CR 732.2a / CR 111.3 / CR 707.2: `derived_fodder_class` is the ONE-CLASS gate that gives the
+/// boundary `Tokens` mint its per-cycle fodder count k. It returns `Some((class, k))` for a period
+/// whose new battlefield objects are all one homogeneous class, and `None` otherwise (a
+/// heterogeneous multi-fodder shape ⇒ no `Tokens` stash ⇒ no mint from an unrepresentative profile).
+///
+/// HOMOGENEITY IS A CONJUNCTION and each conjunct has its own row: `fodder_content_eq` (A-2) and
+/// `intrinsic_copiable_values` (A-2b). A-1 is the positive; A-2c is the fail-closed reconciliation.
+///
+/// REVERT-FAILING assertions: **A-1** restore `if new_ids.next().is_some() { return None }` ⇒ k=2
+/// returns `None`; **A-2** delete the `fodder_content_eq` conjunct ⇒ the counter-differing pair
+/// returns `Some((class, 2))` (`CopiableValues` carries no counters field, so the other conjunct
+/// cannot red it); **A-2b** delete the `intrinsic_copiable_values` conjunct ⇒ the
+/// `base_card_types`-differing pair returns `Some((class, 2))`; **A-2c** delete the `.then_some`
+/// reconciliation ⇒ the torn frame returns `Some((class, 1))`. Each ⇒ FAILS.
+#[test]
+fn derived_fodder_class_is_one_class_multiset_gate() {
+    // A-1 (positive) — a homogeneous k=2 period classifies AND reports k.
+    let (before, after) = fodder_multiset_frames(|_, _, _| {});
+    let derived = derived_fodder_class(&before, &after);
+    assert!(
+        derived.is_some(),
+        "A-1: a homogeneous two-object period is a certifiable fodder multiset; got {derived:?}"
+    );
+    let (class, k) = derived.expect("asserted Some above");
+    assert_eq!(
+        k, 2,
+        "A-1: the reported per-cycle count IS the member count"
+    );
+    assert_eq!(
+        class.name, "Saproling",
+        "A-1: the class is the reproduced fodder, not an unrelated object"
+    );
+
+    // A-1 reach-guard: the k≡1 shape still classifies, with k == 1.
+    let single_before = GameState::new_two_player(7);
+    let mut single_after = single_before.clone();
+    let lone = create_object(
+        &mut single_after,
+        CardId(1),
         PlayerId(0),
         "Saproling".to_string(),
         Zone::Battlefield,
     );
     assert!(
-        derived_fodder_class(&before, &after_two).is_none(),
-        "single-new-object gate: two new battlefield objects ⇒ None (delete the second-`next` \
-         guard and this flips to Some)"
+        derived_fodder_class(&single_before, &single_after)
+            .is_some_and(|(o, k)| o.id == lone && k == 1),
+        "A-1 reach-guard: one new battlefield object ⇒ that class with k == 1"
+    );
+
+    // A-2 (matched negative, MUTABLE axis) — a counter difference makes the multiset
+    // heterogeneous under `fodder_content_eq` (`object_content_eq` compares `counters`).
+    // CR 707.2: "Other effects …, status, counters, and stickers are
+    // not copied", so `CopiableValues` has no counters field and this moves EXACTLY one conjunct.
+    // `CounterType::Stun` is deliberate: `is_monotone_loop_resource()` is false for it, so
+    // `project_object_for_loop`'s `retain` cannot strip it if projection is ever reordered ahead
+    // of this derivation.
+    let (before, after) = fodder_multiset_frames(|state, _a, b| {
+        state
+            .objects
+            .get_mut(&b)
+            .expect("fixture object b exists")
+            .counters
+            .insert(CounterType::Stun, 1);
+    });
+    assert!(
+        derived_fodder_class(&before, &after).is_none(),
+        "A-2: a counter-differing pair is NOT one fodder class (delete the `fodder_content_eq` \
+         conjunct and this flips to Some)"
+    );
+
+    // A-2b (matched negative, COPIABLE axis) — the pair the OLD, content-only predicate would
+    // have accepted. `intrinsic_copiable_values` folds `obj.base_card_types` into
+    // `CopiableValues.card_types` (`printed_cards.rs`), and `object_content_eq` compares NEITHER
+    // `card_types` NOR `base_card_types` — asserted below rather than claimed.
+    let (before, after) = fodder_multiset_frames(|state, _a, b| {
+        state
+            .objects
+            .get_mut(&b)
+            .expect("fixture object b exists")
+            .base_card_types = CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Artifact],
+            subtypes: vec![],
+        };
+    });
+    {
+        let a_obj = after
+            .objects
+            .values()
+            .find(|o| o.base_card_types.core_types != vec![CoreType::Artifact])
+            .expect("the unmutated member");
+        let b_obj = after
+            .objects
+            .values()
+            .find(|o| o.base_card_types.core_types == vec![CoreType::Artifact])
+            .expect("the mutated member");
+        assert!(
+            crate::analysis::resource::fodder_content_eq(a_obj, b_obj),
+            "A-2b non-vacuity: the PRE-EXISTING content predicate cannot tell these two apart — \
+             so only the `CopiableValues` conjunct can refuse them"
+        );
+    }
+    assert!(
+        derived_fodder_class(&before, &after).is_none(),
+        "A-2b: members differing on what the MINT copies are not one class (delete the \
+         `intrinsic_copiable_values` conjunct and this flips to Some)"
+    );
+
+    // A-2c (fail-closed reconciliation) — a torn frame: a battlefield id with no `objects` entry
+    // is skipped by the `filter_map`, and must not be silently dropped from k.
+    let torn_before = GameState::new_two_player(7);
+    let mut torn_after = torn_before.clone();
+    create_object(
+        &mut torn_after,
+        CardId(1),
+        PlayerId(0),
+        "Saproling".to_string(),
+        Zone::Battlefield,
+    );
+    torn_after.battlefield.push_back(ObjectId(999_999));
+    assert!(
+        !torn_after.objects.contains_key(&ObjectId(999_999)),
+        "A-2c reach-guard: the torn id must genuinely have no `objects` entry"
+    );
+    assert!(
+        derived_fodder_class(&torn_before, &torn_after).is_none(),
+        "A-2c: a torn frame is refused, not under-counted (delete the `.then_some` \
+         reconciliation and this returns Some((class, 1)))"
     );
 }

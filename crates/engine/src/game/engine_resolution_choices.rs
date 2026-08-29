@@ -692,7 +692,8 @@ fn collect_search_observer_triggers(
 pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
     matches!(
         waiting_for,
-        WaitingFor::MeldPairChoice { .. }
+        WaitingFor::ResolutionOptionalPaymentChoice { .. }
+            | WaitingFor::MeldPairChoice { .. }
             | WaitingFor::MeldAttackTargetChoice { .. }
             | WaitingFor::EntryAttackTargetChoice { .. }
             | WaitingFor::ScryChoice { .. }
@@ -814,7 +815,7 @@ pub(crate) fn route_rest_partition(
     route_rest_partition_then(state, &ordered_ids, rest_zone, source_id, None, events)
 }
 
-fn route_rest_partition_then(
+pub(crate) fn route_rest_partition_then(
     state: &mut GameState,
     rest_ids: &[ObjectId],
     rest_zone: Zone,
@@ -1564,6 +1565,19 @@ pub(super) fn handle_resolution_choice(
     events: &mut Vec<GameEvent>,
 ) -> Result<ResolutionChoiceOutcome, EngineError> {
     let outcome = match (waiting_for, action) {
+        // CR 608.2d: the resolving effect offers only its legal optional payment choices; CR 118.12: choosing a payable branch continues the payment whose success governs the reflexive "If you do" result.
+        (
+            WaitingFor::ResolutionOptionalPaymentChoice {
+                player,
+                source_id,
+                costs,
+            },
+            GameAction::ChooseResolutionOptionalPaymentBranch { choice },
+        ) => ResolutionChoiceOutcome::WaitingFor(
+            super::engine_payment_choices::handle_resolution_optional_payment_choice(
+                state, player, source_id, costs, choice, events,
+            )?,
+        ),
         (
             WaitingFor::MeldPairChoice { player, choices },
             GameAction::ChooseMeldPair {
@@ -1849,6 +1863,7 @@ pub(super) fn handle_resolution_choice(
                     crate::game::zone_pipeline::defer_completion_on_pause(
                         state,
                         crate::types::game_state::BatchCompletion::RevealRestPile {
+                            delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                             player,
                             source_id: Some(source_id),
                             rest_cards: graveyard_cards,
@@ -1857,10 +1872,13 @@ pub(super) fn handle_resolution_choice(
                             clear_markers: cards.clone(),
                             publish_tracked_set: None,
                             emit_reveal_until_resolved: None,
-                            // #7467 review round 2: the entry paused, so the
-                            // publish below never runs — the completion drain
-                            // publishes instead, once the entry completed.
+                            // The entry paused, so the publish below never
+                            // runs — the completion drain publishes instead,
+                            // once the entry has completed.
                             manifested_for_continuation: Some(manifest_id),
+                            kept_delivery: Default::default(),
+                            continuation_targets: Vec::new(),
+                            rest_delivery: Default::default(),
                         },
                     );
                     return Ok(ResolutionChoiceOutcome::WaitingFor(
@@ -1869,7 +1887,7 @@ pub(super) fn handle_resolution_choice(
                 }
             }
 
-            // CR 608.2c + CR 701.62a (#7467): the manifested creature enters
+            // CR 608.2c + CR 701.62a: the manifested creature enters
             // from THIS continuation, so its `ZoneChanged` never reaches the
             // resolver-side harvest — the chain's tracked set was published
             // EMPTY when the head parked. Re-publish it here so a chained
@@ -2102,6 +2120,8 @@ pub(super) fn handle_resolution_choice(
                             crate::game::zone_pipeline::defer_completion_on_pause(
                                 state,
                                 crate::types::game_state::BatchCompletion::RevealRestPile {
+                                    delivery_stage:
+                                        crate::types::game_state::DigDeliveryStage::Rest,
                                     player,
                                     source_id: Some(source_id),
                                     rest_cards: misses,
@@ -2111,6 +2131,9 @@ pub(super) fn handle_resolution_choice(
                                     publish_tracked_set: None,
                                     emit_reveal_until_resolved: None,
                                     manifested_for_continuation: None,
+                                    kept_delivery: Default::default(),
+                                    continuation_targets: Vec::new(),
+                                    rest_delivery: Default::default(),
                                 },
                             );
                             return Ok(ResolutionChoiceOutcome::WaitingFor(
@@ -2167,6 +2190,7 @@ pub(super) fn handle_resolution_choice(
                 &misses,
                 rest_destination,
                 Some(crate::types::game_state::BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                     player,
                     source_id: Some(source_id),
                     rest_cards: Vec::new(),
@@ -2176,6 +2200,9 @@ pub(super) fn handle_resolution_choice(
                     publish_tracked_set: None,
                     emit_reveal_until_resolved: None,
                     manifested_for_continuation: None,
+                    kept_delivery: Default::default(),
+                    continuation_targets: Vec::new(),
+                    rest_delivery: Default::default(),
                 }),
                 events,
             ) {
@@ -2672,28 +2699,26 @@ pub(super) fn handle_resolution_choice(
                             continue;
                         }
                         match item {
-                            PersistentAxisMaterialization::Tokens(profile) => {
-                                // CR 707.2 (+ CR 111.10): mint N tapped copy-tokens of the
-                                // fodder profile — a source-less mint, so route through
-                                // `drive_copy_token_batches` (`ObjectId(0)` sentinel source).
+                            PersistentAxisMaterialization::Tokens(growth) => {
+                                // CR 707.2 + CR 111.3: mint `per_cycle_delta × N` tapped
+                                // copy-tokens of the fodder profile — a source-less mint, so route
+                                // through `drive_copy_token_batches` (`ObjectId(0)` sentinel).
                                 //
-                                // CR 732.2a k≡1 INVARIANT: this mints `count: amount` == k·amount
-                                // with the per-cycle fodder count k STRUCTURALLY ≡ 1. A `Tokens`
-                                // stash is only registered under `if let Some(profile)` in
-                                // `materialize_object_growth_shortcut` (engine.rs), whose
-                                // `current_period_fodder` derives the profile from
-                                // `derived_fodder_class` (`game/engine.rs`), which returns `None`
-                                // unless EXACTLY one new battlefield object appeared per period
-                                // (`let id = new_ids.next()?; if new_ids.next().is_some() { None }`).
-                                // A k>1 period (two+ new objects/cycle) fails that gate ⇒ no `Tokens`
-                                // stash ⇒ this arm is never reached for k≠1. So `count: amount` is
-                                // EXACT, not a k·N undercount. (Counters/Life instead carry a measured
-                                // `per_cycle_delta`, so those axes handle k>1 by construction.)
+                                // CR 732.2a k-MULTISET INVARIANT: k is the per-cycle count from
+                                // `game::engine::derived_fodder_class`, which is `None` unless
+                                // EVERY new battlefield object of the period is equal under BOTH
+                                // `analysis::resource::fodder_content_eq` and
+                                // `game::printed_cards::intrinsic_copiable_values` — so one
+                                // profile faithfully represents all k. A period whose k already
+                                // absorbed a `CreateToken` replacement's factor is routed to
+                                // `DriveSequence` instead (`token_growth_is_observed`, gated on
+                                // k > 1), so this mint's own `replace_event` below cannot apply it
+                                // twice. Counters/Life carry the same `per_cycle_delta` field.
                                 let batch = crate::types::game_state::PendingCopyTokenBatch {
                                     owner: player,
-                                    count: amount,
+                                    count: growth.per_cycle_delta.saturating_mul(amount),
                                     copy: Box::new(crate::types::proposed_event::CopyTokenSpec {
-                                        values: profile.clone(),
+                                        values: growth.profile.clone(),
                                         display_source:
                                             crate::game::game_object::DisplaySource::Token,
                                         printed_ref: None,
@@ -2815,7 +2840,7 @@ pub(super) fn handle_resolution_choice(
                     // CR 732.2a: cash out ONLY the axes actually collapsed (axis-scoped) —
                     // end their ∞ status + stash + pile, PRESERVING any coexisting axis (a
                     // debug infinite-mana capability, or a finding-#4-declined axis). The ∞
-                    // display collapses to an ordinary ×N for the collapsed axes (§9).
+                    // display collapses to an ordinary ×N for the collapsed axes.
                     //
                     // FINDING #4 DECLINED-AXIS ∞ LIFECYCLE (CR 732.1b — the shortcut system
                     // determines how the loop is broken; see BoundaryHold::ObservedGrowth): a declined `Counters`/`Life`
@@ -2851,12 +2876,65 @@ pub(super) fn handle_resolution_choice(
                     // whole backing gone: the growth still lands here, and a row that vanished
                     // before it landed would be the display lying about an agreed result.
                     state.clear_collapsed_materializations(player, &collapsed);
-                    // Continue the boundary fixpoint (§7): re-draining either prompts the
-                    // next APNAP player with a stash or restores Priority now.
+                    // Re-drain the boundary: it either raises a prompt of its own — the
+                    // next APNAP controller's collapse count, or a CR 616.1 ordering
+                    // choice — or completes the phase entry.
                     crate::game::turns::drain_pending_phase_transition_progress(state, events);
-                    return Ok(ResolutionChoiceOutcome::WaitingFor(
-                        state.waiting_for.clone(),
-                    ));
+                    // The phase cursor says which of those two the re-drain did, and it is
+                    // this arm's own result rather than an invariant of the call below.
+                    // Still standing ⇒ the drain paused with the entry unfinished, so the
+                    // beat belongs to whoever finishes it and the deferred-trigger latch
+                    // stays set for them.
+                    let waiting_for = if state.pending_phase_transition_progress.is_some() {
+                        state.waiting_for.clone()
+                    } else {
+                        // Entry complete. `turns::finish_enter_phase` granted
+                        // `priority_player` but wrote no beat and put none of the phase's
+                        // beginning-of-phase abilities on the stack, and CR 117.3a places
+                        // the grant after BOTH the phase's turn-based actions and those
+                        // abilities. `turns::process_phase_triggers` is what stacks them
+                        // and it runs on no path but `turns::auto_advance`'s phase arms.
+                        //
+                        // So the latch is cleared on the ONE branch below that goes back
+                        // through the interpreter in this action, and only there: an exit
+                        // that deferred to a live prompt has not paid CR 117.3a yet, and
+                        // clearing the latch would retire the debt with nothing having
+                        // stacked. `turns::resume_deferred_step_triggers` collects it at the
+                        // priority boundary the deferred-to prompt returns through.
+                        // CR 732.2a: the taken shortcut's ending point is the first
+                        // priority the turn interpreter grants — the beat below, or the one
+                        // behind the entered phase's CR 703.1 turn-based action (CR 508.1's
+                        // declare-attackers is the reachable instance). CR 732.2c: the
+                        // shortcut is taken with the proposal's game choices having been
+                        // taken; its shortened-proposal sentence binds only IF the proposal
+                        // was shortened, and then the player who now has priority MUST make
+                        // a different game choice than the one originally proposed.
+                        //
+                        // Read before the call, because `auto_advance` overwrites
+                        // `state.waiting_for`. Both shapes below go back through the
+                        // interpreter: the stale collapse prompt this arm answered, and a
+                        // `Priority` an applier wrote on its way through — that one still
+                        // owes the phase's triggers, so it is not the grant CR 117.3a
+                        // describes. Anything else standing here is an applier's LIVE
+                        // prompt — a mint's CR 303.4f host choice is the reachable one,
+                        // because `token_copy`'s pause parks its continuation BELOW the
+                        // child boundary and the `active_copy_token()` guard above reads
+                        // only the top frame. Overwriting it would destroy the choice, so
+                        // this exit defers to it and leaves the latch owed instead.
+                        if matches!(
+                            state.waiting_for,
+                            WaitingFor::PayAmountChoice {
+                                resource: PayableResource::LoopCollapse { .. },
+                                ..
+                            } | WaitingFor::Priority { .. }
+                        ) {
+                            state.deferred_step_trigger_resume = None;
+                            crate::game::turns::auto_advance(state, events)
+                        } else {
+                            state.waiting_for.clone()
+                        }
+                    };
+                    return Ok(ResolutionChoiceOutcome::WaitingFor(waiting_for));
                 }
                 PayableResource::Energy => {
                     // CR 107.14: Remove N energy counters from the player.
@@ -3527,6 +3605,8 @@ pub(super) fn handle_resolution_choice(
                             crate::game::zone_pipeline::defer_completion_on_pause(
                                 state,
                                 crate::types::game_state::BatchCompletion::RevealRestPile {
+                                    delivery_stage:
+                                        crate::types::game_state::DigDeliveryStage::Rest,
                                     player,
                                     source_id: dig_source_id,
                                     rest_cards: Vec::new(),
@@ -3536,6 +3616,9 @@ pub(super) fn handle_resolution_choice(
                                     publish_tracked_set: None,
                                     emit_reveal_until_resolved: None,
                                     manifested_for_continuation: None,
+                                    kept_delivery: Default::default(),
+                                    continuation_targets: Vec::new(),
+                                    rest_delivery: Default::default(),
                                 },
                             );
                             return Ok(ResolutionChoiceOutcome::WaitingFor(
@@ -3549,129 +3632,70 @@ pub(super) fn handle_resolution_choice(
                 ));
             }
             if let Some(kept_zone) = kept_destination {
-                if kept_zone != Zone::Battlefield {
-                    // CR 614.1 + CR 616.1 + CR 608.2c: Kept cards leaving the
-                    // library are effect-owned zone events. Their destination
-                    // delivery, rest-pile routing, tracked-set publication, and
-                    // continuation drain are one typed batch tail so none can
-                    // run before every kept card has settled.
-                    let publish_set = if kept.is_empty() {
-                        Vec::new()
-                    } else if state.active_ability_continuation().is_some_and(|cont| {
-                        dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
-                    }) {
-                        unkept.clone()
-                    } else {
-                        kept.clone()
-                    };
-                    let defer_rest_routing =
-                        state.active_ability_continuation().is_some_and(|cont| {
-                            dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
-                        });
-                    let reqs = kept
-                        .iter()
-                        .map(|&obj_id| {
-                            crate::game::zone_pipeline::ZoneMoveRequest::effect(
-                                obj_id,
-                                kept_zone,
-                                dig_source_id.unwrap_or(obj_id),
-                            )
-                        })
-                        .collect();
-                    crate::game::zone_pipeline::move_objects_simultaneously_then(
-                        state,
-                        reqs,
-                        Some(
-                            crate::types::game_state::BatchCompletion::DigKeptDeliveryComplete {
-                                player,
-                                source_id: dig_source_id,
-                                rest_cards: if defer_rest_routing {
-                                    Vec::new()
-                                } else {
-                                    unkept
-                                },
-                                rest_destination: rest_destination.unwrap_or(Zone::Graveyard),
-                                rest_order,
-                                publish_tracked_set: publish_set,
-                                continuation_targets: kept.clone(),
-                            },
-                        ),
-                        events,
-                    );
-                    return Ok(ResolutionChoiceOutcome::WaitingFor(
-                        state.waiting_for.clone(),
-                    ));
-                }
-                for &obj_id in &kept {
-                    // CR 614.1c + CR 306.5b / CR 310.4b: route battlefield
-                    // entries through the zone-change pipeline so the delivery
-                    // tail seeds intrinsic enters-with counters and applies the
-                    // CR 614.1 tap-state. The previous manual `obj.tapped` is
-                    // dropped (the tail does it from the seeded EntryMods).
-                    // CR 400.7: attribute the entry to the dig's source when
-                    // known; otherwise the moved object anchors itself (the
-                    // pre-pipeline raw move recorded no source).
-                    let mut req = crate::game::zone_pipeline::ZoneMoveRequest::effect(
-                        obj_id,
-                        Zone::Battlefield,
-                        dig_source_id.unwrap_or(obj_id),
-                    );
-                    req.mods.enter_tapped =
-                        crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped);
-                    req.mods.enters_attacking = enters_attacking;
-                    match crate::game::zone_pipeline::move_object(state, req, events) {
-                        crate::game::zone_pipeline::ZoneMoveResult::Done => {}
-                        // CR 303.4f / CR 616.1: the kept card's battlefield
-                        // entry paused on an as-enters choice (aura host pick /
-                        // replacement ordering). The pause is already parked;
-                        // defer the rest-pile move + tracked-set publish +
-                        // continuation wiring onto the batch tail so the drain
-                        // runs it once the entry resolves — otherwise the
-                        // unkept cards strand in the library (they were not yet
-                        // moved). The drain fires on both the replacement-choice
-                        // resume and the aura-attachment resume.
-                        //
-                        // SCOPING (multi-kept limitation, pre-existing,
-                        // strictly no-worse-than-before): this `return` exits
-                        // the `for &obj_id in &kept` loop, so if kept card #1
-                        // pauses, kept #2+ are NOT moved to the battlefield —
-                        // they remain in the library. The deferred completion
-                        // only finishes the rest-pile (unkept) move and the
-                        // tracked-set publish; it does not resume the kept
-                        // loop. The old raw-`move_to_zone` path had the same
-                        // ceiling (it could not pause and resume a kept tail
-                        // either), so this is no regression. WRINKLE:
-                        // `publish_tracked_set: Some(kept.clone())` publishes
-                        // ALL kept cards, including the unmoved #2+, so a
-                        // downstream sub-ability keyed off the tracked set can
-                        // be wired to cards still in the library on this paused
-                        // path. Acceptable today because no supported dig card
-                        // both keeps 2+ cards to the battlefield AND surfaces an
-                        // as-enters pause on the first; revisit if such a card
-                        // is added (the fix is a kept-loop continuation, not a
-                        // single completion).
-                        crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_)
-                        | crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
-                            crate::game::zone_pipeline::defer_completion_on_pause(
-                                state,
-                                crate::types::game_state::BatchCompletion::RevealRestPile {
-                                    player,
-                                    source_id: dig_source_id,
-                                    rest_cards: unkept.clone(),
-                                    rest_destination: rest_destination.unwrap_or(Zone::Graveyard),
-                                    rest_order,
-                                    clear_markers: Vec::new(),
-                                    publish_tracked_set: Some(kept.clone()),
-                                    emit_reveal_until_resolved: None,
-                                    manifested_for_continuation: None,
-                                },
-                            );
-                            return Ok(ResolutionChoiceOutcome::WaitingFor(
-                                state.waiting_for.clone(),
-                            ));
+                // Every kept-card delivery,
+                // including battlefield entry, shares one logical batch. Its
+                // completion receives only the settled ZoneChanged occurrences,
+                // so redirected/prevented selections cannot leak into "this
+                // way" continuations after a pause.
+                let publish_set = if kept.is_empty() {
+                    Vec::new()
+                } else if state.active_ability_continuation().is_some_and(|cont| {
+                    dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
+                }) {
+                    unkept.clone()
+                } else {
+                    kept.clone()
+                };
+                let defer_rest_routing = state.active_ability_continuation().is_some_and(|cont| {
+                    dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
+                });
+                let reqs = kept
+                    .iter()
+                    .map(|&obj_id| {
+                        let mut request = crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                            obj_id,
+                            kept_zone,
+                            dig_source_id.unwrap_or(obj_id),
+                        );
+                        if kept_zone == Zone::Battlefield {
+                            request.mods.enter_tapped =
+                                crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped);
+                            request.mods.enters_attacking = enters_attacking;
                         }
-                    }
-                }
+                        request
+                    })
+                    .collect();
+                crate::game::zone_pipeline::move_objects_simultaneously_then(
+                    state,
+                    reqs,
+                    Some(crate::types::game_state::BatchCompletion::RevealRestPile {
+                        delivery_stage: crate::types::game_state::DigDeliveryStage::Kept,
+                        player,
+                        source_id: dig_source_id,
+                        rest_cards: if defer_rest_routing {
+                            Vec::new()
+                        } else {
+                            unkept
+                        },
+                        rest_destination: rest_destination.unwrap_or(Zone::Graveyard),
+                        rest_order,
+                        clear_markers: Vec::new(),
+                        publish_tracked_set: Some(publish_set),
+                        emit_reveal_until_resolved: None,
+                        manifested_for_continuation: None,
+                        kept_delivery: crate::types::game_state::DigKeptDeliveryOutcome::pending(
+                            state,
+                            kept.clone(),
+                            kept_zone,
+                        ),
+                        continuation_targets: kept.clone(),
+                        rest_delivery: Default::default(),
+                    }),
+                    events,
+                );
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
             }
             // CR 701.20b + CR 608.2c: Publish a tracked set for downstream
             // sub_abilities. Reveal/keep continuations (Zimone land split) bind
@@ -3701,39 +3725,45 @@ pub(super) fn handle_resolution_choice(
                 .active_ability_continuation()
                 .is_some_and(|cont| dig_continuation_needs_full_looked_at_tracked_set(&cont.chain));
             if !defer_rest_routing {
-                match route_rest_partition(
-                    state,
-                    &unkept,
-                    rest_destination.unwrap_or(Zone::Graveyard),
-                    rest_order,
-                    dig_source_id,
-                    events,
-                ) {
-                    crate::game::zone_pipeline::BatchMoveResult::Done => {}
-                    crate::game::zone_pipeline::BatchMoveResult::NeedsChoice => {
-                        // CR 701.20e + CR 616.1: `route_rest_partition` has
-                        // parked the undelivered suffix. Its cleanup tail owns
-                        // the publication and continuation work, so the drain
-                        // performs it exactly once only after the true batch end.
-                        crate::game::zone_pipeline::defer_completion_on_pause(
-                            state,
-                            crate::types::game_state::BatchCompletion::RevealRestPile {
-                                player,
-                                source_id: dig_source_id,
-                                rest_cards: Vec::new(),
-                                rest_destination: rest_destination.unwrap_or(Zone::Graveyard),
-                                rest_order,
-                                clear_markers: Vec::new(),
-                                publish_tracked_set: Some(publish_set),
-                                emit_reveal_until_resolved: None,
-                                manifested_for_continuation: None,
-                            },
-                        );
-                        return Ok(ResolutionChoiceOutcome::WaitingFor(
-                            state.waiting_for.clone(),
-                        ));
-                    }
+                let rest_destination = rest_destination.unwrap_or(Zone::Graveyard);
+                let mut ordered_unkept = unkept.clone();
+                if rest_destination == Zone::Library && rest_order == DigRestOrder::Random {
+                    ordered_unkept.shuffle(&mut state.rng);
                 }
+                let completion = crate::types::game_state::BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
+                    player,
+                    source_id: dig_source_id,
+                    rest_cards: Vec::new(),
+                    rest_destination,
+                    rest_order,
+                    clear_markers: Vec::new(),
+                    publish_tracked_set: Some(publish_set),
+                    emit_reveal_until_resolved: None,
+                    manifested_for_continuation: None,
+                    kept_delivery: Default::default(),
+                    continuation_targets: Vec::new(),
+                    rest_delivery: crate::types::game_state::DigRestDeliveryOutcome::pending(
+                        state,
+                        ordered_unkept.clone(),
+                        rest_destination,
+                    ),
+                };
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    match route_rest_partition_then(
+                        state,
+                        &ordered_unkept,
+                        rest_destination,
+                        dig_source_id,
+                        Some(completion),
+                        events,
+                    ) {
+                        crate::game::zone_pipeline::BatchMoveResult::Done
+                        | crate::game::zone_pipeline::BatchMoveResult::NeedsChoice => {
+                            state.waiting_for.clone()
+                        }
+                    },
+                ));
             }
             effects::publish_fresh_tracked_set(state, publish_set);
             if let Some(frame) = state.active_ability_continuation_frame_mut() {
@@ -5666,20 +5696,41 @@ pub(super) fn handle_resolution_choice(
                 // deferred optional attach (Nahiri, the Lithomancer +2).
                 EffectKind::Attach => {
                     let Some(frame) = state
-                        .take_active_ability_continuation()
-                        .expect("attach choice cannot consume a buried continuation")
+                        .active_ability_continuation_frame()
+                        .filter(|frame| frame.pending.attachment_choice.is_some())
+                        .cloned()
                     else {
                         return Err(EngineError::InvalidAction(
                             "Attach EffectZoneChoice missing stashed ability".to_string(),
                         ));
                     };
-                    effects::attach::complete_resolution_attachment_choice(
+                    let trigger_context = frame.pending.trigger_context.clone();
+                    let trigger_firing = frame.pending.trigger_firing;
+                    effects::restore_continuation_trigger_firing(state, trigger_firing);
+                    let trigger_snapshot = trigger_context.as_ref().map(|context| {
+                        crate::game::triggers::push_resolving_trigger_context(state, context)
+                    });
+                    set_priority(state, player);
+                    let resolve_result = effects::attach::resolve_selected_attachment_choice(
                         &mut *state,
-                        *frame.pending.chain,
                         &chosen,
                         events,
-                    )
-                    .map_err(|e| EngineError::InvalidAction(e.to_string()))?;
+                    );
+                    if let Some(snapshot) = trigger_snapshot {
+                        crate::game::triggers::restore_trigger_event_context(state, snapshot);
+                    }
+                    let completed =
+                        resolve_result.map_err(|e| EngineError::InvalidAction(e.to_string()))?;
+                    if !completed {
+                        // CR 608.2c + CR 616.1: A host answer can replace its
+                        // marker with the following Equipment-choice child,
+                        // and an Attached replacement parks above that same
+                        // marker. In either case it remains the next prompt's
+                        // exact owner until the resolution reaches priority.
+                        return Ok(ResolutionChoiceOutcome::WaitingFor(
+                            state.waiting_for.clone(),
+                        ));
+                    }
                     set_priority(state, player);
                     resume_with_error_propagation(state, events)?;
                     return Ok(ResolutionChoiceOutcome::WaitingFor(
@@ -7349,6 +7400,7 @@ fn route_kept_card_or_defer(
             crate::game::zone_pipeline::defer_completion_on_pause(
                 state,
                 crate::types::game_state::BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                     player,
                     source_id: Some(source_id),
                     rest_cards: misses.to_vec(),
@@ -7358,6 +7410,9 @@ fn route_kept_card_or_defer(
                     publish_tracked_set: None,
                     emit_reveal_until_resolved: None,
                     manifested_for_continuation: None,
+                    kept_delivery: Default::default(),
+                    continuation_targets: Vec::new(),
+                    rest_delivery: Default::default(),
                 },
             );
             Some(ResolutionChoiceOutcome::WaitingFor(
@@ -7693,6 +7748,9 @@ pub(crate) fn run_batch_completion(
 ) -> crate::game::zone_pipeline::BatchMoveResult {
     use crate::types::game_state::BatchCompletion;
     match completion {
+        BatchCompletion::MilledDeliveryComplete { player_id, cards } => {
+            effects::mill::complete_mill_delivery(state, player_id, cards, events)
+        }
         BatchCompletion::ReturnAsAuraNoTargetComplete { source_id } => {
             effects::return_as_aura::complete_no_target_delivery(source_id, events)
         }
@@ -7922,54 +7980,6 @@ pub(crate) fn run_batch_completion(
             );
             crate::game::zone_pipeline::BatchMoveResult::Done
         }
-        BatchCompletion::DigKeptDeliveryComplete {
-            player,
-            source_id,
-            rest_cards,
-            rest_destination,
-            rest_order,
-            publish_tracked_set,
-            continuation_targets,
-        } => {
-            if !rest_cards.is_empty() {
-                match route_rest_partition(
-                    state,
-                    &rest_cards,
-                    rest_destination,
-                    rest_order,
-                    source_id,
-                    events,
-                ) {
-                    crate::game::zone_pipeline::BatchMoveResult::Done => {}
-                    crate::game::zone_pipeline::BatchMoveResult::NeedsChoice => {
-                        crate::game::zone_pipeline::defer_completion_on_pause(
-                            state,
-                            BatchCompletion::DigKeptDeliveryComplete {
-                                player,
-                                source_id,
-                                rest_cards: Vec::new(),
-                                rest_destination,
-                                rest_order,
-                                publish_tracked_set,
-                                continuation_targets,
-                            },
-                        );
-                        return crate::game::zone_pipeline::BatchMoveResult::NeedsChoice;
-                    }
-                }
-            }
-            effects::publish_fresh_tracked_set(state, publish_tracked_set);
-            if let Some(frame) = state.active_ability_continuation_frame_mut() {
-                frame.pending.chain.targets = continuation_targets
-                    .iter()
-                    .map(|&id| TargetRef::Object(id))
-                    .collect();
-                frame.pending.chain.context.optional_effect_performed =
-                    !continuation_targets.is_empty();
-            }
-            finish_with_continuation(state, player, events);
-            crate::game::zone_pipeline::BatchMoveResult::Done
-        }
         BatchCompletion::ForEachCategoryExileComplete {
             ability,
             pool,
@@ -8022,6 +8032,7 @@ pub(crate) fn run_batch_completion(
         // continuation wiring (if any), then drain the continuation — exactly the
         // tail the synchronous path runs inline.
         BatchCompletion::RevealRestPile {
+            delivery_stage,
             player,
             source_id,
             rest_cards,
@@ -8031,40 +8042,86 @@ pub(crate) fn run_batch_completion(
             publish_tracked_set,
             emit_reveal_until_resolved,
             manifested_for_continuation,
+            kept_delivery,
+            continuation_targets,
+            rest_delivery,
         } => {
+            // CR 608.2c + CR 614.1 + CR 616.1: A kept Dig delivery can pause
+            // before its rest pile starts. Keep its completion in the same
+            // typed carrier, then advance it to the rest stage before routing
+            // the unkept cards so replacement re-parks retain the full tail.
+            if delivery_stage == crate::types::game_state::DigDeliveryStage::Kept
+                && !rest_cards.is_empty()
+            {
+                let mut ordered_rest_cards = rest_cards.clone();
+                if rest_destination == Zone::Library && rest_order == DigRestOrder::Random {
+                    ordered_rest_cards.shuffle(&mut state.rng);
+                }
+                let completion = BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
+                    player,
+                    source_id,
+                    rest_cards: Vec::new(),
+                    rest_destination,
+                    rest_order,
+                    clear_markers,
+                    publish_tracked_set,
+                    emit_reveal_until_resolved,
+                    manifested_for_continuation,
+                    kept_delivery,
+                    continuation_targets,
+                    rest_delivery: crate::types::game_state::DigRestDeliveryOutcome::pending(
+                        state,
+                        ordered_rest_cards.clone(),
+                        rest_destination,
+                    ),
+                };
+                return route_rest_partition_then(
+                    state,
+                    &ordered_rest_cards,
+                    rest_destination,
+                    source_id,
+                    Some(completion),
+                    events,
+                );
+            }
             // The dig path (`publish_tracked_set.is_some()`) routes the rest pile
             // through `route_rest_partition` (ordered library bottom); the
             // reveal-until path routes through `move_rest_then`, including
             // Library-bottom placement and any CR 616.1 pause. Dispatch on the
             // dig-only payload so each site keeps its synchronous semantics.
-            if publish_tracked_set.is_some() {
-                match route_rest_partition(
-                    state,
-                    &rest_cards,
+            if publish_tracked_set.is_some() && !rest_cards.is_empty() {
+                let mut ordered_rest_cards = rest_cards.clone();
+                if rest_destination == Zone::Library && rest_order == DigRestOrder::Random {
+                    ordered_rest_cards.shuffle(&mut state.rng);
+                }
+                let cleanup = BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
+                    player,
+                    source_id,
+                    rest_cards: Vec::new(),
                     rest_destination,
                     rest_order,
+                    clear_markers,
+                    publish_tracked_set,
+                    emit_reveal_until_resolved,
+                    manifested_for_continuation,
+                    kept_delivery,
+                    continuation_targets,
+                    rest_delivery: crate::types::game_state::DigRestDeliveryOutcome::pending(
+                        state,
+                        ordered_rest_cards.clone(),
+                        rest_destination,
+                    ),
+                };
+                return route_rest_partition_then(
+                    state,
+                    &ordered_rest_cards,
+                    rest_destination,
                     source_id,
+                    Some(cleanup),
                     events,
-                ) {
-                    crate::game::zone_pipeline::BatchMoveResult::Done => {}
-                    crate::game::zone_pipeline::BatchMoveResult::NeedsChoice => {
-                        crate::game::zone_pipeline::defer_completion_on_pause(
-                            state,
-                            BatchCompletion::RevealRestPile {
-                                player,
-                                source_id,
-                                rest_cards: Vec::new(),
-                                rest_destination,
-                                rest_order,
-                                clear_markers,
-                                publish_tracked_set,
-                                emit_reveal_until_resolved,
-                                manifested_for_continuation,
-                            },
-                        );
-                        return crate::game::zone_pipeline::BatchMoveResult::NeedsChoice;
-                    }
-                }
+                );
             } else if !rest_cards.is_empty() {
                 // CR 701.20a + CR 616.1: Reveal-until rest piles are fully
                 // pipeline-owned, including Library-bottom placement. If a
@@ -8072,6 +8129,7 @@ pub(crate) fn run_batch_completion(
                 // this completion as cleanup-only so reveal markers and
                 // continuation drain run after the pile actually lands.
                 let cleanup = BatchCompletion::RevealRestPile {
+                    delivery_stage: crate::types::game_state::DigDeliveryStage::Rest,
                     player,
                     source_id,
                     rest_cards: Vec::new(),
@@ -8081,6 +8139,9 @@ pub(crate) fn run_batch_completion(
                     publish_tracked_set: None,
                     emit_reveal_until_resolved,
                     manifested_for_continuation,
+                    kept_delivery,
+                    continuation_targets,
+                    rest_delivery,
                 };
                 return effects::reveal_until::move_rest_then(
                     state,
@@ -8098,13 +8159,64 @@ pub(crate) fn run_batch_completion(
                     ResolvedInformationEdit::Hide,
                 )
                 .expect("reveal-rest cleanup must reference live card occurrences");
+            // CR 608.2c + CR 614.1 + CR 616.1: The kept and rest deliveries can
+            // settle in different replacement-choice groups; publish each from
+            // its own completed outcome only after both tails have finished.
+            let kept_completed = kept_delivery.completed_ids();
+            let rest_completed = rest_delivery.completed_ids();
             if let Some(kept) = publish_tracked_set {
-                effects::publish_fresh_tracked_set(state, kept.clone());
+                let published = if !kept.is_empty()
+                    && rest_delivery.destination.is_some()
+                    && kept.iter().all(|id| {
+                        rest_delivery
+                            .selected
+                            .iter()
+                            .any(|selected| selected.object_id == *id)
+                    }) {
+                    rest_completed.clone()
+                } else if !kept.is_empty()
+                    && kept_delivery.destination.is_some()
+                    && kept.iter().all(|id| {
+                        kept_delivery
+                            .selected
+                            .iter()
+                            .any(|selected| selected.object_id == *id)
+                    })
+                {
+                    kept_completed.clone()
+                } else {
+                    kept
+                };
+                effects::publish_fresh_tracked_set(state, published.clone());
                 if let Some(frame) = state.active_ability_continuation_frame_mut() {
-                    frame.pending.chain.targets =
-                        kept.iter().map(|&id| TargetRef::Object(id)).collect();
-                    frame.pending.chain.context.optional_effect_performed = !kept.is_empty();
+                    let continuation = if continuation_targets.is_empty() {
+                        published
+                    } else {
+                        continuation_targets
+                            .iter()
+                            .filter(|id| kept_completed.contains(id))
+                            .copied()
+                            .collect()
+                    };
+                    frame.pending.chain.targets = continuation
+                        .iter()
+                        .map(|&id| TargetRef::Object(id))
+                        .collect();
+                    frame.pending.chain.context.optional_effect_performed =
+                        !continuation.is_empty();
                 }
+            }
+            if kept_delivery.destination.is_some() {
+                // CR 608.2c + CR 614.1 + CR 616.1: A Dig's continuation reads
+                // its kept delivery (for example, Equipment put onto the
+                // battlefield), not the later rest-pile move. Replace the
+                // ledger even when every kept move was prevented or redirected
+                // so a `ZoneChangedThisWay` rider cannot read stale data.
+                state.last_zone_changed_ids = kept_completed;
+            } else if rest_delivery.destination.is_some() {
+                // A non-Dig reveal-rest completion has no kept delivery, so its
+                // settled rest pile remains the resolution's event population.
+                state.last_zone_changed_ids = rest_completed;
             }
             if let Some(source_id) = emit_reveal_until_resolved {
                 events.push(crate::types::events::GameEvent::EffectResolved {
@@ -8113,7 +8225,7 @@ pub(crate) fn run_batch_completion(
                     subject: None,
                 });
             }
-            // CR 608.2c + CR 701.62a (#7467): the paused manifest entry has
+            // CR 608.2c + CR 701.62a: the paused manifest entry has
             // completed by now — publish its object for the parked consumer,
             // the deferred mirror of the synchronous `ManifestDreadChoice`
             // publish (same gate, same battlefield filter).
@@ -10744,7 +10856,12 @@ mod tests {
         use crate::game::derived_views::CollapseCertainty;
 
         let kinds = [
-            PersistentAxisMaterialization::Tokens(boundary_census_token_profile()),
+            PersistentAxisMaterialization::Tokens(Box::new(
+                crate::types::game_state::TokenGrowth {
+                    profile: boundary_census_token_profile(),
+                    per_cycle_delta: 1,
+                },
+            )),
             PersistentAxisMaterialization::Counters(vec![]),
             PersistentAxisMaterialization::Life {
                 player: PlayerId(0),
