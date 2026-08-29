@@ -45905,6 +45905,171 @@ fn cast_from_among_the_instant_or_sorcery_cards_exiled_this_way_binds_to_exiled_
     );
 }
 
+/// CR 601.2 (strict lowering): a printed cast cap too large for the window's
+/// representation must NOT become the unbounded sentinel.
+///
+/// These fixtures are deliberately synthetic — the largest printed
+/// `"cast up to N"` in the entire card corpus is THREE (Ashiok, Nightmare Muse)
+/// and the largest `"up to N"` of any kind is TEN (Reshape the Earth), so this
+/// is a representation-boundary hostile fixture, not a card surface. The defect
+/// it locks: `parse_from_among_cast_count` returned `u8::try_from(count).ok()`,
+/// and once `None` became the "any number of spells" sentinel, `"up to 300"`
+/// silently WIDENED a stated bound to unlimited — strictly more permissive than
+/// the printed instruction.
+///
+/// The paired positive control below proves the fixture reaches the real
+/// resolution-window arm rather than dying in some upstream anchor, so the
+/// negative assertions are not vacuous.
+#[test]
+fn from_among_cast_cap_above_u8_is_refused_not_widened_to_unbounded() {
+    // Positive control: an in-range cap on the identical surface DOES lower to a
+    // bounded resolution window. If this stops holding, the negatives below
+    // prove nothing.
+    let control =
+        parse_effect("cast up to two spells from among them without paying their mana costs");
+    let Effect::CastFromZone {
+        driver: CastFromZoneDriver::ResolutionWindow { bounds },
+        ..
+    } = &control
+    else {
+        panic!("in-range cap must lower to a resolution window, got {control:?}");
+    };
+    assert_eq!(
+        bounds.max_casts,
+        Some(2),
+        "the printed in-range bound must be carried losslessly"
+    );
+
+    // And the genuinely unbounded surface is what `None` is reserved for.
+    let unbounded =
+        parse_effect("cast any number of spells from among them without paying their mana costs");
+    let Effect::CastFromZone {
+        driver: CastFromZoneDriver::ResolutionWindow { bounds },
+        ..
+    } = &unbounded
+    else {
+        panic!("\"any number of\" must lower to a resolution window, got {unbounded:?}");
+    };
+    assert_eq!(
+        bounds.max_casts, None,
+        "\"any number of spells\" is the one surface that means unbounded"
+    );
+
+    for count in ["256", "300"] {
+        let text =
+            format!("cast up to {count} spells from among them without paying their mana costs");
+        let e = parse_effect(&text);
+        // The whole point: whatever else happens, an out-of-range literal must
+        // never reach the runtime as an unbounded window.
+        if let Effect::CastFromZone {
+            driver: CastFromZoneDriver::ResolutionWindow { bounds },
+            ..
+        } = &e
+        {
+            panic!(
+                "\"up to {count}\" must not lower to a resolution window \
+                 (got max_casts {:?}); an unrepresentable cap is not unbounded",
+                bounds.max_casts
+            );
+        }
+        // It stays on the pre-existing lingering-permission path instead.
+        assert!(
+            matches!(
+                &e,
+                Effect::CastFromZone {
+                    driver: LingeringPermission,
+                    ..
+                }
+            ),
+            "\"up to {count}\" must fall back to the established permission path, got {e:?}"
+        );
+    }
+}
+
+/// CR 601.2 (strict lowering): the direct graveyard/hand free-cast route must
+/// refuse the same out-of-range literals.
+///
+/// This is the second, independent route the maintainer flagged. It had a
+/// cruder version of the same defect: a bare `parse_number` followed by
+/// `count as u8`, so `"up to 300"` WRAPPED to 44 — a fabricated bound that is
+/// neither the printed number nor an honest refusal. Both routes now share
+/// `parse_representable_cast_count`, so they cannot diverge again.
+#[test]
+fn free_cast_from_zones_cap_above_u8_is_refused_not_truncated() {
+    // Positive control: Invoke Calamity's real, in-range surface still lowers.
+    let control = parse_effect(
+        "you may cast up to two instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs",
+    );
+    let Effect::FreeCastFromZones { count, .. } = &control else {
+        panic!("in-range cap must lower to FreeCastFromZones, got {control:?}");
+    };
+    assert_eq!(
+        *count,
+        Some(2),
+        "the printed in-range bound must be carried losslessly"
+    );
+
+    for n in ["256", "300"] {
+        let text = format!(
+            "you may cast up to {n} instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs"
+        );
+        let e = parse_effect(&text);
+        if let Effect::FreeCastFromZones { count, .. } = &e {
+            panic!(
+                "\"up to {n}\" must not lower to a free-cast window (got count {count:?}); \
+                 truncating to {} or widening to unbounded are both silent rules errors",
+                n.parse::<u32>().unwrap() as u8
+            );
+        }
+    }
+}
+
+/// CR 601.2 (strict lowering): the counted exiled-this-way route (Plargg and
+/// Nassari's "up to two spells from among the other cards exiled this way")
+/// shares the same cap authority.
+///
+/// This route already rejected out-of-range literals via an inline
+/// `count > u8::MAX as u32` check; the test pins that behavior now that the
+/// check has moved into the shared `parse_representable_cast_count`, so a future
+/// refactor cannot silently drop it from this route alone.
+#[test]
+fn counted_exiled_this_way_cast_cap_above_u8_is_refused() {
+    let control = parse_effect(
+        "cast up to two spells from among the cards exiled this way without paying their mana costs",
+    );
+    assert!(
+        matches!(&control, Effect::FreeCastFromZones { count: Some(2), .. })
+            || matches!(
+                &control,
+                Effect::CastFromZone {
+                    driver: CastFromZoneDriver::ResolutionWindow { .. },
+                    ..
+                }
+            ),
+        "in-range cap must still lower to a bounded window, got {control:?}"
+    );
+
+    for n in ["256", "300"] {
+        let text = format!(
+            "cast up to {n} spells from among the cards exiled this way without paying their mana costs"
+        );
+        let e = parse_effect(&text);
+        if let Effect::FreeCastFromZones { count, .. } = &e {
+            panic!("\"up to {n}\" must not lower to a counted free cast, got count {count:?}");
+        }
+        if let Effect::CastFromZone {
+            driver: CastFromZoneDriver::ResolutionWindow { bounds },
+            ..
+        } = &e
+        {
+            panic!(
+                "\"up to {n}\" must not lower to a resolution window, got max_casts {:?}",
+                bounds.max_casts
+            );
+        }
+    }
+}
+
 /// CR 406.6 + CR 603.10a: Jeleva, Nephalia's Scourge attack-trigger
 /// surface — "cast an instant or sorcery spell from among cards exiled
 /// with ~ without paying its mana cost." Distinct from the

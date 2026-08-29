@@ -24008,18 +24008,19 @@ fn from_among_batch_cast_driver(
     if clause_states_a_duration(rest) {
         return CastFromZoneDriver::LingeringPermission;
     }
-    // CR 601.2 (strict lowering): "cast up to X spells" states a hard cap whose
-    // value is not a literal at parse time (Wand of Wonder's X comes from a d20
-    // roll). Lowering it to an unbounded window would silently WIDEN a stated
-    // bound, so leave that shape on the established permission path — the same
-    // rule `try_parse_counted_free_cast_from_exiled_this_way` already applies to
-    // its own counted form.
-    if from_among_head(rest).is_some_and(has_unrepresentable_cast_cap) {
+    // CR 601.2 (strict lowering): "cast up to X spells" states a hard cap the
+    // window representation cannot express — either because the value is not a
+    // literal at parse time (Wand of Wonder's X comes from a d20 roll) or
+    // because the literal does not fit `max_casts` (see
+    // `parse_representable_cast_count`). Lowering either one would silently
+    // WIDEN a stated bound into the unbounded sentinel, so leave that shape on
+    // the established permission path — the same rule
+    // `try_parse_counted_free_cast_from_exiled_this_way` already applies to its
+    // own counted form.
+    let Some(bounds) = parse_from_among_window_bounds(rest) else {
         return CastFromZoneDriver::LingeringPermission;
-    }
-    CastFromZoneDriver::ResolutionWindow {
-        bounds: parse_from_among_window_bounds(rest),
-    }
+    };
+    CastFromZoneDriver::ResolutionWindow { bounds }
 }
 
 /// CR 611.2a: true when the clause states a durational scope at ANY position.
@@ -24035,12 +24036,84 @@ fn clause_states_a_duration(rest: &str) -> bool {
         .is_some()
 }
 
-/// CR 601.2: true for an "up to <non-literal>" cap the window cannot represent.
-fn has_unrepresentable_cast_cap(head: &str) -> bool {
+/// CR 601.2: A printed cast cap, read as a value the window can actually carry.
+///
+/// The three readings are kept in ONE type because the previous `Option<u8>`
+/// encoding conflated two of them: `None` meant "any number of spells", so a
+/// literal that merely failed to fit a `u8` (`u8::try_from(300).ok()`) decayed
+/// into the unbounded sentinel and silently WIDENED a stated bound to
+/// unlimited. A cap the representation cannot express is a third, distinct
+/// outcome — never a synonym for "unbounded" — and this enum makes that
+/// unrepresentable by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CastCapReading {
+    /// CR 601.2: the explicit "any number of" quantifier, or a bare plural head
+    /// noun. Genuinely no printed cap.
+    Unbounded,
+    /// CR 601.2: a stated cap the window carries losslessly.
+    Capped(u8),
+    /// CR 601.2 (strict lowering): a cap IS printed, but this representation
+    /// cannot express it — a non-literal `X` (Wand of Wonder's d20 roll) or a
+    /// literal outside `parse_representable_cast_count`'s range. Callers must
+    /// fall back to the established permission path rather than lower it.
+    Unrepresentable,
+}
+
+/// CR 601.2: `parse_number` narrowed to the counts a cast window can carry.
+///
+/// The single authority for "is this printed literal a usable cast cap?", shared
+/// by every route that lowers a `"up to N"` cast bound (the `from among`
+/// resolution window, the counted exiled-this-way form, and the direct
+/// graveyard/hand form) so they cannot drift in how they treat an out-of-range
+/// literal. Each caller composes it in place of a bare `parse_number` and
+/// inherits the rejection as a normal parse failure.
+///
+/// Rejects, rather than silently mangling, both degenerate ends:
+///   * `0` — "up to zero spells" is not a window this effect models, and
+///     `try_parse_counted_free_cast_from_exiled_this_way` already excluded it.
+///   * `> u8::MAX` — the bound `max_casts`/`count` cannot hold. Truncating
+///     (`300 as u8` → 44) or widening it to the unbounded sentinel
+///     (`u8::try_from(300).ok()` → `None`) are both silent rules errors, so the
+///     clause is left unlowered instead. This costs no real coverage: the
+///     largest printed `"cast up to N"` in the whole card corpus is THREE
+///     (Ashiok, Nightmare Muse), and the largest `"up to N"` of any kind is TEN
+///     (Reshape the Earth) — `u8` keeps two orders of magnitude of headroom.
+fn parse_representable_cast_count(input: &str) -> OracleResult<'_, u8> {
+    let (rest, count) = nom_primitives::parse_number.parse(input)?;
+    let count = u8::try_from(count)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| oracle_err(input))?;
+    Ok((rest, count))
+}
+
+/// CR 601.2: Read the cast cap stated by the quantifier phrase (see
+/// `CastCapReading`).
+fn read_from_among_cast_cap(head: &str) -> CastCapReading {
     type E<'a> = OracleError<'a>;
-    tag::<_, _, E>("up to ")
-        .parse(head)
-        .is_ok_and(|(after_up_to, _)| nom_primitives::parse_number.parse(after_up_to).is_err())
+    // CR 601.2: "any number of" is the explicit unbounded quantifier and wins
+    // over the noun's grammatical number.
+    if tag::<_, _, E>("any number of ").parse(head).is_ok() {
+        return CastCapReading::Unbounded;
+    }
+    // CR 601.2: "up to N" is a hard cap the window's stop-early loop enforces.
+    // Once the "up to " anchor matches, a cap IS printed, so anything the count
+    // parser refuses is `Unrepresentable` — never a fall-through to the plural
+    // heuristic below, which would read the stated bound as unbounded.
+    if let Ok((after_up_to, _)) = tag::<_, _, E>("up to ").parse(head) {
+        return match parse_representable_cast_count(after_up_to) {
+            Ok((_, count)) => CastCapReading::Capped(count),
+            Err(_) => CastCapReading::Unrepresentable,
+        };
+    }
+    // Otherwise the head noun's grammatical number decides. The trailing space
+    // is part of the tag so `scan_contains`'s word-boundary scan cannot match
+    // the plural inside a longer word, and a singular "spell"/"card" head never
+    // matches it at all.
+    if scan_contains_phrase(head, "spells ") || scan_contains_phrase(head, "cards ") {
+        return CastCapReading::Unbounded;
+    }
+    CastCapReading::Capped(1)
 }
 
 /// CR 601.2 + CR 202.3: Read the two window bounds out of the quantifier phrase
@@ -24053,12 +24126,22 @@ fn has_unrepresentable_cast_cap(head: &str) -> bool {
 /// instruction in the same line cannot leak in (Improvisation Capstone exiles
 /// "until you exile cards with total mana value 4 or greater", which is the
 /// EXILE step's bound, not the cast window's).
-fn parse_from_among_window_bounds(rest: &str) -> ResolutionCastWindow {
+///
+/// `None` is the strict-lowering refusal: the head states a cap this window
+/// cannot represent (`CastCapReading::Unrepresentable`), so the caller keeps the
+/// clause on the lingering-permission path instead of lowering a bound it would
+/// have to falsify.
+fn parse_from_among_window_bounds(rest: &str) -> Option<ResolutionCastWindow> {
     let head = from_among_head(rest).unwrap_or(rest);
-    ResolutionCastWindow {
-        max_casts: parse_from_among_cast_count(head),
+    let max_casts = match read_from_among_cast_cap(head) {
+        CastCapReading::Unbounded => None,
+        CastCapReading::Capped(count) => Some(count),
+        CastCapReading::Unrepresentable => return None,
+    };
+    Some(ResolutionCastWindow {
+        max_casts,
         max_total_mv: parse_from_among_total_mv_budget(head),
-    }
+    })
 }
 
 /// The quantifier + noun phrase preceding the `from among` anchor.
@@ -24067,34 +24150,6 @@ fn from_among_head(rest: &str) -> Option<&str> {
         .parse(rest)
         .ok()
         .map(|(_, head)| head)
-}
-
-/// CR 601.2: How many spells the window may cast. `None` is the unbounded
-/// "any number of spells" / bare-plural form; `Some(n)` is an explicit "up to
-/// n"; a singular head noun ("a spell", "an instant or sorcery spell") is one.
-fn parse_from_among_cast_count(head: &str) -> Option<u8> {
-    type E<'a> = OracleError<'a>;
-    // CR 601.2: "any number of" is the explicit unbounded quantifier and wins
-    // over the noun's grammatical number.
-    if tag::<_, _, E>("any number of ").parse(head).is_ok() {
-        return None;
-    }
-    // CR 601.2: "up to N" is a hard cap the window's stop-early loop enforces.
-    // A non-literal N is rejected upstream by `has_unrepresentable_cast_cap`, and
-    // a cap too large for `u8` is indistinguishable from "any number" here.
-    if let Ok((after_up_to, _)) = tag::<_, _, E>("up to ").parse(head) {
-        if let Ok((_, count)) = nom_primitives::parse_number.parse(after_up_to) {
-            return u8::try_from(count).ok();
-        }
-    }
-    // Otherwise the head noun's grammatical number decides. The trailing space
-    // is part of the tag so `scan_contains`'s word-boundary scan cannot match
-    // the plural inside a longer word, and a singular "spell"/"card" head never
-    // matches it at all.
-    if scan_contains_phrase(head, "spells ") || scan_contains_phrase(head, "cards ") {
-        return None;
-    }
-    Some(1)
 }
 
 /// CR 202.3: The cross-selection running-total budget ("with total mana value 10
@@ -24303,10 +24358,10 @@ fn try_parse_counted_free_cast_from_exiled_this_way(rest: &str) -> Option<Effect
     // counts ("up to X") have no concrete cap at parse time and fall through
     // to the existing permission-based arms.
     let (after_count, _) = tag::<_, _, E>("up to ").parse(rest).ok()?;
-    let (after_count, count) = nom_primitives::parse_number.parse(after_count).ok()?;
-    if count == 0 || count > u8::MAX as u32 {
-        return None;
-    }
+    // CR 601.2 (strict lowering): the shared cap authority also refuses `0` and
+    // any literal too large for `count`, so an out-of-range printed bound falls
+    // through to the permission arms instead of being truncated or widened.
+    let (after_count, count) = parse_representable_cast_count(after_count).ok()?;
     // CR 601.2a: the "spells" noun — this window casts spells (a land card can
     // never be cast, CR 305.1), so require the spell noun rather than "cards".
     let (after_noun, _) = alt((tag::<_, _, E>(" spells "), tag(" spell ")))
@@ -24320,10 +24375,11 @@ fn try_parse_counted_free_cast_from_exiled_this_way(rest: &str) -> Option<Effect
     rewrite_target_filter_another_to_tracked_set(&mut filter);
 
     Some(Effect::FreeCastFromZones {
-        // CR 601.2: this arm parsed a printed "up to N", so the bound is
-        // stated — `Some`. `None` is reserved for the unbounded "any number of
-        // spells" form, which does not reach this combinator.
-        count: Some(count as u8),
+        // CR 601.2: this arm parsed a printed "up to N" the representation can
+        // carry losslessly, so the bound is stated — `Some`. `None` is reserved
+        // for the unbounded "any number of spells" form, which does not reach
+        // this combinator.
+        count: Some(count),
         max_total_mv: None,
         filter,
         zones: vec![Zone::Exile],
@@ -24477,11 +24533,16 @@ fn try_parse_free_cast_from_zones(lower: &str) -> Option<Effect> {
     let (rest, _) = alt((tag::<_, _, E>("you may cast up to "), tag("cast up to ")))
         .parse(lower)
         .ok()?;
-    let (rest, count) = nom_primitives::parse_number.parse(rest).ok()?;
+    // CR 601.2 (strict lowering): the shared cap authority refuses `0` and any
+    // literal too large for `count`. This used to be a bare `parse_number`
+    // followed by `count as u8`, which wrapped a printed "up to 300" to 44 — a
+    // silent rules error. An out-of-range literal now fails the parse and the
+    // clause falls through unlowered rather than casting a fabricated bound.
+    let (rest, count) = parse_representable_cast_count(rest).ok()?;
     // CR 601.2: this arm matched a printed "up to N", so the bound is stated —
     // `Some`. `None` (unbounded "any number of spells") is produced only by the
     // `ResolutionCastWindow` route, which does not pass through here.
-    let count = Some(count as u8);
+    let count = Some(count);
     // `parse_number` leaves the trailing word boundary; consume the space
     // before the candidate type phrase.
     let (rest, _) = tag::<_, _, E>(" ").parse(rest).ok()?;

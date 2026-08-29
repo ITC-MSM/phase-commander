@@ -3129,3 +3129,103 @@ fn primeval_spawn_enforces_its_running_total_mana_value_budget() {
          withdrawn from the offer; offered = {candidates:?}"
     );
 }
+
+/// CR 601.2 (strict lowering): the `from among` resolution-window route must not
+/// turn an unrepresentable printed cap into an UNBOUNDED window.
+///
+/// Production-path companion to the parser regression
+/// `from_among_cast_cap_above_u8_is_refused_not_widened_to_unbounded`. This is
+/// the route-1 half of the maintainer's "both routes" ask; the route-2
+/// (graveyard/hand) runtime half lives in `invoke_calamity_free_cast.rs`.
+///
+/// The defect this pins is a direct side effect of this PR's own earlier fix.
+/// Making `max_casts: None` mean "any number of spells" was correct for the
+/// genuinely unbounded surface — but the cap reader produced that same `None`
+/// from `u8::try_from(300).ok()`, so a card printing a FINITE cap of 300 became
+/// indistinguishable from one printing "any number of". That is strictly more
+/// permissive than the card says, which CR 601.2 does not allow.
+///
+/// 256 (the exact boundary) and 300 (the wrap case) are the maintainer's
+/// explicitly requested values. Neither is a real card — the largest printed
+/// "cast up to N" in the corpus is THREE — so both are representation-boundary
+/// hostile fixtures.
+#[test]
+fn from_among_window_refuses_an_unrepresentable_cap_instead_of_unbounding_it() {
+    /// Resolve an exile-then-cast card whose printed cast cap is parameterized,
+    /// returning the cast bound of the window it opened (if it opened one).
+    ///
+    /// `Some(bound)` = a resolution-scoped window opened carrying `bound`;
+    /// `None` = no free-cast window opened at all.
+    /// `quantifier` is the full printed quantifier phrase ("up to two",
+    /// "any number of"), so the unbounded surface can be exercised through the
+    /// same fixture without fabricating "up to any number of".
+    fn window_bound_for(quantifier: &str) -> Option<Option<u8>> {
+        let oracle = format!(
+            "Exile the top four cards of your library. You may cast {quantifier} spells \
+             from among them without paying their mana costs."
+        );
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_spell_to_hand_from_oracle(P0, "Boundary Probe", false, &oracle)
+            .with_mana_cost(ManaCost::generic(1))
+            .id();
+        for i in 0..4 {
+            scenario
+                .add_spell_to_library_top(P0, &format!("Probe Spell {i}"), false)
+                .with_mana_cost(ManaCost::generic(1))
+                .from_oracle_text("You gain 1 life.");
+        }
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(ManaType::Colorless, source, false, vec![])],
+        );
+
+        let mut runner = scenario.build();
+        let outcome = runner.cast(source).accept_optional().resolve();
+        match outcome.final_waiting_for() {
+            WaitingFor::CastOffer {
+                kind:
+                    CastOfferKind::FreeCastWindow {
+                        remaining_casts, ..
+                    },
+                ..
+            } => Some(*remaining_casts),
+            _ => None,
+        }
+    }
+
+    // REACH GUARD (mandatory paired positive): the identical surface with an
+    // in-range cap DOES open a resolution-scoped window carrying exactly that
+    // printed bound. Without this the negatives below could pass simply because
+    // the fixture never reaches the window seam.
+    assert_eq!(
+        window_bound_for("up to two"),
+        Some(Some(2)),
+        "reach guard: an in-range printed cap must open a window bounded by it"
+    );
+
+    // The one surface that legitimately means unbounded still does.
+    assert_eq!(
+        window_bound_for("any number of"),
+        Some(None),
+        "\"any number of spells\" is the one surface that legitimately opens an          UNBOUNDED window, and must keep doing so"
+    );
+
+    for printed_cap in ["256", "300"] {
+        let observed = window_bound_for(&format!("up to {printed_cap}"));
+        assert_ne!(
+            observed,
+            Some(None),
+            "\"up to {printed_cap}\" opened an UNBOUNDED window. A stated finite cap the \
+             representation cannot express is not the same thing as \"any number of spells\" \
+             — it must be refused, never widened."
+        );
+        assert_eq!(
+            observed, None,
+            "\"up to {printed_cap}\" must not open a resolution-scoped window at all; it \
+             stays on the established lingering-permission path"
+        );
+    }
+}

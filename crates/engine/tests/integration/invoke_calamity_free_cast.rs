@@ -491,3 +491,112 @@ fn invoke_calamity_can_target_resolving_source_with_first_counterspell() {
         "the counterspell loses its only target and is exiled by Invoke's rider"
     );
 }
+
+/// CR 601.2 (strict lowering): a printed free-cast bound the representation
+/// cannot express must never reach the runtime as a *fabricated* bound.
+///
+/// Production-path companion to the parser regressions
+/// `free_cast_from_zones_cap_above_u8_is_refused_not_truncated` and
+/// `from_among_cast_cap_above_u8_is_refused_not_widened_to_unbounded`. This
+/// drives the real cast pipeline (`GameAction::CastSpell` → resolution →
+/// `WaitingFor::CastOffer`) rather than asserting on parsed AST shape, so it
+/// fails on the *runtime* consequence of the defect.
+///
+/// The two ways the old code got this wrong, both silent:
+///   * direct graveyard/hand route: `count as u8` wrapped `up to 300` to a
+///     44-cast window, and `up to 256` to a **zero**-cast window.
+///   * resolution-window route: `u8::try_from(300).ok()` decayed to `None`,
+///     which this PR made the UNBOUNDED sentinel — a stated cap silently
+///     widened to unlimited.
+///
+/// `up to 256` is the boundary case and `up to 300` the wrap case, per the
+/// maintainer's explicit ask. Neither is a real card: the largest printed
+/// "cast up to N" in the corpus is THREE, so these are representation-boundary
+/// hostile fixtures by construction.
+#[test]
+fn out_of_range_free_cast_bound_never_opens_a_fabricated_window() {
+    /// Build and resolve the same scenario with a parameterized printed bound,
+    /// returning the state the resolution settles into.
+    fn window_after_resolving(bound: &str) -> WaitingFor {
+        let text = format!(
+            "You may cast up to {bound} instant and/or sorcery spells with total mana value 6 \
+             or less from your graveyard and/or hand without paying their mana costs. If those \
+             spells would be put into your graveyard, exile them instead. Exile Invoke Calamity."
+        );
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let invoke_id = scenario
+            .add_spell_to_hand_from_oracle(P0, "Invoke Calamity", true, &text)
+            .with_mana_cost(ManaCost::generic(1))
+            .id();
+        scenario
+            .add_spell_to_graveyard(P0, "Graveyard Bolt", true)
+            .with_mana_cost(ManaCost::generic(2))
+            .from_oracle_text("Draw a card.");
+        scenario
+            .add_spell_to_hand(P0, "Hand Divination", false)
+            .with_mana_cost(ManaCost::generic(3))
+            .from_oracle_text("Draw a card.");
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(0),
+                false,
+                vec![],
+            )],
+        );
+
+        let mut runner = scenario.build();
+        let invoke_card_id = runner.state().objects[&invoke_id].card_id;
+        runner
+            .act(GameAction::CastSpell {
+                object_id: invoke_id,
+                card_id: invoke_card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("casting Invoke Calamity must succeed");
+        runner.act(GameAction::PassPriority).expect("p0 pass");
+        runner.act(GameAction::PassPriority).expect("p1 pass");
+        runner.state().waiting_for.clone()
+    }
+
+    // REACH GUARD (mandatory paired positive): the identical scenario with an
+    // in-range printed bound DOES open a window carrying exactly that bound.
+    // Without this, the negative assertions below would pass vacuously if the
+    // harness never reached the free-cast seam at all.
+    match window_after_resolving("two") {
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow {
+                remaining_casts, ..
+            },
+            ..
+        } => assert_eq!(
+            remaining_casts,
+            Some(2),
+            "the in-range control must open a window bounded by its printed cap"
+        ),
+        other => panic!(
+            "reach guard failed: the in-range control must open a FreeCastWindow, got {other:?}"
+        ),
+    }
+
+    for bound in ["256", "300"] {
+        let settled = window_after_resolving(bound);
+        if let WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow {
+                remaining_casts, ..
+            },
+            ..
+        } = &settled
+        {
+            panic!(
+                "\"up to {bound}\" opened a free-cast window bounded at {remaining_casts:?}. \
+                 A cap the representation cannot express must be refused outright — it is \
+                 neither the printed number, nor unbounded, nor a wrapped value."
+            );
+        }
+    }
+}
