@@ -10878,10 +10878,16 @@ mod tests {
         (state, bear, def)
     }
 
-    /// CR 118.12a + CR 611.3a + CR 613.1c: an "as long as <payment>" gate on a
-    /// continuous GRANT must leave the grant off at runtime, because the CR 613
-    /// layer pipeline offers no optional-payment round-trip and the player is
-    /// therefore never given the "may".
+    /// CR 118.12a + CR 611.3a + CR 613.1f + CR 613.4c: an "as long as <payment>"
+    /// gate on a continuous GRANT must leave the grant off at runtime, because the
+    /// CR 613 layer pipeline offers no optional-payment round-trip and the player
+    /// is therefore never given the "may".
+    ///
+    /// The two layers cited are the two this test actually drives: CR 613.1f is
+    /// Layer 6 (ability-adding effects), which carries the `has flying` shape, and
+    /// CR 613.4c is Layer 7c (effects that MODIFY power/toughness without setting
+    /// it), which carries the `gets +2/+2` shape. Both are gated by the same
+    /// condition slot, which is why one gate defect would surface in both.
     ///
     /// This is the runtime half of
     /// `oracle_static::tests::attached_conditional_grant_payment_gate_is_deferred_not_accepted`,

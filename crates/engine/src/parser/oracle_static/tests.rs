@@ -1499,7 +1499,8 @@ fn as_long_as_peel_rejects_for_as_long_as_duration() {
     let dur_l = dur.to_lowercase();
     assert!(
         super::shared::parse_as_long_as_static_condition(
-            &crate::parser::oracle_util::TextPair::new(dur, &dur_l)
+            &crate::parser::oracle_util::TextPair::new(dur, &dur_l),
+            Some(&TargetFilter::SelfRef)
         )
         .is_none(),
         "\"for as long as\" is duration text and must not attach as a static gate"
@@ -1510,7 +1511,8 @@ fn as_long_as_peel_rejects_for_as_long_as_duration() {
     let gate_l = gate.to_lowercase();
     assert!(
         super::shared::parse_as_long_as_static_condition(
-            &crate::parser::oracle_util::TextPair::new(gate, &gate_l)
+            &crate::parser::oracle_util::TextPair::new(gate, &gate_l),
+            Some(&TargetFilter::SelfRef)
         )
         .is_some(),
         "bare \"as long as\" must still attach as a static gate (no over-rejection)"
@@ -11106,6 +11108,39 @@ fn unrecognized_lure_conjunct_surfaces_unimplemented_residual() {
     );
 }
 
+/// CR 303.4 + CR 613.1g: Timber Paladin's tiered gates, driven through the
+/// PRODUCTION entry point. `parse_static_condition` lowercases before handing
+/// off to `parse_inner_condition`, so a capitalized `tag("Aura")` in the
+/// combinator makes the whole arm unreachable in a real parse even while the
+/// combinator's own mixed-case unit tests stay green. That is exactly how
+/// Timber Paladin regressed after #2418: all three tiers landed as
+/// `StaticCondition::Unrecognized`, which `game/layers.rs` evaluates as
+/// always-true, so the 10/10 tier applied with zero Auras attached.
+///
+/// Discriminating (fail-on-revert): re-capitalize either `tag` and every case
+/// below returns `Unrecognized`.
+#[test]
+fn aura_count_gates_parse_from_printed_oracle_casing() {
+    for (text, comparator, value) in [
+        ("~ is enchanted by exactly one Aura", Comparator::EQ, 1),
+        ("~ is enchanted by exactly two Auras", Comparator::EQ, 2),
+        ("~ is enchanted by three or more Auras", Comparator::GE, 3),
+    ] {
+        let cond = parse_static_condition(text)
+            .unwrap_or_else(|| panic!("{text} must parse to a typed condition"));
+        let StaticCondition::QuantityComparison {
+            comparator: got_cmp,
+            rhs,
+            ..
+        } = cond
+        else {
+            panic!("{text} must parse to QuantityComparison, got {cond:?}");
+        };
+        assert_eq!(got_cmp, comparator, "{text}");
+        assert_eq!(rhs, QuantityExpr::Fixed { value }, "{text}");
+    }
+}
+
 /// Building-block (Step 3 backstop): `parse_static_condition` for combat state
 /// must no longer collapse an ATTACHED subject into a `Source*` condition, while
 /// the genuine source-referential forms are preserved unchanged.
@@ -20441,7 +20476,10 @@ fn classify_block_exception_count_vs_quality() {
 
 #[test]
 fn cant_be_blocked_as_long_as_defending_controls() {
-    // CR 509.1a: "can't be blocked as long as defending player controls an artifact"
+    // CR 509.1b: an evasion ability creates a blocking restriction — "can't be
+    // blocked as long as defending player controls an artifact". NOT 509.1a,
+    // which governs only which creatures the defending player chooses to block
+    // with and says nothing about restrictions.
     let def = parse_static_line(
         "This creature can't be blocked as long as defending player controls an artifact.",
     )
@@ -20464,6 +20502,27 @@ fn cant_be_blocked_attacking_alone() {
         .unwrap();
     assert_eq!(def.mode, StaticMode::CantBeBlocked);
     assert_eq!(def.condition, Some(StaticCondition::SourceAttackingAlone));
+}
+
+/// CR 303.4b: an Aura's host is "enchanted", so "as long as it's enchanted" on a
+/// SelfRef static is a self-state gate, not an unparsed remainder. Metathran
+/// Elite is the corpus witness for the `as long as` branch of the pronoun
+/// rewrite; every other #8183 regression test rides the `unless` branch, which
+/// already trimmed its clause before this fix. Without the shared trim in
+/// `parse_affected_scoped_static_condition`, the trailing period survives into
+/// `rewrite_self_pronoun_subject`, whose match is exact, so "enchanted." misses
+/// and the condition fails open as `Unrecognized`.
+#[test]
+fn cant_be_blocked_as_long_as_its_enchanted() {
+    let def =
+        parse_static_line("This creature can't be blocked as long as it's enchanted.").unwrap();
+    assert_eq!(def.mode, StaticMode::CantBeBlocked);
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::SourceIsEnchanted),
+        "Metathran Elite's gate must resolve to a typed self-state condition; \
+         an Unrecognized remainder fails open in the layer system (#8183)"
+    );
 }
 
 #[test]
@@ -27514,7 +27573,11 @@ fn awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt() {
     // a mode whose enforcement point can't run the payment changed.
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
-    let parsed = super::shared::parse_unless_static_condition(&tp)
+    // `def.affected` is threaded in exactly as the production route does (CR
+    // 611.3a: the gate's anaphoric "it" binds against the host static's affected
+    // set), so this building-block probe mirrors the real call rather than
+    // guessing a filter.
+    let parsed = super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())
         .expect("the unless clause itself must still parse");
     let StaticCondition::UnlessPay { scaling, .. } = &parsed else {
         panic!("expected UnlessPay from the clause parser, got {parsed:?}");
@@ -27527,6 +27590,46 @@ fn awesome_presence_block_tax_is_deferred_for_lack_of_a_payment_prompt() {
         gate_static_condition(&StaticMode::CantBlock, parsed.clone(), "gap"),
         parsed,
         "UnlessPay must still pass through on a mode WaitingFor::CombatTaxPayment covers"
+    );
+}
+
+/// CR 509.1b + CR 118.12a: the `"can't be blocked"` FALLBACK arm in `dispatch`
+/// must clear the same enforcement-point bar as the evasion route above it.
+///
+/// TWO authorities build `StaticMode::CantBeBlocked`. `parse_subject_rule_static`
+/// classifies the well-formed subject lines; whatever it declines — here a
+/// flavor-word prefix, one of the shapes the fallback exists to catch — lands on
+/// `dispatch`'s fallback instead. Gating only the first authority would leave the
+/// second one reporting an unofferable CR 509.1c payment as a fully supported
+/// `UnlessPay`, which is precisely the defect this change closes for Awesome
+/// Presence. The enforcement point is a property of the MODE, so it cannot depend
+/// on which parser happened to build the definition.
+///
+/// This is a building-block probe rather than a card assertion: it pins that the
+/// CLASS is gated at both entry points, and the first assertion proves the probe
+/// actually exercises the fallback rather than silently retesting the evasion
+/// route.
+#[test]
+fn cant_be_blocked_fallback_arm_defers_unenforceable_payment_gate() {
+    let text = "Wraith Form — This creature can't be blocked unless defending player pays {2}.";
+    assert!(
+        crate::parser::oracle_static::evasion::parse_subject_rule_static(text).is_none(),
+        "this probe must exercise the dispatch FALLBACK arm, not the evasion route"
+    );
+
+    let def = parse_static_line(text).expect("the fallback arm should still parse the line");
+    assert_eq!(def.mode, StaticMode::CantBeBlocked);
+    assert!(
+        !matches!(def.condition, Some(StaticCondition::UnlessPay { .. })),
+        "the fallback must not report an unofferable payment as a supported UnlessPay, got {:?}",
+        def.condition
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized),
+        "the deferral must stay visible to every coverage-honesty gate, got {:?}",
+        def.condition
     );
 }
 

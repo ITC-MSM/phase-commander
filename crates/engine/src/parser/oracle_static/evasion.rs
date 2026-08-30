@@ -2486,7 +2486,9 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
         return Some(def);
     }
     let tp = TextPair::new(text, &lower);
-    if let Some(unless_cond) = super::shared::parse_unless_static_condition(&tp) {
+    if let Some(unless_cond) =
+        super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())
+    {
         // CR 118.12a: `parse_unless_static_condition` passes an `UnlessPay` leaf
         // through RAW (no `Not` wrapper), so this site can attach a payment gate
         // to whatever mode the predicate lowered to — including `BlockRestriction`
@@ -2598,7 +2600,7 @@ fn parse_forced_attack_defender_static_body(text: &str) -> Option<StaticDefiniti
     // not parse as if the rider were absent.
     let (gap_text, _) = tag::<_, _, OracleError<'_>>("unless ").parse(rest).ok()?;
     let tp = TextPair::new(text, &lower);
-    let condition = super::shared::parse_unless_static_condition(&tp)?;
+    let condition = super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())?;
     // Coverage-honesty gate (CR 604.1): only emit the forced-attack static when the
     // `unless` gate is a FULLY-MODELED condition. `parse_unless_static_condition`
     // wraps an unrecognized inner clause as `Not(Unrecognized)` — which (a) would

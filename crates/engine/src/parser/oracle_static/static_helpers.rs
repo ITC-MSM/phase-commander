@@ -1953,8 +1953,12 @@ pub(crate) fn accept_enforceable_condition(
 ///   gate anyway so this list is exhaustive by construction rather than by
 ///   assertion.
 /// - `oracle_static::dispatch`'s `"~ can't block"`, `"~ can't attack"` (both via
-///   [`parse_trailing_gate_with_polarity`]) and `"activated abilities can't be
+///   [`parse_trailing_gate_condition`]) and `"activated abilities can't be
 ///   activated"` arms.
+/// - `oracle_static::dispatch`'s `"<subject> can't be blocked …"` FALLBACK arm —
+///   the second authority that catches lines `parse_subject_rule_static`
+///   declined (flavor-word subject prefixes, untyped gates). It builds the same
+///   `CantBeBlocked` mode as the evasion route, so it clears the same bar.
 /// - `oracle_static::grammar::parse_enchanted_equipped_predicate`'s three
 ///   `"can't be blocked …"` branches, whose gated condition is also what the
 ///   granted-keyword companion inherits (Awesome Presence).
@@ -1987,10 +1991,21 @@ pub(crate) fn attach_gated_condition(
 /// ([`unenforceable_gate_marker`]) is inert in both directions. Only the
 /// unparsed-clause fallback still cares, and its call sites know their own
 /// grammar locally — see [`ConditionGatePolarity`].
-pub(crate) fn parse_trailing_gate_condition(tp: &TextPair<'_>) -> Option<StaticCondition> {
-    super::shared::parse_unless_static_condition(tp).or_else(|| {
-        super::shared::parse_as_long_as_static_condition(tp)
-            .or_else(|| super::shared::parse_if_static_condition(tp))
+///
+/// `affected` is the host static's affected set, threaded unchanged to all three
+/// clause parsers so the gate's anaphoric "it" binds to the source only for a
+/// SelfRef static (CR 611.3a). Centralizing the precedence must not centralize
+/// away that binding: a gate parsed without the host's affected set would resolve
+/// "it" against the wrong object, so the parameter travels with the text.
+/// Call sites pass `def.affected.as_ref()` — the same definition the resulting
+/// condition is attached to by [`attach_gated_condition`].
+pub(crate) fn parse_trailing_gate_condition(
+    tp: &TextPair<'_>,
+    affected: Option<&TargetFilter>,
+) -> Option<StaticCondition> {
+    super::shared::parse_unless_static_condition(tp, affected).or_else(|| {
+        super::shared::parse_as_long_as_static_condition(tp, affected)
+            .or_else(|| super::shared::parse_if_static_condition(tp, affected))
     })
 }
 

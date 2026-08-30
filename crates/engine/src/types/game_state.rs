@@ -2121,6 +2121,21 @@ impl ResolveAllConsentRun {
             .find(|participant| !participant.granted)
             .map(|participant| participant.representative)
     }
+
+    /// The single authority for whether a `RespondResolveAllConsent` naming
+    /// `epoch` and `representative` is still answerable.
+    ///
+    /// The public `WaitingFor::ResolveAllConsent` prompt and this private run
+    /// are separate fields, and a run can be absent behind a standing prompt —
+    /// a viewer projection redacts the run (`visibility.rs`) while retaining
+    /// the prompt, so any state reconstructed from one carries the prompt with
+    /// no run behind it. Every producer of the prompt's action domain must ask
+    /// this before offering Grant or Decline: an offer the reducer can only
+    /// reject leaves the representative hammering an unanswerable prompt with
+    /// no other legal action, which no later boundary can undo.
+    pub fn accepts_response_from(&self, epoch: u64, representative: PlayerId) -> bool {
+        self.epoch == epoch && self.next_pending_representative() == Some(representative)
+    }
 }
 
 /// CR 609.7a: A source of damage chosen while creating a prevention or
@@ -11251,6 +11266,53 @@ fn reject_zero_bound_shortcut_offer(state: &GameState) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuses a viewer projection presented as authoritative state.
+///
+/// A projection is not a damaged authority that could be repaired — it is a
+/// different kind of object. `filter_state_for_viewer` zeroes `rng_seed` and
+/// `rng_word_pos`, clears `resolved_rules_journal` and `product_knowledge_state`,
+/// and empties `resolution_stack`; none of that is reconstructible, so a
+/// "repair" could only fabricate rules authority. Refusing is the only sound
+/// answer. `RestoredStackAutomation::Repair` keeps its separate job: an
+/// authoritative state whose stack automation is incoherent.
+///
+/// THIS STRING IS PLAYER-VISIBLE COPY, not a log line. On the WASM restore
+/// route it is wrapped by these frames, innermost outward — named by SYMBOL
+/// rather than counted, because a frame count is exactly the claim that goes
+/// stale:
+///
+///   - `prepare_restored_game_state` (`crates/engine-wasm/src/lib.rs`) —
+///     `format!("Failed to deserialize GameState: {error}")`. A **Rust** frame.
+///   - `gameProvider.resumeReset.restoreFailed` —
+///     `"Could not restore saved game: {{error}}"`, interpolated from
+///     `err.message` by the resume `catch` in
+///     `client/src/providers/GameProvider.tsx`.
+///   - `gamePage.resumeReset.message` — `"{{reason}} A new game was started."`,
+///     rendered by `client/src/pages/GamePage.tsx` in a dismissible notice.
+///
+/// **That list is scoped to that route and is NOT asserted complete for any
+/// other.** Other ingests wrap differently (`GameSession::from_persisted` in
+/// server-core; the bare `impl Deserialize for GameState`), and the
+/// `TrustedEnvelope` arm adds two `serde::de::Error::custom` hops that add no
+/// text of their own.
+///
+/// So this sentence must read correctly BOTH standing alone (a future caller
+/// may drop the Rust prefix) and inside those frames: it must neither repeat
+/// "could not restore" nor announce that a new game is starting, because the
+/// two locale frames already say those. Write for a player; keep seat numbers
+/// and engine vocabulary out of it. The engine-wasm prefix contributes its own
+/// duplicated register and the noun `GameState`; that residue belongs to that
+/// frame, is knowingly accepted here, and is NOT a reason to reword this
+/// sentence — rewording it cannot remove either.
+fn reject_viewer_projection_as_authority(state: &GameState) -> Result<(), String> {
+    match state.viewer_projection {
+        None => Ok(()),
+        Some(_) => Err("This saved game only holds the view that was shown on \
+                        screen, not the full game record."
+            .to_string()),
+    }
+}
+
 impl Serialize for TrustedGameStateEnvelope {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -16758,6 +16820,28 @@ declare_game_state! {
     /// one for legacy saves and is minted only by `BeginResolveAll`.
     #[serde(default = "initial_resolve_all_consent_epoch")]
     pub next_resolve_all_consent_epoch: u64,
+    /// Records that this state is a VIEWER PROJECTION, not rules authority.
+    ///
+    /// `None` is an authoritative state. `Some(viewer)` is the display snapshot
+    /// [`crate::game::visibility::filter_state_for_viewer`] produced for `viewer`,
+    /// which blanks ~20 private rules-execution carriers (the Resolve All consent
+    /// run, the stack-resolution session, every pending-resume cursor, the rules
+    /// journal, the RNG seed) while deliberately preserving the public
+    /// `waiting_for` that stands over them — see CR 400.2 for why hidden-zone
+    /// information is stripped in the first place. `viewer` may be a real seat or
+    /// the server's non-seat spectator sentinel.
+    ///
+    /// Serialized on purpose. The confusion this prevents crosses a JSON boundary:
+    /// without a marker on the wire, a projection is byte-identical to an
+    /// authoritative state whose carriers are legitimately absent, and installing
+    /// one leaves a prompt no player can answer (#8193). `skip_serializing_if`
+    /// keeps every authoritative payload byte-identical to what it is today, and
+    /// `default` keeps every pre-existing save loadable as `None`.
+    ///
+    /// NEVER `#[serde(skip)]`: that is defeated by exactly the round-trip this
+    /// exists to catch and would make the gate vacuous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_projection: Option<PlayerId>,
     /// Private protocol ledger behind the public consent/ready waiting states.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolve_all_consent_run: Option<ResolveAllConsentRun>,
@@ -17731,6 +17815,24 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub crew_activated_this_turn: HashSet<ObjectIncarnationRef>,
+    /// CR 702.122a: Vehicles whose `KeywordAction::Crew` stack entry has
+    /// RESOLVED this turn — the explicit successful-crew provenance behind the
+    /// AI crew-repeat guard's payoff-in-force predicate
+    /// ([`crate::game::engine::crew_resolved_this_turn_contains`]). Recorded at
+    /// stack RESOLUTION (never at announcement — a countered crew never resolves
+    /// and never sets this, CR 701.6a) in the same arm that installs the UEOT
+    /// `AddType(Creature)` transient, so the marker and the payoff cannot drift.
+    /// Deliberately NOT derivable from `transient_continuous_effects`: a generic
+    /// SelfRef self-animation (Kylox, Voltstrider-class) installs the same
+    /// transient shape with no Crew resolution behind it. Cleared at turn start.
+    ///
+    /// Legacy saves default to an empty set: a save created after a crew already
+    /// resolved restores the UEOT transient without the marker, so the guard may
+    /// permit one bounded redundant crew before the first re-crew writes the
+    /// marker (mirrors the accepted `crew_activated_this_turn` legacy default).
+    #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub crew_resolved_this_turn: HashSet<ObjectIncarnationRef>,
     /// CR 606.1 + CR 606.3 + CR 603.4: Per-player count of loyalty-ability
     /// activations this turn. Incremented in
     /// `planeswalker::finalize_loyalty_activation` whenever any loyalty ability
@@ -18987,6 +19089,9 @@ impl GameStateDecode {
             .map_err(|error| error.to_string())?;
         validate_restored_zone_change_replay_keys(&state)?;
         normalize_delayed_trigger_allocators(&mut state)?;
+        // The PERSISTED half of the projection gate; `decode` below carries the other.
+        // See the pairing comment there for why one site is not enough.
+        reject_viewer_projection_as_authority(&state)?;
         validate_trigger_firing_coherence(&state)?;
         reject_zero_bound_shortcut_offer(&state)?;
         #[cfg(debug_assertions)]
@@ -19013,12 +19118,22 @@ impl GameStateDecode {
         migrate_legacy_dungeon_choice_previews(&mut value)?;
         let mut state = Self::materialize_prepared(value)?;
         normalize_delayed_trigger_allocators(&mut state)?;
+        // NO viewer-projection guard here, deliberately. This is the TRANSPORT decode
+        // path as much as a restore path: `ServerMessage::GameStarted { state, .. }`
+        // (`server-core/src/protocol.rs`) carries a `filter_state_for_viewer` projection
+        // by design, so a bare `GameState` deserialize is how a viewer legitimately
+        // receives a redacted board. Refusing projections here rejects that broadcast.
+        // The gate lives only on the PERSISTENCE ingress
+        // (`decode_persisted_resolution_state`), which is what a saved game restores
+        // through and where installing a projection as authority is the actual defect.
         validate_trigger_firing_coherence(&state)?;
-        // Both decode entry points guard, because they are genuinely two ingresses:
-        // `decode_persisted_resolution_state` above deserializes `ResolutionStateWire`
-        // itself and never routes through `decode`. Hosting the CR 732.2a bound check on
-        // only one of them leaves the other — the one a bare-`GameState` `impl Deserialize`
-        // reaches — able to revive a zero-bound offer.
+        // The CR 732.2a bound check IS hosted on both decode entry points, because they
+        // are genuinely two ingresses: `decode_persisted_resolution_state` above
+        // deserializes `ResolutionStateWire` itself and never routes through `decode`.
+        // Hosting it on only one leaves the other — the one a bare-`GameState`
+        // `impl Deserialize` reaches — able to revive a zero-bound offer. That argument
+        // is about a value no wire should ever carry; it does NOT extend to the
+        // projection marker, which the transport wire carries on purpose.
         reject_zero_bound_shortcut_offer(&state)?;
         #[cfg(debug_assertions)]
         debug_assert_runtime_resolution_invariants(&state);
@@ -22877,6 +22992,7 @@ impl GameState {
                 player: starting_player,
             },
             next_resolve_all_consent_epoch: initial_resolve_all_consent_epoch(),
+            viewer_projection: None,
             resolve_all_consent_run: None,
             stack_resolution_session: None,
             interaction_session_id: None,
@@ -22978,6 +23094,7 @@ impl GameState {
             activated_abilities_this_turn: HashMap::new(),
             activated_abilities_this_game: HashMap::new(),
             crew_activated_this_turn: HashSet::new(),
+            crew_resolved_this_turn: HashSet::new(),
             loyalty_abilities_activated_this_turn: HashMap::new(),
             extra_loyalty_activations_this_turn: HashMap::new(),
             exerted_this_turn: std::collections::HashSet::new(),
@@ -24878,6 +24995,10 @@ fn _gamestate_partition_is_total(s: &GameState) {
         combat: _,
         waiting_for: _,
         next_resolve_all_consent_epoch: _,
+        // `viewer_projection`: COMPARED (fail-safe). It is `None` on every authoritative
+        // state, so every loop-detection sample compares `None == None` and COMPARING it
+        // can never suppress a legitimate CR 104.4b repeat. It is not an accumulator.
+        viewer_projection: _,
         resolve_all_consent_run: _,
         stack_resolution_session: _,
         interaction_session_id: _,
@@ -25002,6 +25123,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         activated_abilities_this_turn: _,
         activated_abilities_this_game: _,
         crew_activated_this_turn: _,
+        crew_resolved_this_turn: _,
         loyalty_abilities_activated_this_turn: _,
         extra_loyalty_activations_this_turn: _,
         exerted_this_turn: _,
@@ -25247,6 +25369,7 @@ impl PartialEq for GameState {
             && self.combat == other.combat
             && self.waiting_for == other.waiting_for
             && self.next_resolve_all_consent_epoch == other.next_resolve_all_consent_epoch
+            && self.viewer_projection == other.viewer_projection
             && self.resolve_all_consent_run == other.resolve_all_consent_run
             && self.stack_resolution_session == other.stack_resolution_session
             && self.lands_played_this_turn == other.lands_played_this_turn
@@ -25329,6 +25452,7 @@ impl PartialEq for GameState {
             && self.activated_abilities_this_turn == other.activated_abilities_this_turn
             && self.activated_abilities_this_game == other.activated_abilities_this_game
             && self.crew_activated_this_turn == other.crew_activated_this_turn
+            && self.crew_resolved_this_turn == other.crew_resolved_this_turn
             && self.loyalty_abilities_activated_this_turn
                 == other.loyalty_abilities_activated_this_turn
             && self.extra_loyalty_activations_this_turn == other.extra_loyalty_activations_this_turn
