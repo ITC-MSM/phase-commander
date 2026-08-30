@@ -153,7 +153,7 @@ fn drain_until_kotis_cast_window(runner: &mut GameRunner) -> Vec<ObjectId> {
     panic!("Kotis's trigger never opened its resolution-scoped cast window");
 }
 
-/// CR 406.6: the granting source carried on the parked window itself.
+/// The granting source carried on the parked window itself.
 ///
 /// Reach guards read the batch through THIS id rather than through a
 /// fixture-side handle so the guard is anchored to the very window whose
@@ -174,8 +174,8 @@ fn kotis_window_source(runner: &GameRunner) -> ObjectId {
     *source
 }
 
-/// CR 607.2a: the source's "exiled this way" ledger for this turn — the full
-/// batch BEFORE any mana-value budget is applied.
+/// The engine's per-source "exiled this turn" ledger — the full batch BEFORE
+/// any mana-value budget is applied.
 ///
 /// This is the set the `expensive` reach guard needs: `member_pool` on the
 /// window is already budget-filtered, so it can never witness that an
@@ -494,7 +494,7 @@ fn kotis_offers_the_whole_in_budget_batch_and_nothing_outside_it() {
     assert!(
         tracked_exile_batch(state, source).contains(&expensive),
         "the over-budget control must actually have been exiled by THIS Kotis trigger \
-         (CR 607.2a) — otherwise its absence from the offer proves nothing about the \
+         — otherwise its absence from the offer proves nothing about the \
          mana-value bound; tracked batch was {:?}",
         tracked_exile_batch(state, source)
     );
@@ -541,7 +541,7 @@ fn kotis_offers_the_whole_in_budget_batch_and_nothing_outside_it() {
     );
     assert!(
         !tracked_exile_batch(state, source).contains(&unrelated_exiled),
-        "the batch-scope control must NOT be in this trigger's exiled batch (CR 607.2a) \
+        "the batch-scope control must NOT be in this trigger's exiled batch \
          — that is the single property under test"
     );
     assert!(
