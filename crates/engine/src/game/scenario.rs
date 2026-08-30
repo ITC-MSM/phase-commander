@@ -922,7 +922,7 @@ impl GameScenario {
     /// Oracle text or any exile-link record. Used to stage a card that is
     /// merely SITTING in exile (via some unrelated mechanism) so tests can
     /// prove a `TargetFilter::ExiledBySource`-scoped cast permission does not
-    /// accidentally widen to "any eligible card in exile" (CR 601.2a).
+    /// accidentally widen to "any eligible card in exile".
     ///
     /// Use `is_instant: true` for instants, `false` for sorceries.
     pub fn add_spell_to_exile(

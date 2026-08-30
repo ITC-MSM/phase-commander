@@ -6706,6 +6706,77 @@ mod tests {
         }
     }
 
+    /// CR 301.5f + CR 303.4m + CR 208.1: the attached-creature characteristic
+    /// grammar is a 2x2 product — attachment kind (Equipment "equipped
+    /// creature's" / Aura "enchanted creature's") x characteristic (power /
+    /// toughness). `parse_attached_creature_pt_ref` accepts all four, so all
+    /// four are pinned here: a swapped attachment `FilterProp` or a
+    /// power/toughness branch regression must fail a row rather than hide
+    /// behind the single Glamdring card-level assertion.
+    #[test]
+    fn attached_creature_characteristic_grammar_covers_equipment_and_aura_pt() {
+        for (phrase, expected_property, expected_prop) in [
+            (
+                "equipped creature's power",
+                ObjectProperty::Power,
+                FilterProp::EquippedBy,
+            ),
+            (
+                "equipped creature's toughness",
+                ObjectProperty::Toughness,
+                FilterProp::EquippedBy,
+            ),
+            (
+                "enchanted creature's power",
+                ObjectProperty::Power,
+                FilterProp::EnchantedBy,
+            ),
+            (
+                "enchanted creature's toughness",
+                ObjectProperty::Toughness,
+                FilterProp::EnchantedBy,
+            ),
+        ] {
+            let (rest, qty) =
+                parse_quantity_ref(phrase).unwrap_or_else(|e| panic!("{phrase} must parse: {e:?}"));
+            assert_eq!(rest, "", "{phrase} must be fully consumed");
+            let QuantityRef::PropertyAggregate(aggregate) = qty else {
+                panic!("{phrase}: expected PropertyAggregate, got {qty:?}");
+            };
+            // CR 301.5f / CR 303.4m: an unattached source has no such creature,
+            // so the population is empty and `Sum` is 0 — the "no reduction"
+            // outcome. Pin the aggregate function alongside the 2x2 axes.
+            assert_eq!(aggregate.function(), AggregateFunction::Sum, "{phrase}");
+            assert_eq!(aggregate.property(), expected_property, "{phrase}");
+            let CardTypeSetSource::Objects {
+                filter: TargetFilter::Typed(tf),
+            } = aggregate.source()
+            else {
+                panic!(
+                    "{phrase}: expected Objects(Typed(..)) population, got {:?}",
+                    aggregate.source()
+                );
+            };
+            assert_eq!(tf.type_filters, vec![TypeFilter::Creature], "{phrase}");
+            assert_eq!(tf.properties, vec![expected_prop], "{phrase}");
+        }
+
+        // Near misses: the grammar is attachment-possessive-anchored, so a
+        // non-creature attachment noun or a characteristic outside the
+        // power/toughness pair must not silently reach this combinator.
+        for near_miss in [
+            "equipped creature's loyalty",
+            "equipped permanent's power",
+            "enchanted player's power",
+            "equipped creature power",
+        ] {
+            assert!(
+                parse_quantity_ref_complete(near_miss).is_err(),
+                "near miss must remain unsupported: {near_miss}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // CR 109.2 population grammar — union tier, per-head grammar pinning, and
     // the guards that keep each hazard from becoming a silent misparse.
