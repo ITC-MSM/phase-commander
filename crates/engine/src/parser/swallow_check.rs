@@ -2351,37 +2351,64 @@ fn active_dynamic_markers(cleaned: &str, evidence: &UnitEvidence) -> Vec<&'stati
 /// the gate defers the condition that carrier is gone by design, not by
 /// accident.
 ///
-/// MARKER-level, not span-level, so it is robust to the punctuation and
-/// case normalization between the raw audit text and the recorded condition
-/// text. The residual it accepts is bounded and one-directional: a line with two
-/// independent clauses sharing a marker, only one of which is inside the
-/// recorded text, stays silent. That card is already reported unsupported by the
-/// `Unrecognized` gap itself, so the residual costs detail, never a false green
-/// — and it is strictly tighter than `detect_duration_this_turn`'s precedent,
-/// which suppresses on the mere presence of an `Unrecognized` condition slot.
+/// MARKER-level rather than span-level (the raw audit text and the recorded
+/// condition text disagree on punctuation and case, so a byte-span association
+/// is not available here), but **occurrence-counted**, not set-like. That
+/// distinction is the whole safety property:
+///
+/// A predicate of the shape "some recorded text contains this marker" answers
+/// the question *does this marker appear anywhere in recorded text?* — which is
+/// a question about the marker's TYPE, not about its OCCURRENCES. A unit whose
+/// text raises `"for each "` twice, from two independent clauses, of which only
+/// ONE was recorded as an `Unrecognized` gap, satisfied that predicate and had
+/// BOTH occurrences suppressed. The second clause's dropped dynamic quantity was
+/// then reported by nothing at all: the `Unrecognized` gap names only the first
+/// clause's text, so the second is a silent false green, exactly the failure
+/// mode this detector exists to prevent.
+///
+/// So each marker is CONSUMED: suppression requires the recorded text to supply
+/// at least as many occurrences of that marker as the audited text raises. One
+/// recorded `for each` discharges one raised `for each` and no more. The
+/// residual that remains is one-directional and bounded — an unrecorded clause
+/// that happens to sit alongside enough recorded occurrences of the same marker
+/// is still absorbed — but the *cardinality* channel, the one that hid a whole
+/// second clause, is closed.
+///
+/// The recorded side reads `StaticCondition::unrecognized_texts`, the single
+/// authority for `And`/`Or`/`Not` recursion over a condition tree, so a gap
+/// marker stored `Not`-wrapped (the shape `parse_unless_static_condition`
+/// produces) counts the same as a bare one.
 fn dynamic_markers_are_all_recorded_unrecognized(
+    cleaned: &str,
     markers: &[&'static str],
     evidence: &UnitEvidence,
 ) -> bool {
     if markers.is_empty() {
         return false;
     }
+    // Key- AND type-anchored on the `StaticDefinition` carrier: the bare JSON key
+    // `condition` also carries `ReplacementCondition`, whose `Unrecognized` variant is
+    // field-identical to the static one, so a replacement effect's recorded gap text
+    // would otherwise discharge a static's suppression. See
+    // `swallow_evidence::STATIC_DEFINITION_KEYS`.
     let recorded: Vec<String> = evidence
-        .collect_at::<StaticCondition>(&["condition"])
-        .into_iter()
-        .filter_map(|condition| match condition {
-            StaticCondition::Unrecognized { text } => Some(text.to_ascii_lowercase()),
-            _ => None,
-        })
+        .static_definition_conditions()
+        .iter()
+        .flat_map(StaticCondition::unrecognized_texts)
+        .map(str::to_ascii_lowercase)
         .collect();
     if recorded.is_empty() {
         return false;
     }
     markers.iter().all(|marker| {
-        recorded
+        // allow-noncombinator: swallow detector marker scan on classified text
+        let raised = cleaned.matches(marker).count();
+        let accounted: usize = recorded
             .iter()
             // allow-noncombinator: swallow detector marker scan on classified text
-            .any(|text| text.contains(marker))
+            .map(|text| text.matches(marker).count())
+            .sum();
+        raised > 0 && accounted >= raised
     })
 }
 
@@ -2405,7 +2432,7 @@ fn detect_dynamic_qty(
     // Not swallowed — explicitly recorded. Checked before the carrier probes
     // because it is a claim about REPORTING (the defect is already on the card),
     // not about representation.
-    if dynamic_markers_are_all_recorded_unrecognized(&markers, evidence) {
+    if dynamic_markers_are_all_recorded_unrecognized(cleaned, &markers, evidence) {
         return;
     }
     // ── Typed dynamic-quantity carriers ─────────────────────────────────
@@ -2874,36 +2901,51 @@ fn decline_iteration_prefix(input: &str) -> bool {
     .is_ok()
 }
 
+/// The counter-multiplier phrases whose ×2 is carried intrinsically by the
+/// resolver: the "+1/+1 counters" form (`Effect::MultiplyCounter`) and the
+/// "each kind of counter" form (`Effect::Double { DoubleTarget::Counters }`,
+/// counter.rs). Each phrase CONTAINS the marker "the number of ", which is why
+/// it accounts for one occurrence of it.
+const COUNTER_MULTIPLIER_PHRASES: &[&str] = &[
+    "double the number of +1/+1 counters",
+    "double the number of each kind of counter",
+];
+
+/// CR 701.10e: True when the ONLY dynamic-quantity marker in `cleaned` is the
+/// one a counter-multiplier phrase carries intrinsically.
+///
+/// RESIDUAL-based, not set-based, and for the same reason
+/// [`dynamic_markers_are_all_recorded_unrecognized`] counts occurrences: the
+/// accepted phrase accounts for exactly the occurrence of `"the number of "` it
+/// contains, and for no other. The earlier form checked `contains(phrase)` and
+/// then scanned for the other markers with `"the number of "` OMITTED from the
+/// scanned list — so one counter multiplier discharged EVERY `"the number of "`
+/// on the unit, and a second, independent, genuinely-swallowed
+/// `"the number of …"` clause ("Double the number of +1/+1 counters on target
+/// creature. Draw the number of cards …") was hidden with no marker left to
+/// report it.
+///
+/// Stripping every accepted phrase and re-scanning the residual against the FULL
+/// marker vocabulary is the same shape
+/// [`cleaned_twice_damage_double_is_only_dynamic_marker`] already uses, and it
+/// makes the accounting positional instead of type-level.
 fn cleaned_has_only_counter_multiplier_dynamic(cleaned: &str) -> bool {
-    // The counter multiplier phrase: either the "+1/+1 counters" form
-    // (`Effect::MultiplyCounter`) or the "each kind of counter" form
-    // (`Effect::Double { DoubleTarget::Counters }`, counter.rs).
-    let has_counter_multiplier = [
-        "double the number of +1/+1 counters",
-        "double the number of each kind of counter",
-    ]
-    .iter()
-    // allow-noncombinator: swallow detector phrase scan on classified text
-    .any(|phrase| cleaned.contains(phrase));
+    let has_counter_multiplier = COUNTER_MULTIPLIER_PHRASES
+        .iter()
+        // allow-noncombinator: swallow detector phrase scan on classified text
+        .any(|phrase| cleaned.contains(phrase));
     if !has_counter_multiplier {
         return false;
     }
-    // The counter multiplier itself accounts for "the number of". If another
-    // dynamic marker is present, keep the warning because that second marker
-    // may be a real uncaptured clause.
-    ![
-        " equal to ",
-        "for each ",
-        " twice ",
-        "where x is ",
-        "half your ",
-        "half their ",
-        "half its ",
-        "half the ",
-    ]
-    .iter()
+    // Strip every accepted phrase (all occurrences — two multipliers account for
+    // two markers), then require NO dynamic marker to remain.
+    let residual = COUNTER_MULTIPLIER_PHRASES
+        .iter()
+        .fold(cleaned.to_string(), |text, phrase| {
+            text.replace(phrase, " ")
+        });
     // allow-noncombinator: swallow detector marker scan on classified text
-    .any(|marker| cleaned.contains(marker))
+    !(residual.contains(" twice ") || OTHER_DYNAMIC_MARKERS.iter().any(|m| residual.contains(m)))
 }
 
 /// True when " twice " is the ONLY dynamic-quantity marker in `cleaned` (and
@@ -7961,17 +8003,54 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     /// above; the `Not` wrapper is deliberate, because the recorded text must be
     /// found at any nesting depth, not only at the root.
     fn recorded_unrecognized_evidence(text: &str) -> UnitEvidence {
-        let mut def = StaticDefinition::new(StaticMode::CantBeBlocked);
-        def.condition = Some(StaticCondition::Not {
-            condition: Box::new(StaticCondition::Unrecognized {
-                text: text.to_string(),
-            }),
-        });
+        recorded_unrecognized_evidence_multi(&[text], &[])
+    }
+
+    /// The general form: one `Not`-wrapped `StaticCondition::Unrecognized` per
+    /// entry in `static_texts`, plus one `ReplacementCondition::Unrecognized`
+    /// per entry in `replacement_texts`.
+    ///
+    /// Two axes, because two distinct suppression hazards need pinning: several
+    /// static gaps on one unit (does the predicate COUNT occurrences, or merely
+    /// detect the marker's type?) and a replacement gap alongside them (can a
+    /// CR 614.1 condition discharge a CR 604.1 static's suppression, given the
+    /// two `Unrecognized` variants are field-identical and share the JSON key
+    /// `condition`?).
+    fn recorded_unrecognized_evidence_multi(
+        static_texts: &[&str],
+        replacement_texts: &[&str],
+    ) -> UnitEvidence {
+        use crate::types::ability::{ReplacementCondition, ReplacementDefinition};
+        use crate::types::replacements::ReplacementEvent;
+
+        let statics = static_texts
+            .iter()
+            .map(|text| {
+                let mut def = StaticDefinition::new(StaticMode::CantBeBlocked);
+                def.condition = Some(StaticCondition::Not {
+                    condition: Box::new(StaticCondition::Unrecognized {
+                        text: (*text).to_string(),
+                    }),
+                });
+                def
+            })
+            .collect();
+        let replacements = replacement_texts
+            .iter()
+            .map(|text| {
+                let mut def = ReplacementDefinition::new(ReplacementEvent::Moved);
+                def.condition = Some(ReplacementCondition::Unrecognized {
+                    text: (*text).to_string(),
+                });
+                def
+            })
+            .collect();
+
         UnitEvidence::of(&crate::parser::oracle::ParsedAbilities {
             abilities: Vec::new(),
             triggers: Vec::new(),
-            statics: vec![def],
-            replacements: Vec::new(),
+            statics,
+            replacements,
             extracted_keywords: Vec::new(),
             modal: None,
             additional_cost: None,
@@ -7992,29 +8071,148 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     /// answers matter and only the first has a printed card behind it today.
     #[test]
     fn recorded_unrecognized_text_discharges_only_the_markers_it_contains() {
-        let recorded =
-            recorded_unrecognized_evidence("defending player pays {3} for each creature blocking");
+        let clause = "defending player pays {3} for each creature blocking";
+        let recorded = recorded_unrecognized_evidence(clause);
         assert!(
-            dynamic_markers_are_all_recorded_unrecognized(&["for each "], &recorded),
+            dynamic_markers_are_all_recorded_unrecognized(clause, &["for each "], &recorded),
             "a marker INSIDE the recorded text is already reported by the gap itself"
         );
+
+        // Same recorded gap, but the audited unit ALSO drops a quantity the gap
+        // says nothing about.
+        let with_sibling = "defending player pays {3} for each creature blocking. \
+                            draw cards equal to your life total.";
         assert!(
-            !dynamic_markers_are_all_recorded_unrecognized(&[" equal to "], &recorded),
+            !dynamic_markers_are_all_recorded_unrecognized(
+                with_sibling,
+                &[" equal to "],
+                &recorded
+            ),
             "a marker the recorded text does NOT contain is still a live swallow: \
              suppressing it would hide an unrelated dropped quantity on the same line"
         );
         assert!(
-            !dynamic_markers_are_all_recorded_unrecognized(&["for each ", " equal to "], &recorded),
+            !dynamic_markers_are_all_recorded_unrecognized(
+                with_sibling,
+                &["for each ", " equal to "],
+                &recorded
+            ),
             "ALL markers must be accounted for — one recorded marker must not excuse \
              an unrecorded sibling"
         );
         assert!(
             !dynamic_markers_are_all_recorded_unrecognized(
+                clause,
                 &["for each "],
                 &no_activation_limit_evidence()
             ),
             "with no Unrecognized condition anywhere, nothing was recorded and the \
              marker is a genuine swallow"
+        );
+    }
+
+    /// CR 107.3 + CR 604.1: one recorded gap discharges ONE raised occurrence of
+    /// its marker, not the marker's whole type on the unit.
+    ///
+    /// Regression for a set-like suppression predicate ("does some recorded text
+    /// contain this marker?"). A unit raising `"for each "` twice, from two
+    /// independent clauses of which only one was recorded as an `Unrecognized`
+    /// gap, satisfied that predicate — and the second clause's dropped dynamic
+    /// quantity was then reported by nothing at all, because the `Unrecognized`
+    /// gap names only the first clause's text. That is a silent false green of
+    /// exactly the shape this detector exists to prevent.
+    #[test]
+    fn a_second_same_marker_clause_is_not_discharged_by_the_first() {
+        let first = "defending player pays {3} for each creature blocking";
+        let second = "its controller loses 1 life for each card in their graveyard";
+        let both_raised = format!("{first}. {second}.");
+
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                &both_raised,
+                &["for each "],
+                &recorded_unrecognized_evidence(first)
+            ),
+            "the SECOND independently swallowed 'for each' is unrepresented and \
+             unrecorded — one recorded occurrence must not account for two raised ones"
+        );
+
+        // Both occurrences recorded inside a single gap: fully accounted, suppress.
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(
+                &both_raised,
+                &["for each "],
+                &recorded_unrecognized_evidence(&both_raised)
+            ),
+            "when the recorded text supplies as many occurrences as the unit raises, \
+             every one of them is already reported verbatim by the gap"
+        );
+
+        // Both occurrences recorded, but split across two separate gap markers —
+        // counting is over the recorded SET, not over any single recorded text.
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(
+                &both_raised,
+                &["for each "],
+                &recorded_unrecognized_evidence_multi(&[first, second], &[])
+            ),
+            "two independently recorded gaps account for two raised occurrences"
+        );
+    }
+
+    /// CR 604.1 vs CR 614.1: a REPLACEMENT effect's recorded gap must not
+    /// discharge a STATIC ability's suppression.
+    ///
+    /// `ReplacementCondition::Unrecognized { text }` and
+    /// `StaticCondition::Unrecognized { text }` are field-identical and both
+    /// serialize under the bare JSON key `condition`, so a key-only
+    /// `collect_at::<StaticCondition>(&["condition"])` deserialized the
+    /// replacement's node as a static condition and accepted an unrelated rule's
+    /// gap text as proof. The collection is now anchored on the
+    /// `StaticDefinition` carrier — path AND type — so the two kinds cannot be
+    /// confused.
+    #[test]
+    fn a_replacement_gap_does_not_discharge_a_static_conditions_suppression() {
+        let clause = "defending player pays {3} for each creature blocking";
+
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                clause,
+                &["for each "],
+                &recorded_unrecognized_evidence_multi(&[], &[clause])
+            ),
+            "only a CR 614.1 replacement gap was recorded; the static's dynamic \
+             quantity is still swallowed and must stay reported"
+        );
+
+        // Cross-kind: the replacement records one marker, the static records a
+        // DIFFERENT one. The marker the static did not record stays live.
+        let unit = "defending player pays {3} for each creature blocking. \
+                    draw cards equal to your life total.";
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                unit,
+                &["for each ", " equal to "],
+                &recorded_unrecognized_evidence_multi(
+                    &["draw cards equal to your life total"],
+                    &[clause],
+                )
+            ),
+            "the replacement gap must not stand in for the static's unrecorded \
+             'for each' — the genuinely swallowed static quantity must still report"
+        );
+
+        // Positive control on the same shape: with the static gap actually
+        // recording BOTH markers, suppression is restored, so the guard above is
+        // discriminating rather than a blanket rejection.
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(
+                unit,
+                &["for each ", " equal to "],
+                &recorded_unrecognized_evidence_multi(&[unit], &[clause]),
+            ),
+            "a static gap that records every raised marker still suppresses, \
+             replacement gap or not"
         );
     }
 
@@ -9883,6 +10081,40 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         assert!(!super::cleaned_has_only_counter_multiplier_dynamic(
             "double the number of each kind of counter on target creature for each card in your hand"
         ));
+    }
+
+    /// CR 701.10e + CR 107.3: the counter-multiplier escape hatch accounts for
+    /// the `"the number of "` occurrence its OWN phrase contains, and for no
+    /// other occurrence of that same marker on the unit.
+    ///
+    /// Regression for a set-like escape hatch. The recognizer used to test
+    /// `contains(<multiplier phrase>)` and then scan for "other" dynamic markers
+    /// with `"the number of "` deliberately omitted from the scanned list —
+    /// because the accepted phrase contains it. That omission was unconditional,
+    /// so ONE multiplier discharged EVERY `"the number of "` on the unit and a
+    /// second, independent, genuinely swallowed one was left reported by
+    /// nothing. Same failure shape as the `for each` marker suppression in
+    /// `a_second_same_marker_clause_is_not_discharged_by_the_first`.
+    #[test]
+    fn counter_multiplier_does_not_discharge_a_second_the_number_of_clause() {
+        assert!(
+            !super::cleaned_has_only_counter_multiplier_dynamic(
+                "double the number of +1/+1 counters on target creature, \
+                 then draw the number of cards in your graveyard"
+            ),
+            "the SECOND 'the number of' is an independent dynamic quantity the \
+             MultiplyCounter resolver does not carry — it must stay reported"
+        );
+
+        // Two multiplier phrases account for two occurrences: still clean.
+        assert!(
+            super::cleaned_has_only_counter_multiplier_dynamic(
+                "double the number of +1/+1 counters on target creature, \
+                 then double the number of each kind of counter on it"
+            ),
+            "each accepted phrase accounts for the one marker occurrence it \
+             contains, so two phrases account for two"
+        );
     }
 
     /// FIX1 end-to-end (CR 701.10e): the "each kind of counter" doubling form no

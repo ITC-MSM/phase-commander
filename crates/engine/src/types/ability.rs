@@ -25904,6 +25904,44 @@ impl StaticDefinition {
             condition: self.condition.as_ref(),
         })
     }
+
+    /// THE `StaticDefinition` nesting walk: visits `self`, then every static
+    /// definition nested beneath it by a
+    /// [`ContinuousModification::GrantStaticAbility`], transitively, in Oracle
+    /// order.
+    ///
+    /// CR 613.1f + CR 604.1: a granted static is a static ability in its own
+    /// right — it carries its own `mode`, `affected` scope, `modifications` and
+    /// (load-bearing here) its own `condition`. Any authority that asks a
+    /// question about "this face's static abilities" must therefore ask it of
+    /// the granted definitions too, or a nested definition is invisible to it.
+    ///
+    /// Single authority for that recursion, for the same reason
+    /// [`StaticCondition::walk_leaves`] is the single authority for the
+    /// condition-tree recursion: parallel walks are exactly how a nested node
+    /// comes to be seen by one coverage gate and missed by another. The
+    /// corpus-wide unenforceable-gate backstop
+    /// (`database::CardDatabase::export_integrity_errors`) originally read only
+    /// each face's top-level `static_abilities`, so an unofferable CR 118.12a
+    /// `UnlessPay` sitting on a definition inside a `GrantStaticAbility`
+    /// bypassed it entirely and the card shipped falsely supported.
+    ///
+    /// `GrantAbility` / `GrantTrigger` / `GrantReplacement` are deliberately NOT
+    /// descended into: they nest an `AbilityDefinition` / `TriggerDefinition` /
+    /// `ReplacementDefinition`, not a `StaticDefinition`, so they hold nothing
+    /// this walk's element type can yield.
+    pub(crate) fn walk_self_and_granted<F>(&self, visit: &mut F) -> ControlFlow<()>
+    where
+        F: FnMut(&StaticDefinition) -> ControlFlow<()>,
+    {
+        visit(self)?;
+        for modification in &self.modifications {
+            if let ContinuousModification::GrantStaticAbility { definition } = modification {
+                definition.walk_self_and_granted(visit)?;
+            }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 impl CostModifierCasterScope {

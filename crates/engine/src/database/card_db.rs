@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -322,22 +323,44 @@ impl CardDatabase {
     /// has (see `unenforceable_gate_marker`, which labels the gap with it).
     /// Silently substituting a marker here would hide the bypass instead of
     /// surfacing it.
+    ///
+    /// CR 613.1f + CR 604.1: the walk is over
+    /// [`StaticDefinition::walk_self_and_granted`], not over
+    /// `face.static_abilities` alone. A `ContinuousModification::
+    /// GrantStaticAbility` owns a whole nested `StaticDefinition` — its own
+    /// mode, its own scope, and its own `condition` — so the top-level view
+    /// leaves every granted definition unchecked, and an unofferable
+    /// `UnlessPay` inside one bypasses this backstop exactly the way the
+    /// parser-side gate was bypassed three times before it existed. Nesting is
+    /// transitive (a granted static may itself grant one), which is why the
+    /// recursion lives in the shared walk rather than being open-coded here.
     fn unenforceable_static_condition_errors(&self) -> Vec<String> {
         let mut errors: Vec<String> = self
             .face_index
             .values()
             .flat_map(|face| {
-                face.static_abilities.iter().filter_map(move |def| {
-                    let condition = def.condition.as_ref()?;
-                    condition.is_unenforceable_on(&def.mode).then(|| {
-                        format!(
-                            "{}: static {:?} carries a condition its enforcement point can \
-                             never satisfy ({:?}) — it must be routed through \
-                             oracle_static::static_helpers::gate_static_condition",
-                            face.name, def.mode, condition
-                        )
-                    })
-                })
+                let mut face_errors = Vec::new();
+                for root in &face.static_abilities {
+                    // The collector never breaks, so the traversal always runs
+                    // to completion and the `ControlFlow` result carries no
+                    // information.
+                    let _: ControlFlow<()> = root.walk_self_and_granted(&mut |def| {
+                        let unenforceable = def
+                            .condition
+                            .as_ref()
+                            .filter(|condition| condition.is_unenforceable_on(&def.mode));
+                        if let Some(condition) = unenforceable {
+                            face_errors.push(format!(
+                                "{}: static {:?} carries a condition its enforcement point can \
+                                 never satisfy ({:?}) — it must be routed through \
+                                 oracle_static::static_helpers::gate_static_condition",
+                                face.name, def.mode, condition
+                            ));
+                        }
+                        ControlFlow::Continue(())
+                    });
+                }
+                face_errors
             })
             .collect();
         // `face_index` is a HashMap, so the natural order is nondeterministic;
@@ -768,6 +791,88 @@ mod tests {
             errors.iter().any(|e| e.contains("Untaxed Probe")),
             "a payment gate on a mode with no payment prompt must fail the export \
              no matter which parser route built it, got {errors:?}"
+        );
+    }
+
+    /// CR 613.1f + CR 604.1 + CR 118.12a: a granted static ability is a static
+    /// ability, so the unenforceable-gate backstop must reach the condition on
+    /// the definition a `ContinuousModification::GrantStaticAbility` nests —
+    /// and on the definition THAT one nests, transitively.
+    ///
+    /// Regression for the top-level-only view: the outer definition here is
+    /// deliberately clean (no condition at all, and a mode that WOULD accept a
+    /// payment gate), so the only thing that can fail the export is the inner
+    /// definition's leaf. Before the walk existed this face shipped reported as
+    /// fully supported while the inner `CantBeBlocked` gate was hard-coded
+    /// `false` by the layer pipeline — the exact Awesome Presence shape, one
+    /// level down.
+    #[test]
+    fn export_integrity_reaches_conditions_on_nested_granted_statics() {
+        use crate::types::ability::{ContinuousModification, StaticCondition, UnlessPayScaling};
+        use crate::types::mana::ManaCost;
+        use crate::types::statics::StaticMode;
+
+        let pay_gate = || StaticCondition::UnlessPay {
+            cost: ManaCost::NoCost,
+            scaling: UnlessPayScaling::default(),
+            defended: None,
+        };
+
+        // Innermost: CR 509.1b — no block-declaration prompt exists, so this
+        // leaf is the unofferable gate.
+        let mut inner = StaticDefinition::new(StaticMode::CantBeBlocked);
+        inner.condition = Some(pay_gate());
+
+        // Middle: a granted static that is itself clean, proving the walk does
+        // not stop at the first level of nesting.
+        let mut middle = StaticDefinition::continuous();
+        middle.modifications = vec![ContinuousModification::GrantStaticAbility {
+            definition: Box::new(inner),
+        }];
+
+        // Outer/top-level: clean, and on `CantAttack`, whose CR 508.1h combat-tax
+        // prompt makes a payment gate legitimately enforceable — so a top-level
+        // -only check finds nothing to report on this face.
+        let mut outer = StaticDefinition::new(StaticMode::CantAttack);
+        outer.modifications = vec![ContinuousModification::GrantStaticAbility {
+            definition: Box::new(middle),
+        }];
+
+        let mut faces = HashMap::new();
+        let mut face = test_face("Nested Grant Probe");
+        face.static_abilities = vec![outer];
+        faces.insert("nested grant probe".to_string(), face);
+        let db =
+            CardDatabase::from_json_str(&serde_json::to_string(&faces).unwrap()).expect("parses");
+
+        let errors = db.export_integrity_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Nested Grant Probe") && e.contains("CantBeBlocked")),
+            "an unofferable payment gate two levels inside GrantStaticAbility must fail \
+             the export rather than leaving the card falsely supported, got {errors:?}"
+        );
+
+        // ACCEPT direction at depth: the same nesting with an enforceable inner
+        // mode must still pass, so the recursion is not a blanket rejection of
+        // every nested condition.
+        let mut inner_ok = StaticDefinition::new(StaticMode::CantAttack);
+        inner_ok.condition = Some(pay_gate());
+        let mut outer_ok = StaticDefinition::continuous();
+        outer_ok.modifications = vec![ContinuousModification::GrantStaticAbility {
+            definition: Box::new(inner_ok),
+        }];
+        let mut ok_faces = HashMap::new();
+        let mut ok_face = test_face("Nested Taxed Probe");
+        ok_face.static_abilities = vec![outer_ok];
+        ok_faces.insert("nested taxed probe".to_string(), ok_face);
+        let ok_db = CardDatabase::from_json_str(&serde_json::to_string(&ok_faces).unwrap())
+            .expect("parses");
+        assert!(
+            ok_db.export_integrity_errors().is_empty(),
+            "a nested payment gate on a combat-taxed mode is enforceable and must pass: {:?}",
+            ok_db.export_integrity_errors()
         );
     }
 
