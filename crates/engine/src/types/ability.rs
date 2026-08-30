@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use serde::de;
@@ -4196,20 +4197,20 @@ pub enum DelayedTriggerCondition {
     WhenLeavesPlay {
         object_id: super::identifiers::ObjectId,
     },
-    /// CR 603.7c: "when [object] dies" — fires on zone change to graveyard.
+    /// CR 603.7: "when [object] dies" — fires on zone change to graveyard.
     /// Filter-based variant resolved at trigger check time (unlike WhenLeavesPlay
     /// which uses a specific object_id).
     WhenDies { filter: TargetFilter },
-    /// CR 603.7c: "when [object] leaves the battlefield" — filter-based variant
+    /// CR 603.7: "when [object] leaves the battlefield" — filter-based variant
     /// that fires on any zone change from battlefield.
     WhenLeavesPlayFiltered { filter: TargetFilter },
-    /// CR 603.7c: "when [object] enters the battlefield" — fires on zone change
+    /// CR 603.7: "when [object] enters the battlefield" — fires on zone change
     /// to battlefield.
     WhenEntersBattlefield { filter: TargetFilter },
     /// "when [object] dies or is exiled" — fires on zone change to graveyard OR exile.
     /// Filter-based variant resolved at trigger check time.
     WhenDiesOrExiled { filter: TargetFilter },
-    /// CR 603.7c: "Whenever [event] this turn" — fires each time the event occurs
+    /// CR 603.7b: "Whenever [event] this turn" — fires each time the event occurs
     /// until end of turn. Reuses existing trigger matching infrastructure via embedded
     /// TriggerDefinition. The embedded trigger's `execute` field should be `None` —
     /// the actual effect lives in `DelayedTrigger.ability`.
@@ -4483,10 +4484,10 @@ pub struct DamageAmountThreshold {
 ///
 /// This is not a speculative shim — three live consumers read the legacy shape:
 /// browser IndexedDB saved games (`client/src/services/gamePersistence.ts`,
-/// `saveGame` :147 / `loadGame` :181), the phase-server session store
-/// (`crates/phase-server/src/persistence.rs:488` deserializing a
-/// `PersistedSession` whose `state` is a `PersistedGameState`,
-/// `crates/server-core/src/persist.rs:23`), and the in-repo shared card fixture
+/// `saveGame` / `loadGame`), the phase-server session store
+/// (`crates/phase-server/src/persistence.rs` deserializing a
+/// `PersistedSession` whose `state` is a `PersistedGameState`, and
+/// `crates/server-core/src/persist.rs`), and the in-repo shared card fixture
 /// `crates/engine/tests/fixtures/integration_cards.json.gz`, which already
 /// carries legacy `["GE",5]` / `["EQ",1]` arrays.
 /// Write-side counterpart to [`deserialize_damage_amount_compat`]: `PerSource`
@@ -5902,45 +5903,20 @@ pub enum TargetFilter {
     PlayerWhoChoseLabel {
         label: String,
     },
-    /// CR 102.1 + CR 102.2 / CR 102.3 + CR 109.5: the player(s) satisfying an
-    /// arbitrary [`PlayerFilter`] predicate. CR 102.1 supplies the population
-    /// (the people in the game) this selects from, CR 102.2 / CR 102.3 the
-    /// `relation` axis's opponent semantics, and CR 109.5 the controller-relative
-    /// "you" every relation is measured against. (Deliberately NOT CR 109.4:
-    /// that rule governs an OBJECT's controller, which is the object-axis
-    /// mirror's business, not this variant's.)
+    /// CR 102.1 + CR 102.2 / CR 102.3 + CR 109.5: the player(s) satisfying an arbitrary
+    /// [`PlayerFilter`] predicate — CR 102.1 supplies the population, CR 102.2 / CR 102.3 the
+    /// `relation` axis's opponent semantics, CR 109.5 the controller-relative "you" it is measured
+    /// against. (Not CR 109.4, which governs an OBJECT's controller — that is the object-axis
+    /// mirror [`FilterProp::ControllerMatches`], whose pair this variant completes.) Evaluated by
+    /// the single-authority `game::effects::matches_player_scope`, so every predicate
+    /// `PlayerFilter` already expresses becomes usable wherever a `TargetFilter` names a player.
     ///
-    /// The PLAYER-axis mirror of [`FilterProp::ControllerMatches`], which is
-    /// itself documented as the object-axis mirror of `PlayerFilter`; this
-    /// variant completes the pair.
-    ///
-    /// Evaluated by the single-authority `game::effects::matches_player_scope`,
-    /// so every predicate `PlayerFilter` already expresses — life total
-    /// (CR 119.1), hand size (CR 402.1), controlled-permanent counts (CR 109.4),
-    /// counters (CR 122.1), attack history (CR 508.6) — becomes usable anywhere
-    /// a `TargetFilter` names a player, with no further variants.
-    ///
-    /// First consumer: `TriggerDefinition::valid_target` on a CR 508.1a attack
-    /// trigger whose attacked player carries a relative-clause predicate
-    /// ("attacks a player who has more life than you"). Per CR 603.2 that clause
-    /// is part of the TRIGGER EVENT and is checked once at declaration — which
-    /// is exactly `valid_target`'s contract
-    /// (`trigger_matchers::attack_target_matches`) and exactly why it is NOT
-    /// modelled as a `TriggerCondition`, which CR 603.4 re-checks at resolution.
-    ///
-    /// The `PlayerFilter`'s `relation` is evaluated against the TRIGGER SOURCE's
-    /// CONTROLLER, which is not always the attacking player — a player-subject
-    /// attack trigger routes the attacker into `valid_source` instead. Producers
-    /// must not assume the two coincide.
-    ///
-    /// `Box` breaks the `TargetFilter -> PlayerFilter -> ControlsCount { filter:
-    /// TargetFilter }` size cycle (same rationale as
-    /// `FilterProp::ControllerMatches` and `PlayerFilter::AllExcept`).
-    ///
-    /// FOLLOW-UP (not this change): [`TargetFilter::PlayerWhoChoseLabel`] is the
-    /// hard-coded single-predicate sibling this variant supersedes. Retiring it
-    /// needs a `PlayerFilter::ChoseLabel { label }` backed by the existing single
-    /// authority `game::players::player_last_chose_label`.
+    /// On a CR 508.1a attack trigger's `valid_target` the relative clause is part of the TRIGGER
+    /// EVENT, checked once at declaration (CR 603.2) — which is why it is not a `TriggerCondition`,
+    /// re-checked at resolution under CR 603.4. `relation` is measured against the trigger SOURCE's
+    /// controller, which need not be the attacker. `Box` breaks the `TargetFilter -> PlayerFilter
+    /// -> ControlsCount { filter: TargetFilter }` size cycle. [`TargetFilter::PlayerWhoChoseLabel`]
+    /// is the hard-coded sibling this supersedes, retirable via `PlayerFilter::ChoseLabel`.
     PlayerMatching {
         player: Box<PlayerFilter>,
     },
@@ -5978,6 +5954,21 @@ pub enum TargetFilter {
     /// resolving spell or ability. Used by effects such as "the exiled card"
     /// after an exile-as-cost clause.
     CostPaidObject,
+    /// CR 701.47c + CR 608.2c: "the amassed Army" / "the Army you amassed" —
+    /// the Army creature chosen by the current amass instruction, whether or
+    /// not it received counters. A resolution-local, non-targeted object
+    /// reference (the `TargetFilter` object-target counterpart of
+    /// [`ObjectScope::AmassedArmy`], which reads the same
+    /// `ResolvedAbility.amassed_army_object` snapshot for QuantityRef
+    /// properties like "the amassed Army's power"). Used by
+    /// `Effect::Attach.target` for "amass Goblins 1, then attach this
+    /// Equipment to the amassed Army" (Goblin Plate Mail): the sub-ability
+    /// chain walker in `game/effects/mod.rs` stamps `amassed_army_object`
+    /// from the `Amass` effect's resolution onto this sub-ability before it
+    /// resolves, so the attach binds to the EXACT Army amass just touched —
+    /// the newly created token, or an existing Army — never re-derived by
+    /// rescanning the battlefield for "an Army you control".
+    AmassedArmy,
     /// CR 613.1f + CR 611.2c + CR 400.7: Resolves to the single card most recently
     /// recorded on the FILTER's source object via `ChosenAttribute::Card` (written
     /// by `Effect::RememberCard`). Models "the last chosen card" — Koh, the Face
@@ -6157,7 +6148,7 @@ pub enum TargetFilter {
     /// ability's target slot) and `TriggeringSpellController` (which resolves
     /// via `state.current_trigger_event`, which is `None` during post-replacement
     /// resolution). Architectural twin of the quantity-side `last_effect_count`
-    /// fallback at `replacement.rs:317` — both stash event context that lives
+    /// fallback in `replacement.rs` — both stash event context that lives
     /// outside the trigger window. The parser never emits this variant directly;
     /// the prevention follow-up call site rewrites `ParentTargetController`
     /// → `PostReplacementSourceController` via `each_target_filter_mut` after
@@ -6594,6 +6585,8 @@ pub enum CardTypeSetSource {
     /// Draw->Discard set is disambiguated by CAUSE (drawn members are unstamped),
     /// so Some(Discarded) counts only discarded members. None counts all.
     TrackedSet {
+        #[serde(default, skip_serializing_if = "TrackedAnaphorSource::is_chain_set")]
+        set: TrackedAnaphorSource,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caused_by: Option<ThisWayCause>,
     },
@@ -6835,6 +6828,34 @@ impl CardTypeSetSource {
             }
         }
     }
+
+    /// Mutable counterpart of [`try_for_each_member`](Self::try_for_each_member).
+    ///
+    /// Transformations over the population axis use the same bounded recursion
+    /// authority as readers, so a nested `AnyOf` cannot evade a rewrite that is
+    /// exhaustive over leaf sources.
+    pub fn try_for_each_member_mut(
+        &mut self,
+        depth: u32,
+        visit: &mut impl FnMut(&mut CardTypeSetSource),
+    ) -> bool {
+        let Some(depth) = depth.checked_sub(1) else {
+            return false;
+        };
+        match self {
+            CardTypeSetSource::AnyOf { sources } => {
+                let mut complete = true;
+                for member in &mut sources.0 {
+                    complete &= member.try_for_each_member_mut(depth, visit);
+                }
+                complete
+            }
+            leaf => {
+                visit(leaf);
+                true
+            }
+        }
+    }
 }
 
 /// CR 109.2: Depth budget for [`CardTypeSetSource::try_for_each_member`].
@@ -6889,6 +6910,167 @@ pub enum CastManaSpentMetric {
     OfColor { color: ManaColor },
     /// Amount of mana whose source matched the filter at payment time.
     FromSource { source_filter: TargetFilter },
+}
+
+/// A validated numeric reduction over one characteristic-bearing population.
+///
+/// CR 202.3 + CR 208.1 + CR 209.1: the source must carry enough snapshot data
+/// to answer the selected property. In particular, spell-cast journal records
+/// retain mana value but not the other object characteristics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PropertyAggregate {
+    function: AggregateFunction,
+    property: ObjectProperty,
+    source: CardTypeSetSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PropertyAggregateError {
+    #[error("turn-journal property aggregates support only ManaValue, not {0:?}")]
+    UnsupportedTurnJournalProperty(ObjectProperty),
+    #[error("property aggregate source exceeds the supported union depth")]
+    SourceDepthExceeded,
+}
+
+impl PropertyAggregate {
+    pub fn new(
+        function: AggregateFunction,
+        property: ObjectProperty,
+        source: CardTypeSetSource,
+    ) -> Result<Self, PropertyAggregateError> {
+        let mut invalid_journal = false;
+        let complete = source.try_for_each_member(UNION_DEPTH_BUDGET, &mut |leaf| {
+            if matches!(leaf, CardTypeSetSource::TurnJournal { .. })
+                && property != ObjectProperty::ManaValue
+            {
+                invalid_journal = true;
+            }
+        });
+        if !complete {
+            return Err(PropertyAggregateError::SourceDepthExceeded);
+        }
+        if invalid_journal {
+            return Err(PropertyAggregateError::UnsupportedTurnJournalProperty(
+                property,
+            ));
+        }
+        Ok(Self {
+            function,
+            property,
+            source,
+        })
+    }
+
+    pub fn function(&self) -> AggregateFunction {
+        self.function
+    }
+
+    pub fn property(&self) -> ObjectProperty {
+        self.property
+    }
+
+    pub fn source(&self) -> &CardTypeSetSource {
+        &self.source
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PropertyAggregateRepr {
+    function: AggregateFunction,
+    property: ObjectProperty,
+    source: CardTypeSetSource,
+}
+
+impl<'de> Deserialize<'de> for PropertyAggregate {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let repr = PropertyAggregateRepr::deserialize(deserializer)?;
+        Self::new(repr.function, repr.property, repr.source).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", deny_unknown_fields)]
+enum LegacyPropertyAggregateWire {
+    Aggregate {
+        function: AggregateFunction,
+        property: ObjectProperty,
+        filter: TargetFilter,
+    },
+    TrackedSetAggregate {
+        function: AggregateFunction,
+        property: ObjectProperty,
+        #[serde(default)]
+        source: TrackedAnaphorSource,
+    },
+}
+
+pub(crate) fn deserialize_quantity_ref_compat<'de, D>(
+    deserializer: D,
+) -> Result<QuantityRef, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    quantity_ref_from_value(value)
+}
+
+pub(crate) fn deserialize_boxed_quantity_ref_compat<'de, D>(
+    deserializer: D,
+) -> Result<Box<QuantityRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_quantity_ref_compat(deserializer).map(Box::new)
+}
+
+pub(crate) fn deserialize_optional_quantity_ref_compat<'de, D>(
+    deserializer: D,
+) -> Result<Option<QuantityRef>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<serde_json::Value>::deserialize(deserializer)?
+        .map(quantity_ref_from_value)
+        .transpose()
+}
+
+fn quantity_ref_from_value<E: serde::de::Error>(
+    value: serde_json::Value,
+) -> Result<QuantityRef, E> {
+    let tag = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| E::custom("quantity reference requires a string type tag"))?;
+    match tag {
+        "Aggregate" | "TrackedSetAggregate" => {
+            let legacy: LegacyPropertyAggregateWire =
+                serde_json::from_value(value).map_err(E::custom)?;
+            let (function, property, source) = match legacy {
+                LegacyPropertyAggregateWire::Aggregate {
+                    function,
+                    property,
+                    filter,
+                } => (function, property, CardTypeSetSource::Objects { filter }),
+                LegacyPropertyAggregateWire::TrackedSetAggregate {
+                    function,
+                    property,
+                    source,
+                } => (
+                    function,
+                    property,
+                    CardTypeSetSource::TrackedSet {
+                        set: source,
+                        caused_by: None,
+                    },
+                ),
+            };
+            PropertyAggregate::new(function, property, source)
+                .map(QuantityRef::PropertyAggregate)
+                .map_err(E::custom)
+        }
+        _ => serde_json::from_value(value).map_err(E::custom),
+    }
 }
 
 /// A dynamic game quantity — a runtime lookup into the game state.
@@ -7118,11 +7300,7 @@ pub enum QuantityRef {
     /// `filter.extract_zones()`, so the query is zone-general.
     // TODO: no dedicated CR governs the extremum/aggregation itself; CR 202.3 is
     // cited for the mana-value property — the most common aggregated property.
-    Aggregate {
-        function: AggregateFunction,
-        property: ObjectProperty,
-        filter: TargetFilter,
-    },
+    PropertyAggregate(PropertyAggregate),
     /// CR 107.1 + CR 102.1/102.2/102.3: The [min/max], across players in
     /// `relation`, of the number
     /// of **battlefield** objects matching `filter` that the player controls
@@ -7234,15 +7412,6 @@ pub enum QuantityRef {
     /// are read in place. Used by "deals damage equal to the total mana value of
     /// those exiled cards" (Ensnared by the Mara — `Sum` over `ManaValue` of the
     /// set the preceding `ExileTop` published).
-    TrackedSetAggregate {
-        function: AggregateFunction,
-        property: ObjectProperty,
-        /// CR 608.2c: which object-id set to reduce. Defaults to `ChainSet`
-        /// (the chain-published tracked set) so existing serialized card-data
-        /// stays byte-identical — no `source` key is emitted for the default.
-        #[serde(default, skip_serializing_if = "TrackedAnaphorSource::is_chain_set")]
-        source: TrackedAnaphorSource,
-    },
     /// CR 400.7 + CR 608.2c: Number of cards exiled from a hand by the immediately
     /// preceding `Effect::ChangeZoneAll` resolution. Read by Deadly Cover-Up's
     /// "draws a card for each card exiled from their hand this way." The counter
@@ -7838,7 +8007,7 @@ impl QuantityRef {
             | QuantityRef::ObjectTypelineComponentCount { .. }
             | QuantityRef::ManaSymbolsInManaCost { .. }
             | QuantityRef::SelfManaValue
-            | QuantityRef::Aggregate { .. }
+            | QuantityRef::PropertyAggregate(_)
             | QuantityRef::ControlledByEachPlayer { .. }
             | QuantityRef::TargetZoneCardCount { .. }
             | QuantityRef::Devotion { .. }
@@ -7850,7 +8019,6 @@ impl QuantityRef {
             | QuantityRef::BasicLandTypeCount { .. }
             | QuantityRef::TrackedSetSize
             | QuantityRef::FilteredTrackedSetSize { .. }
-            | QuantityRef::TrackedSetAggregate { .. }
             | QuantityRef::ExiledFromHandThisResolution
             | QuantityRef::PreviousEffectAmount { .. }
             | QuantityRef::PreviousEffectCount
@@ -7936,7 +8104,7 @@ pub enum TrackedAnaphorSource {
 impl TrackedAnaphorSource {
     /// The default source. Used by `skip_serializing_if` so existing
     /// `TrackedSetAggregate` card-data stays byte-identical (no `source` key).
-    fn is_chain_set(&self) -> bool {
+    pub(crate) fn is_chain_set(&self) -> bool {
         matches!(self, Self::ChainSet)
     }
 }
@@ -8369,6 +8537,7 @@ pub enum PlayerFilter {
     /// the enum infinite size.
     PlayerAttribute {
         relation: PlayerRelation,
+        #[serde(deserialize_with = "deserialize_boxed_quantity_ref_compat")]
         attr: Box<QuantityRef>,
         comparator: Comparator,
         value: Box<QuantityExpr>,
@@ -8585,6 +8754,7 @@ impl<'de> serde::Deserialize<'de> for QuantityExpr {
                 #[serde(tag = "type")]
                 enum Tagged {
                     Ref {
+                        #[serde(deserialize_with = "deserialize_quantity_ref_compat")]
                         qty: QuantityRef,
                     },
                     Fixed {
@@ -8970,9 +9140,11 @@ pub enum UnlessPayScaling {
     Flat,
     PerAffectedCreature,
     PerQuantityRef {
+        #[serde(deserialize_with = "deserialize_quantity_ref_compat")]
         quantity: QuantityRef,
     },
     PerAffectedAndQuantityRef {
+        #[serde(deserialize_with = "deserialize_quantity_ref_compat")]
         quantity: QuantityRef,
     },
     /// CR 118.12a + CR 202.3e: Per-affected-creature cost where the scaling quantity
@@ -8985,6 +9157,7 @@ pub enum UnlessPayScaling {
     /// quantity is resolved per-creature using that creature as the `TargetRef::Object`
     /// during resolution.
     PerAffectedWithRef {
+        #[serde(deserialize_with = "deserialize_quantity_ref_compat")]
         quantity: QuantityRef,
     },
 }
@@ -9007,6 +9180,44 @@ pub enum CommanderOwnership {
     /// the evaluating player, regardless of owner (a stolen opponent's commander
     /// counts).
     Any,
+}
+
+/// Engine limitation, not CR-mandated: the out-of-layer-pipeline continuation
+/// that decides a [`StaticCondition`] LEAF's truth value, for the handful of
+/// leaves that have one.
+///
+/// `game::layers::evaluate_condition_with_context` is a pure function of
+/// `(GameState, controller, source_id, recipient_id)`. A few leaves are not
+/// answerable from that tuple at all: their truth is established by an
+/// interactive payment round-trip, or by an in-flight cast, both of which live
+/// OUTSIDE the layer pipeline. For those, the pipeline hard-codes a degenerate
+/// answer (`false`) rather than computing one.
+///
+/// That is correct wherever the enforcement point actually runs the
+/// continuation — a combat-tax `UnlessPay` is resolved by
+/// `WaitingFor::CombatTaxPayment` at attack/block declaration, and a
+/// cast-variant gate is resolved by `collect_self_spell_cost_modifiers`. It is
+/// NOT correct anywhere else: an enforcement point that never runs the
+/// continuation can only ever see the degenerate answer, so the condition is
+/// unsatisfiable by construction. Any parser gate that would attach such a leaf
+/// to a static whose enforcement point lacks the matching continuation must
+/// decline — otherwise the parser reports a condition "supported" that no
+/// player can ever satisfy.
+///
+/// A typed reason rather than a bare `bool` so the axis stays self-documenting
+/// and each future gate can ask about the specific continuation IT provides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConditionContinuation {
+    /// CR 118.12a: the optional-cost payment round-trip ("unless [a player]
+    /// pays [cost]"). Offered only at attack/block declaration via
+    /// `WaitingFor::CombatTaxPayment`; the layer pipeline hard-codes `false`
+    /// for [`StaticCondition::UnlessPay`] everywhere else.
+    OptionalCostPayment,
+    /// CR 601.2f: the in-flight cast (`GameState::pending_cast`), consulted by
+    /// `collect_self_spell_cost_modifiers` when computing self-spell cost
+    /// modifiers. Outside a cast of the source object these leaves are `false`
+    /// unconditionally.
+    PendingCast,
 }
 
 /// Condition for static ability applicability.
@@ -9421,8 +9632,8 @@ pub enum StaticCondition {
 }
 
 impl StaticCondition {
-    /// CR 109.4 + CR 725.5: the player whose DESIGNATION this leaf tests, when
-    /// the leaf is a designation predicate at all.
+    /// Engine limitation, not CR-mandated: the player whose DESIGNATION this
+    /// leaf tests, when the leaf is a designation predicate at all.
     ///
     /// Exhaustive by design — there is deliberately no wildcard arm. This is
     /// the guard that makes the static-side polarity boundary gate in
@@ -9497,6 +9708,291 @@ impl StaticCondition {
             | StaticCondition::CastingAsVariant { .. }
             | StaticCondition::None => None,
         }
+    }
+
+    /// Engine limitation (not CR-mandated): true when this condition (or a
+    /// Boolean sub-condition of it) tests a [`PlayerScope`] designation anchor
+    /// other than `Controller` — a "that player" / "that opponent" / other
+    /// scoped-player reference that has no runtime binding authority outside a
+    /// triggering event or combat context (a recipient id, a combat-tax
+    /// defender, etc.).
+    ///
+    /// Single authority shared by the runtime layer evaluator
+    /// (`game::layers::evaluate_condition`, which has no triggering event to
+    /// bind a scoped player against and must reject the condition outright) and
+    /// any parser-time gate that would otherwise mark such a condition
+    /// "supported" while it can never actually apply at runtime. Recipient-
+    /// bearing evaluators (`evaluate_condition_with_recipient`) intentionally do
+    /// NOT call this — a recipient id is exactly the binding authority a
+    /// `ScopedPlayer` anchor needs.
+    pub(crate) fn has_unbindable_designation_anchor(&self) -> bool {
+        self.any_leaf(|leaf| {
+            leaf.designation_player_anchor()
+                .is_some_and(|scope| !matches!(scope, PlayerScope::Controller))
+        })
+    }
+
+    /// Engine limitation, not CR-mandated: the out-of-layer-pipeline
+    /// [`ConditionContinuation`] this leaf's truth value is decided by, when it
+    /// has one. See that type for why a leaf can have no answer inside the
+    /// layer pipeline at all.
+    ///
+    /// Exhaustive by design — there is deliberately no wildcard arm, mirroring
+    /// [`Self::designation_player_anchor`]. A future leaf whose truth is
+    /// established by an interactive round-trip (a "unless you discard a card"
+    /// tax, a "unless you sacrifice" gate) is a COMPILE ERROR here, not a
+    /// latent false green in every gate that consults this.
+    ///
+    /// Boolean combinators return `None`; the tree-level view
+    /// ([`Self::requires_out_of_layer_continuation`]) walks them.
+    pub(crate) fn required_continuation(&self) -> Option<ConditionContinuation> {
+        match self {
+            // CR 118.12a: resolved by `WaitingFor::CombatTaxPayment` at
+            // attack/block declaration; `layers::evaluate_condition` returns
+            // `false` (restriction active) everywhere else.
+            StaticCondition::UnlessPay { .. } => Some(ConditionContinuation::OptionalCostPayment),
+            // CR 702.166a + CR 601.2f: read off `state.pending_cast` for the
+            // source object; there is no pending cast outside a cast of it.
+            StaticCondition::AdditionalCostPaid => Some(ConditionContinuation::PendingCast),
+            // CR 702.34a + CR 601.2f: evaluated in
+            // `collect_self_spell_cost_modifiers`, NOT in the layer pipeline,
+            // which hard-codes `false` for it.
+            StaticCondition::CastingAsVariant { .. } => Some(ConditionContinuation::PendingCast),
+            // Everything else is a pure function of the game state plus the
+            // source/recipient anchors the layer pipeline already supplies.
+            // Combat-scoped leaves (`SourceIsAttacking`, `SourceAttackingAlone`,
+            // `RecipientAttackingOwnerTarget`, …) belong HERE, not above: they
+            // are computed correctly from `state.combat` and are legitimately
+            // `false` outside combat, which is the rules-correct answer rather
+            // than a missing continuation.
+            StaticCondition::DevotionGE { .. }
+            | StaticCondition::IsPresent { .. }
+            | StaticCondition::ChosenColorIs { .. }
+            | StaticCondition::ChosenLabelIs { .. }
+            | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::HasMaxSpeed
+            | StaticCondition::SpeedGE { .. }
+            | StaticCondition::And { .. }
+            | StaticCondition::Or { .. }
+            | StaticCondition::Not { .. }
+            | StaticCondition::DayNightIs { .. }
+            | StaticCondition::HasCounters { .. }
+            | StaticCondition::CastVariantPaid { .. }
+            | StaticCondition::RecipientHasCounters { .. }
+            | StaticCondition::ClassLevelGE { .. }
+            | StaticCondition::DefendingPlayerControls { .. }
+            | StaticCondition::SourceAttackingAlone
+            | StaticCondition::SourceIsAttacking
+            | StaticCondition::SourceIsBlocking
+            | StaticCondition::SourceIsBlocked
+            | StaticCondition::IsMonarch { .. }
+            | StaticCondition::IsInitiative
+            | StaticCondition::NoMonarch
+            | StaticCondition::HasCityBlessing
+            | StaticCondition::HasEnduringStory
+            | StaticCondition::CompletedADungeon
+            | StaticCondition::WasStartingPlayer { .. }
+            | StaticCondition::SpellCastWithVariantThisTurn { .. }
+            | StaticCondition::AnyPlayerAttackedYouLastTurn
+            | StaticCondition::OpponentPoisonAtLeast { .. }
+            | StaticCondition::Unrecognized { .. }
+            | StaticCondition::DuringYourTurn
+            | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+            | StaticCondition::SourceEnteredThisTurn
+            | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::WasCast { .. }
+            | StaticCondition::IsRingBearer
+            | StaticCondition::RingLevelAtLeast { .. }
+            | StaticCondition::ControlsCommander { .. }
+            | StaticCondition::SourceIsTapped
+            | StaticCondition::IsTapped { .. }
+            | StaticCondition::SourceIsFaceUp
+            | StaticCondition::SourceIsSaddled
+            | StaticCondition::SourceControllerEquals { .. }
+            | StaticCondition::SourceIsEquipped
+            | StaticCondition::SourceIsEnchanted
+            | StaticCondition::SourceIsMonstrous
+            | StaticCondition::SourceIsHarnessed
+            | StaticCondition::SourceAttachedToCreature
+            | StaticCondition::SourceMatchesFilter { .. }
+            | StaticCondition::TopOfLibraryMatches { .. }
+            | StaticCondition::RecipientMatchesFilter { .. }
+            | StaticCondition::RecipientAttackingOwnerTarget { .. }
+            | StaticCondition::SourceIsPaired
+            | StaticCondition::SourceInZone { .. }
+            | StaticCondition::EnchantedIsFaceDown
+            | StaticCondition::None => None,
+        }
+    }
+
+    /// True when this condition, or a Boolean sub-condition of it at ANY
+    /// nesting depth, has a leaf whose truth is decided by an out-of-layer
+    /// [`ConditionContinuation`].
+    ///
+    /// Callers must only use this where the enforcement point does NOT run the
+    /// continuation in question. The untap step (CR 502.3) is such a point: it
+    /// is a turn-based action with no cast in flight and no payment prompt, so
+    /// BOTH continuations are unavailable and any such leaf is unsatisfiable
+    /// there. The combat-tax and self-spell-cost gates deliberately do NOT call
+    /// this — they are the continuations.
+    pub(crate) fn requires_out_of_layer_continuation(&self) -> bool {
+        self.any_leaf(|leaf| leaf.required_continuation().is_some())
+    }
+
+    /// True when this condition (or a Boolean sub-condition of it, at ANY
+    /// nesting depth) is an [`StaticCondition::Unrecognized`] leaf.
+    ///
+    /// Single authority for "does this condition tree contain a parser gap,"
+    /// shared by every coverage-honesty gate in the codebase. Recursing through
+    /// `And`/`Or`/`Not` is load-bearing: a parser fallback that wraps an
+    /// unparsed clause as `Not(Unrecognized)` (the shape
+    /// `extract_cant_untap_condition` and `parse_unless_static_condition`
+    /// produce for an `unless <condition we can't decompose>` gate — see
+    /// `oracle_static/static_helpers.rs` and `oracle_static/shared.rs`) is a
+    /// TOP-LEVEL `Not`, not a top-level `Unrecognized`. A caller that only
+    /// checks `matches!(condition, StaticCondition::Unrecognized { .. })`
+    /// misses it entirely and reports the card as fully supported even though
+    /// the wrapped restriction is permanently inert at runtime (`Unrecognized`
+    /// evaluates `true`; the wrapping `Not` negates it to `false` forever).
+    /// Every coverage/support check MUST call this method instead of matching
+    /// `Unrecognized` directly. The recursion itself lives in
+    /// [`Self::walk_leaves`], which is exhaustive over `StaticCondition`, so a
+    /// future nesting variant cannot silently escape this view.
+    pub(crate) fn contains_unrecognized(&self) -> bool {
+        self.any_leaf(|leaf| matches!(leaf, StaticCondition::Unrecognized { .. }))
+    }
+
+    /// Returns the text of every [`StaticCondition::Unrecognized`] leaf found
+    /// anywhere in this condition tree, for use in coverage gap labels.
+    /// Derived from [`Self::walk_leaves`] — the same single traversal
+    /// [`Self::contains_unrecognized`] uses — so the two can never disagree
+    /// about what counts as "unrecognized."
+    pub(crate) fn unrecognized_texts(&self) -> Vec<&str> {
+        let mut texts = Vec::new();
+        // The collector never breaks, so the traversal always runs to
+        // completion and the `ControlFlow` result carries no information.
+        let _: ControlFlow<()> = self.walk_leaves(&mut |leaf| {
+            if let StaticCondition::Unrecognized { text } = leaf {
+                texts.push(text.as_str());
+            }
+            ControlFlow::Continue(())
+        });
+        texts
+    }
+
+    /// THE `StaticCondition` tree traversal. Visits every LEAF of this
+    /// condition tree in Oracle order, descending through the Boolean
+    /// combinators, and stops early the moment `visit` returns
+    /// [`ControlFlow::Break`].
+    ///
+    /// Single authority for tree recursion over `StaticCondition`. Every
+    /// tree-level view — [`Self::contains_unrecognized`],
+    /// [`Self::unrecognized_texts`], [`Self::has_unbindable_designation_anchor`],
+    /// [`Self::requires_out_of_layer_continuation`] — is DERIVED from this one
+    /// walk rather than reimplementing its own `And`/`Or`/`Not` recursion.
+    /// Parallel walks are exactly how a nested `Unrecognized` came to be seen by
+    /// one coverage check and missed by another (PR #8012, review rounds 2-5):
+    /// with one traversal they cannot drift.
+    ///
+    /// Exhaustive by design — there is deliberately no wildcard arm, mirroring
+    /// [`Self::designation_player_anchor`]. Adding a future variant that NESTS a
+    /// `StaticCondition` (a ternary combinator, an `Xor`, a quantified
+    /// sub-condition) is a COMPILE ERROR here, forcing an explicit
+    /// descend-or-treat-as-leaf decision, instead of silently returning
+    /// "no unrecognized leaves / no unbindable anchor" from every derived view
+    /// at once.
+    ///
+    /// Takes `&mut dyn FnMut` rather than `impl FnMut` because the recursive
+    /// call would otherwise monomorphize infinitely (`&mut &mut F`, `&mut &mut
+    /// &mut F`, …).
+    fn walk_leaves<'a>(
+        &'a self,
+        visit: &mut dyn FnMut(&'a StaticCondition) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        match self {
+            // Boolean combinators are STRUCTURE, not leaves: descend, never visit.
+            StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+                for condition in conditions {
+                    condition.walk_leaves(visit)?;
+                }
+                ControlFlow::Continue(())
+            }
+            StaticCondition::Not { condition } => condition.walk_leaves(visit),
+            // Every non-combinator variant is a leaf.
+            StaticCondition::DevotionGE { .. }
+            | StaticCondition::IsPresent { .. }
+            | StaticCondition::ChosenColorIs { .. }
+            | StaticCondition::ChosenLabelIs { .. }
+            | StaticCondition::QuantityComparison { .. }
+            | StaticCondition::HasMaxSpeed
+            | StaticCondition::SpeedGE { .. }
+            | StaticCondition::DayNightIs { .. }
+            | StaticCondition::HasCounters { .. }
+            | StaticCondition::CastVariantPaid { .. }
+            | StaticCondition::RecipientHasCounters { .. }
+            | StaticCondition::ClassLevelGE { .. }
+            | StaticCondition::DefendingPlayerControls { .. }
+            | StaticCondition::SourceAttackingAlone
+            | StaticCondition::SourceIsAttacking
+            | StaticCondition::SourceIsBlocking
+            | StaticCondition::SourceIsBlocked
+            | StaticCondition::IsMonarch { .. }
+            | StaticCondition::IsInitiative
+            | StaticCondition::NoMonarch
+            | StaticCondition::HasCityBlessing
+            | StaticCondition::HasEnduringStory
+            | StaticCondition::CompletedADungeon
+            | StaticCondition::WasStartingPlayer { .. }
+            | StaticCondition::SpellCastWithVariantThisTurn { .. }
+            | StaticCondition::AnyPlayerAttackedYouLastTurn
+            | StaticCondition::OpponentPoisonAtLeast { .. }
+            | StaticCondition::UnlessPay { .. }
+            | StaticCondition::Unrecognized { .. }
+            | StaticCondition::DuringYourTurn
+            | StaticCondition::DuringOpponentsTurn
+            | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+            | StaticCondition::SourceEnteredThisTurn
+            | StaticCondition::SourceHasDealtDamage
+            | StaticCondition::WasCast { .. }
+            | StaticCondition::IsRingBearer
+            | StaticCondition::RingLevelAtLeast { .. }
+            | StaticCondition::ControlsCommander { .. }
+            | StaticCondition::SourceIsTapped
+            | StaticCondition::IsTapped { .. }
+            | StaticCondition::SourceIsFaceUp
+            | StaticCondition::SourceIsSaddled
+            | StaticCondition::SourceControllerEquals { .. }
+            | StaticCondition::SourceIsEquipped
+            | StaticCondition::SourceIsEnchanted
+            | StaticCondition::SourceIsMonstrous
+            | StaticCondition::SourceIsHarnessed
+            | StaticCondition::SourceAttachedToCreature
+            | StaticCondition::SourceMatchesFilter { .. }
+            | StaticCondition::TopOfLibraryMatches { .. }
+            | StaticCondition::RecipientMatchesFilter { .. }
+            | StaticCondition::RecipientAttackingOwnerTarget { .. }
+            | StaticCondition::SourceIsPaired
+            | StaticCondition::SourceInZone { .. }
+            | StaticCondition::EnchantedIsFaceDown
+            | StaticCondition::AdditionalCostPaid
+            | StaticCondition::CastingAsVariant { .. }
+            | StaticCondition::None => visit(self),
+        }
+    }
+
+    /// True when any LEAF of this condition tree satisfies `predicate`.
+    /// Short-circuiting projection of [`Self::walk_leaves`]; combinator nodes
+    /// are never passed to `predicate`.
+    fn any_leaf(&self, mut predicate: impl FnMut(&StaticCondition) -> bool) -> bool {
+        self.walk_leaves(&mut |leaf| {
+            if predicate(leaf) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
     }
 }
 
@@ -9582,8 +10078,10 @@ pub enum ParsedCondition {
     /// Compares a player-relative quantity against each opponent's quantity.
     /// The comparison must hold for ALL opponents.
     QuantityVsEachOpponent {
+        #[serde(deserialize_with = "deserialize_quantity_ref_compat")]
         lhs: QuantityRef,
         comparator: Comparator,
+        #[serde(deserialize_with = "deserialize_quantity_ref_compat")]
         rhs: QuantityRef,
     },
     /// CR 601.3 / CR 602.5: Generic measurable restriction predicate.
@@ -11524,9 +12022,8 @@ impl LegacyUnlessCost {
 /// falls back to the legacy `PaymentCost` wrapper shape so saved-game JSON /
 /// persisted continuations keep loading after `PaymentCost` was deleted.
 ///
-/// Legacy `PaymentCost` → modern `AbilityCost` mapping (§4 of the unification
-/// plan; field types already align — the fold is lossless except `ScaledMana`,
-/// see below):
+/// Legacy `PaymentCost` → modern `AbilityCost` mapping (field types already
+/// align — the fold is lossless except `ScaledMana`, see below):
 /// - `Mana { cost }` → `Mana { cost }`
 /// - `Life { amount }` → `PayLife { amount }`
 /// - `Speed { amount }` → `PaySpeed { amount }`
@@ -11764,7 +12261,7 @@ pub enum EachDamageRecipient {
         /// selected object list alone cannot prove type/controller legality.
         source_filters: [Box<TargetFilter>; 2],
     },
-    // DEFERRED (§9, set-audit backlog): AttachedPermanent — each Aura source deals
+    // NOT YET SUPPORTED: AttachedPermanent — each Aura source deals
     // to the permanent it's attached to (CR 303.4). Needs a new attachment
     // `FilterProp` (`AttachedToObjectOfType`) for the source filter; until then
     // the parser fails the "...to the creature it's attached to" recipient closed
@@ -15148,6 +15645,22 @@ pub enum Effect {
         /// controller ("under your control" on Telemin Performance / Sméagol).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enters_under: Option<ControllerRef>,
+        /// CR 202.3 + CR 608.2c: Dynamic branch on the hit card's own
+        /// characteristics — "if its mana value is less than or equal to the
+        /// number of lands you control, put it onto the battlefield.
+        /// Otherwise, put it into your hand" (Part in Friendship).
+        /// `Some((filter, zone))` routes a hit card matching `filter` to
+        /// `zone`; `kept_destination` is repurposed as the "otherwise" zone.
+        /// `None` (default) preserves the unconditional single-
+        /// `kept_destination` path for every existing card. Distinct from
+        /// `kept_optional_to` (a controller CHOICE between two zones, "you
+        /// may put that card onto the battlefield") — this is a
+        /// card-property-driven branch with no decision point, evaluated
+        /// with `matches_target_filter` exactly like the primary `filter`
+        /// field. Mirrors `ChangeZone.enters_modified_if`'s "gate a rider on
+        /// the moved object's own characteristics" pattern.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kept_destination_if: Option<(Box<TargetFilter>, Zone)>,
     },
     /// CR 701.57a: Discover N — exile from top until nonland with MV ≤ N,
     /// cast free or put to hand, rest to bottom in random order.
@@ -16778,6 +17291,23 @@ impl TargetFilter {
         }
     }
 
+    /// True when this filter carries the typed "other than the currently
+    /// resolving object" marker at any structural position.
+    pub fn contains_other_than_trigger_object(&self) -> bool {
+        match self {
+            TargetFilter::Typed(TypedFilter { properties, .. }) => properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::OtherThanTriggerObject)),
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+                .iter()
+                .any(TargetFilter::contains_other_than_trigger_object),
+            TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+                filter.contains_other_than_trigger_object()
+            }
+            _ => false,
+        }
+    }
+
     /// CR 613.1f + CR 702.1: True when this filter tree asks a KIND-level keyword
     /// question (`HasKeywordKind` / `WithoutKeywordKind`) at any structural
     /// position. Mirrors [`Self::references_cost_paid_object`]'s recursion.
@@ -16890,6 +17420,16 @@ impl TargetFilter {
                 | TargetFilter::Neighbor { .. }
                 | TargetFilter::AttachedTo
                 | TargetFilter::CostPaidObject
+                // CR 701.47c: "the amassed Army" / "the Army you amassed" is
+                // resolved from `ResolvedAbility.amassed_army_object` after
+                // the current amass instruction runs — never declared as a
+                // target slot. Mirrors `CostPaidObject` immediately above:
+                // without this arm, the targeting layer treats it as a CR 115
+                // target needing legal candidates BEFORE amass has created or
+                // chosen the Army, so it always finds zero legal targets and
+                // the whole ability (Amass head included) is removed from the
+                // stack for lack of a legal target before it ever resolves.
+                | TargetFilter::AmassedArmy
                 | TargetFilter::ParentTarget
                 | TargetFilter::ParentTargetSlot { .. }
                 | TargetFilter::ParentTargetController
@@ -21309,11 +21849,14 @@ impl SubAbilityLink {
 /// CR 702.1c ("the same is true") + CR 608.2c (written order): whether a
 /// `SequentialSibling` continuation with its OWN gating condition must still be
 /// checked when a PRECEDING sibling's condition was
-/// false. `Dependent` (default) is today's behavior — the continuation's own
+/// false. `Dependent` (default) suppresses the continuation because its own
 /// condition/effect may presuppose the preceding sibling's effect actually ran
 /// (Thieving Skydiver's "If that artifact is an Equipment" presupposes
 /// `GainControl` produced a target), so it is skipped alongside a failed
-/// predecessor. `ReplicatedOrBranch` marks a sibling produced by per-item
+/// predecessor. The sole narrow exception is a direct dependent
+/// `SequentialSibling` whose condition is `NthResolutionThisTurn`: ordinal
+/// clauses are evaluated in their written order under CR 608.2c even after an
+/// earlier ordinal is false. `ReplicatedOrBranch` marks a sibling produced by per-item
 /// keyword-list replication ("The same is true for…" is CR 702.1c; "Repeat
 /// this process for…" follows CR 608.2c) — each item is an INDEPENDENT OR-branch checked on its own
 /// keyword, so it must be evaluated regardless of any other branch's outcome.
@@ -22145,22 +22688,19 @@ pub enum AbilityCondition {
     /// turn (Y'shtola Rhul's additional-end-step loop guard). End-step sibling of
     /// `FirstCombatPhaseOfTurn`; both read a per-turn phase-occurrence counter.
     FirstEndStepOfTurn,
-    /// CR 608.2c: "If a [noun] was [verb]ed this way" — sub_ability executes only if
-    /// the parent effect produced a zone change involving an object matching the filter.
-    /// Evaluated by checking `state.last_zone_changed_ids` against the filter.
-    /// Handles both optional-targeting parents (empty targets → empty IDs → false)
-    /// and mandatory parents (type filter check on moved objects).
+    /// CR 608.2c: "If a [noun] was [verb]ed this way" — sub_ability executes only if the parent
+    /// effect produced a zone change involving an object matching the filter, checked against
+    /// `state.last_zone_changed_ids`. Handles optional-targeting parents (empty targets → empty
+    /// IDs → false) and mandatory ones (type filter check on moved objects).
     ///
-    /// `destination`: destination-bound wordings ("is put into a graveyard this
-    /// way"; "dies this way", CR 700.4) additionally require the moved object to
-    /// have ARRIVED in this zone — a replacement that redirects the arrival
-    /// (CR 122.1h finality counters: exile instead of the graveyard) defeats the
-    /// clause, because the replaced event never happened (CR 614.6).
-    /// Cause-bound wordings ("destroyed/sacrificed/exiled … this way") keep
-    /// `None`: the cause survives a redirect, the destination does not. The
-    /// check reads the object's CURRENT zone — the condition is evaluated in
-    /// the same resolution step as the parent instruction (CR 608.2c), before
-    /// any state-based action or trigger could move the object again, so the
+    /// `destination`: destination-bound wordings ("is put into a graveyard this way"; "dies this
+    /// way", CR 700.4) additionally require the moved object to have ARRIVED in this zone — a
+    /// replacement that redirects the arrival (CR 122.1h finality counters: exile instead of the
+    /// graveyard) defeats the clause, because the replaced event never happened (CR 614.6).
+    /// Cause-bound wordings ("destroyed/sacrificed/exiled … this way") keep `None`: the cause
+    /// survives a redirect, the destination does not. The check reads the object's CURRENT zone —
+    /// the condition is evaluated in the same resolution step as the parent instruction
+    /// (CR 608.2c), before any state-based action or trigger could move the object again, so the
     /// current zone IS the arrival zone.
     ZoneChangedThisWay {
         filter: TargetFilter,
@@ -22217,7 +22757,8 @@ pub enum AbilityCondition {
     DayNightIs {
         state: crate::types::game_state::DayNight,
     },
-    /// CR 603.4: Intervening-if gate for "if this is the [Nth] time this ability has
+    /// CR 608.2c: Ordinary resolution-time condition (not an intervening-if
+    /// condition under CR 603.4) for "if this is the [Nth] time this ability has
     /// resolved this turn". Counter is keyed by `(source_id, ability_index)` and
     /// incremented at the top of `resolve_ability_chain` (depth 0). The condition is
     /// satisfied when, after the increment, the per-turn resolution count equals `n`.
@@ -27112,9 +27653,10 @@ pub struct ResolvedAbility {
     /// accidentally bind to an amass-specific referent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amassed_army_object: Option<CostPaidObjectSnapshot>,
-    /// CR 603.4: Index of the printed ability this resolution came from on the
+    /// CR 608.2c: Index of the printed ability this resolution came from on the
     /// source object's ability list. Identifies "this ability" for per-turn
-    /// resolution tracking (`AbilityCondition::NthResolutionThisTurn`). `None` for
+    /// ordinary-resolution-condition tracking (`AbilityCondition::NthResolutionThisTurn`),
+    /// not an intervening-if condition under CR 603.4. `None` for
     /// synthesized/runtime-only abilities (prowess, firebending) and activated
     /// abilities for which nth-resolution gating is not yet wired through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -27172,7 +27714,9 @@ pub struct ResolvedAbility {
     /// per-item OR-branch produced by keyword-list replication (Mutable Pupa,
     /// Kathril) and must be evaluated by `resolve_chain_body` regardless of a
     /// preceding sibling's failed gate. `Dependent` (default) preserves the
-    /// prior skip-with-failed-predecessor behavior. See [`SiblingCondition`].
+    /// prior skip-with-failed-predecessor behavior, except the narrow direct
+    /// `NthResolutionThisTurn` ordinal-sibling case described by
+    /// [`SiblingCondition`]. See [`SiblingCondition`].
     #[serde(default, skip_serializing_if = "SiblingCondition::is_default")]
     pub sibling_condition: SiblingCondition,
     /// CR 700.2b + CR 603.3c: Modal choice for a reflexive modal trigger whose modes
@@ -28701,6 +29245,7 @@ mod tests {
     #[test]
     fn try_for_each_member_unrolls_unions_and_bounds_depth() {
         let leaf = |n: u32| CardTypeSetSource::TrackedSet {
+            set: TrackedAnaphorSource::ChainSet,
             caused_by: (n > 0).then_some(ThisWayCause::Discarded),
         };
         let union = CardTypeSetSource::any_of(vec![
@@ -28788,7 +29333,10 @@ mod tests {
         // A snapshot population is NOT a zone read (CR 400.7 / CR 608.2c), and
         // that is asserted rather than left implicit.
         for snapshot in [
-            CardTypeSetSource::TrackedSet { caused_by: None },
+            CardTypeSetSource::TrackedSet {
+                set: TrackedAnaphorSource::ChainSet,
+                caused_by: None,
+            },
             CardTypeSetSource::TurnJournal {
                 journal: TurnJournalKind::SpellsCast,
                 scope: CountScope::Controller,
@@ -28992,7 +29540,10 @@ mod tests {
         };
         for source in [
             CardTypeSetSource::ExiledBySource,
-            CardTypeSetSource::TrackedSet { caused_by: None },
+            CardTypeSetSource::TrackedSet {
+                set: TrackedAnaphorSource::ChainSet,
+                caused_by: None,
+            },
             objects.clone(),
             CardTypeSetSource::any_of(vec![
                 objects,
@@ -29014,6 +29565,221 @@ mod tests {
                 "the current reading must win for {json}",
             );
         }
+    }
+
+    #[test]
+    fn legacy_property_aggregate_variants_deserialize_and_reserialize_canonically() {
+        let legacy_objects = r#"{"type":"Aggregate","function":"Sum","property":"Power","filter":{"type":"Typed","type_filters":["Creature"],"properties":[]}}"#;
+        let legacy_tracked = r#"{"type":"TrackedSetAggregate","function":"Max","property":"ManaValue","source":"TriggeringBatch"}"#;
+        let legacy_tracked_default =
+            r#"{"type":"TrackedSetAggregate","function":"Min","property":"Power"}"#;
+
+        for (payload, expected_source) in [
+            (
+                legacy_objects,
+                CardTypeSetSource::Objects {
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                },
+            ),
+            (
+                legacy_tracked,
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::TriggeringBatch,
+                    caused_by: None,
+                },
+            ),
+            (
+                legacy_tracked_default,
+                CardTypeSetSource::TrackedSet {
+                    set: TrackedAnaphorSource::ChainSet,
+                    caused_by: None,
+                },
+            ),
+        ] {
+            let wrapped = format!(r#"{{"type":"Ref","qty":{payload}}}"#);
+            let expr: QuantityExpr =
+                serde_json::from_str(&wrapped).expect("legacy aggregate loads at its wire field");
+            let QuantityExpr::Ref {
+                qty: node @ QuantityRef::PropertyAggregate(aggregate),
+            } = &expr
+            else {
+                panic!("legacy aggregate must lift to PropertyAggregate: {expr:?}");
+            };
+            assert_eq!(aggregate.source(), &expected_source);
+            let canonical = serde_json::to_string(&expr).expect("canonical aggregate serializes");
+            assert!(canonical.contains(r#""type":"PropertyAggregate""#));
+            assert!(canonical.contains(r#""source""#));
+            let canonical_value: serde_json::Value = serde_json::from_str(&canonical).unwrap();
+            let canonical_qty = &canonical_value["qty"];
+            assert!(!canonical_qty.as_object().unwrap().contains_key("filter"));
+            assert!(!canonical.contains("TrackedSetAggregate"));
+            assert_eq!(
+                serde_json::from_str::<QuantityExpr>(&canonical).unwrap(),
+                expr
+            );
+            assert!(matches!(node, QuantityRef::PropertyAggregate(_)));
+        }
+    }
+
+    /// Every direct `QuantityRef` carrier must use the compatibility deserializer,
+    /// not only `QuantityExpr::Ref`. This is the bounded direct-field census:
+    /// `PlayerFilter::PlayerAttribute`, all three quantity-bearing
+    /// `UnlessPayScaling` variants, and both sides of
+    /// `ParsedCondition::QuantityVsEachOpponent`. The three `StaticMode`
+    /// carriers are pinned separately in `types::statics`.
+    #[test]
+    fn legacy_property_aggregate_loads_through_every_direct_quantity_ref_carrier() {
+        let legacy_objects = serde_json::json!({
+            "type": "Aggregate",
+            "function": "Sum",
+            "property": "Power",
+            "filter": { "type": "Any" }
+        });
+        let legacy_tracked = serde_json::json!({
+            "type": "TrackedSetAggregate",
+            "function": "Max",
+            "property": "ManaValue",
+            "source": "TriggeringBatch"
+        });
+        let assert_canonical = |value: &serde_json::Value| {
+            let json = serde_json::to_string(value).unwrap();
+            assert!(json.contains(r#""type":"PropertyAggregate""#), "{json}");
+            assert!(!json.contains(r#""type":"Aggregate""#), "{json}");
+            assert!(!json.contains("TrackedSetAggregate"), "{json}");
+        };
+
+        let player_filter = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Fixed { value: 1 }),
+        };
+        let mut wire = serde_json::to_value(player_filter).unwrap();
+        wire["attr"] = legacy_objects.clone();
+        let loaded: PlayerFilter = serde_json::from_value(wire).unwrap();
+        assert_canonical(&serde_json::to_value(loaded).unwrap());
+
+        for scaling in [
+            UnlessPayScaling::PerQuantityRef {
+                quantity: QuantityRef::LifeAboveStarting,
+            },
+            UnlessPayScaling::PerAffectedAndQuantityRef {
+                quantity: QuantityRef::LifeAboveStarting,
+            },
+            UnlessPayScaling::PerAffectedWithRef {
+                quantity: QuantityRef::LifeAboveStarting,
+            },
+        ] {
+            let mut wire = serde_json::to_value(scaling).unwrap();
+            wire["data"]["quantity"] = legacy_tracked.clone();
+            let loaded: UnlessPayScaling = serde_json::from_value(wire).unwrap();
+            assert_canonical(&serde_json::to_value(loaded).unwrap());
+        }
+
+        for field in ["lhs", "rhs"] {
+            let restriction = ParsedCondition::QuantityVsEachOpponent {
+                lhs: QuantityRef::LifeTotal {
+                    player: PlayerScope::Controller,
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            };
+            let mut wire = serde_json::to_value(restriction).unwrap();
+            wire[field] = if field == "lhs" {
+                legacy_objects.clone()
+            } else {
+                legacy_tracked.clone()
+            };
+            let loaded: ParsedCondition = serde_json::from_value(wire).unwrap();
+            assert_canonical(&serde_json::to_value(loaded).unwrap());
+        }
+    }
+
+    #[test]
+    fn property_aggregate_wire_tags_require_their_exact_population_shape() {
+        let canonical_source = r#"{"type":"Objects","filter":{"type":"Any"}}"#;
+        let typed_filter = r#"{"type":"Typed","type_filters":["Creature"],"properties":[]}"#;
+        let wrap = |qty: &str| format!(r#"{{"type":"Ref","qty":{qty}}}"#);
+
+        let canonical = format!(
+            r#"{{"type":"PropertyAggregate","function":"Sum","property":"Power","source":{canonical_source}}}"#
+        );
+        assert!(serde_json::from_str::<QuantityExpr>(&wrap(&canonical)).is_ok());
+
+        for rejected in [
+            r#"{"type":"PropertyAggregate","function":"Sum","property":"Power"}"#.to_string(),
+            format!(
+                r#"{{"type":"PropertyAggregate","function":"Sum","property":"Power","filter":{typed_filter}}}"#
+            ),
+            format!(
+                r#"{{"type":"Aggregate","function":"Sum","property":"Power","source":{canonical_source}}}"#
+            ),
+            r#"{"type":"Aggregate","function":"Sum","property":"Power"}"#.to_string(),
+            format!(
+                r#"{{"type":"TrackedSetAggregate","function":"Sum","property":"Power","filter":{typed_filter}}}"#
+            ),
+            format!(
+                r#"{{"type":"TrackedSetAggregate","function":"Sum","property":"Power","source":{canonical_source}}}"#
+            ),
+        ] {
+            assert!(
+                serde_json::from_str::<QuantityExpr>(&wrap(&rejected)).is_err(),
+                "crossed or incomplete aggregate shape must be rejected: {rejected}",
+            );
+        }
+
+        let legacy = format!(
+            r#"{{"type":"Aggregate","function":"Sum","property":"Power","filter":{typed_filter}}}"#
+        );
+        assert!(serde_json::from_str::<QuantityExpr>(&wrap(&legacy)).is_ok());
+    }
+
+    #[test]
+    fn property_aggregate_rejects_incompatible_source_property_pairs() {
+        let journal = CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: None,
+        };
+        assert!(PropertyAggregate::new(
+            AggregateFunction::Sum,
+            ObjectProperty::ManaValue,
+            journal.clone()
+        )
+        .is_ok());
+        assert_eq!(
+            PropertyAggregate::new(AggregateFunction::Max, ObjectProperty::Power, journal),
+            Err(PropertyAggregateError::UnsupportedTurnJournalProperty(
+                ObjectProperty::Power
+            ))
+        );
+
+        let mixed = CardTypeSetSource::any_of(vec![
+            CardTypeSetSource::Objects {
+                filter: TargetFilter::Any,
+            },
+            CardTypeSetSource::TurnJournal {
+                journal: TurnJournalKind::SpellsCast,
+                scope: CountScope::Controller,
+                filter: None,
+            },
+        ])
+        .unwrap();
+        assert!(matches!(
+            PropertyAggregate::new(AggregateFunction::Min, ObjectProperty::Toughness, mixed),
+            Err(PropertyAggregateError::UnsupportedTurnJournalProperty(
+                ObjectProperty::Toughness
+            ))
+        ));
+
+        let invalid_json = r#"{"type":"PropertyAggregate","function":"Sum","property":"Power","source":{"type":"TurnJournal","journal":"SpellsCast","scope":"Controller"}}"#;
+        assert!(serde_json::from_str::<QuantityRef>(invalid_json).is_err());
     }
 
     #[test]
@@ -33015,5 +33781,168 @@ mod monarch_subject_axis_tests {
 
         let mut object_axis = QuantityRef::SelfManaValue;
         assert!(object_axis.player_scope_mut().is_none());
+    }
+}
+
+/// PR #8012 (Bombur, Gentle Dreamer), maintainer review round 5 [MED]:
+/// `contains_unrecognized`, `unrecognized_texts` and
+/// `has_unbindable_designation_anchor` used to be three INDEPENDENT
+/// wildcard-recursive walks that could silently diverge. They — plus the new
+/// `requires_out_of_layer_continuation` — are now all derived from the single
+/// exhaustive [`StaticCondition::walk_leaves`]. These tests pin that
+/// derivation: every view must agree on the same tree at the same depth.
+#[cfg(test)]
+mod static_condition_traversal_tests {
+    use super::*;
+
+    /// Builds `And[ Or[ Not(inner), <filler leaf> ], <filler leaf> ]` — the
+    /// deepest nesting the combinator set can express, with the probe leaf
+    /// buried under all three combinators plus sibling leaves on either side
+    /// (so a walk that stops at the first branch, or never revisits siblings,
+    /// fails here).
+    fn nested_at_depth(inner: StaticCondition) -> StaticCondition {
+        StaticCondition::And {
+            conditions: vec![
+                StaticCondition::Or {
+                    conditions: vec![
+                        StaticCondition::Not {
+                            condition: Box::new(inner),
+                        },
+                        StaticCondition::DuringYourTurn,
+                    ],
+                },
+                StaticCondition::HasCityBlessing,
+            ],
+        }
+    }
+
+    #[test]
+    fn static_condition_views_find_unrecognized_at_full_nesting_depth() {
+        let tree = nested_at_depth(StaticCondition::Unrecognized {
+            text: "you have an enduring story and also something extra".to_string(),
+        });
+
+        assert!(
+            tree.contains_unrecognized(),
+            "an Unrecognized leaf under And(Or(Not(..))) must be found, got {tree:?}"
+        );
+        assert_eq!(
+            tree.unrecognized_texts(),
+            vec!["you have an enduring story and also something extra"],
+            "the text view must surface the same leaf the boolean view found —              these are two projections of one walk and cannot disagree"
+        );
+    }
+
+    #[test]
+    fn static_condition_unrecognized_views_agree_when_absent() {
+        // Same shape, no Unrecognized leaf anywhere: both views must say "clean".
+        let tree = nested_at_depth(StaticCondition::HasEnduringStory);
+        assert!(!tree.contains_unrecognized());
+        assert!(tree.unrecognized_texts().is_empty());
+    }
+
+    #[test]
+    fn static_condition_unrecognized_texts_collects_every_leaf_in_oracle_order() {
+        let tree = StaticCondition::And {
+            conditions: vec![
+                StaticCondition::Unrecognized {
+                    text: "first".to_string(),
+                },
+                StaticCondition::Not {
+                    condition: Box::new(StaticCondition::Or {
+                        conditions: vec![
+                            StaticCondition::Unrecognized {
+                                text: "second".to_string(),
+                            },
+                            StaticCondition::Unrecognized {
+                                text: "third".to_string(),
+                            },
+                        ],
+                    }),
+                },
+            ],
+        };
+        assert_eq!(
+            tree.unrecognized_texts(),
+            vec!["first", "second", "third"],
+            "every Unrecognized leaf must be collected, in Oracle order — a              coverage label that dropped siblings would under-report the gap"
+        );
+    }
+
+    /// Engine limitation, not CR-mandated. CR 725.1 designation leaves carry a
+    /// [`PlayerScope`]; only `Controller` can be bound by the layer pipeline.
+    #[test]
+    fn static_condition_designation_anchor_view_recurses_to_full_depth() {
+        let unbindable = nested_at_depth(StaticCondition::IsMonarch {
+            player: PlayerScope::ScopedPlayer,
+        });
+        assert!(
+            unbindable.has_unbindable_designation_anchor(),
+            "a ScopedPlayer designation nested under And(Or(Not(..))) must be found"
+        );
+
+        let bindable = nested_at_depth(StaticCondition::IsMonarch {
+            player: PlayerScope::Controller,
+        });
+        assert!(
+            !bindable.has_unbindable_designation_anchor(),
+            "a Controller-scoped designation binds fine at any depth and must NOT be rejected"
+        );
+    }
+
+    /// CR 118.12a / CR 601.2f: leaves whose truth is decided by an
+    /// out-of-layer-pipeline continuation, found at full nesting depth.
+    /// Maintainer-flagged HIGH on PR #8012 (round 5) — `UnlessPay` nested in
+    /// `And`/`Or` was the specific escape route called out.
+    #[test]
+    fn static_condition_continuation_view_recurses_to_full_depth() {
+        for leaf in [
+            StaticCondition::UnlessPay {
+                cost: ManaCost::Cost {
+                    shards: vec![],
+                    generic: 2,
+                },
+                scaling: UnlessPayScaling::Flat,
+                defended: None,
+            },
+            StaticCondition::AdditionalCostPaid,
+            StaticCondition::CastingAsVariant {
+                variant: crate::types::game_state::CastingVariant::Flashback,
+            },
+        ] {
+            assert!(
+                leaf.required_continuation().is_some(),
+                "{leaf:?} has no layer-pipeline answer and must report a required continuation"
+            );
+            assert!(
+                nested_at_depth(leaf.clone()).requires_out_of_layer_continuation(),
+                "{leaf:?} nested under And(Or(Not(..))) must still be found"
+            );
+        }
+    }
+
+    /// The complement of the test above: the leaves that DO have real layer
+    /// pipeline backing must not be swept up. Combat-scoped leaves are the
+    /// interesting case — they are legitimately `false` outside combat, which
+    /// is the rules-correct answer, not a missing continuation.
+    #[test]
+    fn static_condition_continuation_view_accepts_state_backed_leaves() {
+        for leaf in [
+            StaticCondition::HasEnduringStory,
+            StaticCondition::SourceIsAttacking,
+            StaticCondition::SourceAttackingAlone,
+            StaticCondition::RecipientAttackingOwnerTarget {
+                target: crate::types::triggers::AttackTargetFilter::Player,
+            },
+            StaticCondition::SourceIsTapped,
+            StaticCondition::None,
+        ] {
+            assert_eq!(
+                leaf.required_continuation(),
+                None,
+                "{leaf:?} is a pure function of game state and must stay enforceable"
+            );
+            assert!(!nested_at_depth(leaf.clone()).requires_out_of_layer_continuation());
+        }
     }
 }

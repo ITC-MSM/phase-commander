@@ -20086,20 +20086,26 @@ fn assert_abzan_greatest_toughness_gate(condition: &AbilityCondition) {
         let FilterProp::PtComparison {
             stat: PtStat::Toughness,
             scope: PtValueScope::Current,
-            comparator: Comparator::GE,
+            comparator: Comparator::EQ,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Toughness,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Toughness
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature] && population.controller.is_none()
     });
     assert!(
@@ -20638,15 +20644,8 @@ fn assert_controlled_creature_greatest_power_ability_gate(condition: &AbilityCon
 }
 
 fn assert_controlled_creature_greatest_power_trigger_gate(condition: &TriggerCondition) {
-    let TriggerCondition::QuantityComparison {
-        lhs: QuantityExpr::Ref {
-            qty: QuantityRef::ObjectCount { filter },
-        },
-        comparator: Comparator::GE,
-        rhs: QuantityExpr::Fixed { value: 1 },
-    } = condition
-    else {
-        panic!("expected ObjectCount >= 1 trigger condition, got {condition:?}");
+    let TriggerCondition::ControlsType { filter } = condition else {
+        panic!("expected controlled-type trigger condition, got {condition:?}");
     };
     assert_controlled_creature_greatest_power_filter(filter);
 }
@@ -20657,24 +20656,41 @@ fn assert_controlled_creature_greatest_power_filter(filter: &TargetFilter) {
     };
     assert_eq!(controlled.controller, Some(ControllerRef::You));
     assert_eq!(controlled.type_filters, vec![TypeFilter::Creature]);
+    assert_eq!(
+        controlled.properties.len(),
+        2,
+        "expected exactly battlefield scope plus aggregate membership: {controlled:?}"
+    );
+    assert!(controlled.properties.iter().any(|property| matches!(
+        property,
+        FilterProp::InZone {
+            zone: Zone::Battlefield
+        }
+    )));
     let has_battlefield_power_max = controlled.properties.iter().any(|prop| {
         let FilterProp::PtComparison {
             stat: PtStat::Power,
             scope: PtValueScope::Current,
-            comparator: Comparator::GE,
+            comparator: Comparator::EQ,
             value:
                 QuantityExpr::Ref {
-                    qty:
-                        QuantityRef::Aggregate {
-                            function: AggregateFunction::Max,
-                            property: ObjectProperty::Power,
-                            filter: TargetFilter::Typed(population),
-                        },
+                    qty: QuantityRef::PropertyAggregate(aggregate),
                 },
         } = prop
         else {
             return false;
         };
+        let crate::types::ability::CardTypeSetSource::Objects {
+            filter: TargetFilter::Typed(population),
+        } = aggregate.source()
+        else {
+            return false;
+        };
+        if aggregate.function() != AggregateFunction::Max
+            || aggregate.property() != ObjectProperty::Power
+        {
+            return false;
+        }
         population.type_filters == vec![TypeFilter::Creature]
             && population.properties.iter().any(|prop| {
                 matches!(
