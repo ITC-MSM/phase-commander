@@ -12,10 +12,10 @@ use crate::types::ability::{
     CopyRetargetPermission, CountScope, DamageAmountScope, DamageAmountThreshold, DamageChannel,
     DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect,
     EffectScope, FilterProp, ManaContribution, ManaProduction, ManaSpendPermission, ModalChoice,
-    ObjectScope, PerpetualModification, PlayerFilter, PlayerScope, PropertyAggregate, PtStat,
-    PtValue, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
-    SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter, TriggerCondition,
-    TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
+    ObjectProperty, ObjectScope, PerpetualModification, PlayerFilter, PlayerScope,
+    PropertyAggregate, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, SeatDirection,
+    SharedQuality, SiblingCondition, SubAbilityLink, TapStateChange, TargetFilter,
+    TriggerCondition, TriggerDefinition, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -5949,7 +5949,7 @@ fn parse_dark_leo_trigger_structure() {
     }
 }
 
-/// CR 104.3e + CR 119 + CR 603.4 + CR 603.7c + CR 603.12: Ezio Auditore
+/// CR 104.3e + CR 119 + CR 603.4 + CR 603.12: Ezio Auditore
 /// da Firenze — "Whenever ~ deals combat damage to a player, you may pay
 /// {W}{U}{B}{R}{G} if that player has 10 or less life. When you do, that
 /// player loses the game."
@@ -5966,7 +5966,7 @@ fn parse_dark_leo_trigger_structure() {
 ///    elimination to the ability controller (Ezio's controller), so the
 ///    Ezio player eliminated *themselves*. The new
 ///    `Effect::LoseTheGame.target` field must be
-///    `Some(TargetFilter::TriggeringPlayer)` (CR 603.7c — "that player"
+///    `Some(TargetFilter::TriggeringPlayer)` (CR 120.3 — "that player"
 ///    anaphora binds to the player named by the damage event).
 /// 3. The reflexive "When you do" gate (CR 603.12) on the directed-loss
 ///    sub-ability must be preserved so the loss only fires after the
@@ -5983,7 +5983,7 @@ fn parse_ezio_damage_trigger_full_structure() {
             "Ezio Auditore da Firenze",
         );
 
-    // (a) Mode + damage kind + valid_target — CR 120.3 + CR 603.7c.
+    // (a) Mode + damage kind + valid_target — CR 120.3.
     assert!(
         matches!(def.mode, TriggerMode::DamageDone),
         "mode must be DamageDone, got {:?}",
@@ -6085,7 +6085,7 @@ fn parse_ezio_damage_trigger_full_structure() {
     );
 }
 
-/// CR 104.3e + CR 119 + CR 603.4 + CR 603.7c + CR 603.12: Ezio Auditore
+/// CR 104.3e + CR 119 + CR 603.4 + CR 603.12: Ezio Auditore
 /// da Firenze — VERBATIM printed Oracle text (post-effect `if` form):
 /// "Whenever ~ deals combat damage to a player, you may pay
 /// {W}{U}{B}{R}{G} if that player has 10 or less life. When you do,
@@ -6119,7 +6119,7 @@ fn parse_ezio_damage_trigger_verbatim_oracle_text() {
             "Ezio Auditore da Firenze",
         );
 
-    // (a) Mode + damage kind + valid_target — CR 120.3 + CR 603.7c.
+    // (a) Mode + damage kind + valid_target — CR 120.3.
     // These are unchanged from the normalized form: the trigger shape
     // itself doesn't depend on which side of the comma the `if` clause
     // lives on.
@@ -6250,9 +6250,9 @@ fn parse_ezio_damage_trigger_verbatim_oracle_text() {
     );
 }
 
-/// CR 603.7c + CR 120.3 + CR 119.3: Unstoppable Slasher — "Whenever this
+/// CR 120.3 + CR 119.3: Unstoppable Slasher — "Whenever this
 /// creature deals combat damage to a player, they lose half their life,
-/// rounded up." is an event-bound (non-targeted) trigger per CR 603.6f.
+/// rounded up." is an event-bound (non-targeted) trigger per CR 115.1d.
 /// "they" must resolve to `TriggeringPlayer` (the damaged player), and the
 /// half-life amount must read `PlayerScope::ScopedPlayer`, NOT the
 /// targeting `PlayerScope::Target` (which has no chosen target on an
@@ -7230,7 +7230,7 @@ fn mirror_march_flip_win_effect_folds_copy_haste_exile_on_last_created() {
     );
 }
 
-/// CR 705.2 + CR 603.7c: the fixed-count sibling has the same per-win rider
+/// CR 705.2 + CR 608.2c: the fixed-count sibling has the same per-win rider
 /// boundary as Mirror March. The present-tense form is used by cards such as
 /// Yusri, Fortune's Flame; once lowered, the copied token's haste/exile riders
 /// must be part of `FlipCoins.win_effect`, not post-loop siblings.
@@ -8852,7 +8852,7 @@ fn trigger_you_attack() {
     assert_eq!(def.mode, TriggerMode::YouAttack);
 }
 
-// CR 508.1 + CR 603.7c: a delayed "Whenever you attack this turn" trigger is
+// CR 508.1 + CR 603.7b: a delayed "Whenever you attack this turn" trigger is
 // prefix-stripped to the bare condition "you attack" before reaching
 // `parse_trigger_condition`. Bare "you attack" must resolve to YouAttack, not
 // Unknown — the #433 root cause (Dalkovan Encampment).
@@ -8872,7 +8872,7 @@ fn trigger_condition_you_attacked_is_not_a_trigger() {
     assert_ne!(mode, TriggerMode::YouAttack);
 }
 
-// CR 603.7c: the full Dalkovan Encampment activated ability — the inner
+// CR 603.7b: the full Dalkovan Encampment activated ability — the inner
 // "Whenever you attack this turn, ..." clause is an effect-body delayed
 // trigger, so it builds a CreateDelayedTrigger whose WheneverEvent trigger
 // has mode YouAttack (previously Unknown — the #433 bug).
@@ -8900,7 +8900,7 @@ fn trigger_dalkovan_encampment_delayed_you_attack() {
     };
     assert_eq!(trigger.mode, TriggerMode::YouAttack);
 
-    // CR 603.7c + CR 513.1: the sacrifice cleanup must nest under the token
+    // CR 603.7a + CR 513.1: the sacrifice cleanup must nest under the token
     // creator inside the WheneverEvent delayed trigger, not as a sibling
     // activated sub registered at ability activation time (issue #2433).
     let Effect::CreateDelayedTrigger { effect: inner, .. } = delayed_effect else {
@@ -10517,6 +10517,76 @@ fn trigger_leonin_vanguard_control_creature_count() {
 }
 
 #[test]
+fn parse_greatest_mana_value_among_instant_and_sorcery_spells_cast_this_turn() {
+    let oracle = "At the beginning of combat on your turn, if you've cast an instant or sorcery spell this turn, create an X/X blue and red Elemental creature token with flying and haste, where X is the greatest mana value among instant and sorcery spells you've cast this turn.";
+    let def = parse_trigger_line(oracle, "Rootha, Mastering the Moment");
+    assert_eq!(def.mode, TriggerMode::Phase);
+    assert_eq!(def.phase, Some(Phase::BeginCombat));
+    assert_eq!(def.constraint, Some(TriggerConstraint::OnlyDuringYourTurn));
+    assert!(matches!(
+        def.condition,
+        Some(TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::SpellsCastThisTurn {
+                    filter: Some(_),
+                    ..
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        })
+    ));
+
+    let execute = def.execute.as_deref().expect("Rootha token effect");
+    let Effect::Token {
+        name,
+        power,
+        toughness,
+        colors,
+        keywords,
+        ..
+    } = execute.effect.as_ref()
+    else {
+        panic!("expected Rootha token effect, got {:#?}", execute.effect);
+    };
+    assert_eq!(name, "Elemental");
+    assert_eq!(colors, &vec![ManaColor::Blue, ManaColor::Red]);
+    assert!(keywords.contains(&Keyword::Flying));
+    assert!(keywords.contains(&Keyword::Haste));
+    let PtValue::Quantity(QuantityExpr::Ref {
+        qty: QuantityRef::PropertyAggregate(aggregate),
+    }) = power
+    else {
+        panic!("expected property-sized token power, got {power:?}");
+    };
+    assert_eq!(toughness, power);
+    assert_eq!(aggregate.function(), AggregateFunction::Max);
+    assert_eq!(aggregate.property(), ObjectProperty::ManaValue);
+    assert!(matches!(
+        aggregate.source(),
+        CardTypeSetSource::TurnJournal {
+            journal: TurnJournalKind::SpellsCast,
+            scope: CountScope::Controller,
+            filter: Some(filter),
+        } if !filter.contains_other_than_trigger_object()
+    ));
+
+    // The typed Token and PropertyAggregate assertions above are the positive
+    // reach guard. Change only the aggregate's unsupported spell filter; the
+    // trigger condition and token clause remain byte-identical.
+    let near_miss_oracle = oracle.replacen(
+        "greatest mana value among instant and sorcery spells",
+        "greatest mana value among creature spells",
+        1,
+    );
+    let near_miss = parse_trigger_line(&near_miss_oracle, "Near Miss");
+    assert!(near_miss
+        .execute
+        .as_deref()
+        .is_some_and(|ability| matches!(ability.effect.as_ref(), Effect::Unimplemented { .. })));
+}
+
+#[test]
 fn extract_if_control_creature_count() {
     let (cleaned, cond) = extract_if_condition(
         "if you control three or more creatures, ~ gets +1/+1 until end of turn",
@@ -10992,7 +11062,7 @@ fn trigger_you_draw_a_card_scopes_to_controller() {
 
 #[test]
 fn trigger_opponent_loses_life_exquisite_blood() {
-    // CR 119.3 + CR 603.2 + CR 603.7c: Exquisite Blood — opponent-scoped
+    // CR 119.3 + CR 603.2: Exquisite Blood — opponent-scoped
     // life-loss trigger whose effect reads "that much" from the event.
     let def = parse_trigger_line(
         "Whenever an opponent loses life, you gain that much life.",
@@ -12955,7 +13025,7 @@ fn trigger_unless_you_pay_dynamic_energy() {
     );
 }
 
-/// CR 608.2k + CR 603.7c: Self-ETB "sacrifice it" anaphor — Azorius
+/// CR 608.2k: Self-ETB "sacrifice it" anaphor — Azorius
 /// Herald, Balduvian Horde, Glint Hawk, Faerie Impostor, Phlage. The
 /// bare object pronoun "it" in a `SelfRef`-subject trigger sub-effect
 /// must resolve to `TargetFilter::SelfRef` (the source itself), NOT to
@@ -15845,7 +15915,7 @@ fn trigger_opponent_causes_you_to_discard_this_card() {
     assert_eq!(def.trigger_zones, vec![Zone::Graveyard, Zone::Exile]);
 }
 
-/// CR 701.9 + CR 603.7c + CR 406.1: Necropotence's on-discard trigger
+/// CR 701.9 + CR 608.2k + CR 406.1: Necropotence's on-discard trigger
 /// exiles the just-discarded card from the graveyard. The "that card"
 /// anaphor must lift from `ParentTarget` to `TriggeringSource` so the
 /// `ChangeZone { origin: Some(Graveyard), destination: Exile }` resolves
@@ -16598,11 +16668,10 @@ fn reflexive_optional_payment_does_not_rewrite_separate_you_control_target() {
     }
 }
 
-/// CR 118.12 + CR 603.12: Phase 1 admits only direct disjunctive resolution
-/// costs. Sacrifice-bearing alternatives remain strict until the replacement-
-/// aware payment continuation exists.
+/// CR 118.12 + CR 603.12: the structural classifier admits direct disjunctive
+/// resolution costs and only fixed, typed, non-self sacrifice alternatives.
 #[test]
-fn anthropede_and_isu_unlock_without_sacrifice_leak() {
+fn resolution_optional_payment_family_accepts_fixed_typed_sacrifice() {
     fn root_cost(def: &TriggerDefinition) -> (&Vec<AbilityCost>, &AbilityDefinition) {
         let execute = def.execute.as_ref().expect("execute");
         let Effect::PayCost {
@@ -16677,21 +16746,97 @@ fn anthropede_and_isu_unlock_without_sacrifice_leak() {
         );
     }
 
-    for (name, text) in [
+    for (name, text, connector) in [
         (
             "K'un-Lun Warrior",
             "When this creature enters, you may sacrifice an artifact or discard a card. If you do, draw a card.",
+            AbilityCondition::effect_performed(),
         ),
         (
             "Bullseye, Death Dealer",
             "When Bullseye enters, you may sacrifice an artifact or discard a nonland card. When you do, Bullseye deals 2 damage to any target.",
+            AbilityCondition::WhenYouDo,
         ),
     ] {
-        let strict = parse_trigger_line(text, name);
-        assert!(matches!(
-            strict.execute.as_deref().map(|ability| ability.effect.as_ref()),
-            Some(Effect::Unimplemented { name, .. }) if name == "reflexive optional payment"
-        ), "sacrifice alternative must remain the exact Phase-1 strict gap for {name}");
+        let parsed = parse_trigger_line(text, name);
+        let (costs, execute) = root_cost(&parsed);
+        assert_eq!(costs.len(), 2, "{name}");
+        assert!(matches!(costs[0], AbilityCost::Sacrifice(_)), "{name}");
+        assert!(matches!(costs[1], AbilityCost::Discard { .. }), "{name}");
+        assert_eq!(
+            execute.sub_ability.as_ref().expect("affirmative tail").condition,
+            Some(connector),
+            "{name} must preserve its printed connector"
+        );
+    }
+}
+
+#[test]
+fn resolution_optional_payment_sacrifice_allowlist_fails_closed() {
+    fn strict(text: &str) {
+        let parsed = parse_trigger_line(text, "Strict Sacrifice Probe");
+        assert!(
+            matches!(
+                parsed.execute.as_deref().map(|ability| ability.effect.as_ref()),
+                Some(Effect::Unimplemented { name, .. })
+                    if name == "reflexive optional payment"
+            ),
+            "unsupported sacrifice form must reach the exact strict classifier: {text}"
+        );
+    }
+
+    // Paired reach guard: punctuation and connector are valid, and the exact
+    // fixed typed form reaches PayCost(OneOf).
+    let positive = parse_trigger_line(
+        "When this creature enters, you may sacrifice an artifact or discard a card. If you do, draw a card.",
+        "Positive Sacrifice Probe",
+    );
+    assert!(matches!(
+        positive
+            .execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::PayCost {
+            cost: AbilityCost::OneOf { .. },
+            ..
+        })
+    ));
+
+    strict("When this creature enters, you may sacrifice this creature or discard a card. If you do, draw a card.");
+    strict("When this creature enters, you may sacrifice any number of artifacts or discard a card. If you do, draw a card.");
+    strict("When this creature enters, you may sacrifice X artifacts or discard a card. If you do, draw a card.");
+
+    use crate::types::ability::{SacrificeAggregateStat, SacrificeCost, SacrificeRequirement};
+    let typed = TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact));
+    assert!(
+        reflexive_optional_direct_cost(&AbilityCost::Sacrifice(SacrificeCost::count(
+            typed.clone(),
+            1,
+        ))),
+        "the fixed typed count-1 sacrifice must be admitted by the structural allowlist"
+    );
+    for forbidden in [
+        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
+        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::GrantingObject, 1)),
+        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 1)),
+        AbilityCost::Sacrifice(SacrificeCost::count(typed.clone(), 0)),
+        AbilityCost::Sacrifice(SacrificeCost::count(typed.clone(), u32::MAX)),
+        AbilityCost::Sacrifice(SacrificeCost::new(
+            typed.clone(),
+            SacrificeRequirement::Aggregate {
+                stat: SacrificeAggregateStat::TotalPower,
+                comparator: Comparator::GE,
+                value: 3,
+            },
+        )),
+        AbilityCost::Composite {
+            costs: vec![AbilityCost::Sacrifice(SacrificeCost::count(typed, 1))],
+        },
+    ] {
+        assert!(
+            !reflexive_optional_direct_cost(&forbidden),
+            "forbidden shape leaked through the structural allowlist: {forbidden:?}"
+        );
     }
 }
 
@@ -16885,7 +17030,7 @@ fn opponent_draws_trigger_deals_damage_to_them_binds_triggering_player() {
     }
 }
 
-/// CR 603.7c + CR 608.2c: God-Pharaoh's Gift — "create a token that's a copy
+/// CR 608.2c: God-Pharaoh's Gift — "create a token that's a copy
 /// of that card … It gains haste." The "It gains haste" grant, nested as the
 /// token creator's own sub-ability, must apply to the newly created token
 /// (`LastCreated`), not the source artifact (`SelfRef`). Issue #2356.
@@ -25613,7 +25758,7 @@ fn trigger_another_player_attacks_with_two_or_more_creatures_intervening_if() {
                 "expected And(controller AttackersDeclaredCount, target AttackersDeclaredCount), got {other:?}"
             ),
         }
-    // CR 121.1 + CR 603.7c + CR 608.2k: "they draw a card" — the effect-level
+    // CR 121.1 + CR 608.2k: "they draw a card" — the effect-level
     // subject ("they") must be encoded directly on the Draw target as
     // `TriggeringPlayer`, not via a post-hoc `player_scope` override on the
     // execute ability. The runtime auto-binds `target: TriggeringPlayer`
@@ -28362,7 +28507,7 @@ fn relative_player_scope_binds_article_less_damage_source_to_triggering_player()
     }
 }
 
-/// CR 120.3 + CR 603.7c: Sigil of Sleep's bounce must target a creature the
+/// CR 120.3: Sigil of Sleep's bounce must target a creature the
 /// DAMAGED player controls (`ControllerRef::TriggeringPlayer`), not a
 /// separately-chosen `TargetPlayer`. The `TargetPlayer` mis-scoping made the
 /// runtime surface a phantom Player target slot, freezing the game (the reported
