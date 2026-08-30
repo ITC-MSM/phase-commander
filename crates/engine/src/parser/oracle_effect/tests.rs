@@ -45905,26 +45905,60 @@ fn cast_from_among_the_instant_or_sorcery_cards_exiled_this_way_binds_to_exiled_
     );
 }
 
-/// CR 601.2 (strict lowering): a printed cast cap too large for the window's
-/// representation must NOT become the unbounded sentinel.
+/// The strict-refusal shape, asserted EXACTLY.
+///
+/// A printed cast cap this engine cannot carry (`0`, anything past `u8::MAX`, or
+/// a non-literal `X`) refuses the whole clause and lowers to the honest gap node
+/// named by the shared `UNREPRESENTABLE_CAST_CAP_GAP` constant, carrying the
+/// refused clause text as its fragment. Asserting the exact effect — rather than
+/// "it isn't a window" — is what makes the regressions below non-vacuous: an
+/// upstream parse loss, a `TargetFilter::Any` permission fallback, a
+/// differently-named gap, or a dropped fragment each fail here, and only the
+/// intended refusal passes.
+fn assert_cast_cap_refused(text: &str, expected_fragment: &str) {
+    let effect = parse_effect(text);
+    let Effect::Unimplemented { name, description } = &effect else {
+        panic!("expected the strict cast-cap refusal for {text:?}, got {effect:?}");
+    };
+    assert_eq!(
+        name, UNREPRESENTABLE_CAST_CAP_GAP,
+        "the refusal must be the shared cast-cap gap, not some other parse loss"
+    );
+    assert_eq!(
+        description.as_deref(),
+        Some(expected_fragment),
+        "the gap must carry the refused clause verbatim so coverage stays honest"
+    );
+}
+
+/// A printed cast cap the resolution window cannot represent is REFUSED, not
+/// downgraded to an uncapped permission.
 ///
 /// These fixtures are deliberately synthetic — the largest printed
 /// `"cast up to N"` in the entire card corpus is THREE (Ashiok, Nightmare Muse)
 /// and the largest `"up to N"` of any kind is TEN (Reshape the Earth), so this
-/// is a representation-boundary hostile fixture, not a card surface. The defect
-/// it locks: `parse_from_among_cast_count` returned `u8::try_from(count).ok()`,
-/// and once `None` became the "any number of spells" sentinel, `"up to 300"`
-/// silently WIDENED a stated bound to unlimited — strictly more permissive than
-/// the printed instruction.
+/// is a representation-boundary hostile fixture, not a card surface. No CR
+/// citation belongs on the fixture itself: which literals a `u8` can hold is an
+/// engine representation limit, not a rule.
 ///
-/// The paired positive control below proves the fixture reaches the real
+/// Two successive defects are locked here. First, `u8::try_from(count).ok()`
+/// made `"up to 300"` decay into the `None` "any number of spells" sentinel.
+/// Second — the shape this test now pins — the resulting `Unrepresentable`
+/// reading was mapped to `CastFromZoneDriver::LingeringPermission`, whose
+/// resolver records per-object permissions with NO shared cast count
+/// (`game/effects/cast_from_zone.rs`). That is still an uncapped grant, merely a
+/// delayed one. CR 608.2c: the printed "up to N" is part of the instruction the
+/// controller follows, so the only honest options are to carry the bound or to
+/// refuse the clause.
+///
+/// The paired positive controls prove the fixtures reach the real
 /// resolution-window arm rather than dying in some upstream anchor, so the
-/// negative assertions are not vacuous.
+/// refusals are not vacuous.
 #[test]
-fn from_among_cast_cap_above_u8_is_refused_not_widened_to_unbounded() {
+fn from_among_cast_cap_the_window_cannot_represent_is_refused() {
     // Positive control: an in-range cap on the identical surface DOES lower to a
-    // bounded resolution window. If this stops holding, the negatives below
-    // prove nothing.
+    // bounded resolution window. If this stops holding, the refusals below prove
+    // nothing.
     let control =
         parse_effect("cast up to two spells from among them without paying their mana costs");
     let Effect::CastFromZone {
@@ -45955,47 +45989,33 @@ fn from_among_cast_cap_above_u8_is_refused_not_widened_to_unbounded() {
         "\"any number of spells\" is the one surface that means unbounded"
     );
 
-    for count in ["256", "300"] {
+    // Every unrepresentable printed cap — over `u8::MAX`, the degenerate zero,
+    // and the non-literal `X` — refuses to the SAME exact gap node.
+    for cap in ["256", "300", "0", "x"] {
         let text =
-            format!("cast up to {count} spells from among them without paying their mana costs");
-        let e = parse_effect(&text);
-        // The whole point: whatever else happens, an out-of-range literal must
-        // never reach the runtime as an unbounded window.
-        if let Effect::CastFromZone {
-            driver: CastFromZoneDriver::ResolutionWindow { bounds },
-            ..
-        } = &e
-        {
-            panic!(
-                "\"up to {count}\" must not lower to a resolution window \
-                 (got max_casts {:?}); an unrepresentable cap is not unbounded",
-                bounds.max_casts
-            );
-        }
-        // It stays on the pre-existing lingering-permission path instead.
-        assert!(
-            matches!(
-                &e,
-                Effect::CastFromZone {
-                    driver: LingeringPermission,
-                    ..
-                }
-            ),
-            "\"up to {count}\" must fall back to the established permission path, got {e:?}"
+            format!("cast up to {cap} spells from among them without paying their mana costs");
+        assert_cast_cap_refused(
+            &text,
+            &format!("up to {cap} spells from among them without paying their mana costs"),
         );
     }
 }
 
-/// CR 601.2 (strict lowering): the direct graveyard/hand free-cast route must
-/// refuse the same out-of-range literals.
+/// The direct graveyard/hand free-cast route refuses the same caps, through the
+/// same gap node.
 ///
-/// This is the second, independent route the maintainer flagged. It had a
-/// cruder version of the same defect: a bare `parse_number` followed by
-/// `count as u8`, so `"up to 300"` WRAPPED to 44 — a fabricated bound that is
-/// neither the printed number nor an honest refusal. Both routes now share
-/// `parse_representable_cast_count`, so they cannot diverge again.
+/// This is the second, independent lowering route the maintainer flagged, and it
+/// had two successive defects of its own. First a bare `parse_number` followed
+/// by `count as u8` WRAPPED `"up to 300"` to 44. Then, once the shared
+/// `parse_representable_cast_count` rejected the literal, the rejection was
+/// treated as "not my shape": the clause fell out of
+/// `try_parse_free_cast_from_zones` straight into `try_parse_cast_effect`'s
+/// Branch-2 filter permission — an uncapped `CastFromZone` over the
+/// graveyard/hand pool, which is the same uncapped grant by another name.
+/// CR 608.2c: the printed bound is part of the instruction, so the route must
+/// refuse rather than silently widen.
 #[test]
-fn free_cast_from_zones_cap_above_u8_is_refused_not_truncated() {
+fn free_cast_from_zones_cap_the_window_cannot_represent_is_refused() {
     // Positive control: Invoke Calamity's real, in-range surface still lowers.
     let control = parse_effect(
         "you may cast up to two instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs",
@@ -46009,64 +46029,103 @@ fn free_cast_from_zones_cap_above_u8_is_refused_not_truncated() {
         "the printed in-range bound must be carried losslessly"
     );
 
-    for n in ["256", "300"] {
+    for cap in ["256", "300", "0", "x"] {
         let text = format!(
-            "you may cast up to {n} instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs"
+            "you may cast up to {cap} instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs"
         );
-        let e = parse_effect(&text);
-        if let Effect::FreeCastFromZones { count, .. } = &e {
-            panic!(
-                "\"up to {n}\" must not lower to a free-cast window (got count {count:?}); \
-                 truncating to {} or widening to unbounded are both silent rules errors",
-                n.parse::<u32>().unwrap() as u8
-            );
-        }
+        assert_cast_cap_refused(
+            &text,
+            &format!(
+                "up to {cap} instant and/or sorcery spells from your graveyard and/or hand without paying their mana costs"
+            ),
+        );
     }
 }
 
-/// CR 601.2 (strict lowering): the counted exiled-this-way route (Plargg and
-/// Nassari's "up to two spells from among the other cards exiled this way")
-/// shares the same cap authority.
+/// The counted exiled-this-way route shares the same cap authority and the same
+/// refusal.
 ///
-/// This route already rejected out-of-range literals via an inline
-/// `count > u8::MAX as u32` check; the test pins that behavior now that the
-/// check has moved into the shared `parse_representable_cast_count`, so a future
-/// refactor cannot silently drop it from this route alone.
+/// This route already rejected out-of-range literals inside
+/// `try_parse_counted_free_cast_from_exiled_this_way`, but the rejection merely
+/// fell through to the `from among … exiled this way` arm, which built an
+/// uncapped `CastFromZone`. The refusal is now terminal for this route too.
 #[test]
-fn counted_exiled_this_way_cast_cap_above_u8_is_refused() {
+fn counted_exiled_this_way_cast_cap_the_window_cannot_represent_is_refused() {
     let control = parse_effect(
         "cast up to two spells from among the cards exiled this way without paying their mana costs",
     );
     assert!(
-        matches!(&control, Effect::FreeCastFromZones { count: Some(2), .. })
-            || matches!(
-                &control,
-                Effect::CastFromZone {
-                    driver: CastFromZoneDriver::ResolutionWindow { .. },
-                    ..
-                }
-            ),
-        "in-range cap must still lower to a bounded window, got {control:?}"
+        matches!(&control, Effect::FreeCastFromZones { count: Some(2), .. }),
+        "reach guard: the in-range cap must still lower to the counted free-cast \
+         window carrying exactly the printed bound, got {control:?}"
     );
 
-    for n in ["256", "300"] {
+    for cap in ["256", "300", "0", "x"] {
         let text = format!(
-            "cast up to {n} spells from among the cards exiled this way without paying their mana costs"
+            "cast up to {cap} spells from among the cards exiled this way without paying their mana costs"
         );
-        let e = parse_effect(&text);
-        if let Effect::FreeCastFromZones { count, .. } = &e {
-            panic!("\"up to {n}\" must not lower to a counted free cast, got count {count:?}");
-        }
-        if let Effect::CastFromZone {
-            driver: CastFromZoneDriver::ResolutionWindow { bounds },
-            ..
-        } = &e
-        {
-            panic!(
-                "\"up to {n}\" must not lower to a resolution window, got max_casts {:?}",
-                bounds.max_casts
-            );
-        }
+        assert_cast_cap_refused(
+            &text,
+            &format!(
+                "up to {cap} spells from among the cards exiled this way without paying their mana costs"
+            ),
+        );
+    }
+}
+
+/// The refusal is STRUCTURAL at the construction seam, not only at the door.
+///
+/// `from_among_batch_cast_driver` is the shared driver authority for all four
+/// `from among` arms. It must answer `None` for an unrepresentable printed cap
+/// on EVERY driver axis — free/`Cast` (which would otherwise pick
+/// `ResolutionWindow`), paid, land-play, and duration-bearing (which would
+/// otherwise pick `LingeringPermission`) — so that no reordering of the arms,
+/// and no future caller that bypasses `refuse_unrepresentable_cast_cap`, can
+/// rebuild the downgrade. The paired representable rows prove each axis still
+/// produces its intended driver, so the refusals are not vacuous.
+#[test]
+fn from_among_batch_cast_driver_refuses_an_unrepresentable_cap_on_every_axis() {
+    let free = "up to 300 spells from among them without paying their mana costs";
+    let free_ok = "up to two spells from among them without paying their mana costs";
+    let durational = "up to 300 spells from among them this turn without paying their mana costs";
+    let durational_ok =
+        "up to two spells from among them this turn without paying their mana costs";
+    let paid = "up to 300 spells from among them";
+    let paid_ok = "up to two spells from among them";
+
+    // Representable caps still pick their established drivers.
+    assert!(
+        matches!(
+            from_among_batch_cast_driver(Cast, true, free_ok),
+            Some(CastFromZoneDriver::ResolutionWindow { bounds })
+                if bounds.max_casts == Some(2)
+        ),
+        "reach guard: the free, no-duration axis must still build a bounded window"
+    );
+    assert_eq!(
+        from_among_batch_cast_driver(Cast, true, durational_ok),
+        Some(LingeringPermission),
+        "reach guard: a stated duration must still keep the lingering grant"
+    );
+    assert_eq!(
+        from_among_batch_cast_driver(Cast, false, paid_ok),
+        Some(LingeringPermission),
+        "reach guard: a paid batch cast must still keep the lingering grant"
+    );
+
+    // The same axes refuse an unrepresentable printed cap.
+    for (label, rest, mode, without_paying) in [
+        ("free/no-duration", free, Cast, true),
+        ("duration-bearing", durational, Cast, true),
+        ("paid", paid, Cast, false),
+        ("land play", paid, Play, false),
+    ] {
+        assert_eq!(
+            from_among_batch_cast_driver(mode, without_paying, rest),
+            None,
+            "{label}: an unrepresentable printed cap must refuse, never downgrade \
+             to a driver with no count channel"
+        );
     }
 }
 

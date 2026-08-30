@@ -4,6 +4,7 @@
 //! path. They distinguish that one-shot private-library flow from the durable
 //! exile permission used by ordinary impulse-draw chains.
 
+use engine::game::casting::spell_objects_available_to_cast;
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::visibility::filter_state_for_viewer;
@@ -1850,7 +1851,17 @@ const SANWELL: &str = "As long as an artifact creature you control is attacking,
 /// Sanwell's becomes-tapped trigger body, verbatim from `SANWELL` above — the
 /// trigger's own instruction chain, without the card's separate static ability.
 const SANWELL_TRIGGER_BODY: &str = "exile the top six cards of your library. You may cast a Vehicle or artifact creature spell from among them. Then put the rest on the bottom of your library in a random order.";
-const WAND_OF_WONDER: &str = "{4}, {T}: Roll a d20. Each opponent exiles cards from the top of their library until they exile an instant or sorcery card, then shuffles the rest into their library. You may cast up to X instant and/or sorcery spells from among cards exiled this way without paying their mana costs.\n1\u{2014}9 | X is one.\n10\u{2014}19 | X is two.\n20 | X is three.";
+/// Synthetic Oracle text: Wand of Wonder is the ONLY printed card that puts a
+/// type list before the `"from among "` anchor in the counted `exiled this way`
+/// form, and its printed cap is a non-literal `X` fixed by a d20 roll. CR
+/// 608.2c: that bound is part of the instruction and no `CastFromZoneDriver`
+/// can carry it, so the clause is now refused outright rather than downgraded to
+/// an uncapped lingering permission — which means Wand of Wonder no longer
+/// produces a `CastFromZone` to read the pre-anchor probe off. This fixture is
+/// Wand of Wonder's clause verbatim except for the printed cap ("up to two"),
+/// so the pre-anchor type-list probe stays covered on a representable bound.
+/// Called out as synthetic in the PR body.
+const SYNTHETIC_TYPED_PRE_ANCHOR_EXILED_THIS_WAY: &str = "{4}, {T}: Roll a d20. Each opponent exiles cards from the top of their library until they exile an instant or sorcery card, then shuffles the rest into their library. You may cast up to two instant and/or sorcery spells from among cards exiled this way without paying their mana costs.";
 const SCHOLAR_OF_THE_LOST_TROVE: &str = "Flying\nWhen this creature enters, you may cast target instant, sorcery, or artifact card from your graveyard without paying its mana cost. If an instant or sorcery spell cast this way would be put into your graveyard, exile it instead.";
 const ETALI_PRIMAL_CONQUEROR: &str = "Trample\nWhen Etali enters, each player exiles cards from the top of their library until they exile a nonland card. You may cast any number of spells from among the nonland cards exiled this way without paying their mana costs.\n{9}{G/P}: Transform Etali. Activate only as a sorcery.";
 const HELLCARVER_DEMON: &str = "Flying\nWhenever this creature deals combat damage to a player, sacrifice all other permanents you control and discard your hand. Exile the top six cards of your library. You may cast any number of spells from among cards exiled this way without paying their mana costs.";
@@ -2079,13 +2090,20 @@ fn or_shaped_cast_gate_still_references_the_exile_set() {
 /// form. The untyped members of that family carry `"any number of spells "` /
 /// `"up to two spells "` in exactly that position, and must not gain a gate.
 ///
-/// Wand of Wonder in the same test is the mandatory paired positive: it proves
-/// the prefix probe actually ran, so the negatives below are not vacuous.
+/// `SYNTHETIC_TYPED_PRE_ANCHOR_EXILED_THIS_WAY` in the same test is the
+/// mandatory paired positive: it proves the prefix probe actually ran, so the
+/// negatives below are not vacuous. It carries Wand of Wonder's clause with a
+/// representable printed cap, because Wand's own `"up to X"` is now a strict
+/// refusal (see the constant's doc comment).
 #[test]
 fn untyped_pre_anchor_prefix_adds_no_type_gate() {
     // Positive reach guard: the pre-anchor type list IS consumed.
-    let filters = exile_gated_cast_legs(WAND_OF_WONDER, "Wand of Wonder", &["Artifact"]);
-    let typed = typed_leg_of(&filters, "Wand of Wonder");
+    let filters = exile_gated_cast_legs(
+        SYNTHETIC_TYPED_PRE_ANCHOR_EXILED_THIS_WAY,
+        "Typed Pre-Anchor Fixture",
+        &["Artifact"],
+    );
+    let typed = typed_leg_of(&filters, "Typed Pre-Anchor Fixture");
     assert_eq!(typed.type_filters, vec![instant_or_sorcery()]);
     assert!(
         typed
@@ -3130,52 +3148,82 @@ fn primeval_spawn_enforces_its_running_total_mana_value_budget() {
     );
 }
 
-/// CR 601.2 (strict lowering): the `from among` resolution-window route must not
-/// turn an unrepresentable printed cap into an UNBOUNDED window.
+/// The exact production outcome of a `from among` cast clause, so the
+/// unrepresentable-cap rows can assert what DID happen rather than a list of
+/// things that did not.
+#[derive(Debug, PartialEq, Eq)]
+enum FromAmongCastOutcome {
+    /// A resolution-scoped free-cast window opened, carrying this bound.
+    Window(Option<u8>),
+    /// No window opened, but the exiled batch is still castable for free at a
+    /// later priority. This is the `CastFromZoneDriver::LingeringPermission`
+    /// downgrade: its resolver records per-object permissions with NO shared
+    /// cast count, so a printed "up to N" becomes an uncapped, merely delayed,
+    /// grant. It is the exact wrong answer this test forbids.
+    UncappedLingeringPermission,
+    /// No window, and no free-cast permission anywhere once the chain hands
+    /// priority back: the clause was refused end to end.
+    Refused,
+}
+
+/// CR 608.2c + CR 608.2g: the `from among` resolution-window route must REFUSE a
+/// printed cast cap it cannot carry, not silently widen it.
 ///
 /// Production-path companion to the parser regression
-/// `from_among_cast_cap_above_u8_is_refused_not_widened_to_unbounded`. This is
-/// the route-1 half of the maintainer's "both routes" ask; the route-2
+/// `from_among_cast_cap_the_window_cannot_represent_is_refused`. This is the
+/// route-1 half of the maintainer's "both routes" ask; the route-2
 /// (graveyard/hand) runtime half lives in `invoke_calamity_free_cast.rs`.
 ///
-/// The defect this pins is a direct side effect of this PR's own earlier fix.
-/// Making `max_casts: None` mean "any number of spells" was correct for the
-/// genuinely unbounded surface — but the cap reader produced that same `None`
-/// from `u8::try_from(300).ok()`, so a card printing a FINITE cap of 300 became
-/// indistinguishable from one printing "any number of". That is strictly more
-/// permissive than the card says, which CR 601.2 does not allow.
+/// Two successive defects are pinned here, and only the second one is about the
+/// runtime. Making `max_casts: None` mean "any number of spells" was correct for
+/// the genuinely unbounded surface — but the cap reader produced that same
+/// `None` from `u8::try_from(300).ok()`, so a card printing a FINITE cap of 300
+/// became indistinguishable from one printing "any number of". The follow-up fix
+/// separated those readings, then mapped the unrepresentable one to
+/// `CastFromZoneDriver::LingeringPermission` — which grants a later-priority
+/// permission with no shared cast count at all. That is still an uncapped grant.
+/// CR 608.2c makes the printed "up to N" part of the instruction the controller
+/// follows, so the only honest outcomes are to carry the bound or to refuse the
+/// clause; `FromAmongCastOutcome` names all three possibilities so the
+/// assertions below distinguish them instead of merely excluding one.
 ///
 /// 256 (the exact boundary) and 300 (the wrap case) are the maintainer's
-/// explicitly requested values. Neither is a real card — the largest printed
-/// "cast up to N" in the corpus is THREE — so both are representation-boundary
-/// hostile fixtures.
+/// explicitly requested values, and `0` / `X` are the two other readings the
+/// same authority refuses. None is a real card — the largest printed
+/// "cast up to N" in the corpus is THREE — so all four are
+/// representation-boundary hostile fixtures, not card surfaces.
 #[test]
-fn from_among_window_refuses_an_unrepresentable_cap_instead_of_unbounding_it() {
-    /// Resolve an exile-then-cast card whose printed cast cap is parameterized,
-    /// returning the cast bound of the window it opened (if it opened one).
-    ///
-    /// `Some(bound)` = a resolution-scoped window opened carrying `bound`;
-    /// `None` = no free-cast window opened at all.
-    /// `quantifier` is the full printed quantifier phrase ("up to two",
-    /// "any number of"), so the unbounded surface can be exercised through the
-    /// same fixture without fabricating "up to any number of".
-    fn window_bound_for(quantifier: &str) -> Option<Option<u8>> {
-        let oracle = format!(
+fn from_among_window_refuses_a_cap_it_cannot_carry_instead_of_granting_an_uncapped_permission() {
+    /// The synthetic exile-then-cast surface under test, parameterized by its
+    /// printed quantifier phrase ("up to two", "any number of", "up to 300") so
+    /// the unbounded surface is exercised through the same fixture without
+    /// fabricating "up to any number of".
+    fn oracle_for(quantifier: &str) -> String {
+        format!(
             "Exile the top four cards of your library. You may cast {quantifier} spells \
              from among them without paying their mana costs."
-        );
+        )
+    }
 
+    /// Resolve the fixture and report what the production pipeline actually
+    /// offered — a bounded/unbounded window, an uncapped lingering permission,
+    /// or nothing at all.
+    fn cast_outcome_for(quantifier: &str) -> FromAmongCastOutcome {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
         let source = scenario
-            .add_spell_to_hand_from_oracle(P0, "Boundary Probe", false, &oracle)
+            .add_spell_to_hand_from_oracle(P0, "Boundary Probe", false, &oracle_for(quantifier))
             .with_mana_cost(ManaCost::generic(1))
             .id();
+        let mut probes = Vec::new();
         for i in 0..4 {
-            scenario
-                .add_spell_to_library_top(P0, &format!("Probe Spell {i}"), false)
-                .with_mana_cost(ManaCost::generic(1))
-                .from_oracle_text("You gain 1 life.");
+            probes.push(
+                scenario
+                    .add_spell_to_library_top(P0, &format!("Probe Spell {i}"), false)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .from_oracle_text("You gain 1 life.")
+                    .id(),
+            );
         }
         scenario.with_mana_pool(
             P0,
@@ -3184,48 +3232,117 @@ fn from_among_window_refuses_an_unrepresentable_cap_instead_of_unbounding_it() {
 
         let mut runner = scenario.build();
         let outcome = runner.cast(source).accept_optional().resolve();
-        match outcome.final_waiting_for() {
-            WaitingFor::CastOffer {
-                kind:
-                    CastOfferKind::FreeCastWindow {
-                        remaining_casts, ..
-                    },
-                ..
-            } => Some(*remaining_casts),
-            _ => None,
+        if let WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow {
+                remaining_casts, ..
+            },
+            ..
+        } = outcome.final_waiting_for()
+        {
+            return FromAmongCastOutcome::Window(*remaining_casts);
         }
+        drop(outcome);
+
+        // REACH GUARD: distinguishing "refused" from "uncapped lingering
+        // permission" is only meaningful once the resolution chain has finished
+        // and handed priority back. A run that parked on some other
+        // `WaitingFor` would report an empty permission scan vacuously, so
+        // require the empty-stack priority window before reading it.
+        let mut reached_empty_stack_priority = false;
+        for _ in 0..24 {
+            if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+                && runner.state().stack.is_empty()
+            {
+                reached_empty_stack_priority = true;
+                break;
+            }
+            if runner.act(GameAction::PassPriority).is_err() {
+                break;
+            }
+        }
+        assert!(
+            reached_empty_stack_priority,
+            "{quantifier:?}: the chain must finish and hand priority back with an empty \
+             stack before the permission scan is meaningful; parked at {:?} with stack {}",
+            runner.state().waiting_for,
+            runner.state().stack.len(),
+        );
+
+        let state = runner.state();
+        let available = spell_objects_available_to_cast(state, P0);
+        if probes.iter().any(|probe| available.contains(probe)) {
+            return FromAmongCastOutcome::UncappedLingeringPermission;
+        }
+        FromAmongCastOutcome::Refused
+    }
+
+    /// Every `Effect::Unimplemented` gap name the parser produced for `oracle`,
+    /// walking the same ability / sub-ability spine the cast accessors walk.
+    fn gap_names(oracle: &str) -> Vec<String> {
+        fn walk(definition: &AbilityDefinition, out: &mut Vec<String>) {
+            if let Effect::Unimplemented { name, .. } = definition.effect.as_ref() {
+                out.push(name.clone());
+            }
+            if let Some(sub) = definition.sub_ability.as_deref() {
+                walk(sub, out);
+            }
+        }
+        let parsed = parse(oracle, "Boundary Probe", &["Sorcery"]);
+        let mut names = Vec::new();
+        for definition in &parsed.abilities {
+            walk(definition, &mut names);
+        }
+        for execute in parsed.triggers.iter().filter_map(|t| t.execute.as_deref()) {
+            walk(execute, &mut names);
+        }
+        names
     }
 
     // REACH GUARD (mandatory paired positive): the identical surface with an
     // in-range cap DOES open a resolution-scoped window carrying exactly that
-    // printed bound. Without this the negatives below could pass simply because
-    // the fixture never reaches the window seam.
+    // printed bound, and raises no gap. Without this the refusals below could
+    // pass simply because the fixture never reaches the window seam.
     assert_eq!(
-        window_bound_for("up to two"),
-        Some(Some(2)),
+        cast_outcome_for("up to two"),
+        FromAmongCastOutcome::Window(Some(2)),
         "reach guard: an in-range printed cap must open a window bounded by it"
+    );
+    assert!(
+        gap_names(&oracle_for("up to two")).is_empty(),
+        "reach guard: the in-range surface must parse cleanly, with no gap node"
     );
 
     // The one surface that legitimately means unbounded still does.
     assert_eq!(
-        window_bound_for("any number of"),
-        Some(None),
-        "\"any number of spells\" is the one surface that legitimately opens an          UNBOUNDED window, and must keep doing so"
+        cast_outcome_for("any number of"),
+        FromAmongCastOutcome::Window(None),
+        "\"any number of spells\" is the one surface that legitimately opens an \
+         UNBOUNDED window, and must keep doing so"
     );
 
-    for printed_cap in ["256", "300"] {
-        let observed = window_bound_for(&format!("up to {printed_cap}"));
-        assert_ne!(
-            observed,
-            Some(None),
-            "\"up to {printed_cap}\" opened an UNBOUNDED window. A stated finite cap the \
-             representation cannot express is not the same thing as \"any number of spells\" \
-             — it must be refused, never widened."
-        );
+    for printed_cap in ["256", "300", "0", "X"] {
+        let quantifier = format!("up to {printed_cap}");
+
+        // The EXACT parser result: the shared strict-refusal gap node, and no
+        // `CastFromZone` anywhere on the spine. Asserting the exact shape is
+        // what keeps the runtime row below non-vacuous — an upstream parse loss
+        // would also produce "no window", but it would not produce this name.
         assert_eq!(
-            observed, None,
-            "\"up to {printed_cap}\" must not open a resolution-scoped window at all; it \
-             stays on the established lingering-permission path"
+            gap_names(&oracle_for(&quantifier)),
+            vec!["unrepresentable_cast_cap".to_string()],
+            "\"{quantifier}\" must lower to exactly the shared cast-cap refusal gap \
+             (see UNREPRESENTABLE_CAST_CAP_GAP in parser::oracle_effect)"
+        );
+
+        // The EXACT production outcome: not a window, and — the part the
+        // previous round got wrong — not a lingering permission either.
+        assert_eq!(
+            cast_outcome_for(&quantifier),
+            FromAmongCastOutcome::Refused,
+            "\"{quantifier}\" must be refused outright. A window would carry a bound the \
+             engine invented; an uncapped lingering permission lets every exiled card be \
+             cast for free at a later priority, which is strictly more permissive than \
+             the printed instruction (CR 608.2c)."
         );
     }
 }
