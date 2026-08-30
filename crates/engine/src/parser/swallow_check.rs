@@ -564,7 +564,7 @@ fn detect_replacement_instead(
 
 // ── Detector B: ActivateOnlyDuring ──────────────────────────────────────
 
-/// CR 605.1c: "Activate only during X" — restricted activation timing.
+/// CR 602.5: "Activate only during X" — restricted activation timing.
 /// Must be represented as an activation constraint on the parsed ability.
 fn detect_activate_only_during(
     cleaned: &str,
@@ -3418,7 +3418,7 @@ fn enters_with_finality_this_way_is_only_if_marker(
 /// "cast ... this way, pay ..." rider shape and must not drift apart on what
 /// counts as "the carrier's clause".
 fn alt_cost_rider_residual_sentences(stripped: &str) -> Option<Vec<&str>> {
-    let sentences: Vec<&str> = stripped.split('.').collect();
+    let sentences = crate::parser::oracle_nom::primitives::split_sentence_units(stripped);
     let matching_rider_count = sentences
         .iter()
         .filter(|sentence| {
@@ -3445,7 +3445,7 @@ fn alt_cost_rider_residual_sentences(stripped: &str) -> Option<Vec<&str>> {
     )
 }
 
-/// CR 118.9 + CR 119.4 + CR 305.1: Inside Information class — mirrors
+/// CR 118.9 + CR 119.4 + CR 701.18b: Inside Information class — mirrors
 /// `cast_this_way_alt_cost_is_only_if_marker`'s text-scoped exemption for the
 /// sibling `PlayFromExile.alt_ability_cost` shape. Structural presence of the
 /// field (`any_ability_has_play_from_exile_alt_ability_cost`) only proves the
@@ -3467,7 +3467,7 @@ fn play_from_exile_alt_ability_cost_is_only_if_marker(
     let Some(residual_sentences) = alt_cost_rider_residual_sentences(stripped) else {
         return false;
     };
-    let residual = residual_sentences.join(".");
+    let residual = residual_sentences.join(" ");
     let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -3499,7 +3499,7 @@ fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvide
     let Some(residual_sentences) = alt_cost_rider_residual_sentences(stripped) else {
         return false;
     };
-    let residual = residual_sentences.join(".");
+    let residual = residual_sentences.join(" ");
     let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -3559,8 +3559,9 @@ fn detect_condition_if(
     // Strip CR-implicit "if" phrases that aren't real conditional gates
     // before scanning. These are built-in rules of their parent effect, not
     // separate conditions:
-    //   CR 701.19f: "If you search your library this way, shuffle." — search
-    //               always-shuffles is built into the search effect.
+    //   "If you search your library this way, shuffle." — no CR makes this
+    //   implicit; the engine's SearchLibrary effect auto-shuffles, so the
+    //   "if" gates nothing.
     //   CR 305.9 :  "If you don't, [it/this/this land] enters tapped." — the
     //               mana-payment alternative is encoded as a replacement
     //               with `ReplacementMode::Optional { decline: Tap(SelfRef) }`,
@@ -3806,12 +3807,14 @@ fn detect_condition_if(
     // conditional representation.
     //   CR 305.9   on_decline                        — "if you don't" alternative
     //   CR 701.20a kept_optional_to                  — RevealUntil decline branch
+    //   CR 202.3 + CR 608.2c kept_destination_if     — RevealUntil card-property destination branch
     //   CR 614.1a  graveyard_destination_replacement — "exile it instead" rider
     //   CR 705     win_effect / lose_effect          — flip branches
     //   CR 701.6   source_rider                      — "if countered this way, ..."
     //   CR 701.6a  countered_spell_zone              — countered-spell destination
     if evidence.has_slot("on_decline")
         || evidence.has_slot("kept_optional_to")
+        || evidence.has_slot("kept_destination_if")
         || evidence.has_slot("graveyard_destination_replacement")
         || evidence.has_slot("win_effect")
         || evidence.has_slot("lose_effect")
@@ -3839,7 +3842,8 @@ fn strip_cr_implicit_if_phrases(cleaned: &str) -> String {
         if s.is_empty() {
             continue;
         }
-        // CR 701.19f: search-shuffle implicit.
+        // Search-shuffle implicit: SearchLibrary auto-shuffles (engine
+        // convention, no CR).
         // allow-noncombinator: swallow detector phrase scan on classified text
         if s.contains("if you search your library this way") {
             continue;
@@ -4585,7 +4589,7 @@ fn detect_duration_this_turn(
     //       CR 615.1   PreventDamage / CreateDamageReplacement — prevention shields
     //       CR 614.11  CreateDrawReplacement — "next time you would draw ... instead"
     //       CR 614.1a  AddTargetReplacement
-    //       CR 603.7c  CreateDelayedTrigger — delayed triggers from spells expire at EOT
+    //       CR 603.7b  CreateDelayedTrigger — delayed triggers from spells expire at EOT
     //       CR 601.2f  ReduceNextSpellCost — consumed by the next cast
     //       CR 509.1c  ForceBlock — a one-turn combat requirement
     //       CR 601.2   CastFromZone — a cast permission, not a duration
@@ -4604,7 +4608,7 @@ fn detect_duration_this_turn(
     }) {
         return;
     }
-    // (j) CR 603.7c: a `WhenNextEvent` delayed-trigger condition IS the "next [event] this
+    // (j) CR 603.7b: a `WhenNextEvent` delayed-trigger condition IS the "next [event] this
     //     turn" scope (Chandra, the Firebrand -2; Doublecast).
     if evidence.any::<DelayedTriggerCondition>(|c| {
         matches!(c, DelayedTriggerCondition::WhenNextEvent { .. })
@@ -10390,6 +10394,69 @@ mod detect_condition_if_replacement_exemption_tests {
              value\" rider must still be flagged as a swallowed Condition_If — a \
              cardinality-blind carrier exemption strips BOTH matching sentences and reports \
              nothing; diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn play_from_exile_alt_cost_residual_scans_newline_separated_conditions() {
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, PlayFromExileProvenance, QuantityExpr,
+        };
+        use crate::types::player::PlayerId;
+        use crate::types::statics::CastFrequency;
+        use crate::types::zones::EtbTapState;
+
+        let permission = CastingPermission::PlayFromExile {
+            provenance: PlayFromExileProvenance::Impulse,
+            duration: Duration::UntilEndOfTurn,
+            granted_to: PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_raise: None,
+            alt_ability_cost: Some(AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 0 },
+            }),
+            land_enter_tapped: EtbTapState::Unspecified,
+            invalidation: None,
+        };
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GrantCastingPermission {
+                    permission,
+                    target: crate::types::ability::default_target_filter_any(),
+                    grantee: crate::types::ability::PermissionGrantee::AbilityController,
+                },
+            )],
+            triggers: Vec::new(),
+            statics: Vec::new(),
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+        let text = "you may play those cards this turn. if you cast a spell this way, pay life \
+                    equal to its mana value rather than pay its mana cost.\nif you control an \
+                    artifact, draw a card.";
+        let cleaned = text.to_ascii_lowercase();
+        let mut diagnostics = Vec::new();
+        detect_condition_if(&cleaned, text, &evidence, &parsed, &mut diagnostics);
+
+        assert!(
+            has_condition_if_swallow(&diagnostics),
+            "the newline-separated unrepresented condition must remain visible after the rider \
+             is removed; diagnostics: {diagnostics:?}"
         );
     }
 

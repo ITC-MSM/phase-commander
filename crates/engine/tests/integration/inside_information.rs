@@ -7,8 +7,8 @@
 //! 1. CR 601.2b + CR 115 (targeting): X is announced as part of the cost, and
 //!    the exile comes from a TARGET OPPONENT's library — not the caster's own
 //!    — while the resulting `PlayFromExile` grant still binds to the ability
-//!    CONTROLLER (CR 611.2a), not the exiled cards' owner.
-//! 2. CR 116.1 + CR 305.1 (play, not cast): "play" covers both casting a spell
+//!    CONTROLLER (CR 109.5), not the exiled cards' owner.
+//! 2. CR 701.18b (play, not cast): "play" covers both casting a spell
 //!    and playing a land, so a land among the exiled cards must be playable
 //!    too, not just spells.
 //! 3. CR 118.9 + CR 119.4 (alternative cost): "pay life equal to its mana
@@ -136,7 +136,7 @@ fn build_rig() -> Rig {
 /// Claims (a)+(1): casting with X=3 targeting an opponent exiles the top
 /// THREE cards of THEIR library (not the caster's own), and the resulting
 /// `PlayFromExile` grant binds to the CASTER (P0), not the exiled cards'
-/// owner (P1) — CR 611.2a.
+/// owner (P1) — CR 109.5.
 #[test]
 fn inside_information_exiles_x_from_targeted_opponents_library() {
     let rig = build_rig();
@@ -188,7 +188,7 @@ fn inside_information_exiles_x_from_targeted_opponents_library() {
             }
             _ => unreachable!("matched PlayFromExile above"),
         }
-        // CR 611.2a: the grant is scoped to the CASTER, never the opponent
+        // CR 109.5: the grant is scoped to the CASTER, never the opponent
         // whose library was exiled from.
         assert!(
             play_from_exile_for(outcome.state(), id, P1).is_none(),
@@ -238,7 +238,7 @@ fn casting_an_exiled_spell_pays_life_instead_of_mana_cost() {
 
 /// Claim (c)+(2): a LAND among the exiled cards is playable too, not just
 /// spells — the alt-cost rider is spell-cast-only and must never block the
-/// CR 305.1 land-play route the same grant also authorizes.
+/// CR 701.18b land-play route the same grant also authorizes.
 #[test]
 fn an_exiled_land_can_be_played_not_just_cast() {
     let rig = build_rig();
@@ -313,7 +313,7 @@ fn unplayed_exiled_cards_expire_at_end_of_turn() {
 
     assert!(
         !spell_objects_available_to_cast(runner.state(), P0).contains(&rig.spell_c),
-        "CR 611.2a: the unplayed exiled card must no longer be castable once the turn changes"
+        "CR 514.2 + CR 611.2a: the unplayed exiled card must no longer be castable once the turn changes"
     );
     assert!(
         play_from_exile_for(runner.state(), rig.spell_c, P0).is_none(),
