@@ -29,7 +29,7 @@ use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
-use engine::types::game_state::{CastOfferKind, WaitingFor};
+use engine::types::game_state::{CastOfferKind, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -151,6 +151,51 @@ fn drain_until_kotis_cast_window(runner: &mut GameRunner) -> Vec<ObjectId> {
         }
     }
     panic!("Kotis's trigger never opened its resolution-scoped cast window");
+}
+
+/// CR 406.6: the granting source carried on the parked window itself.
+///
+/// Reach guards read the batch through THIS id rather than through a
+/// fixture-side handle so the guard is anchored to the very window whose
+/// candidate list is under assertion. A window that belonged to some other
+/// source would then fail the guard instead of silently validating a batch the
+/// offer never consulted.
+fn kotis_window_source(runner: &GameRunner) -> ObjectId {
+    let WaitingFor::CastOffer {
+        kind: CastOfferKind::FreeCastWindow { source, .. },
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "expected to be parked on Kotis's free-cast window, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    *source
+}
+
+/// CR 607.2a: the source's "exiled this way" ledger for this turn — the full
+/// batch BEFORE any mana-value budget is applied.
+///
+/// This is the set the `expensive` reach guard needs: `member_pool` on the
+/// window is already budget-filtered, so it can never witness that an
+/// over-budget card reached the batch at all.
+fn tracked_exile_batch(state: &GameState, source: ObjectId) -> &[ObjectId] {
+    state
+        .cards_exiled_with_source_this_turn
+        .get(&source)
+        .map_or(&[][..], Vec::as_slice)
+}
+
+/// CR 304.1 + CR 307.1: the card-type half of "cast any number of spells" —
+/// an instant card or a sorcery card is what may be cast as a spell.
+///
+/// Kept as its own predicate so a reach guard can prove that type eligibility
+/// is NOT what excluded a negative control, isolating the exclusion to the one
+/// property under test (mana-value budget, or batch membership).
+fn is_instant_or_sorcery(state: &GameState, id: ObjectId) -> bool {
+    let core_types = &state.objects[&id].card_types.core_types;
+    core_types.contains(&CoreType::Instant) || core_types.contains(&CoreType::Sorcery)
 }
 
 /// CR 608.2g + CR 608.2h: the batch is exiled, the window opens DURING the
@@ -335,6 +380,7 @@ fn kotis_declining_leaves_no_lingering_cast_permission() {
 /// exiled-by-this-source pool can be.
 struct KotisBatchFixture {
     runner: GameRunner,
+    kotis: ObjectId,
     cheap_one: ObjectId,
     cheap_two: ObjectId,
     expensive: ObjectId,
@@ -383,6 +429,7 @@ fn kotis_batch_scope_fixture() -> KotisBatchFixture {
 
     KotisBatchFixture {
         runner,
+        kotis,
         cheap_one,
         cheap_two,
         expensive,
@@ -412,6 +459,7 @@ fn kotis_batch_scope_fixture() -> KotisBatchFixture {
 fn kotis_offers_the_whole_in_budget_batch_and_nothing_outside_it() {
     let KotisBatchFixture {
         mut runner,
+        kotis,
         cheap_one,
         cheap_two,
         expensive,
@@ -419,6 +467,13 @@ fn kotis_offers_the_whole_in_budget_batch_and_nothing_outside_it() {
     } = kotis_batch_scope_fixture();
 
     let candidates = drain_until_kotis_cast_window(&mut runner);
+
+    let source = kotis_window_source(&runner);
+    assert_eq!(
+        source, kotis,
+        "the window under assertion must be the one Kotis's trigger opened, so the \
+         batch the reach guards below read is this trigger's own"
+    );
 
     assert!(
         candidates.contains(&cheap_one),
@@ -429,10 +484,65 @@ fn kotis_offers_the_whole_in_budget_batch_and_nothing_outside_it() {
         "a SECOND mana value 3 card (<= X=3) in the SAME batch must be offered too — \
          \"any number\" is a batch grant, not a single pick"
     );
+    // REACH GUARD (budget control). `!candidates.contains(&expensive)` is
+    // satisfied by ANY failure to reach the offer, including a fixture in which
+    // Kotis never exiled the card at all. Prove first that `expensive` actually
+    // landed in THIS trigger's exiled batch and is otherwise a perfectly
+    // eligible instant sitting in exile, so the ONLY property left that can
+    // explain its absence is the mana-value ceiling (CR 202.3: MV 5 > X = 3).
+    let state = runner.state();
+    assert!(
+        tracked_exile_batch(state, source).contains(&expensive),
+        "the over-budget control must actually have been exiled by THIS Kotis trigger \
+         (CR 607.2a) — otherwise its absence from the offer proves nothing about the \
+         mana-value bound; tracked batch was {:?}",
+        tracked_exile_batch(state, source)
+    );
+    assert_eq!(
+        state.objects[&expensive].zone,
+        Zone::Exile,
+        "the over-budget control must still be in exile where the window looks"
+    );
+    assert!(
+        is_instant_or_sorcery(state, expensive),
+        "the over-budget control must be an otherwise-castable instant/sorcery, so \
+         card type cannot be what excludes it"
+    );
+    assert!(
+        state.objects[&expensive].mana_cost.mana_value() > 3,
+        "the over-budget control must genuinely exceed X = 3, or it is not a control \
+         for the budget at all"
+    );
     assert!(
         !candidates.contains(&expensive),
         "a mana value 5 card (> X=3) must NOT be offered even though it was exiled \
          in the same batch"
+    );
+
+    // REACH GUARD (batch-scope control). Symmetrically, prove `unrelated_exiled`
+    // is a card the window would have to offer if "from among them" widened to
+    // all of exile: still in `Zone::Exile`, an eligible instant, and WITHIN the
+    // X = 3 budget — while being absent from this trigger's exiled batch. Batch
+    // membership is then the only property that can explain its exclusion.
+    assert_eq!(
+        state.objects[&unrelated_exiled].zone,
+        Zone::Exile,
+        "the batch-scope control must still be sitting in exile — if it left, its \
+         absence from the offer would say nothing about \"from among them\""
+    );
+    assert!(
+        is_instant_or_sorcery(state, unrelated_exiled),
+        "the batch-scope control must be an otherwise-castable instant/sorcery"
+    );
+    assert!(
+        state.objects[&unrelated_exiled].mana_cost.mana_value() <= 3,
+        "the batch-scope control must be WITHIN X = 3, so the budget cannot be what \
+         excludes it"
+    );
+    assert!(
+        !tracked_exile_batch(state, source).contains(&unrelated_exiled),
+        "the batch-scope control must NOT be in this trigger's exiled batch (CR 607.2a) \
+         — that is the single property under test"
     );
     assert!(
         !candidates.contains(&unrelated_exiled),
@@ -465,6 +575,28 @@ fn kotis_offers_the_whole_in_budget_batch_and_nothing_outside_it() {
     assert!(
         !reoffered.contains(&cheap_one),
         "an already-cast card must not be offered a second time"
+    );
+    // REACH GUARD (re-offer). The re-opened window is a freshly built candidate
+    // set, so its negatives need the same proof that both controls are still in
+    // the state that makes their exclusion meaningful.
+    let reoffer_source = kotis_window_source(&runner);
+    assert_eq!(
+        reoffer_source, kotis,
+        "the re-opened window must still be Kotis's own"
+    );
+    let state = runner.state();
+    assert!(
+        tracked_exile_batch(state, reoffer_source).contains(&expensive)
+            && state.objects[&expensive].zone == Zone::Exile,
+        "the over-budget control must still be an exiled member of this trigger's batch \
+         when the window re-opens"
+    );
+    assert!(
+        state.objects[&unrelated_exiled].zone == Zone::Exile
+            && is_instant_or_sorcery(state, unrelated_exiled)
+            && !tracked_exile_batch(state, reoffer_source).contains(&unrelated_exiled),
+        "the batch-scope control must still be an eligible exiled non-member when the \
+         window re-opens"
     );
     assert!(
         !reoffered.contains(&expensive) && !reoffered.contains(&unrelated_exiled),
