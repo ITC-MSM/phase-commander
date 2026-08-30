@@ -490,7 +490,7 @@ fn singular_batch_anaphors_are_one_shot_resolution_windows() {
     }
 }
 
-/// CR 608.2g + CR 601.2 + CR 202.3: the exile-batch class and the two bound axes
+/// CR 608.2g + CR 608.2c + CR 202.3: the exile-batch class and the two bound axes
 /// its Oracle grammar states independently.
 ///
 /// Every card here has a published WotC ruling saying the casts happen during
@@ -529,7 +529,7 @@ fn exile_batch_anaphors_are_resolution_windows_with_their_stated_bounds() {
             &["Sorcery"][..],
             ResolutionCastWindow::default(),
         ),
-        // CR 601.2: an explicit cast cap.
+        // CR 608.2c: an explicit printed cast cap.
         (
             "Collected Conjuring",
             COLLECTED_CONJURING,
@@ -550,7 +550,7 @@ fn exile_batch_anaphors_are_resolution_windows_with_their_stated_bounds() {
                 max_total_mv: Some(10),
             },
         ),
-        // CR 601.2: "a spell" is an implicit cap of one, reached through the
+        // CR 608.2c: "a spell" is an implicit cap of one, reached through the
         // subject-phrase "may" seam rather than the leading "you may".
         (
             "Itazura, Lingering Wick",
@@ -2632,7 +2632,7 @@ fn collected_conjuring_does_not_offer_an_instant() {
             .is_empty(),
         "the ineligible instant must not receive a casting permission"
     );
-    // CR 601.2: "up to two" is a hard cap the window's stop-early loop owns.
+    // CR 608.2c: "up to two" is a printed hard cap the window's stop-early loop owns.
     let WaitingFor::CastOffer {
         kind: CastOfferKind::FreeCastWindow {
             remaining_casts, ..
@@ -2654,7 +2654,7 @@ fn collected_conjuring_does_not_offer_an_instant() {
     take_offer_onto_the_stack(&mut runner, legal_sorcery);
 }
 
-/// R12b — RUNTIME. CR 601.2: an UNBOUNDED window ("you may cast any number of
+/// R12b — RUNTIME. CR 608.2c: an UNBOUNDED window ("you may cast any number of
 /// spells … from among them") has no printed cast cap, so a batch larger than
 /// 255 must stay fully castable.
 ///
@@ -2718,7 +2718,7 @@ fn unbounded_resolution_window_casts_past_the_former_255_cap() {
         POOL,
         "reach guard: every exiled card is inside the mana-value ceiling and must be offered"
     );
-    // CR 601.2: "any number of spells" — the window carries NO cast bound. This
+    // CR 608.2c: "any number of spells" — the window carries NO cast bound. This
     // is the typed encoding of unbounded, not a 255 sentinel.
     assert_eq!(
         remaining_casts, None,

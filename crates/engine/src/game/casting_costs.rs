@@ -10796,9 +10796,10 @@ fn handle_resolution_cast_success(
                 // CR 614.1a: Carry the exact printed replacement destination.
                 apply_spell_graveyard_replacement_rider(state, cast_object, destination);
             }
-            // CR 601.2: `None` is the unbounded "any number of spells" form —
-            // it stays `None` across every re-offer rather than decrementing
-            // toward an artificial floor. Only a printed bound counts down.
+            // CR 608.2c: only a bound the card actually prints counts down.
+            // `None` is the unbounded "any number of spells" form and stays
+            // `None` across every re-offer rather than decrementing toward an
+            // artificial floor the instruction never stated.
             let casts_left = remaining_casts.map(|left| left.saturating_sub(1));
             // CR 202.3: shrink the shared budget by what was actually spent on
             // mana value (resulting MV after X, copies, etc.).

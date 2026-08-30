@@ -3358,7 +3358,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             zones,
             graveyard_replacement,
         } => {
-            // CR 601.2: `None` is the unbounded "any number of spells" form.
+            // `None` is the unbounded "any number of spells" form.
             d.push((
                 "count".into(),
                 count.map_or_else(|| "any".to_string(), |n| n.to_string()),

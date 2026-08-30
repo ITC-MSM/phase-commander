@@ -24446,7 +24446,7 @@ fn try_parse_counted_free_cast_from_exiled_this_way(rest: &str) -> Option<Effect
     // counts ("up to X") have no concrete cap at parse time and fall through
     // to the existing permission-based arms.
     let (after_count, _) = tag::<_, _, E>("up to ").parse(rest).ok()?;
-    // CR 601.2 (strict lowering): the shared cap authority also refuses `0` and
+    // CR 608.2c (strict lowering): the shared cap authority also refuses `0` and
     // any literal too large for `count`, so an out-of-range printed bound falls
     // through to the permission arms instead of being truncated or widened.
     let (after_count, count) = parse_representable_cast_count(after_count).ok()?;
@@ -24463,10 +24463,10 @@ fn try_parse_counted_free_cast_from_exiled_this_way(rest: &str) -> Option<Effect
     rewrite_target_filter_another_to_tracked_set(&mut filter);
 
     Some(Effect::FreeCastFromZones {
-        // CR 601.2: this arm parsed a printed "up to N" the representation can
-        // carry losslessly, so the bound is stated — `Some`. `None` is reserved
-        // for the unbounded "any number of spells" form, which does not reach
-        // this combinator.
+        // This arm parsed a printed "up to N" the representation can carry
+        // losslessly, so the bound is stated — `Some`. `None` is reserved for
+        // the unbounded "any number of spells" form, which does not reach this
+        // combinator.
         count: Some(count),
         max_total_mv: None,
         filter,
@@ -24621,14 +24621,14 @@ fn try_parse_free_cast_from_zones(lower: &str) -> Option<Effect> {
     let (rest, _) = alt((tag::<_, _, E>("you may cast up to "), tag("cast up to ")))
         .parse(lower)
         .ok()?;
-    // CR 601.2 (strict lowering): the shared cap authority refuses `0` and any
+    // CR 608.2c (strict lowering): the shared cap authority refuses `0` and any
     // literal too large for `count`. This used to be a bare `parse_number`
     // followed by `count as u8`, which wrapped a printed "up to 300" to 44 — a
     // silent rules error. An out-of-range literal now fails the parse and the
     // clause falls through unlowered rather than casting a fabricated bound.
     let (rest, count) = parse_representable_cast_count(rest).ok()?;
-    // CR 601.2: this arm matched a printed "up to N", so the bound is stated —
-    // `Some`. `None` (unbounded "any number of spells") is produced only by the
+    // This arm matched a printed "up to N", so the bound is stated — `Some`.
+    // `None` (unbounded "any number of spells") is produced only by the
     // `ResolutionCastWindow` route, which does not pass through here.
     let count = Some(count);
     // `parse_number` leaves the trailing word boundary; consume the space
@@ -34864,7 +34864,7 @@ pub(crate) fn parse_effect_chain_ir(
         // the commit-point latch (casting_costs.rs) as the sole authority for the
         // rider gate. Mirrors the `FreeCastFromZones` arm above.
         //
-        // CR 608.2g + CR 601.2: the resolution-scoped BATCH window
+        // CR 608.2g + CR 608.2c: the resolution-scoped BATCH window
         // (`CastFromZoneDriver::ResolutionWindow` — "you may cast any number of
         // spells … from among them without paying their mana costs") reaches the
         // runtime as exactly the same `CastOfferKind::FreeCastWindow` as the

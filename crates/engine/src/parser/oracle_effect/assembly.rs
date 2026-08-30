@@ -2385,7 +2385,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 ..
             }
         );
-        // CR 608.2g + CR 601.2: the resolution-scoped BATCH window
+        // CR 608.2g + CR 608.2c: the resolution-scoped BATCH window
         // (`CastFromZoneDriver::ResolutionWindow` — "you may cast any number
         // of spells … from among them without paying their mana costs")
         // becomes a `CastOfferKind::FreeCastWindow` at resolution

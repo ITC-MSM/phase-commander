@@ -10,7 +10,7 @@ use crate::types::zones::Zone;
 ///
 /// The controller may cast up to `count` spells matching `filter` from their
 /// own graveyard and/or hand (`zones`) — or ANY NUMBER of them when `count` is
-/// `None`, the CR 601.2 "any number of spells" form whose only bound is
+/// `None`, the unbounded "any number of spells" form whose only bound is
 /// candidate exhaustion — each without paying its mana cost,
 /// casting them one at a time during this resolution (CR 608.2g). When
 /// `max_total_mv` is `Some(n)`, the *running total* mana value of the spells
@@ -96,7 +96,7 @@ pub fn resolve(
     // circuiting here avoids a no-op prompt.
     //
     // `count == Some(0)` is the printed-zero case only. `None` is the unbounded
-    // "any number of spells" form (CR 601.2) and must NOT short-circuit: its
+    // "any number of spells" form and must NOT short-circuit: its
     // bound is the candidate list, which the emptiness check above already
     // covers.
     if candidates.is_empty() || count == Some(0) {

@@ -1699,8 +1699,8 @@ pub enum CastFromZoneDriver {
     /// This PARAMETERIZES the during-resolution mechanism rather than
     /// duplicating it: `DuringResolution` casts exactly the one resolved target,
     /// while this variant casts a bounded selection from a batch and therefore
-    /// carries the two bounds the batch form needs (CR 601.2 cast count, CR
-    /// 202.3 running-total mana-value budget). Both are "cast as the granting
+    /// carries the two bounds the batch form needs (CR 608.2c printed cast
+    /// count, CR 202.3 running-total mana-value budget). Both are "cast as the granting
     /// ability resolves"; neither is a lingering `CastingPermission`.
     ///
     /// A stated durational scope (CR 611.2a — Apex of Power's "Until end of
@@ -1711,7 +1711,7 @@ pub enum CastFromZoneDriver {
     ResolutionWindow { bounds: ResolutionCastWindow },
 }
 
-/// CR 601.2 + CR 202.3: The two bounds a resolution-scoped free-cast window
+/// CR 608.2c + CR 202.3: The two bounds a resolution-scoped free-cast window
 /// (`CastFromZoneDriver::ResolutionWindow`) enforces on the batch it offers.
 ///
 /// Both axes are `Option` because Oracle text states them independently:
@@ -1725,8 +1725,8 @@ pub enum CastFromZoneDriver {
 /// carries it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResolutionCastWindow {
-    /// CR 601.2: Maximum number of spells castable this way; `None` is the
-    /// "any number of spells" form (bounded in practice only by the batch).
+    /// CR 608.2c: Maximum number of spells castable this way, as printed; `None`
+    /// is the "any number of spells" form (bounded in practice only by the batch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_casts: Option<u8>,
     /// CR 202.3: Running-total mana-value budget shared across every spell cast
@@ -1755,7 +1755,7 @@ impl CastFromZoneDriver {
         matches!(self, CastFromZoneDriver::DuringResolution)
     }
 
-    /// CR 608.2g + CR 601.2 + CR 202.3: The bounds of the resolution-scoped
+    /// CR 608.2g + CR 608.2c + CR 202.3: The bounds of the resolution-scoped
     /// free-cast window this driver opens, or `None` for the two single-card
     /// mechanisms. The single authority the `cast_from_zone` router reads to
     /// decide whether to convert the grant into an `Effect::FreeCastFromZones`
@@ -4126,7 +4126,7 @@ pub enum ResolutionCastSuccessAction {
     /// recomputed from the controller's current graveyard/hand.
     FreeCastOfferRemaining {
         controller: PlayerId,
-        /// CR 601.2: Casts still available in the window, or `None` for the
+        /// CR 608.2c: Casts still available in the window, or `None` for the
         /// unbounded "any number of spells" form — the same encoding as
         /// `Effect::FreeCastFromZones::count`, carried unchanged through every
         /// re-offer so an unbounded window never acquires an artificial cap.
@@ -15064,8 +15064,8 @@ pub enum Effect {
     /// is no target slot; candidates are gathered by `filter` across `zones` at
     /// resolution time. Invoke Calamity is the type specimen.
     FreeCastFromZones {
-        /// CR 601.2: Maximum number of spells the controller may cast this way,
-        /// or `None` for the UNBOUNDED "any number of spells" form.
+        /// CR 608.2c: Maximum number of spells the controller may cast this way,
+        /// as printed, or `None` for the UNBOUNDED "any number of spells" form.
         ///
         /// The encoding is deliberately identical to
         /// `ResolutionCastWindow::max_casts`, the parsed bound this field is
@@ -15074,7 +15074,7 @@ pub enum Effect {
         /// pass-through instead of a lossy `unwrap_or(pool.len() as u8)`. The
         /// previous `u8` had no unbounded value, so an unbounded window over a
         /// pool larger than 255 silently truncated to 255 casts and stranded
-        /// every eligible card past the cap — a cap CR 601.2 does not state.
+        /// every eligible card past the cap — a cap no printed instruction states.
         ///
         /// Serde: a bare number still deserializes as `Some(n)` (`Option`'s
         /// `visit_some`), so pre-existing serialized `"count": 2` bodies and

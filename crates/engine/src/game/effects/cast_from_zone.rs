@@ -598,7 +598,7 @@ pub fn resolve(
         );
     }
 
-    // CR 608.2g + CR 601.2 + CR 202.3: the "… from among them" BATCH form. The
+    // CR 608.2g + CR 202.3: the "… from among them" BATCH form. The
     // referent set was produced by an earlier instruction of this same
     // resolution and the casts happen inside it — "the currently resolving spell
     // or ability continues to resolve, which may include casting other spells
@@ -840,7 +840,9 @@ pub fn resolve(
     {
         let mut window = ability.clone();
         window.effect = Effect::FreeCastFromZones {
-            // CR 601.2: one cast per surviving pair. `u8::try_from(..).ok()`
+            // CR 608.2c: one cast per surviving pair, as printed ("for each
+            // opponent, you may cast up to one target instant or sorcery card
+            // from that player's graveyard"). `u8::try_from(..).ok()`
             // is not a lossy truncation here: a pool that does not fit a `u8`
             // maps to `None`, the unbounded form, whose only bound is the pool
             // itself — exactly the intended "cast one from each opponent"
@@ -910,7 +912,7 @@ pub fn resolve(
 const RESOLUTION_WINDOW_ORIGIN_ZONES: [Zone; 4] =
     [Zone::Exile, Zone::Graveyard, Zone::Library, Zone::Hand];
 
-/// CR 608.2g + CR 601.2 + CR 202.3 + CR 608.2h: Convert a resolution-scoped
+/// CR 608.2g + CR 202.3 + CR 608.2h: Convert a resolution-scoped
 /// `CastFromZone` batch grant into the interactive free-cast window
 /// (`Effect::FreeCastFromZones`) over exactly `pool`.
 ///
@@ -969,16 +971,17 @@ fn open_resolution_cast_window(
         })
         .collect();
 
-    // CR 601.2: "any number of spells" has no printed cap, so the batch itself is
-    // the bound; "up to two" / a singular "a spell" carry their own. Both forms
-    // share `Effect::FreeCastFromZones::count`'s encoding (`None` = unbounded),
-    // so the parsed bound passes straight through.
+    // CR 608.2c: the controller follows the instruction as printed. "any number
+    // of spells" states no cap, so the batch itself is the bound; "up to two" /
+    // a singular "a spell" carry their own. Both forms share
+    // `Effect::FreeCastFromZones::count`'s encoding (`None` = unbounded), so the
+    // parsed bound passes straight through.
     //
     // This used to substitute `pool.len()` for the unbounded case and clamp it
     // with `unwrap_or(u8::MAX)`, which silently capped an unbounded window over
-    // a 256+ card pool at 255 casts. CR 601.2 states no such cap; the window's
-    // real bound is candidate exhaustion, which `eligible_candidates` enforces
-    // on every re-offer.
+    // a 256+ card pool at 255 casts. No printed instruction states such a cap,
+    // and CR 608.2g supplies none either; the window's real bound is candidate
+    // exhaustion, which `eligible_candidates` enforces on every re-offer.
     let count = bounds.max_casts;
 
     // The anaphor leg is discharged (see the doc comment); what remains is the

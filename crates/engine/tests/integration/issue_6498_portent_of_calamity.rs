@@ -482,7 +482,7 @@ fn portent_full_resolution_exiles_picks_to_hand_and_unselected_reveal_to_graveya
         "the revealed-but-unselected duplicate creature must go to the graveyard"
     );
 
-    // CR 608.2g + CR 601.2: Portent's printed "You may cast a spell from among
+    // CR 608.2g + CR 608.2c: Portent's printed "You may cast a spell from among
     // the exiled cards without paying its mana cost if you exiled four or more
     // cards this way" is a resolution-scoped window
     // (`CastFromZoneDriver::ResolutionWindow`) — its accept/decline IS the
@@ -537,7 +537,7 @@ fn portent_full_resolution_exiles_picks_to_hand_and_unselected_reveal_to_graveya
         "the revealed-but-unselected creature went to the graveyard and was never exiled, \
          so it must not be castable from this window"
     );
-    // CR 601.2: "a spell" — singular, so exactly one cast is offered.
+    // CR 608.2c: "a spell" — singular, so exactly one cast is offered.
     assert_eq!(
         remaining_casts,
         Some(1),
@@ -589,7 +589,7 @@ fn portent_full_resolution_exiles_picks_to_hand_and_unselected_reveal_to_graveya
     );
 }
 
-/// CR 608.2g + CR 601.2: Declining Portent's printed offer must still run the
+/// CR 608.2g + CR 608.2c: Declining Portent's printed offer must still run the
 /// trailing "Then put the rest of the exiled cards into your hand" instruction —
 /// the whole exiled batch reaches hand, exactly the issue #6498 invariant, but
 /// now THROUGH the real cast window rather than past a window that never opened.

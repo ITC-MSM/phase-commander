@@ -8815,7 +8815,7 @@ pub enum CastOfferKind {
     /// `Effect::FreeCastFromZones` (Invoke Calamity). The controller repeatedly
     /// chooses one `candidate` to cast for free (or declines to finish), up to
     /// `remaining_casts` times — or without a cast limit at all when
-    /// `remaining_casts` is `None` (CR 601.2 "any number of spells") — while the
+    /// `remaining_casts` is `None` (the printed "any number of spells") — while the
     /// chosen spells' running total mana value stays within
     /// `remaining_mv_budget`. After each successful cast the window is
     /// re-offered with `remaining_casts` decremented (a `None` bound stays
@@ -8826,10 +8826,10 @@ pub enum CastOfferKind {
         /// and/or hand) that match the effect's filter and still fit the
         /// remaining MV budget.
         candidates: Vec<ObjectId>,
-        /// CR 601.2: Casts still available in this window, or `None` for the
+        /// CR 608.2c: Casts still available in this window, or `None` for the
         /// unbounded "any number of spells" form. Same encoding as
         /// `Effect::FreeCastFromZones::count`; the candidate list is then the
-        /// only bound, which is what CR 601.2 actually states.
+        /// only bound, which is what the printed instruction states.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remaining_casts: Option<u8>,
         /// CR 202.3: Running-total mana-value budget remaining, or `None` for
