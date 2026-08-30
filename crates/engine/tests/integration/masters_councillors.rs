@@ -31,6 +31,7 @@ use engine::game::effects::draw::resolve as resolve_draw;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario};
 use engine::game::triggers::process_triggers;
+use engine::game::zone_pipeline::{move_object_for_test, ZoneMoveRequest};
 use engine::game::zones::create_object;
 use engine::types::ability::{Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
@@ -64,19 +65,45 @@ fn graveyard_len(runner: &GameRunner, player: PlayerId) -> usize {
     runner.state().players[player.0 as usize].graveyard.len()
 }
 
-/// Move `count` generic, ruleless cards into `player`'s graveyard through the
-/// REAL zone-move pipeline (`zones::move_to_zone`), mirroring an ordinary
-/// discard/mill rather than seeding the destination zone directly. This is
-/// the seam the zone-invalidation regression requires: a card entering
-/// `Zone::Graveyard` via `move_to_zone` -- not `create_object` straight into
-/// the destination zone -- is what exercises
-/// `any_active_static_reads_zone_membership` at the production zone-change
-/// site (`zones.rs`), so a test that only ever seeds the graveyard directly
-/// (as `GameScenario::with_graveyard` and the old version of this helper did)
-/// can stay green even if that invalidation path is broken. Returns the moved
-/// objects' ids (stable across the move -- CR 400.7's "becomes a new object"
-/// is a game-rules fiction about characteristics, not an engine id reissue).
-fn move_cards_into_graveyard(
+/// Mill `count` generic, ruleless cards from `player`'s library into their
+/// graveyard through the PRODUCTION zone-change pipeline
+/// (`zone_pipeline::move_object`, reached cross-crate via
+/// `move_object_for_test`, over a `ZoneMoveRequest::effect`) -- the exact entry
+/// point `Effect::Mill` uses: `effects/mill.rs` builds one
+/// `ZoneMoveRequest::effect(card, destination, card)` per milled card and hands
+/// the batch to `zone_pipeline::move_objects_simultaneously`.
+///
+/// WHY the pipeline and not a raw `zones::move_to_zone`: the primitive is only
+/// the last third of a production zone change. `move_object` proposes a
+/// `ProposedEvent::ZoneChange`, runs the CR 614.6 replacement consult over it
+/// (the `Moved` redirect family -- "if a card would be put into a graveyard
+/// from anywhere, exile it instead", Rest in Peace / Leyline of the Void
+/// class), and only then reaches `move_to_zone` inside
+/// `deliver_replaced_zone_change`, followed by the delivery tail and a terminal
+/// result. `effects/mill.rs` documents that the raw primitive "never proposed a
+/// per-card ZoneChange, so `Moved` redirects never fired for milled cards" --
+/// i.e. the raw call is a KNOWN-divergent shortcut, not the production path. A
+/// redirect changes the DELIVERED destination zone, which is the very input
+/// `static_layer_dependency_for_zone_transition` classifies, so a regression in
+/// replacement handling or in the delivery tail could stop preserving the dirty
+/// cache while a raw-primitive test stayed green. Routing here also produces a
+/// terminal result to assert instead of the primitive's `()`.
+///
+/// WHY a LIBRARY origin: `zones.rs`'s dirty-mark block ORs `from == Zone::Hand`
+/// into its unconditional `mark_layers_full` arm, so a Hand -> Graveyard move
+/// dirties the layer cache no matter how the zone-dependency classifier
+/// answers -- it cannot discriminate this fix at all. A Library -> Graveyard
+/// mill hits neither the Hand nor the Battlefield arm, and the
+/// `from == Zone::Library` follow-up is self-gated on
+/// `any_active_static_reads_top_of_library` (Master's Councillors reads
+/// graveyards, not library tops, so no such static is live here). That leaves
+/// `static_layer_dependency_for_zone_transition` as the ONLY thing that can
+/// dirty the cache -- exactly the seam under test.
+///
+/// Returns the moved objects' ids (stable across the move -- CR 400.7's
+/// "becomes a new object" is a game-rules fiction about characteristics, not an
+/// engine id reissue).
+fn mill_cards_into_graveyard(
     runner: &mut GameRunner,
     player: PlayerId,
     count: usize,
@@ -90,10 +117,32 @@ fn move_cards_into_graveyard(
             card_id,
             player,
             format!("{label} {i}"),
-            Zone::Hand,
+            Zone::Library,
         );
         let mut events = Vec::new();
-        engine::game::zones::move_to_zone(runner.state_mut(), id, Zone::Graveyard, &mut events);
+        // CR 701.17a: `effects/mill.rs` anchors the `Effect` cause on the
+        // milled card itself (a mill to a graveyard creates no exile link, and
+        // a `Moved` replacement's `valid_card` is evaluated against the moved
+        // card); mirror that attribution exactly.
+        let paused = move_object_for_test(
+            runner.state_mut(),
+            ZoneMoveRequest::effect(id, Zone::Graveyard, id),
+            &mut events,
+        );
+        // Terminal delivery result, not discarded: no replacement definition is
+        // live in this scenario, so the pipeline must run to completion rather
+        // than park on a CR 616.1 replacement-ordering choice. A parked move
+        // would leave the card in its origin zone and silently invalidate every
+        // graveyard-census assertion below.
+        assert!(
+            !paused,
+            "the mill delivery must terminate, not park on a CR 616.1 replacement choice"
+        );
+        assert_eq!(
+            runner.state().objects[&id].zone,
+            Zone::Graveyard,
+            "CR 701.17a: the pipeline must actually deliver the milled card to the graveyard"
+        );
         moved.push(id);
     }
     moved
@@ -107,17 +156,22 @@ fn move_cards_into_graveyard(
 /// and (d) a graveyard re-crossing the threshold DOWNWARD drops its
 /// contribution again.
 ///
-/// Every threshold transition here happens through the REAL `move_to_zone`
-/// zone-change pipeline (`move_cards_into_graveyard`), and each transition
-/// asserts `layers_dirty.is_dirty()` BEFORE the forced recompute in
-/// `effective_pt`. This is the zone-invalidation regression: before
-/// `QuantityRef::PlayerCount { filter: PlayerAttribute { attr: GraveyardSize,
-/// .. } }` was classified as reading the graveyard zone, an ORDINARY
-/// mill/discard move (not Master's Councillors' own ability) never dirtied
-/// the layer cache, so the +2/+0 census could go stale until an unrelated
-/// full refresh happened to occur. Forcing `mark_full` unconditionally (as
-/// the old version of this test did before every assertion) would mask
-/// exactly that bug -- these `is_dirty()` checks are the seam that catches it.
+/// Every threshold transition here happens through the PRODUCTION
+/// `zone_pipeline::move_object` / `ZoneMoveRequest::effect` path (proposal ->
+/// CR 614.6 replacement consult -> `move_to_zone` delivery -> delivery tail ->
+/// terminal result), not a raw `zones::move_to_zone`, and every transition
+/// asserts both the terminal delivery result and `layers_dirty.is_dirty()`
+/// BEFORE the forced recompute in `effective_pt`. This is the zone-invalidation
+/// regression: before `QuantityRef::PlayerCount { filter: PlayerAttribute {
+/// attr: GraveyardSize, .. } }` was classified as reading the graveyard zone,
+/// an ORDINARY mill/discard/exile move (not Master's Councillors' own ability)
+/// never dirtied the layer cache, so the +2/+0 census could go stale until an
+/// unrelated full refresh happened to occur. Forcing `mark_full`
+/// unconditionally (as the first version of this test did before every
+/// assertion) would mask exactly that bug -- these `is_dirty()` checks are the
+/// seam that catches it, and the Library/Graveyard origins keep them
+/// discriminating (see `mill_cards_into_graveyard` on why a Hand origin would
+/// not be).
 #[test]
 fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
     let mut scenario = GameScenario::new_n_player(4, 42);
@@ -146,9 +200,9 @@ fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
         "precondition: the layer cache is clean before the first zone move"
     );
 
-    // (b) P0's own graveyard crosses the threshold (7th card) via the REAL
-    // zone-move pipeline: +2/+0 -> 3/3.
-    move_cards_into_graveyard(&mut runner, P0, 1, "Filler G");
+    // (b) P0's own graveyard crosses the threshold (7th card) via the
+    // PRODUCTION mill pipeline (Library -> Graveyard): +2/+0 -> 3/3.
+    mill_cards_into_graveyard(&mut runner, P0, 1, "Filler G");
     assert_eq!(graveyard_len(&runner, P0), 7);
     assert!(
         runner.state().layers_dirty.is_dirty(),
@@ -167,7 +221,7 @@ fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
     // census counts every player's graveyard in the game, not just the
     // controller's, AND that the invalidation fires again for a second,
     // independent player's zone move.
-    move_cards_into_graveyard(&mut runner, P2, 7, "P2 Filler");
+    mill_cards_into_graveyard(&mut runner, P2, 7, "P2 Filler");
     assert_eq!(graveyard_len(&runner, P2), 7);
     assert!(
         runner.state().layers_dirty.is_dirty(),
@@ -187,7 +241,10 @@ fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
     // (d) RE-CROSS DOWNWARD: an unrelated effect exiles a card straight out of
     // P0's graveyard, dropping it back to six cards -- below the threshold.
     // The dependency walker must dirty the cache on the way back down too,
-    // not only when a graveyard first reaches seven.
+    // not only when a graveyard first reaches seven. Routed through the same
+    // production `move_object` pipeline (an exile effect sourced by an
+    // unrelated permanent), so the Graveyard -> Exile leg also runs proposal,
+    // replacement consult and delivery rather than the raw primitive.
     assert!(!runner.state().layers_dirty.is_dirty());
     let p0_gy_card = runner.state().players[P0.0 as usize]
         .graveyard
@@ -195,7 +252,21 @@ fn masters_councillors_pt_scales_with_graveyard_census_across_players() {
         .copied()
         .expect("P0's graveyard has a card to exile");
     let mut events = Vec::new();
-    engine::game::zones::move_to_zone(runner.state_mut(), p0_gy_card, Zone::Exile, &mut events);
+    let paused = move_object_for_test(
+        runner.state_mut(),
+        ZoneMoveRequest::effect(p0_gy_card, Zone::Exile, mc),
+        &mut events,
+    );
+    assert!(
+        !paused,
+        "the graveyard -> exile delivery must terminate, not park on a CR 616.1 \
+         replacement choice"
+    );
+    assert_eq!(
+        runner.state().objects[&p0_gy_card].zone,
+        Zone::Exile,
+        "the pipeline must actually deliver the exiled card out of the graveyard"
+    );
     assert_eq!(graveyard_len(&runner, P0), 6);
     assert!(
         runner.state().layers_dirty.is_dirty(),
