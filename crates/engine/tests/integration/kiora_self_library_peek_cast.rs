@@ -1848,9 +1848,29 @@ fn kiora_library_choice_is_private_across_serde_round_trip() {
 const RAL_LEYLINE_PRODIGY: &str = "Ral enters with an additional loyalty counter on him for each instant and sorcery spell you've cast this turn.\n[+1]: Until your next turn, instant and sorcery spells you cast cost {1} less to cast.\n[\u{2212}2]: Ral deals 2 damage divided as you choose among one or two targets. Draw a card if you control a blue permanent other than Ral.\n[\u{2212}8]: Exile the top eight cards of your library. You may cast instant and sorcery spells from among them this turn without paying their mana costs.";
 const KYLOX: &str = "Menace, ward {2}, haste\nWhenever Kylox attacks, sacrifice any number of other creatures, then exile the top X cards of your library, where X is their total power. You may cast any number of instant and/or sorcery spells from among the exiled cards without paying their mana costs.";
 const SANWELL: &str = "As long as an artifact creature you control is attacking, prevent all damage that would be dealt to Sanwell.\nWhenever Sanwell becomes tapped, exile the top six cards of your library. You may cast a Vehicle or artifact creature spell from among them. Then put the rest on the bottom of your library in a random order.";
-/// Sanwell's becomes-tapped trigger body, verbatim from `SANWELL` above — the
-/// trigger's own instruction chain, without the card's separate static ability.
-const SANWELL_TRIGGER_BODY: &str = "exile the top six cards of your library. You may cast a Vehicle or artifact creature spell from among them. Then put the rest on the bottom of your library in a random order.";
+/// Sanwell's becomes-tapped trigger body with its head noun PLURALIZED, and nothing else
+/// changed. Synthetic; called out as synthetic in the PR body.
+///
+/// Sanwell's own printed clause is REFUSED now — see
+/// `real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused`. It is a
+/// PAID batch cast printing a cap of ONE over a batch of SIX, and no mechanism
+/// this engine has can enforce that bound: the free-cast window models no mana
+/// payment, and `LingeringPermission`'s resolver writes an INDEPENDENT
+/// `CastingPermission` per object with no grant-scoped ledger, so the old
+/// lowering let the controller cast every matching one of the six. CR 608.2c
+/// makes the printed "a … spell" part of the instruction, so the honest outcome
+/// is a refusal.
+///
+/// The CR 205.3g + CR 205.2b type-gate GRAMMAR that clause exercises — a subtype
+/// leg (`Vehicle`) standing beside a multi-word core-type leg (`artifact
+/// creature`) — is orthogonal to the cap, which is read from the head noun's
+/// grammatical number alone. Pluralizing that ONE token is therefore the minimal
+/// edit that keeps the gate grammar and the paid-offer runtime under test on a
+/// clause that still lowers, without inventing a different gate.
+const SANWELL_PLURAL_GATE_TRIGGER_BODY: &str = "exile the top six cards of your library. You may cast Vehicle or artifact creature spells from among them. Then put the rest on the bottom of your library in a random order.";
+/// The whole-card form of `SANWELL_PLURAL_GATE_TRIGGER_BODY`, for the rows that
+/// parse a full card rather than a trigger body.
+const SANWELL_PLURAL_GATE: &str = "As long as an artifact creature you control is attacking, prevent all damage that would be dealt to Sanwell.\nWhenever Sanwell becomes tapped, exile the top six cards of your library. You may cast Vehicle or artifact creature spells from among them. Then put the rest on the bottom of your library in a random order.";
 /// Synthetic Oracle text: Wand of Wonder is the ONLY printed card that puts a
 /// type list before the `"from among "` anchor in the counted `exiled this way`
 /// form, and its printed cap is a non-literal `X` fixed by a d20 roll. CR
@@ -2035,7 +2055,7 @@ fn serial_comma_cast_type_gate_yields_all_three_legs() {
 /// bearing both types. A grammar that split them would permit any artifact.
 #[test]
 fn subtype_and_multiword_cast_type_gate() {
-    let filters = exile_gated_cast_legs(SANWELL, "Sanwell, Avenger Ace", &["Creature"]);
+    let filters = exile_gated_cast_legs(SANWELL_PLURAL_GATE, "Sanwell, Avenger Ace", &["Creature"]);
     let gate = filters
         .iter()
         .find(|f| matches!(f, TargetFilter::Or { .. }))
@@ -2070,7 +2090,7 @@ fn subtype_and_multiword_cast_type_gate() {
 /// the runtime would stop remapping the library-peek set.
 #[test]
 fn or_shaped_cast_gate_still_references_the_exile_set() {
-    let target = cast_target_of(SANWELL, "Sanwell, Avenger Ace", &["Creature"]);
+    let target = cast_target_of(SANWELL_PLURAL_GATE, "Sanwell, Avenger Ace", &["Creature"]);
     assert!(
         matches!(&target, TargetFilter::And { filters }
             if filters.iter().any(|f| matches!(f, TargetFilter::Or { .. }))),
@@ -2806,7 +2826,7 @@ fn unbounded_resolution_window_casts_past_the_former_255_cap() {
 #[test]
 fn sanwell_offers_only_vehicles_and_artifact_creatures() {
     let mut fixture = sanwell_fixture();
-    let execute = exile_then_cast_chain_without_uncast_cleanup(SANWELL_TRIGGER_BODY);
+    let execute = exile_then_cast_chain_without_uncast_cleanup(SANWELL_PLURAL_GATE_TRIGGER_BODY);
     accept_exile_set_cast(&mut fixture.runner, fixture.sanwell, &execute, None);
     fixture.assert_only_the_two_gate_legs_are_offered();
     take_offer_onto_the_stack(&mut fixture.runner, fixture.vehicle);
@@ -2831,7 +2851,7 @@ fn sanwell_offers_only_vehicles_and_artifact_creatures() {
 #[test]
 fn sanwell_type_gate_holds_under_a_real_trigger_context() {
     let mut fixture = sanwell_fixture();
-    let execute = exile_then_cast_chain_without_uncast_cleanup(SANWELL_TRIGGER_BODY);
+    let execute = exile_then_cast_chain_without_uncast_cleanup(SANWELL_PLURAL_GATE_TRIGGER_BODY);
     let mut resolved = exile_set_cast_ability(&execute, fixture.sanwell, None);
     // CR 603.4: stamp the provenance a real "becomes tapped" trigger would carry.
     let (incarnation, card_id) = {
@@ -2893,7 +2913,7 @@ fn sanwell_fixture() -> SanwellFixture {
     scenario.at_phase(Phase::PreCombatMain);
     let sanwell = scenario
         .add_creature(P0, "Sanwell, Avenger Ace", 3, 3)
-        .from_oracle_text(SANWELL)
+        .from_oracle_text(SANWELL_PLURAL_GATE)
         .id();
     // CR 205.3g: a Vehicle is "Artifact — Vehicle"; `as_creature`
     // first strips the Sorcery seed, `as_artifact` then strips Creature.
@@ -3269,6 +3289,24 @@ fn from_among_window_refuses_a_cap_it_cannot_carry_instead_of_granting_an_uncapp
         );
 
         let state = runner.state();
+        // REACH GUARD (producer): an empty permission scan is only evidence of a
+        // REFUSAL if the cards the refused clause would have offered actually
+        // exist in the zone it would have offered them from. Probes still
+        // sitting in the LIBRARY are uncastable for a completely different
+        // reason — an upstream parse or lowering loss that swallowed the exile
+        // step along with the cast step — and would make every row below pass
+        // without ever exercising the exile-then-refusal path. Require all four
+        // in `Zone::Exile` first.
+        for (index, probe) in probes.iter().enumerate() {
+            let zone = state.objects.get(probe).map(|object| object.zone);
+            assert_eq!(
+                zone,
+                Some(Zone::Exile),
+                "{quantifier:?}: probe {index} must have been exiled by the clause \
+                 preceding the refused cast — a probe left in {zone:?} is uncastable \
+                 for the wrong reason and would make the refusal assertion vacuous"
+            );
+        }
         let available = spell_objects_available_to_cast(state, P0);
         if probes.iter().any(|probe| available.contains(probe)) {
             return FromAmongCastOutcome::UncappedLingeringPermission;
@@ -3345,4 +3383,319 @@ fn from_among_window_refuses_a_cap_it_cannot_carry_instead_of_granting_an_uncapp
              the printed instruction (CR 608.2c)."
         );
     }
+}
+
+/// Verbatim Scryfall Oracle text. Paid, capped at one, AND duration-bearing —
+/// five cards exiled, one artifact spell castable "this turn".
+const CHISS_GORIA_FORGE_TYRANT: &str = "Affinity for artifacts (This spell costs {1} less to cast for each artifact you control.)\nFlying, haste\nWhenever Chiss-Goria attacks, exile the top five cards of your library. You may cast an artifact spell from among them this turn. If you do, it has affinity for artifacts.";
+/// Verbatim Scryfall Oracle text. The paid route with no duration at all, so it
+/// isolates the `without_paying` axis from the duration axis.
+const NATHAN_DRAKE: &str = "First strike\nYou may spend mana as though it were mana of any color to cast spells you don't own or to activate abilities of permanents you control but don't own.\nWhenever Nathan Drake attacks, exile the top card of each player's library. You may cast a spell from among those cards.";
+/// Verbatim Scryfall Oracle text. Paid + a LEADING duration, so the printed cap
+/// is present before the duration seam and the paid seam both run.
+const LOCKE_TREASURE_HUNTER: &str = "Locke can't be blocked by creatures with greater power.\nMug — Whenever Locke attacks, each player mills a card. If a land card was milled this way, create a Treasure token. Until end of turn, you may cast a spell from among those cards.";
+/// Verbatim Scryfall Oracle text. The CR 305.1 land-play sibling with a PLURAL
+/// head noun ("play **lands** from among those cards"), i.e. no printed cap at
+/// all. It is the control for the plural reader: the reader knew only "spells"
+/// and "cards", so this card read as a printed cap of ONE and, once caps started
+/// being honored, was falsely refused.
+const THE_OMENKEEL: &str = "Whenever a Vehicle you control deals combat damage to a player, that player exiles that many cards from the top of their library. You may play lands from among those cards for as long as they remain exiled.\nCrew 1";
+
+/// Every `Effect::Unimplemented` gap name on a parsed card's ability spine.
+fn all_gap_names(oracle: &str, name: &str, types: &[&str]) -> Vec<String> {
+    fn walk(definition: &AbilityDefinition, out: &mut Vec<String>) {
+        if let Effect::Unimplemented { name, .. } = definition.effect.as_ref() {
+            out.push(name.clone());
+        }
+        if let Some(sub) = definition.sub_ability.as_deref() {
+            walk(sub, out);
+        }
+        if let Some(alt) = definition.else_ability.as_deref() {
+            walk(alt, out);
+        }
+    }
+    let parsed = parse(oracle, name, types);
+    let mut names = Vec::new();
+    for definition in &parsed.abilities {
+        walk(definition, &mut names);
+    }
+    for execute in parsed.triggers.iter().filter_map(|t| t.execute.as_deref()) {
+        walk(execute, &mut names);
+    }
+    names
+}
+
+/// CR 608.2c: every `from among` route whose selected mechanism cannot carry the
+/// printed bound refuses the clause, on REAL cards.
+///
+/// This is the general form of the defect. The earlier rounds fixed the loudest
+/// case — a bound the representation could not express at all (`up to 300`,
+/// `up to X`) — but a bound of `1` or `2` is perfectly expressible and was still
+/// dropped, silently, the moment the clause was paid, land-play, or
+/// duration-bearing. `LingeringPermission`'s resolver
+/// (`record_lingering_permissions`) writes an INDEPENDENT `CastingPermission`
+/// per object with no grant-scoped ledger, so "cast **a** Vehicle or artifact
+/// creature spell from among them" over a batch of six granted all six.
+///
+/// These four are the entire real-card fallout of the fix, taken from the
+/// regenerated corpus diff: every one of them printed a cap the engine ignored.
+/// Each row asserts the EXACT gap name, so an unrelated upstream parse loss
+/// cannot satisfy it.
+#[test]
+fn real_cards_whose_printed_cap_no_mechanism_can_carry_are_refused() {
+    for (name, oracle, types, axis) in [
+        (
+            "Sanwell, Avenger Ace",
+            SANWELL,
+            &["Creature", "Legendary"][..],
+            "paid, cap of one over a batch of six",
+        ),
+        (
+            "Chiss-Goria, Forge Tyrant",
+            CHISS_GORIA_FORGE_TYRANT,
+            &["Creature", "Legendary", "Artifact"][..],
+            "paid + duration, cap of one over a batch of five",
+        ),
+        (
+            "Nathan Drake, Treasure Hunter",
+            NATHAN_DRAKE,
+            &["Creature", "Legendary"][..],
+            "paid, no duration",
+        ),
+        (
+            "Locke, Treasure Hunter",
+            LOCKE_TREASURE_HUNTER,
+            &["Creature", "Legendary"][..],
+            "paid + leading duration",
+        ),
+    ] {
+        let gaps = all_gap_names(oracle, name, types);
+        assert!(
+            gaps.iter().any(|gap| gap == "unrepresentable_cast_cap"),
+            "{name} ({axis}): the printed cap must refuse the clause outright — \
+             granting an uncapped permission over the whole batch is strictly \
+             more permissive than the printed instruction (CR 608.2c). gaps = {gaps:?}"
+        );
+    }
+}
+
+/// CR 305.1: the plural land-play sibling is NOT refused.
+///
+/// The paired negative for the row above, and the reason it is load-bearing: the
+/// plural reader enumerated "spells" and "cards" only, so The Omenkeel's
+/// "you may play **lands** from among those cards" read as a printed cap of ONE
+/// and was falsely refused the moment caps started being honored. A fix that
+/// refuses too much is not a fix — the bound has to be READ correctly before it
+/// can be honored correctly.
+#[test]
+fn the_omenkeel_plural_land_play_is_not_refused() {
+    let parsed = parse(
+        THE_OMENKEEL,
+        "The Omenkeel",
+        &["Artifact", "Legendary", "Vehicle"],
+    );
+    let Effect::CastFromZone { driver, mode, .. } = parsed_cast_from_zone(&parsed) else {
+        unreachable!("helper returns CastFromZone")
+    };
+    assert_eq!(
+        *mode,
+        engine::types::ability::CardPlayMode::Play,
+        "The Omenkeel grants a CR 305.1 land play, not a cast"
+    );
+    assert_eq!(
+        *driver,
+        CastFromZoneDriver::LingeringPermission,
+        "a plural head noun prints no cap, so the land-play permission stands"
+    );
+}
+
+/// CR 608.2c: the PAID route, end to end through production — the batch is not
+/// castable at all after the refusal.
+///
+/// Sanwell's printed instruction is one cast out of six exiled cards. The parser
+/// refusal above is only half the claim; this row proves the runtime consequence,
+/// which is what the defect actually was: before the fix, every matching exiled
+/// card carried a standing casting permission the controller could exercise at
+/// any later priority window.
+///
+/// The `Zone::Exile` reach guard is mandatory here for the same reason it is in
+/// the unrepresentable-cap runtime row: probes left in the library are
+/// uncastable for the wrong reason and would make the assertion vacuous.
+#[test]
+fn a_refused_paid_batch_cast_grants_no_casting_permission_in_production() {
+    /// The synthetic exile-then-paid-cast surface — Sanwell's grammar with the
+    /// type gate dropped so the probes are plain spells — parameterized by the
+    /// printed quantifier so the unbounded control runs the identical fixture.
+    fn oracle_for(quantifier: &str) -> String {
+        format!(
+            "Exile the top four cards of your library. You may cast {quantifier} from among them."
+        )
+    }
+
+    fn probe_zones_and_castability(quantifier: &str) -> (Vec<Zone>, Vec<ObjectId>) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario
+            .add_spell_to_hand_from_oracle(P0, "Paid Batch Probe", false, &oracle_for(quantifier))
+            .with_mana_cost(ManaCost::generic(1))
+            .id();
+        let mut probes = Vec::new();
+        for i in 0..4 {
+            probes.push(
+                scenario
+                    .add_spell_to_library_top(P0, &format!("Paid Probe {i}"), false)
+                    .with_mana_cost(ManaCost::generic(1))
+                    .from_oracle_text("You gain 1 life.")
+                    .id(),
+            );
+        }
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(ManaType::Colorless, source, false, vec![])],
+        );
+
+        let mut runner = scenario.build();
+        let outcome = runner.cast(source).accept_optional().resolve();
+        drop(outcome);
+
+        // REACH GUARD: the permission scan is only meaningful once the chain has
+        // finished and handed priority back with an empty stack.
+        let mut reached_empty_stack_priority = false;
+        for _ in 0..24 {
+            if matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
+                && runner.state().stack.is_empty()
+            {
+                reached_empty_stack_priority = true;
+                break;
+            }
+            if runner.act(GameAction::PassPriority).is_err() {
+                break;
+            }
+        }
+        assert!(
+            reached_empty_stack_priority,
+            "{quantifier:?}: the chain must hand priority back with an empty stack \
+             before the permission scan is meaningful; parked at {:?}",
+            runner.state().waiting_for,
+        );
+
+        let state = runner.state();
+        let zones = probes
+            .iter()
+            .map(|probe| {
+                state
+                    .objects
+                    .get(probe)
+                    .map(|object| object.zone)
+                    .expect("probe object must still exist")
+            })
+            .collect::<Vec<_>>();
+        let available = spell_objects_available_to_cast(state, P0);
+        let castable = probes
+            .iter()
+            .copied()
+            .filter(|probe| available.contains(probe))
+            .collect::<Vec<_>>();
+        (zones, castable)
+    }
+
+    // REACH GUARD (mandatory paired positive): the identical surface with an
+    // UNBOUNDED plural head prints no cap, keeps the paid lingering permission,
+    // and therefore DOES leave the exiled batch castable. Without this row the
+    // refusal below could pass because the fixture never produced an exile
+    // batch, or because paid batch permissions stopped working entirely.
+    let (control_zones, control_castable) = probe_zones_and_castability("spells");
+    assert!(
+        control_zones.iter().all(|zone| *zone == Zone::Exile),
+        "reach guard: the unbounded control must exile all four probes, got {control_zones:?}"
+    );
+    // MORE than one, deliberately: this is the exact shape of the defect. A
+    // per-object `CastingPermission` is written for EVERY member of the batch, so
+    // the surface that a "cast a spell" clause used to reach offers the whole
+    // batch at once. That is what makes the cap undroppable rather than merely
+    // untidy — and it is what the refusal below has to remove.
+    assert!(
+        control_castable.len() > 1,
+        "reach guard: an unbounded paid batch grant makes the WHOLE batch \
+         castable ({} of 4 here) — that is the uncapped permission a printed cap \
+         of one must never decay into",
+        control_castable.len()
+    );
+
+    // The refusal: a printed cap of one over a batch of four. The lingering
+    // permission cannot stop the second cast, so the clause is refused and NO
+    // probe is castable.
+    let (zones, castable) = probe_zones_and_castability("a spell");
+    assert!(
+        zones.iter().all(|zone| *zone == Zone::Exile),
+        "the exile step preceding the refused cast must still run — a probe left \
+         in the library is uncastable for the wrong reason, got {zones:?}"
+    );
+    assert!(
+        castable.is_empty(),
+        "CR 608.2c: a paid batch cast printing a cap of one must grant NO casting \
+         permission rather than an uncapped one over the whole batch; still \
+         castable = {castable:?}"
+    );
+}
+
+/// CR 611.2a: the SENTENCE-leading duration seam refuses a bound it would drop.
+///
+/// `split_clause_sequence` cuts "Until end of turn, you may play lands **and**
+/// cast … from among cards exiled this way …" into two chunks and only the first
+/// carries the stripped prefix, so the cast half is reconciled by
+/// `apply_sentence_duration_to_coordinated_casts` → `reconcile_coordinated_cast`
+/// — a structurally distinct seam from the single-chunk `with_clause_duration`
+/// one, with its own copy of the silent degrade.
+///
+/// Magus of the Mind is the real card on this seam and prints a PLURAL head, so
+/// it degrades cleanly and is the reach guard. The capped fixture is synthetic:
+/// no printed card coordinates a land play with a capped cast, which is exactly
+/// why this seam was never exercised with a bound and kept silently dropping one.
+#[test]
+fn sentence_leading_duration_over_a_capped_coordinated_cast_refuses() {
+    // REACH GUARD: the real card on this seam still reconciles to a durational
+    // lingering permission rather than refusing.
+    let magus = parse(MAGUS_OF_THE_MIND, "Magus of the Mind", &["Creature"]);
+    let Effect::CastFromZone {
+        driver, duration, ..
+    } = parsed_cast_from_zone(&magus)
+    else {
+        unreachable!("helper returns CastFromZone")
+    };
+    assert_eq!(
+        *driver,
+        CastFromZoneDriver::LingeringPermission,
+        "reach guard: Magus prints an unbounded plural head, so the coordinated \
+         duration must still degrade it cleanly"
+    );
+    assert_eq!(
+        *duration,
+        Some(Duration::UntilEndOfTurn),
+        "reach guard: the sentence-leading duration must still reach the cast half"
+    );
+
+    // The same coordinated grammar with a printed cap. The duration selects the
+    // lingering mechanism, which has no shared budget for the cap, so the clause
+    // refuses instead of becoming an uncapped end-of-turn free-cast permission.
+    //
+    // The cap is stated by the SINGULAR head noun rather than by "up to two" on
+    // purpose: an explicit "up to N" on this surface is claimed earlier by
+    // `try_parse_counted_free_cast_from_exiled_this_way`, which lowers to
+    // `Effect::FreeCastFromZones` (its own count channel) and never reaches the
+    // `CastFromZone` reconciliation seam under test here. The singular form
+    // reaches the seam carrying `max_casts: Some(1)`.
+    let gaps = all_gap_names(
+        "{U}, {T}, Sacrifice this creature: Shuffle your library, then exile the top four cards. \
+         Until end of turn, you may play lands and cast a spell from among cards exiled \
+         this way without paying its mana cost.",
+        "Capped Coordinated Probe",
+        &["Creature"],
+    );
+    assert!(
+        gaps.iter()
+            .any(|gap| gap == engine::types::ability::CAST_BOUND_LOST_TO_DURATION_GAP),
+        "the coordinated-duration seam must refuse the printed cap through the \
+         shared duration-scoped gap, got gaps {gaps:?}"
+    );
 }

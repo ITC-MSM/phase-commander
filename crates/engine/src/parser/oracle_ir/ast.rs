@@ -1946,6 +1946,9 @@ pub(crate) fn with_clause_duration(
     // Leading duration from Oracle text (e.g., "Until end of turn, ...") is authoritative —
     // it overrides any default injected by sub-parsers (e.g., build_become_clause's Permanent).
     clause.duration = Some(duration.clone());
+    // CR 608.2c: set by the `CastFromZone` arm when the duration-selected
+    // lingering mechanism cannot carry the window's printed bound.
+    let mut refused_bound: Option<crate::types::ability::ResolutionCastWindow> = None;
     match &mut clause.effect {
         Effect::GenericEffect {
             duration: ref mut effect_duration,
@@ -1975,7 +1978,20 @@ pub(crate) fn with_clause_duration(
             // property of a lingering permission, so a resolution-scoped
             // free-cast window the clause body lowered (it cannot see this
             // stripped prefix) is reconciled back to one here.
-            *driver = driver.with_lingering_duration();
+            //
+            // CR 608.2c: the degrade is REFUSABLE. Aminatou's Augury prints
+            // "Until end of turn, … you may cast A spell of that type from among
+            // the exiled cards without paying its mana cost": the body lowers to
+            // a window bounded at one cast, and the per-object lingering
+            // permission this leading duration selects has no shared budget to
+            // hold that bound. Dropping it granted an UNCAPPED free cast over
+            // the whole exiled set. Refuse the clause instead — the refusal is
+            // applied after the match so the borrow of `clause.effect` ends
+            // first.
+            match driver.with_lingering_duration() {
+                Some(reconciled) => *driver = reconciled,
+                None => refused_bound = Some(driver.window_bounds().unwrap_or_default()),
+            }
         }
         Effect::BecomeCopy {
             duration: ref mut effect_duration,
@@ -2002,7 +2018,31 @@ pub(crate) fn with_clause_duration(
         }
         _ => {}
     }
+    if let Some(bounds) = refused_bound {
+        clause.effect = cast_bound_lost_to_duration_gap(bounds);
+    }
     clause
+}
+
+/// CR 608.2c + CR 611.2a: The honest gap a duration reconciliation emits when it
+/// would otherwise drop a printed batch bound.
+///
+/// Every reconciliation seam (`with_clause_duration`, `reconcile_coordinated_cast`,
+/// and the trailing-duration fixup in `oracle_effect/mod.rs`) builds its refusal
+/// here, so all three name the same gap and carry the same diagnostic. The
+/// description records the bound that was about to be lost rather than an Oracle
+/// fragment, because these seams run after lowering and no longer hold the source
+/// text — and the bound is the load-bearing fact for anyone auditing the gap.
+pub(crate) fn cast_bound_lost_to_duration_gap(
+    bounds: crate::types::ability::ResolutionCastWindow,
+) -> Effect {
+    Effect::unimplemented(
+        crate::types::ability::CAST_BOUND_LOST_TO_DURATION_GAP,
+        format!(
+            "cast bound the duration-scoped lingering permission cannot carry: {}",
+            bounds.describe_bound()
+        ),
+    )
 }
 
 /// CR 611.2a + CR 608.2g + CR 608.2c: Carry a sentence's LEADING duration onto a
@@ -2088,8 +2128,17 @@ fn reconcile_coordinated_cast(
     // CR 611.2a + CR 608.2g: a stated duration means the controller casts at a
     // LATER priority window, which is the defining property of a lingering
     // permission — so a resolution-scoped window degrades back to one. Same
-    // authority `with_clause_duration` uses for the single-chunk case.
-    *driver = driver.with_lingering_duration();
+    // authority `with_clause_duration` uses for the single-chunk case, including
+    // its refusal: a sentence-leading duration that reaches a coordinated cast
+    // conjunct whose window printed a cast cap or a CR 202.3 running-total
+    // budget cannot silently drop it into a countless per-object permission.
+    match driver.with_lingering_duration() {
+        Some(reconciled) => *driver = reconciled,
+        None => {
+            let bounds = driver.window_bounds().unwrap_or_default();
+            *effect = cast_bound_lost_to_duration_gap(bounds);
+        }
+    }
 }
 
 pub(crate) fn is_play_from_exile_lifetime_duration(duration: &Duration) -> bool {
