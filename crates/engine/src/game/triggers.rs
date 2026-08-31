@@ -3079,15 +3079,44 @@ pub(crate) fn trigger_event_unreachable_in_phase(def: &TriggerDefinition, phase:
     }
 }
 
-fn live_battlefield_source_was_present_at_event(event: &GameEvent, source_id: ObjectId) -> bool {
-    !matches!(
-        event,
-        GameEvent::ZoneChanged {
-            object_id,
-            from: Some(Zone::Battlefield),
-            ..
-        } if *object_id == source_id
-    )
+/// CR 113.6 + CR 603.2 + CR 400.7: "Abilities of all other objects [than
+/// instants/sorceries] usually function only while that object is on the
+/// battlefield" (CR 113.6) — a battlefield trigger source only "sees" an
+/// event if it was already on the battlefield when that event occurred.
+/// `events` accumulates every event produced across a WHOLE resolved ability chain
+/// (e.g. Living Death's exile, then sacrifice, then return-to-battlefield
+/// steps all land in one `events` vec — CR 608.2c), and the caller scans them
+/// together, once, against the END-of-chain live object state. Gating solely
+/// on "is this event itself the object's own departure" misses the symmetric
+/// case: an object that (re-)ENTERS the battlefield partway through the SAME
+/// batch must not retroactively match an event that happened earlier in that
+/// batch, before its (possibly brand-new, CR 400.7) incarnation existed on the
+/// battlefield to observe it (issue #8160: Carmen, Cruel Skymarcher returning
+/// via a mass-reanimation spell must not gain +1/+1 counters for permanents
+/// that the SAME spell sacrificed before she was put back onto the
+/// battlefield).
+///
+/// `battlefield_entry_index` maps each object to the LAST index in `events`
+/// at which `ZoneChanged { to: Battlefield }` fired for it. An object with no
+/// entry recorded was already on the battlefield before the batch began (the
+/// caller already restricts candidates to objects currently on the
+/// battlefield), so it is present for every event in the batch. An object
+/// that DID (re-)enter mid-batch is present only from that entry's index
+/// onward — CR 400.7 treats a permanent that changes zones as a new object
+/// with no memory of its prior incarnation, so even an earlier temporary
+/// presence within the SAME batch (a blink-and-return) does not extend
+/// backward past the most recent entry. This subsumes the original
+/// self-departure check: for a source that leaves and later re-enters within
+/// the same batch, its own departure index is always strictly less than its
+/// last-entry index, so it is correctly excluded.
+fn live_battlefield_source_was_present_at_event(
+    event_idx: usize,
+    source_id: ObjectId,
+    battlefield_entry_index: &std::collections::HashMap<ObjectId, usize>,
+) -> bool {
+    battlefield_entry_index
+        .get(&source_id)
+        .is_none_or(|&entry_idx| event_idx >= entry_idx)
 }
 
 fn storm_copy_count_before_cast(state: &GameState) -> i32 {
@@ -4061,8 +4090,31 @@ fn collect_pending_triggers_with_collection(
     } else {
         active_suppress_trigger_statics(state)
     };
+    // CR 603.2 + CR 400.7: `events` accumulates every event produced across a
+    // WHOLE resolved ability chain (e.g. Living Death's exile, then sacrifice,
+    // then return-to-battlefield steps all land in one `events` vec), and this
+    // pass scans them together, once, against the END-of-chain live object
+    // state. Record the LAST index at which each object entered the
+    // battlefield in this batch so `live_battlefield_source_was_present_at_event`
+    // can refuse to match an earlier event in the SAME batch against an object
+    // that had not yet (re-)entered the battlefield when that event happened —
+    // otherwise a permanent returned to the battlefield later in the chain
+    // retroactively "sees" a sacrifice/etc. that occurred earlier in the same
+    // chain, before it was there to observe it (issue #8160).
+    let mut battlefield_entry_index: std::collections::HashMap<ObjectId, usize> =
+        std::collections::HashMap::new();
+    for (idx, ev) in events.iter().enumerate() {
+        if let GameEvent::ZoneChanged {
+            object_id,
+            to: Zone::Battlefield,
+            ..
+        } = ev
+        {
+            battlefield_entry_index.insert(*object_id, idx);
+        }
+    }
 
-    for event in events {
+    for (event_idx, event) in events.iter().enumerate() {
         // CR 603.2 / CR 603.3: Per-event dedup. A single printed trigger definition
         // fires at most once per eligible event, even if multiple scan paths
         // (battlefield, leaves-battlefield last-known-information, graveyard/exile/stack)
@@ -4113,7 +4165,11 @@ fn collect_pending_triggers_with_collection(
 
         // Scan candidate permanents for matching triggers
         for obj_id in candidates.iter().copied() {
-            if !live_battlefield_source_was_present_at_event(event, obj_id) {
+            if !live_battlefield_source_was_present_at_event(
+                event_idx,
+                obj_id,
+                &battlefield_entry_index,
+            ) {
                 continue;
             }
             let (
@@ -4591,7 +4647,11 @@ fn collect_pending_triggers_with_collection(
                     .map(|(id, _)| *id)
                     .collect();
                 for obj_id in shadow_population {
-                    if !live_battlefield_source_was_present_at_event(event, obj_id) {
+                    if !live_battlefield_source_was_present_at_event(
+                        event_idx,
+                        obj_id,
+                        &battlefield_entry_index,
+                    ) {
                         continue;
                     }
                     let Some(obj) = state.objects.get(&obj_id) else {
