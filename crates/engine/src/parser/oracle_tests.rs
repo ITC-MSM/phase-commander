@@ -13170,6 +13170,24 @@ fn heart_shaped_herb_activated_ability_grants_monarch_as_continuation() {
         "gated sub must remain the battlefield return, got {:?}",
         change_zone.effect,
     );
+    // CR 608.2c + CR 701.21a (issue #8077): "that card" must bind to the
+    // creature the optional Sacrifice EFFECT just chose (CostPaidObject —
+    // resolved via `effect_context_object`/`cost_paid_object` at runtime),
+    // never to `ParentTarget` (which has no chosen target to inherit here and
+    // silently defaults to the ability's OWN source, Heart-Shaped Herb
+    // itself, at resolution).
+    assert!(
+        matches!(
+            *change_zone.effect,
+            Effect::ChangeZone {
+                target: TargetFilter::CostPaidObject,
+                ..
+            }
+        ),
+        "return target must bind to the sacrificed creature (CostPaidObject), not ParentTarget \
+         (which returns the ability's own source instead) — got {:?}",
+        change_zone.effect,
+    );
     assert_eq!(
         change_zone.condition,
         Some(AbilityCondition::EffectOutcome {

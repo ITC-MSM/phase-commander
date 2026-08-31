@@ -516,7 +516,22 @@ pub(crate) fn resolve_it_pronoun(ctx: &mut ParseContext) -> TargetFilter {
         return target;
     }
     match &ctx.subject {
-        Some(subject) if !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any) => {
+        // CR 608.2c + CR 701.21a: `CostPaidObject` is the gated "If you do,"
+        // Sacrifice-antecedent anchor (`if_you_do_object_anchor`'s
+        // `Effect::Sacrifice` arm) — a resolution-time referent, not a
+        // trigger-subject CATEGORY to refine via `TriggeringSource`. Excluded
+        // here alongside `SelfRef`/`Any` so bare "it" keeps binding to the
+        // ability's source when no other typed trigger subject exists:
+        // Bloodcrazed Socialite's "you may sacrifice a Blood token. If you
+        // do, IT gets +2/+2" needs the ATTACKING CREATURE, not the sacrificed
+        // (now nonexistent, CR 111.7) token. Mirrors the identical exclusion
+        // in `oracle_target::resolve_pronoun_target`.
+        Some(subject)
+            if !matches!(
+                subject,
+                TargetFilter::SelfRef | TargetFilter::Any | TargetFilter::CostPaidObject
+            ) =>
+        {
             TargetFilter::TriggeringSource
         }
         _ => TargetFilter::SelfRef,
@@ -650,6 +665,78 @@ fn condition_refs_cost_paid_object(condition: &AbilityCondition) -> bool {
     }
 }
 
+/// CR 608.2c: the object anchor a gated "If you do,"/"If you don't," clause
+/// binds its bare/demonstrative anaphor to — the antecedent clause's own
+/// target when it has one (`Effect::GenericEffect`'s `target`/`affected`).
+///
+/// CR 701.21a + CR 608.2d: An `Effect::Sacrifice` whose OWN target is a typed
+/// pool (`TargetFilter::Typed`, e.g. "a creature"/"another artifact") is a
+/// resolution-time CHOICE the controller announces while applying the effect
+/// (contrast CR 601.2c target announcement at cast/activation time) — "You
+/// may sacrifice a creature" never produces an `Effect::TargetOnly`/declared
+/// target slot for `ParentTarget` to inherit.
+/// The runtime already resolves exactly this referent through the
+/// cost-paid-object ladder (`ResolvedAbility::cost_paid_object` falling back
+/// to `effect_context_object`, stamped by `perform_player_scope_sacrifices`/
+/// `perform_collected_player_scope_sacrifices_with_completion` whenever
+/// `propagate_parent_context` is set — see `game/effects/mod.rs`), so the
+/// anchor for a gated typed-pool Sacrifice antecedent is
+/// `TargetFilter::CostPaidObject`, not the default source-object
+/// `ParentTarget` fallback. Without this arm, "You may sacrifice a creature.
+/// If you do, return that card to the battlefield ..." (Heart-Shaped Herb,
+/// issue #8077) returned the ability's OWN source instead of the sacrificed
+/// creature, because `ParentTarget` has nothing to inherit and silently
+/// defaults to the source object.
+///
+/// Deliberately a POSITIVE allowlist on `TargetFilter::Typed` rather than a
+/// negative `SelfRef` denylist: `TargetFilter::Typed` is the one shape
+/// `crate::game::effects::effect_object_targets` cannot resolve from the
+/// ability's own pre-chosen targets (a typed pool carries no CR 601.2c
+/// target slot at all), so it is the only shape guaranteed to route through
+/// the resolution-time choice/auto-select machinery that stamps
+/// `cost_paid_object`/`effect_context_object`. Every OTHER Sacrifice-target
+/// shape names an ALREADY-established referent instead of introducing a
+/// fresh one: `SelfRef` ("sacrifice this enchantment") names the ability's
+/// own source; `ParentTarget`/`TriggeringSource` ("its controller may
+/// sacrifice it") name an EARLIER chosen CR 601.2c target or trigger-event
+/// object. A later demonstrative/pronoun after one of those needs to bind to
+/// THAT antecedent (typically via the pre-existing `chunk_subject`/
+/// trigger-subject machinery this function does not touch), never to a
+/// resolution-time choice that was never made. Angelic Renewal ("Whenever a
+/// creature is put into your graveyard ..., you may sacrifice this
+/// enchantment. If you do, return that card to the battlefield") and Grave
+/// Peril ("When a nonblack creature enters, sacrifice this enchantment. If
+/// you do, destroy that creature") both have the `SelfRef` shape with a
+/// DIFFERENT card as the true antecedent (the creature named by the trigger
+/// condition) — an unrelated anaphor-binding gap with its own pre-existing
+/// (and unaffected-by-this-fix) behavior, out of scope here. A `SelfRef`-only
+/// denylist previously let this arm ALSO fire for a `ParentTarget`-targeted
+/// Sacrifice (e.g. Star Athlete's "its controller may sacrifice it", where
+/// "it" is an earlier CR 601.2c target, not a fresh choice) — the
+/// `Typed`-only allowlist rules that out categorically rather than by
+/// enumerating every non-`Typed` shape.
+///
+/// `publishes_aggregate_set_from_resolution`'s doc comment (which contrasts
+/// it with `publishes_tracked_set_from_resolution`) documents this same gap
+/// on the SET axis ("Sacrifice is deliberately NOT added ... re-pointing a
+/// post-sacrifice clause's ParentTarget at the sacrificed set is a different
+/// question with a far wider blast radius") — `CostPaidObject` is the
+/// narrower, already-proven single-object axis that answers it without
+/// touching the wider `TrackedSet` rewrite.
+///
+/// SCOPE NOTE: this anchor is consumed ONLY by the object-position
+/// demonstrative noun phrase ("that card"/"that creature"/"that permanent"/
+/// "that token") in `oracle_target::parse_target_with_syntax`'s "that "
+/// branch — never by the SUBJECT-position demonstrative grammar
+/// (`subject::parse_subject_application`/`build_continuous_clause`, e.g. "If
+/// you do, THAT CREATURE gets +1/+1"/"gains flying"), which resolves its own
+/// subject independently and does not consult this function or `ctx.subject`
+/// at all. A hypothetical future card with "You may sacrifice a creature. If
+/// you do, that creature gets +1/+1" (subject position, not object position)
+/// would reproduce issue #8077's class on that separate grammar — no card in
+/// the current corpus has this exact shape, so it is an out-of-scope sibling
+/// gap here, not a live regression, but a fix for it belongs in
+/// `parse_subject_application`, not in this anchor.
 fn if_you_do_object_anchor(
     clauses: &[ClauseIr],
     condition: &Option<AbilityCondition>,
@@ -675,6 +762,10 @@ fn if_you_do_object_anchor(
                     .iter()
                     .find_map(|definition| definition.affected.clone())
             }),
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(_),
+                ..
+            } => Some(TargetFilter::CostPaidObject),
             _ => None,
         })
 }
