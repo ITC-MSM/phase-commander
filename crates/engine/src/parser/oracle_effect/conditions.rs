@@ -968,7 +968,7 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
         // and exile siblings above: "When you discard a card this way, ..."
         // (Talion's Messenger, The Ancient One) and "If you discard a land
         // card this way, ..." (Silvan Reveler, issue #8122) are the same
-        // same resolution-local condition in the two connectors —
+        // resolution-local condition in the two connectors —
         // nothing about the discard-then-back-reference shape is tied to
         // "when" specifically. The discard's hand → graveyard move publishes
         // the card into `state.last_zone_changed_ids`, which `ZoneChangedThisWay` checks.
