@@ -5700,6 +5700,7 @@ pub(crate) fn active_continuous_effects_from_static_source(
         source.controller,
         source.timestamp,
         source.static_definitions.as_slice(),
+        StaticZoneAdmission::LiveSource,
     )
 }
 
@@ -5719,6 +5720,7 @@ pub(crate) fn active_continuous_effects_from_base_static_source(
         source.controller,
         source.timestamp,
         &static_definitions,
+        StaticZoneAdmission::PreFilteredBaseStatic,
     )
 }
 
@@ -5745,22 +5747,45 @@ fn static_condition_has_source_zone_gate(condition: &StaticCondition) -> bool {
     }
 }
 
+/// CR 113.6 + CR 113.6b: Which zone-of-function screening a call into
+/// `active_continuous_effects_from_static_definitions` has already applied to
+/// the `static_definitions` it's handed. The function has two callers with
+/// different provenance, so a single unconditional gate can't serve both:
+///
+/// - `active_continuous_effects_from_static_source` hands it a source's LIVE
+///   `static_definitions`, unfiltered — nothing upstream has screened them by
+///   zone, so the shared `functioning_abilities::static_functions_in_zone`
+///   gate must run here (`LiveSource`). Without it, a source visited only
+///   because ONE of its static definitions opts into a non-battlefield zone
+///   (Gwaihir the Windlord's cost-reduction static lists `[Hand, Stack,
+///   Command, Graveyard, Exile, Library]`) leaked every OTHER definition on
+///   that same source too — including one with empty `active_zones` that
+///   should default to battlefield-only, like "Other Birds you control have
+///   vigilance." (issue #8158).
+/// - `active_continuous_effects_from_base_static_source` hands it
+///   `base_static_definitions` already screened by
+///   `base_static_can_source_off_zone_keyword_query`, which intentionally
+///   admits a self-referential (`affected: SelfRef`) definition off-zone for
+///   "what would this object's own characteristics be" queries
+///   (`off_zone_characteristics.rs`, e.g. Dream Devourer). Re-running the
+///   ordinary gate here would reject exactly what that pre-filter meant to
+///   admit, so `PreFilteredBaseStatic` skips it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaticZoneAdmission {
+    LiveSource,
+    PreFilteredBaseStatic,
+}
+
 fn active_continuous_effects_from_static_definitions(
     state: &GameState,
     source_id: ObjectId,
     controller: PlayerId,
     timestamp: u64,
     static_definitions: &[StaticDefinition],
+    admission: StaticZoneAdmission,
 ) -> Vec<ActiveContinuousEffect> {
     let mut effects = Vec::new();
-    // CR 113.6 + CR 113.6b: A static's functional zone is the battlefield by
-    // default (empty `active_zones`). A non-empty `active_zones` lists the
-    // non-battlefield zones in which the static functions (e.g., Incarnation
-    // cycle: "as long as this card is in your graveyard, ..."). If the source
-    // is currently outside every declared zone, the static contributes no
-    // effects.
     let source_obj = state.objects.get(&source_id);
-    let source_zone = source_obj.map(|o| o.zone);
     for (def_idx, def) in static_definitions.iter().enumerate() {
         if def.mode != StaticMode::Continuous {
             continue;
@@ -5768,20 +5793,35 @@ fn active_continuous_effects_from_static_definitions(
 
         // CR 709.5 + CR 709.5c: on the battlefield a locked Room half doesn't
         // have its rules text — a door-stamped static contributes no
-        // continuous effects while its half is locked. This gather bypasses
-        // `functioning_abilities::static_functions_in_zone` (see the module
-        // doc there), so the shared door authority is applied here too.
+        // continuous effects while its half is locked. `static_functions_in_zone`
+        // (below) also applies this door check for `LiveSource`, but it stays
+        // here unconditionally because it remains the ONLY door check for
+        // `PreFilteredBaseStatic`, which skips the block below.
         if source_obj.is_some_and(|obj| !crate::game::room::door_text_functions(obj, def.room_door))
         {
             continue;
         }
 
-        // CR 113.6 + CR 113.6b: Zone-of-function gate.
-        if !def.active_zones.is_empty() {
-            let Some(zone) = source_zone else { continue };
-            if !def.active_zones.contains(&zone) {
-                continue;
-            }
+        // CR 113.6 + CR 113.6b: Zone-of-function gate. `LiveSource` delegates
+        // to the shared `functioning_abilities::static_functions_in_zone`
+        // authority — the same predicate
+        // `active_combat_assignment_rule_effects_from_static_definitions`
+        // (below) already uses — so a definition with empty `active_zones`
+        // correctly defaults to battlefield-only even when this source was
+        // only visited because a DIFFERENT definition on it opts into a
+        // non-battlefield zone. A source that has since vanished from
+        // `state.objects` (`source_obj: None`) is treated as functioning
+        // nowhere, same as the door check above. `PreFilteredBaseStatic`
+        // already had this screening applied by its caller and must not be
+        // gated again (see `StaticZoneAdmission`).
+        let admitted = match admission {
+            StaticZoneAdmission::LiveSource => source_obj.is_some_and(|obj| {
+                crate::game::functioning_abilities::static_functions_in_zone(obj, def)
+            }),
+            StaticZoneAdmission::PreFilteredBaseStatic => true,
+        };
+        if !admitted {
+            continue;
         }
 
         let retained_condition = def.condition.clone();

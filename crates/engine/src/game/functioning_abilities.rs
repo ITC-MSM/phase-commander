@@ -18,27 +18,31 @@
 //! - **Statics**: the full CR 113.6 zone-of-function gate lives in the shared
 //!   `static_functions_in_zone` predicate (empty `active_zones` defaults to
 //!   battlefield-only; a non-empty `active_zones` restricts to exactly the
-//!   listed zones; command-zone objects use the emblem-or-opt-in gate). Five
+//!   listed zones; command-zone objects use the emblem-or-opt-in gate). Six
 //!   gathers delegate to it — `active_static_definitions` (which also layers
 //!   CR 113.6g's stack exception for self-referential
 //!   `CantBeCountered`/`CantBeCopied` on top, plus the CR 604.1 / CR 613.1
 //!   condition gate), `game_functioning_statics`, `battlefield_functioning_statics`,
 //!   `layers::active_combat_assignment_rule_effects_from_static_definitions`,
-//!   and `combat::compute_combat_tax`. **`layers::active_continuous_effects_from_static_definitions`
-//!   is the one exception** — it keeps its own inline `active_zones`
-//!   membership check rather than delegating here, and its off-battlefield
-//!   entry point (`active_continuous_effects_from_base_static_source`)
-//!   applies a separate caller-side pre-filter
-//!   (`base_static_can_source_off_zone_keyword_query`) before reaching it.
-//!   That gather does not currently agree with this module's predicate in
-//!   every case (notably: it admits a self-referential `affected` definition
-//!   regardless of whether `active_zones` declares the object's current
-//!   zone, where `static_functions_in_zone` would require the explicit
-//!   opt-in per CR 113.6b) — flagged here rather than silently papered over,
-//!   since the next person touching either side needs to know they can
-//!   diverge. Callers of the five delegating gathers never need to
-//!   pre-filter statics by zone; callers of the sixth should read
-//!   `layers.rs`'s own comments for its exact rule.
+//!   `combat::compute_combat_tax`, and (as of issue #8158)
+//!   `layers::active_continuous_effects_from_static_definitions`'s
+//!   `StaticZoneAdmission::LiveSource` path — the ordinary gather feeding
+//!   `collect_shared_active_continuous_effects`. **Its OTHER admission,
+//!   `StaticZoneAdmission::PreFilteredBaseStatic`, is the one remaining
+//!   exception**: `active_continuous_effects_from_base_static_source` screens
+//!   `base_static_definitions` through the caller-side
+//!   `base_static_can_source_off_zone_keyword_query` pre-filter, which
+//!   intentionally admits a self-referential (`affected: SelfRef`)
+//!   definition with empty `active_zones` regardless of the object's current
+//!   zone — that pre-filter exists precisely so `off_zone_characteristics.rs`
+//!   can answer "what would this object's own characteristics be off the
+//!   battlefield" (e.g. Dream Devourer). Re-running `static_functions_in_zone`
+//!   on an already-admitted definition would reject exactly what that
+//!   pre-filter meant to admit, so the `PreFilteredBaseStatic` path
+//!   intentionally skips the shared gate. Callers of the six delegating call
+//!   sites never need to pre-filter statics by zone; callers reaching
+//!   `PreFilteredBaseStatic` should read `layers.rs`'s own comments for its
+//!   exact rule.
 //! - **Triggers**: gated to the battlefield by the caller's choice of
 //!   iteration (`battlefield_active_*`). Command-zone emblems pass the
 //!   phased-out/command-zone gate for per-object iteration, and non-emblem
@@ -182,9 +186,10 @@ pub fn is_self_referential_prohibition(def: &StaticDefinition) -> bool {
 /// every other zone uses the CR 113.6 default — empty `active_zones`
 /// restricts the static to the battlefield, non-empty restricts it to
 /// exactly the listed zones. Shared by the statics gathers that delegate to
-/// this predicate; `layers::active_continuous_effects_from_static_definitions`
-/// remains the documented exception because it applies its own inline
-/// `active_zones` gate.
+/// this predicate, including `layers::active_continuous_effects_from_static_definitions`'s
+/// `StaticZoneAdmission::LiveSource` path (issue #8158); its
+/// `PreFilteredBaseStatic` path remains the documented exception because its
+/// caller already pre-filtered by zone (see the module doc above).
 pub(crate) fn static_functions_in_zone(obj: &GameObject, def: &StaticDefinition) -> bool {
     // CR 709.5 + CR 709.5c: on the battlefield a locked Room half doesn't
     // have its rules text — a door-stamped static functions only while its
