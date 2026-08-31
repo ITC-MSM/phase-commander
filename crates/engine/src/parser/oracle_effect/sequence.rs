@@ -205,6 +205,31 @@ fn is_search_result_put_onto_battlefield_restatement(lower: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// CR 701.23a + CR 701.24b: "put(s) that card/it/them/the card/those cards/the
+/// chosen cards on top" — the abbreviated positional-put clause used after a
+/// search-and-shuffle compound (e.g. "search your library for a card, then
+/// shuffle and put that card on top"). Composed from the same verb/pronoun
+/// axes as [`parse_search_result_put_onto_battlefield_restatement`] above:
+/// the verb conjugates to "puts" (rather than "put") when the search's
+/// subject is third-person ("target player", "each of them") instead of
+/// "you" — Varragoth, Bloodsky Sire; Scheming Symmetry; and Deceptive
+/// Divination all read "... then shuffles and puts that card on top."
+fn parse_search_result_put_on_top_restatement(
+    input: &str,
+) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
+    let (input, _) = alt((tag::<_, _, OracleError<'_>>("put "), tag("puts "))).parse(input)?;
+    let (input, _) = alt((
+        tag("that card "),
+        tag("it "),
+        tag("them "),
+        tag("the card "),
+        tag("those cards "),
+        tag("the chosen cards "),
+    ))
+    .parse(input)?;
+    value((), tag("on top")).parse(input)
+}
+
 fn has_conditional_search_result_destination(lower: &str) -> bool {
     fn parse_clause(input: &str) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
         let (input, _) = parse_search_result_put_onto_battlefield_restatement(input)?;
@@ -5574,19 +5599,22 @@ pub(super) fn parse_intrinsic_continuation_ast(
             if has_conditional_search_result_destination(&full_lower) {
                 return None;
             }
-            // CR 701.24b: If later clauses contain "put on top", suppress the default
-            // ChangeZone(→Hand) — the card stays in the library and a separate
-            // PutAtLibraryPosition effect in the chain handles placement.
-            // Also suppress for "Nth from the top" (Long-Term Plans, etc.)
-            let has_positional_put =
-                nom_primitives::scan_contains(&full_lower, "put that card on top")
-                    || nom_primitives::scan_contains(&full_lower, "put it on top")
-                    || nom_primitives::scan_contains(&full_lower, "put the card on top")
-                    || nom_primitives::scan_contains(&full_lower, "put them on top")
-                    || nom_primitives::scan_contains(&full_lower, "put those cards on top")
-                    || nom_primitives::scan_contains(&full_lower, "put the chosen cards on top")
-                    || (nom_primitives::scan_contains(&full_lower, "put that card")
-                        && nom_primitives::scan_contains(&full_lower, "from the top"));
+            // CR 701.24b: If later clauses contain "put(s) on top" (in either
+            // the "you"-subject "put" conjugation or the third-person "puts"
+            // conjugation — see `parse_search_result_put_on_top_restatement`),
+            // suppress the default ChangeZone(→Hand) — the card stays in the
+            // library and a separate PutAtLibraryPosition effect in the chain
+            // handles placement. Also suppress for "Nth from the top"
+            // (Long-Term Plans, etc.)
+            let has_positional_put = nom_primitives::scan_at_word_boundaries(&full_lower, |i| {
+                parse_search_result_put_on_top_restatement(i)
+            })
+            .is_some()
+                || (nom_primitives::scan_at_word_boundaries(&full_lower, |i| {
+                    preceded(alt((tag("put "), tag("puts "))), tag("that card")).parse(i)
+                })
+                .is_some()
+                    && nom_primitives::scan_contains(&full_lower, "from the top"));
             if has_positional_put {
                 return None;
             }
