@@ -5760,10 +5760,22 @@ pub enum BatchCompletion {
         /// CR 701.20b: reveal markers to clear once the cards have moved (the
         /// kept card plus the misses).
         clear_markers: Vec<ObjectId>,
-        /// Dig only: `Some(kept)` publishes the kept cards as a fresh tracked set
-        /// and wires them as the continuation's targets (Zimone's Experiment
-        /// class). `None` for reveal-until, which has no tracked-set sub-ability.
+        /// Dig only: `Some(ids)` publishes `ids` as a fresh tracked set and wires
+        /// them as the continuation's targets (Zimone's Experiment class, and —
+        /// paired with `publish_tracked_set_cause` — a downstream count of the
+        /// REST partition, Dihada, Binder of Wills class). `None` for
+        /// reveal-until, which has no tracked-set sub-ability.
         publish_tracked_set: Option<Vec<ObjectId>>,
+        /// CR 608.2c + CR 400.7: when `publish_tracked_set` carries the REST
+        /// (non-selected) partition instead of the default kept partition —
+        /// decided by `dig_continuation_wants_rest_pile_for_count` — every
+        /// published member is stamped with this cause so a downstream
+        /// `QuantityRef::FilteredTrackedSetSize { caused_by: Some(cause), .. }`
+        /// (Dihada's Treasure-per-card-in-graveyard count) can find them.
+        /// `None` for every other publish, including the unchanged
+        /// Zimone's-Experiment-class kept-partition default.
+        #[serde(default)]
+        publish_tracked_set_cause: Option<ThisWayCause>,
         /// `Some(source_id)` emits `EffectResolved { RevealUntil, source_id }`
         /// before draining the continuation — the direct `reveal_until::resolve`
         /// path (no kept-choice) emits it inline at the end, so the deferred path
