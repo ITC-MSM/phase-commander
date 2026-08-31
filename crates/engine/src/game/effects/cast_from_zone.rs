@@ -123,6 +123,9 @@ fn tracked_set_cast_candidates(
         .collect()
 }
 
+/// CR 607.2a + CR 608.2g: restrict the linked cast reference to members
+/// published by this resolving instruction.
+///
 /// Return the live source-linked exile members of the active resolution's
 /// tracked set, preserving publication order and exact current membership.
 fn resolution_window_linked_batch_candidates(
