@@ -1,9 +1,9 @@
-//! Regression coverage for the reflexive **"When you discard a card this way,
-//! <effect>"** trigger class created by a preceding "discard a card" instruction
-//! in the same ability (CR 603.12 reflexive triggered abilities; CR 701.9a
-//! discard = hand → graveyard).
+//! Regression coverage for the reflexive **"if/when you discard a card this
+//! way, <effect>"** trigger class created by a preceding "discard a card"
+//! instruction in the same ability (CR 603.12 reflexive triggered abilities;
+//! CR 701.9a discard = hand → graveyard).
 //!
-//! Two Standard-legal cards motivate the class:
+//! Three cards motivate the class:
 //!
 //!   * **Talion's Messenger** — attack trigger body "draw a card, then discard a
 //!     card. When you discard a card this way, put a +1/+1 counter on target
@@ -13,14 +13,32 @@
 //!     mana value." ("its" = the discarded card → CR 202.3 mana value, resolved
 //!     via the CR 608.2k/CR 400.7j anaphoric referent captured when the card
 //!     reaches the public graveyard.)
+//!   * **Silvan Reveler** (issue #8122) — ETB trigger body "draw a card, then
+//!     discard a card. If you discard a land card this way, put it from your
+//!     graveyard onto the battlefield tapped." Unlike the two cards above, this
+//!     uses the **"if"** connector (not "when") and the consequent references
+//!     the discarded card itself with a bare pronoun ("put **it** … onto the
+//!     battlefield") rather than an independent target. Both were previously
+//!     unhandled: `strip_if_you_do_conditional` only tried the discard/sacrifice
+//!     -this-way combinators under a `"when "` prefix, so the "if" phrasing
+//!     produced no condition at all (`Condition_If` swallowed-clause warning);
+//!     and even once the condition parses, the bare "it" fell through to the
+//!     enclosing self-ETB trigger's generic subject default
+//!     (`resolve_it_pronoun` → `TriggeringSource`), which names Silvan Reveler
+//!     itself rather than the discarded land — see
+//!     `zone_changed_this_way_object_anchor` in `oracle_effect/mod.rs`.
 //!
 //! These tests drive the REAL pipeline: the authoritative Oracle body is parsed
-//! with `parse_effect_chain` (which routes the reflexive clause through
+//! with `parse_effect_chain` (Talion's Messenger / The Ancient One) or the
+//! full-card `parse_oracle_text` (Silvan Reveler, so the ETB trigger's subject
+//! is stamped exactly as production does), routing the reflexive clause through
 //! `strip_if_you_do_conditional` → `parse_you_discard_this_way_clause` →
-//! `AbilityCondition::ZoneChangedThisWay`), built into a `ResolvedAbility`, and
+//! `AbilityCondition::ZoneChangedThisWay`, built into a `ResolvedAbility`, and
 //! resolved through `resolve_ability_chain`. On revert of the parser fix the
-//! reflexive clause parses to `Effect::Unimplemented { name: "when" }`, the
-//! gated sub never runs, and every positive assertion below flips.
+//! reflexive clause parses to `Effect::Unimplemented { name: "when" }` (or, for
+//! the "if" form, the whole gate is dropped and the follow-up unconditionally
+//! targets `TriggeringSource`), the gated sub never runs (or moves the wrong
+//! object), and every positive assertion below flips.
 //!
 //! CR ANCHORS:
 //!   * CR 603.12 — reflexive triggered abilities ("when [something happens] this
@@ -28,19 +46,28 @@
 //!     the same resolution.
 //!   * CR 701.9a — discard = move from hand to graveyard.
 //!   * CR 202.3 — mana value (The Ancient One's "its mana value").
+//!   * CR 608.2c — the controller follows a resolving ability's instructions in
+//!     printed order, and later text may modify or refer back to earlier text
+//!     (the "it"/anaphor back-reference governing rule).
 //!   * CR 608.2k / CR 400.7j — an effect referring to the discarded object finds
 //!     it in the public graveyard via the anaphoric referent.
+//!   * CR 614.1d — "[Objects] enter [the battlefield] tapped" is a replacement
+//!     effect on the zone-change instruction (Silvan Reveler's "... onto the
+//!     battlefield tapped").
 
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::effects::resolve_ability_chain;
 use engine::game::scenario::{GameRunner, GameScenario};
+use engine::parser::oracle::parse_oracle_text;
 use engine::parser::oracle_effect::parse_effect_chain;
 use engine::types::ability::{AbilityKind, ResolvedAbility, TargetRef};
+use engine::types::card_type::{CardType, CoreType};
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
+use engine::types::zones::Zone;
 use engine::types::GameAction;
 
 const P0: PlayerId = PlayerId(0);
@@ -48,6 +75,7 @@ const P1: PlayerId = PlayerId(1);
 
 const TALION_BODY: &str = "draw a card, then discard a card. When you discard a card this way, put a +1/+1 counter on target Faerie you control.";
 const ANCIENT_BODY: &str = "Draw a card, then discard a card. When you discard a card this way, target player mills cards equal to its mana value.";
+const SILVAN_REVELER_ORACLE: &str = "When this creature enters, draw a card, then discard a card. If you discard a land card this way, put it from your graveyard onto the battlefield tapped.";
 
 /// Set an explicit printed mana cost on an already-created object so its mana
 /// value is deterministic for "its mana value" assertions.
@@ -375,5 +403,154 @@ fn the_ancient_one_interactive_discard_mills_discarded_card_mana_value() {
         graveyard_len(&runner, P0),
         1,
         "the controller discarded exactly one card this way"
+    );
+}
+
+/// Parse Silvan Reveler's real ETB trigger through the FULL production
+/// pipeline (`parse_oracle_text`, not the bare-body `parse_effect_chain` the
+/// Talion/Ancient One tests above use), so the trigger condition stamps the
+/// exact `ParseContext.subject` a self-ETB creature trigger gets in production
+/// (`extract_trigger_subject_for_context` on "this creature enters"). That
+/// shape — a *typed*, non-`SelfRef` trigger subject — is exactly what exposed
+/// the `TriggeringSource` misbinding on the bare "it" pronoun (issue #8122);
+/// parsing only the effect body would default `ParseContext.subject` to `None`
+/// and miss that failure mode entirely.
+fn silvan_reveler_ability() -> engine::types::ability::AbilityDefinition {
+    let types: Vec<String> = vec!["Creature".to_string()];
+    let subtypes: Vec<String> = vec!["Elf".to_string(), "Citizen".to_string()];
+    let parsed = parse_oracle_text(
+        SILVAN_REVELER_ORACLE,
+        "Silvan Reveler",
+        &[],
+        &types,
+        &subtypes,
+    );
+    let trigger = parsed
+        .triggers
+        .into_iter()
+        .next()
+        .expect("Silvan Reveler's ETB trigger must parse");
+    *trigger
+        .execute
+        .expect("the ETB trigger must carry a draw/discard/conditional-move effect chain")
+}
+
+/// CR 603.12 + CR 701.9a + CR 614.1d — Silvan Reveler (issue #8122), POSITIVE
+/// case: the forced single discard is a land, so "If you discard a land card
+/// this way, put it from your graveyard onto the battlefield tapped." must
+/// move that exact card out of the graveyard and onto the battlefield tapped.
+///
+/// DISCRIMINATION: on revert of `strip_if_you_do_conditional`'s "if"-prefix
+/// fix, the reflexive clause parses to no condition at all (the follow-up
+/// `ChangeZone` becomes unconditional against `TargetFilter::TriggeringSource`
+/// — Silvan Reveler itself, which is not in the graveyard), so the land never
+/// leaves the graveyard and every assertion below flips. On revert of the
+/// `zone_changed_this_way_object_anchor` pronoun fix alone (condition parses,
+/// pronoun binding does not), the gated `ChangeZone` still targets
+/// `TriggeringSource` instead of the discarded land, producing the same
+/// failure.
+#[test]
+fn silvan_reveler_discards_land_onto_battlefield_tapped() {
+    let mut scenario = GameScenario::new();
+
+    let source = scenario.add_creature(P0, "Silvan Reveler", 3, 2).id();
+    // Empty hand pre-draw + a single library card: "draw a card" pulls it into
+    // hand, "discard a card" then force-discards the ONLY hand card (no choice
+    // prompt), mirroring the Talion's Messenger fixture above.
+    let land = scenario.add_card_to_library_top(P0, "Forest");
+
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&land)
+        .unwrap()
+        .card_types = CardType {
+        supertypes: vec![],
+        core_types: vec![CoreType::Land],
+        subtypes: vec!["Forest".to_string()],
+    };
+
+    let def = silvan_reveler_ability();
+    let ability = build_resolved_from_def(&def, source, P0);
+
+    assert_eq!(
+        runner.state().objects[&land].zone,
+        Zone::Library,
+        "the land starts on top of the library, pre-draw"
+    );
+
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
+        .expect("draw→discard→reflexive land-to-battlefield chain resolves");
+
+    assert_eq!(
+        runner.state().objects[&land].zone,
+        Zone::Battlefield,
+        "the land discarded this way must be put onto the battlefield, not \
+         left in the graveyard"
+    );
+    assert!(
+        runner.state().objects[&land].tapped,
+        "Silvan Reveler puts the discarded land onto the battlefield TAPPED"
+    );
+    assert!(
+        !runner.state().players[P0.0 as usize]
+            .graveyard
+            .iter()
+            .any(|&id| id == land),
+        "the land must have LEFT the graveyard"
+    );
+}
+
+/// CR 603.12 + CR 701.9a — Silvan Reveler (issue #8122), NEGATIVE control: the
+/// forced single discard is a NONLAND card, so the "if you discard a land card
+/// this way" gate must stay false and the card must remain in the graveyard —
+/// it must NOT be moved to the battlefield. Pairs with the positive test above
+/// to pin that the battlefield move is gated on the discarded card's type, not
+/// unconditional (which is exactly the pre-fix "if"-prefix-swallowed / wrong-
+/// pronoun-target failure mode that this issue reports).
+#[test]
+fn silvan_reveler_discards_nonland_stays_in_graveyard() {
+    let mut scenario = GameScenario::new();
+
+    let source = scenario.add_creature(P0, "Silvan Reveler", 3, 2).id();
+    let nonland = scenario.add_card_to_library_top(P0, "Elvish Scout");
+
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&nonland)
+        .unwrap()
+        .card_types = CardType {
+        supertypes: vec![],
+        core_types: vec![CoreType::Creature],
+        subtypes: vec!["Elf".to_string()],
+    };
+
+    let def = silvan_reveler_ability();
+    let ability = build_resolved_from_def(&def, source, P0);
+
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
+        .expect("draw→discard chain resolves even when the gate stays false");
+
+    assert_eq!(
+        runner.state().objects[&nonland].zone,
+        Zone::Graveyard,
+        "a discarded NONLAND card must stay in the graveyard — the battlefield \
+         move is gated on the discarded card being a land"
+    );
+    assert!(
+        runner.state().players[P0.0 as usize]
+            .graveyard
+            .iter()
+            .any(|&id| id == nonland),
+        "the nonland card must remain in the graveyard"
+    );
+    assert!(
+        !runner.state().objects[&nonland].tapped,
+        "a card sitting in the graveyard is never tapped"
     );
 }
