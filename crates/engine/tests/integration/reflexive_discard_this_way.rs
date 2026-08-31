@@ -19,14 +19,19 @@
 //!     uses the **"if"** connector (not "when") and the consequent references
 //!     the discarded card itself with a bare pronoun ("put **it** … onto the
 //!     battlefield") rather than an independent target. Both were previously
-//!     unhandled: `strip_if_you_do_conditional` only tried the discard/sacrifice
-//!     -this-way combinators under a `"when "` prefix, so the "if" phrasing
-//!     produced no condition at all (`Condition_If` swallowed-clause warning);
-//!     and even once the condition parses, the bare "it" fell through to the
-//!     enclosing self-ETB trigger's generic subject default
-//!     (`resolve_it_pronoun` → `TriggeringSource`), which names Silvan Reveler
-//!     itself rather than the discarded land — see
-//!     `zone_changed_this_way_object_anchor` in `oracle_effect/mod.rs`.
+//!     unhandled: (1) `strip_if_you_do_conditional` only tried the
+//!     discard/sacrifice-this-way combinators under a `"when "` prefix, so the
+//!     "if" phrasing produced no condition at all (`Condition_If` swallowed-
+//!     clause warning); (2) even once the condition parses, the bare "it"
+//!     parses to the generic `ParentTarget` fallback (no declared target to
+//!     anaphor to), which a later trigger-lowering pass
+//!     (`lift_parent_target_to_triggering_source_in_ability` in
+//!     `oracle_trigger.rs`) blindly lifts to `TriggeringSource` for self-ETB
+//!     triggers — naming Silvan Reveler itself rather than the discarded land.
+//!     Fixed by `rebind_zone_changed_this_way_pronoun_to_moved_object` in
+//!     `oracle_effect/lower.rs`, which rebinds the pronoun to
+//!     `TargetFilter::LastZoneChanged` during assembly, before that later lift
+//!     can run.
 //!
 //! These tests drive the REAL pipeline: the authoritative Oracle body is parsed
 //! with `parse_effect_chain` (Talion's Messenger / The Ancient One) or the
@@ -34,11 +39,11 @@
 //! is stamped exactly as production does), routing the reflexive clause through
 //! `strip_if_you_do_conditional` → `parse_you_discard_this_way_clause` →
 //! `AbilityCondition::ZoneChangedThisWay`, built into a `ResolvedAbility`, and
-//! resolved through `resolve_ability_chain`. On revert of the parser fix the
-//! reflexive clause parses to `Effect::Unimplemented { name: "when" }` (or, for
-//! the "if" form, the whole gate is dropped and the follow-up unconditionally
-//! targets `TriggeringSource`), the gated sub never runs (or moves the wrong
-//! object), and every positive assertion below flips.
+//! resolved through `resolve_ability_chain`. On revert of either parser fix,
+//! the "if"-phrased reflexive clause either parses to no condition at all (the
+//! follow-up `ChangeZone` becomes unconditional and targets `TriggeringSource`)
+//! or parses the condition but still targets `TriggeringSource`, the gated sub
+//! moves the wrong object either way, and every positive assertion below flips.
 //!
 //! CR ANCHORS:
 //!   * CR 603.12 — reflexive triggered abilities ("when [something happens] this
@@ -444,9 +449,9 @@ fn silvan_reveler_ability() -> engine::types::ability::AbilityDefinition {
 /// fix, the reflexive clause parses to no condition at all (the follow-up
 /// `ChangeZone` becomes unconditional against `TargetFilter::TriggeringSource`
 /// — Silvan Reveler itself, which is not in the graveyard), so the land never
-/// leaves the graveyard and every assertion below flips. On revert of the
-/// `zone_changed_this_way_object_anchor` pronoun fix alone (condition parses,
-/// pronoun binding does not), the gated `ChangeZone` still targets
+/// leaves the graveyard and every assertion below flips. On revert of
+/// `rebind_zone_changed_this_way_pronoun_to_moved_object` alone (condition
+/// parses, pronoun rebind does not run), the gated `ChangeZone` still targets
 /// `TriggeringSource` instead of the discarded land, producing the same
 /// failure.
 #[test]
