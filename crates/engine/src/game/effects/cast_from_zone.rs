@@ -131,27 +131,26 @@ fn tracked_set_cast_candidates(
 fn resolution_window_linked_batch_candidates(
     state: &GameState,
     source_id: ObjectId,
-) -> Vec<ObjectId> {
-    let Some(members) = state
+) -> Option<Vec<ObjectId>> {
+    let members = state
         .chain_tracked_set_id
-        .and_then(|id| state.tracked_object_sets.get(&id))
-    else {
-        return Vec::new();
-    };
+        .and_then(|id| state.tracked_object_sets.get(&id))?;
     let linked = crate::game::players::linked_exile_cards_for_source(state, source_id);
     let mut seen = HashSet::new();
-    members
-        .iter()
-        .copied()
-        .filter(|id| {
-            seen.insert(*id)
-                && state
-                    .objects
-                    .get(id)
-                    .is_some_and(|object| object.zone == Zone::Exile)
-                && linked.iter().any(|link| link.exiled_id == *id)
-        })
-        .collect()
+    Some(
+        members
+            .iter()
+            .copied()
+            .filter(|id| {
+                seen.insert(*id)
+                    && state
+                        .objects
+                        .get(id)
+                        .is_some_and(|object| object.zone == Zone::Exile)
+                    && linked.iter().any(|link| link.exiled_id == *id)
+            })
+            .collect(),
+    )
 }
 
 /// CR 400.1/400.2 + CR 109.4: Eligible hand-pick pool for a private-zone
@@ -497,18 +496,35 @@ pub fn resolve(
     // would drop every target not in `last_revealed_ids`. The remap therefore
     // only applies on the empty-target fallback below.
     let mut used_last_revealed_library_fallback = false;
-    if target_ids.is_empty()
-        && target_filter.references_exiled_by_source()
+    if target_filter.references_exiled_by_source()
         && matches!(
             driver,
             crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
         )
     {
+        let exact_bound_batch = !target_ids.is_empty()
+            && ability.targets.len() == ability.target_incarnations.len()
+            && ability
+                .targets
+                .iter()
+                .zip(&ability.target_incarnations)
+                .all(
+                    |(target, pin)| matches!(target, TargetRef::Object(id) if *id == pin.object_id),
+                );
         // A paused producer such as ForEachCategory publishes its exact
         // resolution batch through the active chain set before this parked
         // cast continuation resumes. Consume that set instead of reopening the
         // source-wide exile ledger; permanent sources may retain older links.
-        target_ids = resolution_window_linked_batch_candidates(state, ability.source_id);
+        // An incarnation-pinned target batch was already bound at the consumer
+        // seam and can span several player-scope publishes or follow a later
+        // producer barrier, so it remains the stronger exact authority.
+        if !exact_bound_batch {
+            if let Some(active_batch) =
+                resolution_window_linked_batch_candidates(state, ability.source_id)
+            {
+                target_ids = active_batch;
+            }
+        }
     }
     if target_ids.is_empty()
         && target_filter.references_exiled_by_source()
@@ -1786,12 +1802,13 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         CardPlayMode, CastFromZoneDriver, CastPermissionConstraint, Comparator, ControllerRef,
-        Effect, FilterProp, QuantityExpr, TargetFilter, TypeFilter, TypedFilter,
+        Effect, FilterProp, QuantityExpr, ResolutionCastWindow, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{ExileLink, ExileLinkKind, WaitingFor};
-    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::player::PlayerId;
 
     fn make_test_state() -> GameState {
@@ -2720,6 +2737,68 @@ mod tests {
             state.objects[&creature].casting_permissions.is_empty(),
             "composed filter must preserve the typed restriction"
         );
+    }
+
+    #[test]
+    fn resolution_window_replaces_forwarded_targets_with_active_linked_batch() {
+        let mut state = make_test_state();
+        let source = create_object(
+            &mut state,
+            CardId(999),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let stale = add_card_to_exile(&mut state, PlayerId(1), CardId(303));
+        let current = add_card_to_exile(&mut state, PlayerId(1), CardId(304));
+        for exiled_id in [stale, current] {
+            state.exile_links.push(ExileLink {
+                exiled_id,
+                source_id: source,
+                kind: ExileLinkKind::TrackedBySource,
+            });
+        }
+        let active_set = TrackedSetId(1);
+        state.tracked_object_sets.insert(active_set, vec![current]);
+        state.chain_tracked_set_id = Some(active_set);
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ExiledBySource,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::ResolutionWindow {
+                    bounds: ResolutionCastWindow::default(),
+                },
+                mana_spend_permission: None,
+            },
+            vec![TargetRef::Object(stale), TargetRef::Object(current)],
+            source,
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::CastOffer {
+                kind:
+                    crate::types::game_state::CastOfferKind::FreeCastWindow {
+                        candidates,
+                        member_pool,
+                        ..
+                    },
+                ..
+            } => {
+                assert_eq!(candidates, &vec![current]);
+                assert_eq!(member_pool, &vec![current]);
+            }
+            other => panic!("expected active-batch cast offer, got {other:?}"),
+        }
     }
 
     /// Issue #2019 — Kiora, Sovereign of the Deep: look-then-cast chains leave
