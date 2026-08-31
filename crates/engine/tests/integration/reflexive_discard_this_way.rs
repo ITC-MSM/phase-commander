@@ -1,7 +1,6 @@
-//! Regression coverage for the reflexive **"if/when you discard a card this
-//! way, <effect>"** trigger class created by a preceding "discard a card"
-//! instruction in the same ability (CR 603.12 reflexive triggered abilities;
-//! CR 701.9a discard = hand → graveyard).
+//! Regression coverage for **"if/when you discard a card this way, <effect>"**
+//! conditions following a preceding "discard a card" instruction in the same
+//! ability (CR 701.9a discard = hand → graveyard).
 //!
 //! Three cards motivate the class:
 //!
@@ -46,9 +45,9 @@
 //! moves the wrong object either way, and every positive assertion below flips.
 //!
 //! CR ANCHORS:
-//!   * CR 603.12 — reflexive triggered abilities ("when [something happens] this
-//!     way") are checked immediately after creation against events earlier in
-//!     the same resolution.
+//!   * CR 603.12 — only the `When` variants are reflexive triggered abilities;
+//!     they are checked immediately after creation against events earlier in the
+//!     same resolution.
 //!   * CR 701.9a — discard = move from hand to graveyard.
 //!   * CR 202.3 — mana value (The Ancient One's "its mana value").
 //!   * CR 608.2c — the controller follows a resolving ability's instructions in
@@ -440,7 +439,7 @@ fn silvan_reveler_ability() -> engine::types::ability::AbilityDefinition {
         .expect("the ETB trigger must carry a draw/discard/conditional-move effect chain")
 }
 
-/// CR 603.12 + CR 701.9a + CR 614.1d — Silvan Reveler (issue #8122), POSITIVE
+/// CR 701.9a + CR 614.1d — Silvan Reveler (issue #8122), POSITIVE
 /// case: the forced single discard is a land, so "If you discard a land card
 /// this way, put it from your graveyard onto the battlefield tapped." must
 /// move that exact card out of the graveyard and onto the battlefield tapped.
@@ -508,7 +507,7 @@ fn silvan_reveler_discards_land_onto_battlefield_tapped() {
     );
 }
 
-/// CR 603.12 + CR 701.9a — Silvan Reveler (issue #8122), NEGATIVE control: the
+/// CR 701.9a — Silvan Reveler (issue #8122), NEGATIVE control: the
 /// forced single discard is a NONLAND card, so the "if you discard a land card
 /// this way" gate must stay false and the card must remain in the graveyard —
 /// it must NOT be moved to the battlefield. Pairs with the positive test above
