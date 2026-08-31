@@ -23481,10 +23481,60 @@ pub struct EffectResolutionResult {
     pub count: usize,
 }
 
+/// CR 608.2c: Objects produced by a `forward_result` instruction, retained for
+/// the remainder of that resolution chain. This is distinct from declared
+/// targets: a producer may move zero objects (`Some(vec![])`), and that result
+/// must not fall back to an earlier target selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedResultContext {
+    pub targets: Vec<TargetRef>,
+    /// CR 400.7: Exact identities of object results at the moment the producer
+    /// completed. A later continuation must not bind a new incarnation that
+    /// reused the same storage `ObjectId`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub object_incarnations: Vec<ObjectIncarnationRef>,
+}
+
+impl ForwardedResultContext {
+    /// Capture the complete ordered object result of a forwarding instruction.
+    pub fn from_object_ids(
+        state: &crate::types::game_state::GameState,
+        object_ids: &[ObjectId],
+    ) -> Self {
+        Self {
+            targets: object_ids.iter().copied().map(TargetRef::Object).collect(),
+            object_incarnations: object_ids
+                .iter()
+                .filter_map(|id| state.objects.get(id).map(ObjectIncarnationRef::from_object))
+                .collect(),
+        }
+    }
+
+    /// CR 400.7: A forwarded object referent remains valid only while its
+    /// producer-time incarnation is still current. Unpinned legacy payloads
+    /// remain readable for wire compatibility.
+    pub fn object_pin_is_current(
+        &self,
+        id: ObjectId,
+        state: &crate::types::game_state::GameState,
+    ) -> bool {
+        self.object_incarnations
+            .iter()
+            .find(|pin| pin.object_id == id)
+            .is_none_or(|pin| pin.is_current(state))
+    }
+}
+
 /// Casting-time facts that flow with a spell from casting through resolution.
 /// Conditions in the sub_ability chain are evaluated against this context.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SpellContext {
+    /// CR 608.2c: The immediate `forward_result` producer's complete ordered
+    /// result. `None` means no producer has run in this resolution; `Some([])`
+    /// is a completed producer that moved no objects and intentionally blocks
+    /// inherited-target fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarded_result_context: Option<Box<ForwardedResultContext>>,
     /// CR 610.3b: specified duration events observed after a triggered ability
     /// triggered but before this initial zone-change effect occurred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -29457,10 +29507,24 @@ mod tests {
             ..SpellContext::default()
         };
         assert!(external_style.attach_target_bindings.is_empty());
+        assert!(external_style.forwarded_result_context.is_none());
 
         let absent: SpellContext =
             serde_json::from_value(serde_json::json!({})).expect("legacy context deserializes");
         assert!(absent.attach_target_bindings.is_empty());
+        assert!(absent.forwarded_result_context.is_none());
+
+        let empty_forwarded: SpellContext = serde_json::from_value(serde_json::json!({
+            "forwarded_result_context": { "targets": [] }
+        }))
+        .expect("empty forward-result context deserializes");
+        assert_eq!(
+            empty_forwarded.forwarded_result_context,
+            Some(Box::new(ForwardedResultContext {
+                targets: vec![],
+                object_incarnations: vec![],
+            }))
+        );
 
         let empty: SpellContext = serde_json::from_value(serde_json::json!({
             "attach_target_bindings": {}
