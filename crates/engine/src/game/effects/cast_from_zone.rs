@@ -123,6 +123,34 @@ fn tracked_set_cast_candidates(
         .collect()
 }
 
+/// Return the live source-linked exile members of the active resolution's
+/// tracked set, preserving publication order and exact current membership.
+fn resolution_window_linked_batch_candidates(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Vec<ObjectId> {
+    let Some(members) = state
+        .chain_tracked_set_id
+        .and_then(|id| state.tracked_object_sets.get(&id))
+    else {
+        return Vec::new();
+    };
+    let linked = crate::game::players::linked_exile_cards_for_source(state, source_id);
+    let mut seen = HashSet::new();
+    members
+        .iter()
+        .copied()
+        .filter(|id| {
+            seen.insert(*id)
+                && state
+                    .objects
+                    .get(id)
+                    .is_some_and(|object| object.zone == Zone::Exile)
+                && linked.iter().any(|link| link.exiled_id == *id)
+        })
+        .collect()
+}
+
 /// CR 400.1/400.2 + CR 109.4: Eligible hand-pick pool for a private-zone
 /// `CastFromZone` — the cards in `source_zone` belonging to the filter-scoped
 /// player (Buster-Sword-class "your hand" filters keep the caster; Silent-Blade
@@ -466,7 +494,26 @@ pub fn resolve(
     // would drop every target not in `last_revealed_ids`. The remap therefore
     // only applies on the empty-target fallback below.
     let mut used_last_revealed_library_fallback = false;
-    if target_ids.is_empty() && target_filter.references_exiled_by_source() {
+    if target_ids.is_empty()
+        && target_filter.references_exiled_by_source()
+        && matches!(
+            driver,
+            crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
+        )
+    {
+        // A paused producer such as ForEachCategory publishes its exact
+        // resolution batch through the active chain set before this parked
+        // cast continuation resumes. Consume that set instead of reopening the
+        // source-wide exile ledger; permanent sources may retain older links.
+        target_ids = resolution_window_linked_batch_candidates(state, ability.source_id);
+    }
+    if target_ids.is_empty()
+        && target_filter.references_exiled_by_source()
+        && !matches!(
+            driver,
+            crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
+        )
+    {
         let linked = crate::game::players::linked_exile_cards_for_source(state, ability.source_id);
         let current_linked_ids: Vec<_> = state
             .last_zone_changed_ids
@@ -504,7 +551,13 @@ pub fn resolve(
         // the Deep) leave the looked-at cards in the library. `Dig { keep_count:
         // 0 }` publishes them via `last_revealed_ids`, not exile links, but the
         // parser still binds the cast step to `ExiledBySource`.
-        if target_ids.is_empty() && !state.last_revealed_ids.is_empty() {
+        if target_ids.is_empty()
+            && !matches!(
+                driver,
+                crate::types::ability::CastFromZoneDriver::ResolutionWindow { .. }
+            )
+            && !state.last_revealed_ids.is_empty()
+        {
             used_last_revealed_library_fallback = true;
             target_ids =
                 crate::game::filter::last_revealed_library_ids_matching(state, target_filter, &ctx);
