@@ -24,7 +24,8 @@
 use engine::game::casting::spell_objects_available_to_cast;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCost, CastingPermission, Duration, PlayFromExileProvenance, QuantityExpr, QuantityRef,
+    AbilityCost, CardPlayMode, CastingPermission, Duration, PlayFromExileProvenance, QuantityExpr,
+    QuantityRef,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
@@ -368,6 +369,7 @@ fn overlapping_exile_grant_pays_the_selected_permissions_cost_not_a_sibling_gran
                 provenance: PlayFromExileProvenance::Impulse,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: P0,
+                mode: CardPlayMode::Play,
                 frequency: CastFrequency::Unlimited,
                 source_id: None,
                 invalidation: None,

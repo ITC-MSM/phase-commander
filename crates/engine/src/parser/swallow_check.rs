@@ -10738,7 +10738,8 @@ mod detect_condition_if_replacement_exemption_tests {
     fn play_from_exile_alt_cost_carrier_scoping_does_not_swallow_a_second_matching_rider_in_the_same_unit(
     ) {
         use crate::types::ability::{
-            AbilityCost, AbilityDefinition, AbilityKind, PlayFromExileProvenance, QuantityExpr,
+            AbilityCost, AbilityDefinition, AbilityKind, CardPlayMode, PlayFromExileProvenance,
+            QuantityExpr,
         };
         use crate::types::player::PlayerId;
         use crate::types::statics::CastFrequency;
@@ -10748,6 +10749,7 @@ mod detect_condition_if_replacement_exemption_tests {
             provenance: PlayFromExileProvenance::Impulse,
             duration: Duration::UntilEndOfTurn,
             granted_to: PlayerId(0),
+            mode: CardPlayMode::Play,
             frequency: CastFrequency::Unlimited,
             source_id: None,
             exiled_by_ability_controller: None,
@@ -10814,7 +10816,8 @@ mod detect_condition_if_replacement_exemption_tests {
     #[test]
     fn play_from_exile_alt_cost_residual_scans_newline_separated_conditions() {
         use crate::types::ability::{
-            AbilityCost, AbilityDefinition, AbilityKind, PlayFromExileProvenance, QuantityExpr,
+            AbilityCost, AbilityDefinition, AbilityKind, CardPlayMode, PlayFromExileProvenance,
+            QuantityExpr,
         };
         use crate::types::player::PlayerId;
         use crate::types::statics::CastFrequency;
@@ -10824,6 +10827,7 @@ mod detect_condition_if_replacement_exemption_tests {
             provenance: PlayFromExileProvenance::Impulse,
             duration: Duration::UntilEndOfTurn,
             granted_to: PlayerId(0),
+            mode: CardPlayMode::Play,
             frequency: CastFrequency::Unlimited,
             source_id: None,
             exiled_by_ability_controller: None,
