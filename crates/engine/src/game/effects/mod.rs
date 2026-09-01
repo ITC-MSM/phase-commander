@@ -3116,18 +3116,21 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
             && !effect_refs_parent_target(&sub.effect))
 }
 
-/// CR 115.1 + CR 608.2d: a nontargeted card choice from a private zone is
-/// announced while the effect resolves. It therefore owns a fresh object
-/// choice instead of consuming an object selected by an earlier instruction.
-fn has_resolution_owned_private_zone_choice(sub: &ResolvedAbility) -> bool {
+/// CR 115.1 + CR 608.2d: a nontargeted zone choice announced while the effect
+/// resolves owns a fresh object choice instead of consuming an object selected
+/// by an earlier instruction. The explicit zone set is the provenance marker:
+/// it covers both scalar `InZone` (Broken Bond) and mixed `InAnyZone`
+/// (Worldsoul's Rage), while context references such as Beseech the Mirror's
+/// exile-linked card remain bound continuations rather than fresh choices.
+fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
     if sub.target_choice_timing != TargetChoiceTiming::Resolution {
         return false;
     }
     let Effect::ChangeZone { origin, target, .. } = &sub.effect else {
         return false;
     };
-    let selection_zone = (*origin).or_else(|| target.extract_in_zone());
-    matches!(selection_zone, Some(Zone::Hand | Zone::Library))
+    let selection_zones = origin.map_or_else(|| target.extract_zones(), |zone| vec![zone]);
+    !selection_zones.is_empty()
         && !target.is_context_ref()
         && !effect_refs_parent_target(&sub.effect)
 }
@@ -13980,7 +13983,7 @@ fn resolve_chain_body(
                         .target_filter()
                         .is_some_and(TargetFilter::references_exiled_by_source)
                         && !effect_refs_parent_target(&sub.effect))
-                    || has_resolution_owned_private_zone_choice(sub);
+                    || has_resolution_owned_zone_choice(sub);
             sub_with_targets.targets = ability
                 .targets
                 .iter()
