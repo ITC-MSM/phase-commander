@@ -15,8 +15,9 @@
 //! effect nor any zone move.
 //!
 //! Every test below drives the real `apply()` pipeline (GameScenario +
-//! GameRunner::cast + CR 601.2 announce/target/resolve) and asserts battlefield/
-//! hand zone deltas — never AST shape — per the `card-test` skill.
+//! GameRunner::cast + CR 601.2 announce/target followed by CR 608 resolution)
+//! and asserts battlefield/hand zone deltas — never AST shape — per the
+//! `card-test` skill.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::types::phase::Phase;
@@ -69,7 +70,7 @@ fn accepting_the_choice_prompts_and_puts_the_selected_land_into_play() {
     );
 
     // Reach-guards proving this wasn't a vacuous pass:
-    // (a) the spell actually resolved and destroyed its target (CR 701.7).
+    // (a) the spell actually resolved and destroyed its target (CR 701.8a).
     assert_ne!(
         outcome.zone_of(artifact),
         Zone::Battlefield,

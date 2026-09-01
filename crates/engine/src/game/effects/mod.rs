@@ -3116,6 +3116,22 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
             && !effect_refs_parent_target(&sub.effect))
 }
 
+/// CR 115.1 + CR 608.2d: a nontargeted card choice from a private zone is
+/// announced while the effect resolves. It therefore owns a fresh object
+/// choice instead of consuming an object selected by an earlier instruction.
+fn has_resolution_owned_private_zone_choice(sub: &ResolvedAbility) -> bool {
+    if sub.target_choice_timing != TargetChoiceTiming::Resolution {
+        return false;
+    }
+    let Effect::ChangeZone { origin, target, .. } = &sub.effect else {
+        return false;
+    };
+    let selection_zone = (*origin).or_else(|| target.extract_in_zone());
+    matches!(selection_zone, Some(Zone::Hand | Zone::Library))
+        && !target.is_context_ref()
+        && !effect_refs_parent_target(&sub.effect)
+}
+
 /// CR 701.3a + CR 303.4f: `forward_result` ChangeZone nesting Attach→ParentTarget
 /// carries the parent's chosen host (not a fresh Resolution-time object pick).
 fn change_zone_forwards_chosen_attach_host(sub: &ResolvedAbility) -> bool {
@@ -13952,10 +13968,9 @@ fn resolve_chain_body(
             // so `change_zone::resolve` saw a non-empty (and wrong-zone)
             // target list, skipped its resolution-time hand scan entirely,
             // and silently moved nothing — no `EffectZoneChoice` prompt, no
-            // land onto the battlefield. `can_inherit_parent_targets` is the
-            // single authority for this exact axis (Kathril, Aspect Warper,
-            // issue #6321 / PR #6533); reuse it here instead of leaving this
-            // arm blind to `target_choice_timing`.
+            // land onto the battlefield. Keep this classification at the
+            // private-zone choice seam: a resolution-window consumer such as
+            // Beseech the Mirror still needs its already-bound searched card.
             let has_independent_target_slot =
                 (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
                     && !effect_refs_parent_target(&sub.effect)
@@ -13965,7 +13980,7 @@ fn resolve_chain_body(
                         .target_filter()
                         .is_some_and(TargetFilter::references_exiled_by_source)
                         && !effect_refs_parent_target(&sub.effect))
-                    || !can_inherit_parent_targets(sub);
+                    || has_resolution_owned_private_zone_choice(sub);
             sub_with_targets.targets = ability
                 .targets
                 .iter()
