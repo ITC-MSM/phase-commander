@@ -326,6 +326,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::UntilNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -338,6 +339,7 @@ mod tests {
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -392,6 +394,7 @@ mod tests {
         );
         let permission = CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::Permanent,
             granted_to: PlayerId(0),
             frequency: crate::types::statics::CastFrequency::Unlimited,
@@ -402,6 +405,7 @@ mod tests {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: Some(PlayPermissionInvalidation::UntilNextGrantFromSameSource),
         };
@@ -471,6 +475,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::UntilEndOfNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -483,6 +488,7 @@ mod tests {
                     single_use_group: None,
                     single_use: true,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -695,6 +701,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::UntilNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -707,6 +714,7 @@ mod tests {
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -753,6 +761,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::UntilNextTurnOf {
                         player: PlayerScope::Controller,
                     },
@@ -765,6 +774,7 @@ mod tests {
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -823,6 +833,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::UntilNextStepOf {
                         step: Phase::End,
                         player: PlayerScope::Controller,
@@ -836,6 +847,7 @@ mod tests {
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -909,6 +921,7 @@ mod tests {
 
         let mk_perm = |duration: Duration, granted_to: PlayerId| CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration,
             granted_to,
             frequency: CastFrequency::Unlimited,
@@ -919,6 +932,7 @@ mod tests {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
         };
@@ -985,6 +999,7 @@ mod tests {
         );
         let permission = CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::UntilNextStepOf {
                 step: Phase::End,
                 player: PlayerScope::Controller,
@@ -998,6 +1013,7 @@ mod tests {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
         };
@@ -1050,6 +1066,7 @@ mod tests {
             .unwrap()
             .casting_permissions = vec![CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::UntilNextStepOf {
                 step: Phase::End,
                 player: PlayerScope::Controller,
@@ -1063,6 +1080,7 @@ mod tests {
             single_use_group: None,
             single_use: false,
             cast_cost_raise: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             invalidation: None,
         }];
@@ -1088,6 +1106,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::UntilNextStepOf {
                         step: Phase::End,
                         player: PlayerScope::Controller,
@@ -1101,6 +1120,7 @@ mod tests {
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },
@@ -1159,6 +1179,7 @@ mod tests {
         state.objects.get_mut(&card).unwrap().casting_permissions =
             vec![CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilNextStepOf {
                     step: Phase::End,
                     player: PlayerScope::Controller,
@@ -1172,6 +1193,7 @@ mod tests {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
             }];
@@ -1203,6 +1225,7 @@ mod tests {
         state.objects.get_mut(&card).unwrap().casting_permissions =
             vec![CastingPermission::PlayFromExile {
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilNextStepOf {
                     step: Phase::End,
                     player: PlayerScope::Controller,
@@ -1216,6 +1239,7 @@ mod tests {
                 single_use_group: None,
                 single_use: false,
                 cast_cost_raise: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
             }];
@@ -1265,6 +1289,7 @@ mod tests {
             Effect::GrantCastingPermission {
                 permission: CastingPermission::PlayFromExile {
                     provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
                     duration: Duration::Permanent,
                     granted_to: PlayerId(0),
                     frequency: crate::types::statics::CastFrequency::Unlimited,
@@ -1275,6 +1300,7 @@ mod tests {
                     single_use_group: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,
                 },

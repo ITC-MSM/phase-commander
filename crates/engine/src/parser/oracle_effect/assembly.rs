@@ -36,7 +36,8 @@ use crate::types::zones::Zone;
 use super::conditions::ability_condition_to_static_condition;
 use super::lower::{
     append_remember_card_to_standalone_exiled_choice, apply_where_x_ability_expression,
-    apply_where_x_to_latest_def, attach_any_color_mana_rider_to_previous_play_from_exile,
+    apply_where_x_to_latest_def, attach_alt_ability_cost_to_previous_play_from_exile,
+    attach_any_color_mana_rider_to_previous_play_from_exile,
     attach_cast_cost_raise_to_previous_play_from_exile,
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
@@ -1756,7 +1757,21 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 // def; emit no sibling. `modifier` selects which field/aspect.
                 match modifier {
                     PriorModifier::AltCost(cost) => {
-                        attach_alt_cost_to_prior_cast_from_zone(&mut defs, cost.clone());
+                        // CR 118.9 + CR 119.4: Xander's Pact / Nashi fold the
+                        // rider onto a preceding `CastFromZone` (their whole
+                        // grant is spell-only). Inside Information's preceding
+                        // grant is a plain "you may play those cards" —
+                        // `GrantCastingPermission { PlayFromExile }` — which
+                        // also authorizes land plays, so when no `CastFromZone`
+                        // is in scope, fall back to folding the cost onto that
+                        // grant's `alt_ability_cost` instead (land plays stay
+                        // unaffected — the field is spell-cast-only).
+                        if !attach_alt_cost_to_prior_cast_from_zone(&mut defs, cost.clone()) {
+                            attach_alt_ability_cost_to_previous_play_from_exile(
+                                &mut defs,
+                                cost.clone(),
+                            );
+                        }
                     }
                     PriorModifier::ManaRetention(expiry) => {
                         attach_mana_retention_to_prior_mana(&mut defs, *expiry);
@@ -2385,6 +2400,30 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 ..
             }
         );
+        // CR 608.2g + CR 608.2c: the resolution-scoped BATCH window
+        // (`CastFromZoneDriver::ResolutionWindow` — "you may cast any number
+        // of spells … from among them without paying their mana costs")
+        // becomes a `CastOfferKind::FreeCastWindow` at resolution
+        // (`cast_from_zone::resolve`). That offer's own accept/decline —
+        // including declining every cast — IS the printed "may", so wrapping
+        // it in a generic `OptionalEffectChoice` prompts the controller twice
+        // for one choice. This mirrors the chunk-level reconciliation in
+        // `oracle_effect/mod.rs`; it is repeated here because a subject-phrase
+        // "may" ("… then THEY MAY cast a spell from among those cards" —
+        // Itazura, Lingering Wick) reaches `def.optional` through
+        // `clause_ir.parsed.optional` below, not through the chunk-level flag.
+        // Unlike `is_lingering_cast_from_zone` this needs no `duration`/
+        // `constraint`/`alt_ability_cost` guard: a `ResolutionWindow` driver is
+        // only assigned to the durationless free-cast batch grammar, and its
+        // frozen CR 608.2h per-spell ceiling is carried by the window's own
+        // bounds rather than by an immediate accept/decline branch.
+        let is_resolution_window_cast_from_zone = matches!(
+            &clause_ir.parsed.effect,
+            Effect::CastFromZone {
+                driver: CastFromZoneDriver::ResolutionWindow { .. },
+                ..
+            }
+        );
         // CR 107.1b/c + CR 117.1d: Join Forces' "each player may pay any
         // amount of mana" is NOT an OptionalEffectChoice — the "may" only
         // means each player may pay zero. PayAmountChoice (min=0) handles
@@ -2420,6 +2459,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 Effect::GrantCastingPermission { .. }
             )
             && !is_lingering_cast_from_zone
+            && !is_resolution_window_cast_from_zone
             && !is_join_forces_pay_any_amount_mana_cost
             && !is_pay_to_end_effect_termination
         {
@@ -2433,6 +2473,7 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 Effect::GrantCastingPermission { .. }
             )
             && !is_lingering_cast_from_zone
+            && !is_resolution_window_cast_from_zone
             && !is_join_forces_pay_any_amount_mana_cost
             && !is_pay_to_end_effect_termination
         {

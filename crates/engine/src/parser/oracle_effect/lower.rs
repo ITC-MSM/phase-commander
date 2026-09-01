@@ -1245,6 +1245,36 @@ pub(super) fn attach_cast_cost_raise_to_previous_play_from_exile(
     true
 }
 
+/// CR 118.9 + CR 119.4: Fold a "[If you cast a spell this way,] pay
+/// <ability-cost> rather than pay its mana cost" rider onto the preceding
+/// `PlayFromExile` grant's `alt_ability_cost`. Mirrors
+/// `attach_cast_cost_raise_to_previous_play_from_exile` exactly: the rider
+/// scopes to spells cast via the just-granted exile-play permission
+/// ("this way"), not a standalone cast clause. Unlike Nashi / Xander's Pact
+/// (whose whole grant is spell-only, so the rider folds onto a `CastFromZone`
+/// via `attach_alt_cost_to_prior_cast_from_zone`), this class's preceding
+/// clause is a plain "you may play those cards" grant that ALSO authorizes
+/// land plays (Inside Information). Folding onto `alt_ability_cost` instead
+/// of converting the grant to `CastFromZone` keeps that land-play authority
+/// intact — the field is only ever consulted by the spell-casting cost
+/// pipeline, never by the land-play path, so lands played under the same
+/// grant are correctly unaffected. Called as a FALLBACK from the `AltCost`
+/// modifier handler only when the `CastFromZone` attach fails to find its
+/// target, so the two attach helpers together cover the full class.
+pub(super) fn attach_alt_ability_cost_to_previous_play_from_exile(
+    defs: &mut [AbilityDefinition],
+    cost: AbilityCost,
+) -> bool {
+    let Some(CastingPermission::PlayFromExile {
+        alt_ability_cost, ..
+    }) = find_prev_play_from_exile_permission_mut(defs)
+    else {
+        return false;
+    };
+    *alt_ability_cost = Some(cost);
+    true
+}
+
 /// CR 614.1c: Fold an "each land played this way enters tapped" rider into the
 /// preceding `PlayFromExile` grant's `land_enter_tapped`.
 pub(super) fn attach_land_enters_tapped_to_previous_play_from_exile(
@@ -8965,6 +8995,59 @@ pub(super) fn compute_sentence_where_x(chunks: &[ClauseChunk]) -> Vec<Option<Str
             Some(_) => current = slot.clone(),
             None => *slot = current.clone(),
         }
+    }
+    out
+}
+
+/// CR 611.2a + CR 608.2c: Compute, for each chunk, the LEADING duration its
+/// enclosing sentence stated — but only for the chunks that come AFTER the one
+/// the duration was printed on.
+///
+/// A leading duration scopes the whole coordinated predicate it introduces
+/// ("Until end of turn, you may play lands **and** cast spells from among cards
+/// exiled this way …" — Magus of the Mind), yet `split_clause_sequence` cuts that
+/// predicate into sibling chunks and only the first of them still carries the
+/// printed prefix. `with_clause_duration` therefore reconciles the first chunk
+/// and cannot reach the rest; this fills that gap.
+///
+/// Deliberately NOT forward-filled across sentences, unlike
+/// `compute_sentence_where_x`: CR 107.3i makes one X binding apply to every later
+/// instance of X on the object, but a duration scopes exactly the predicate it
+/// introduces (CR 611.2a) and must not leak into the next printed sentence.
+///
+/// The group boundary rule is shared verbatim with `compute_sentence_where_x`, so
+/// the two passes cannot disagree about where a sentence ends.
+///
+/// KNOWN RESIDUAL — a coordinated predicate whose conjuncts CHANGE SUBJECT is
+/// not re-bound. Xanathar, Guild Kingpin prints "Until end of turn, **that
+/// player** can't cast spells, **you** may look at the top card of their library
+/// any time, **you** may play the top card of their library, and **you** may
+/// spend mana as though …": the duration reaches the leading restriction
+/// conjunct (`AddRestriction` gets `UntilEndOfTurn`) but the later cast
+/// permission is lowered with `duration: None`, i.e. indefinite. The
+/// subject-changing conjunct breaks the run this pass walks, so the cast half is
+/// never reached. This predates the pass and is outside the "you may cast … from
+/// among them" grammar it was added for; fixing it means teaching the chunk
+/// splitter about subject changes inside a coordinated predicate, which is a
+/// change to the splitter rather than to this binding.
+pub(super) fn compute_sentence_leading_duration(chunks: &[ClauseChunk]) -> Vec<Option<Duration>> {
+    let mut out = vec![None; chunks.len()];
+    let mut group_start = 0usize;
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let ends_sentence = matches!(chunk.boundary_after, Some(ClauseBoundary::Sentence) | None);
+        if !ends_sentence {
+            continue;
+        }
+        // The duration must HEAD the sentence to scope it; one stated mid-sentence
+        // belongs to its own clause and is handled by that clause's own seams
+        // (the trailing-duration fixup, or `from_among_batch_cast_driver`'s
+        // in-clause scan for Ral, Leyline Prodigy's mid-clause "this turn").
+        if let Some((duration, _)) = strip_leading_duration(chunks[group_start].text.trim()) {
+            for slot in &mut out[group_start + 1..=idx] {
+                *slot = Some(duration.clone());
+            }
+        }
+        group_start = idx + 1;
     }
     out
 }
