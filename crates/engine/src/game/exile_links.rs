@@ -73,6 +73,9 @@ pub(crate) fn push_tracked_by_source(
 /// CR 607.2a + CR 406.6: Record an exiled→source link with an explicit
 /// `ExileLinkKind`, deduped on the `(exiled_id, source_id)` pair (mirrors
 /// `push_tracked_by_source`, which delegates here for the plain tracked kind).
+/// A later, more specific link upgrades an existing `TrackedBySource` entry;
+/// this is required when automatic linked-exile detection runs before a
+/// mechanic-specific continuation such as Hideaway concealment.
 /// Used by Hideaway (`ExileLinkKind::HideawayLookable`, CR 702.75a) to mark the
 /// exiled card as look-permitted for the source's controller while keeping it
 /// discoverable by the kind-agnostic `ExiledBySource` companion-ability filter.
@@ -82,11 +85,16 @@ pub(crate) fn push_with_kind(
     source_id: ObjectId,
     kind: ExileLinkKind,
 ) {
-    if state
+    if let Some(existing) = state
         .exile_links
-        .iter()
-        .any(|link| link.exiled_id == exiled_id && link.source_id == source_id)
+        .iter_mut()
+        .find(|link| link.exiled_id == exiled_id && link.source_id == source_id)
     {
+        if matches!(&existing.kind, ExileLinkKind::TrackedBySource)
+            && !matches!(&kind, ExileLinkKind::TrackedBySource)
+        {
+            existing.kind = kind;
+        }
         return;
     }
     state.exile_links.push(ExileLink {
@@ -595,6 +603,27 @@ mod tests {
         );
 
         assert!(contains_linked_exile_consumer(&ability));
+    }
+
+    /// CR 607.2a + CR 702.75a: automatic source tracking may create a plain
+    /// link before Hideaway's conceal continuation marks the same card as
+    /// lookable. The mechanic-specific kind must replace the plain marker,
+    /// and a later generic push must not downgrade it again.
+    #[test]
+    fn specific_link_upgrades_plain_tracking_without_later_downgrade() {
+        let mut state = GameState::new_two_player(1);
+        let exiled = ObjectId(10);
+        let source = ObjectId(20);
+
+        push_with_kind(&mut state, exiled, source, ExileLinkKind::TrackedBySource);
+        push_with_kind(&mut state, exiled, source, ExileLinkKind::HideawayLookable);
+        push_with_kind(&mut state, exiled, source, ExileLinkKind::TrackedBySource);
+
+        assert_eq!(state.exile_links.len(), 1);
+        assert!(matches!(
+            state.exile_links[0].kind,
+            ExileLinkKind::HideawayLookable
+        ));
     }
 
     /// CR 607.2b: `source_is_linked_exile_consumer` must detect a linked-exile
