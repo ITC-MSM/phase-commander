@@ -2213,6 +2213,30 @@ fn moved_object_context_from_events(events: &[GameEvent]) -> Option<CostPaidObje
     moved.next().is_none().then_some(first)
 }
 
+/// CR 608.2h: retain only controller/owner metadata for one object moved from
+/// a public zone to the hidden Library. This is deliberately separate from
+/// `moved_object_context_from_events`: it must not make the hidden object a
+/// general `ParentTarget` referent, but later "that player's" instructions may
+/// still identify the player from the move-time LKI snapshot.
+fn library_move_metadata_context_from_events(
+    events: &[GameEvent],
+) -> Option<CostPaidObjectSnapshot> {
+    let mut moved = events.iter().filter_map(|event| match event {
+        GameEvent::ZoneChanged {
+            object_id,
+            from: Some(from_zone),
+            to: Zone::Library,
+            record,
+        } if is_public_zone(*from_zone) => Some(CostPaidObjectSnapshot {
+            object_id: *object_id,
+            lki: lki_snapshot_from_zone_change_record(record),
+        }),
+        _ => None,
+    });
+    let first = moved.next()?;
+    moved.next().is_none().then_some(first)
+}
+
 /// CR 707.10 + CR 608.2c: A `CopySpell` that puts a copy onto the stack
 /// introduces a singular object a chained `ParentTarget` consumer (Isochron
 /// Scepter's free cast) binds to.
@@ -3132,7 +3156,7 @@ fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
     let selection_zones = origin.map_or_else(|| target.extract_zones(), |zone| vec![zone]);
     !selection_zones.is_empty()
         && !target.is_context_ref()
-        && !effect_refs_parent_target(&sub.effect)
+        && !effect_requires_parent_target_object(&sub.effect)
 }
 
 /// Whether a child owns an object-selection slot independent of its parent's
@@ -3140,13 +3164,13 @@ fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
 /// referent even when their effect is a resolution-time typed zone choice.
 fn sub_has_independent_object_target_slot(sub: &ResolvedAbility) -> bool {
     (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
-        && !effect_refs_parent_target(&sub.effect)
+        && !effect_requires_parent_target_object(&sub.effect)
         && !sub_ability_target_belongs_to_reflexive_context(sub))
         || (sub
             .effect
             .target_filter()
             .is_some_and(TargetFilter::references_exiled_by_source)
-            && !effect_refs_parent_target(&sub.effect))
+            && !effect_requires_parent_target_object(&sub.effect))
         || (has_resolution_owned_zone_choice(sub)
             && !sub_ability_target_belongs_to_reflexive_context(sub))
 }
@@ -7013,6 +7037,61 @@ pub(crate) fn effect_refs_parent_target(effect: &Effect) -> bool {
     effect_parent_ref_slots(effect)
         .iter()
         .any(|filter| filter_refs_parent_target(filter))
+}
+
+/// Whether an effect needs the parent object itself, rather than only the
+/// parent object's controller/owner metadata. Used when deciding whether a
+/// resolution-time private-zone choice owns a fresh object-selection slot.
+fn effect_requires_parent_target_object(effect: &Effect) -> bool {
+    effect_parent_ref_slots(effect)
+        .iter()
+        .any(|filter| filter_requires_parent_target_object(filter))
+}
+
+fn filter_requires_parent_target_object(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. } => true,
+        TargetFilter::Typed(typed) => typed.properties.iter().any(|property| {
+            matches!(
+                property,
+                FilterProp::DistinctFrom { reference }
+                    if filter_requires_parent_target_object(reference)
+            )
+        }),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(filter_requires_parent_target_object)
+        }
+        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+            filter_requires_parent_target_object(filter)
+        }
+        _ => false,
+    }
+}
+
+/// Whether an effect reads only identity metadata from the parent object.
+fn effect_refs_parent_target_metadata(effect: &Effect) -> bool {
+    effect_parent_ref_slots(effect)
+        .iter()
+        .any(|filter| filter_refs_parent_target_metadata(filter))
+}
+
+fn filter_refs_parent_target_metadata(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::ParentTargetController | TargetFilter::ParentTargetOwner => true,
+        TargetFilter::Typed(typed) => {
+            matches!(
+                typed.controller,
+                Some(ControllerRef::ParentTargetController)
+            )
+        }
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(filter_refs_parent_target_metadata)
+        }
+        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+            filter_refs_parent_target_metadata(filter)
+        }
+        _ => false,
+    }
 }
 
 /// CR 115.6: True when the resolving ability head permits zero targets and the
@@ -12843,8 +12922,19 @@ fn resolve_chain_body(
     } else {
         vec![]
     };
+    let effect_events = &events[events_before..];
     let effect_context_object =
-        parent_referent_context_from_events(state, &events[events_before..]);
+        parent_referent_context_from_events(state, effect_events).or_else(|| {
+            ability
+                .sub_ability
+                .as_deref()
+                .is_some_and(|sub| {
+                    effect_refs_parent_target_metadata(&sub.effect)
+                        && !effect_requires_parent_target_object(&sub.effect)
+                })
+                .then(|| library_move_metadata_context_from_events(effect_events))
+                .flatten()
+        });
     let amassed_army_object = amassed_army_context_from_events(state, &events[events_before..]);
 
     // CR 608.2c: "[Mandatory action]. If you do, [rider]." — seed the
