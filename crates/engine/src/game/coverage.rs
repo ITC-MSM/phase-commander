@@ -1226,6 +1226,8 @@ fn fmt_duration(d: &Duration) -> String {
             format!("until end of next turn ({})", fmt_player_scope(player))
         }
         Duration::UntilHostLeavesPlay => "while on battlefield".to_string(),
+        Duration::WhileHostOnBattlefield => "while it remains on the battlefield".to_string(),
+        Duration::WhileControllingHost => "while its controller controls the source".to_string(),
         Duration::UntilSourceExilesAnotherCard => "until source exiles another card".to_string(),
         Duration::UntilOpponentBecomesMonarch => {
             "until an opponent becomes the monarch".to_string()
@@ -2379,6 +2381,7 @@ fn fmt_characteristic_population(source: &CardTypeSetSource) -> String {
                     ThisWayCause::Sacrificed => "sacrificed",
                     ThisWayCause::Returned => "returned",
                     ThisWayCause::Bounced => "bounced",
+                    ThisWayCause::PutIntoGraveyard => "put into a graveyard",
                 };
                 format!("cards {verb} this way")
             }
