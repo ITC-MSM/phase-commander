@@ -8,9 +8,10 @@
 //! static abilities that must be gated independently:
 //!
 //! 1. "This spell costs {2} less to cast..." — `active_zones: [Hand, Stack,
-//!    Command, Graveyard, Exile, Library]` (CR 113.6d: a cost-modifying
-//!    static functions in every zone the object could be cast from, plus the
-//!    stack).
+//!    Command, Graveyard, Exile, Library]`. CR 113.6d covers the stack case;
+//!    CR 113.6e covers zones from which the object may be cast. The broad list
+//!    supports cast-time cost calculation, while the per-definition gate keeps
+//!    the sibling vigilance grant from functioning off the battlefield.
 //! 2. "Other Birds you control have vigilance." — empty `active_zones`, so it
 //!    must default to battlefield-only.
 //!
@@ -25,14 +26,18 @@
 //! EFFECTIVE post-`evaluate_layers` keyword set on a third-party creature —
 //! a runtime test, not an AST-shape test.
 
+use engine::game::casting::display_spell_cost;
 use engine::game::keywords::has_keyword;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0};
-use engine::game::zones::{add_to_zone, remove_from_zone};
+use engine::game::zones::move_to_zone;
+use engine::types::ability::{ContinuousModification, StaticDefinition, TargetFilter};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
+use engine::types::mana::{ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
+use std::sync::Arc;
 
 const GWAIHIR_ORACLE: &str = "This spell costs {2} less to cast as long as you've drawn two or more cards this turn.\nFlying, vigilance\nOther Birds you control have vigilance.";
 
@@ -52,6 +57,10 @@ fn gwaihir_vigilance_grant_requires_battlefield_not_hand() {
     // must not leak its OTHER static's battlefield-default vigilance grant.
     let gwaihir = scenario
         .add_creature_to_hand_from_oracle(P0, "Gwaihir the Windlord", 4, 4, GWAIHIR_ORACLE)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::White, ManaCostShard::Blue],
+            generic: 4,
+        })
         .with_subtypes(vec!["Bird", "Noble"])
         .id();
 
@@ -63,6 +72,36 @@ fn gwaihir_vigilance_grant_requires_battlefield_not_hand() {
         .id();
 
     let mut runner = scenario.build();
+    runner.state_mut().players[P0.0 as usize].cards_drawn_this_turn = 2;
+
+    assert_eq!(
+        display_spell_cost(runner.state(), P0, gwaihir)
+            .expect("Gwaihir in hand has a displayable cast cost")
+            .mana_value(),
+        4,
+        "the parsed in-hand cost-reduction sibling must reduce {{4}}{{W}}{{U}} to {{2}}{{W}}{{U}}"
+    );
+
+    // Same-pipeline reach guard: install an otherwise harmless continuous
+    // sibling that explicitly functions in Hand. Its Flying grant proves the
+    // layer visitor collected this exact off-zone source before the negative
+    // Vigilance assertion tests per-definition admission.
+    let reach_guard = StaticDefinition::continuous()
+        .affected(TargetFilter::SpecificObject { id: other_bird })
+        .modifications(vec![ContinuousModification::AddKeyword {
+            keyword: Keyword::Flying,
+        }])
+        .active_zones(vec![Zone::Hand]);
+    {
+        let obj = runner.state_mut().objects.get_mut(&gwaihir).unwrap();
+        Arc::make_mut(&mut obj.base_static_definitions).push(reach_guard.clone());
+        obj.static_definitions.push(reach_guard);
+    }
+
+    assert!(
+        has_kw(&mut runner, other_bird, &Keyword::Flying),
+        "the in-hand broad-zone sibling must prove Gwaihir reached the live-source layer gather"
+    );
 
     assert!(
         !has_kw(&mut runner, other_bird, &Keyword::Vigilance),
@@ -71,20 +110,10 @@ fn gwaihir_vigilance_grant_requires_battlefield_not_hand() {
          regardless of what a SIBLING static's `active_zones` declares)"
     );
 
-    // Relocate Gwaihir onto the battlefield directly (mirrors
-    // `CardBuilder::with_commander`'s zone-relocation pattern) — no cast or
-    // replacement pipeline is exercised here because the bug under test is
-    // in continuous-effect gathering, not in casting.
-    {
-        let state = runner.state_mut();
-        let owner = state.objects[&gwaihir].owner;
-        remove_from_zone(state, gwaihir, Zone::Hand, owner);
-        add_to_zone(state, gwaihir, Zone::Battlefield, owner);
-        let ts = state.next_timestamp();
-        let obj = state.objects.get_mut(&gwaihir).unwrap();
-        obj.zone = Zone::Battlefield;
-        obj.timestamp = ts;
-    }
+    // Use the canonical zone transition so the battlefield positive follows
+    // the production timestamp/zone bookkeeping path.
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), gwaihir, Zone::Battlefield, &mut events);
 
     // Positive reach-guard: proves the first assertion isn't vacuously true
     // because the grant never fires at all — the SAME Continuous ability now

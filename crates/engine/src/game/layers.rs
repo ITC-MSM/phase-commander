@@ -5668,13 +5668,14 @@ fn for_each_static_effect_source(
         if obj.is_phased_out() {
             continue;
         }
-        // Cheap pre-check: only scan objects that carry at least one
-        // opt-in-zone static. Avoids iterating libraries/hands full of
-        // ordinary cards on every layer recomputation.
+        // Cheap pre-check: only scan objects that carry an all-zone CDA or at
+        // least one opt-in-zone static. Avoids iterating libraries/hands full
+        // of ordinary cards on every layer recomputation while preserving CR
+        // 113.6a / CR 604.3's all-zone characteristic-defining exception.
         if !obj
             .static_definitions
             .iter_all()
-            .any(|def| !def.active_zones.is_empty())
+            .any(|def| def.characteristic_defining || !def.active_zones.is_empty())
         {
             continue;
         }
@@ -5802,7 +5803,8 @@ fn active_continuous_effects_from_static_definitions(
             continue;
         }
 
-        // CR 113.6 + CR 113.6b: Zone-of-function gate. `LiveSource` delegates
+        // CR 113.6 + CR 113.6a-b: Zone-of-function gate. `LiveSource` admits
+        // the narrow all-zone CDA class first, then delegates ordinary statics
         // to the shared `functioning_abilities::static_functions_in_zone`
         // authority — the same predicate
         // `active_combat_assignment_rule_effects_from_static_definitions`
@@ -5816,7 +5818,8 @@ fn active_continuous_effects_from_static_definitions(
         // gated again (see `StaticZoneAdmission`).
         let admitted = match admission {
             StaticZoneAdmission::LiveSource => source_obj.is_some_and(|obj| {
-                crate::game::functioning_abilities::static_functions_in_zone(obj, def)
+                def.characteristic_defining
+                    || crate::game::functioning_abilities::static_functions_in_zone(obj, def)
             }),
             StaticZoneAdmission::PreFilteredBaseStatic => true,
         };
@@ -18084,6 +18087,46 @@ mod tests {
             !bear_obj.has_keyword(&Keyword::Haste),
             "Without a Mountain, the compound condition fails and Haste is not granted"
         );
+    }
+
+    /// CR 113.6a + CR 604.3: a characteristic-defining ability functions in
+    /// every zone.
+    /// This exercises the shared layer-source gather directly: a Hand source
+    /// with only an empty-`active_zones` CDA must survive both the off-zone
+    /// candidate pre-check and the LiveSource per-definition admission gate.
+    #[test]
+    fn live_layer_gather_admits_characteristic_defining_static_from_hand() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Off-Zone CDA".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![ContinuousModification::SetDynamicPower {
+                        value: QuantityExpr::Fixed { value: 7 },
+                    }])
+                    .cda(),
+            );
+
+        let effects = collect_shared_active_continuous_effects(&state);
+        assert!(effects.iter().any(|effect| {
+            effect.source_id == source
+                && effect.characteristic_defining
+                && matches!(
+                    &effect.modification,
+                    ContinuousModification::SetDynamicPower { .. }
+                )
+        }));
     }
 
     /// CR 709.5 + CR 123.6c + CR 613.1c: Room door-gated naming must precede
