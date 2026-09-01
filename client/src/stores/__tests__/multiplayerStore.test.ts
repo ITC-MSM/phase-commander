@@ -1,4 +1,4 @@
-import { waitFor } from "@testing-library/react";
+import { act, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const localStorageItems = vi.hoisted(() => {
@@ -30,13 +30,16 @@ import { formatMetadata } from "../../data/formatRegistry";
 import {
   FORMAT_DEFAULTS,
   isServerCompatible,
+  migrateLegacyLoopDetectionOn,
   migrateOfficialServerAddress,
   migratePersistedMultiplayerState,
+  normalizeRememberedHostConfig,
   type HostingSettings,
   useMultiplayerStore,
 } from "../multiplayerStore";
 import {
   LOBBY_PROTOCOL_VERSION,
+  MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL,
   PROTOCOL_VERSION,
   type ServerInfo,
 } from "../../adapter/ws-adapter";
@@ -228,7 +231,7 @@ describe("multiplayerStore", () => {
     // The floor still bites.
     expect(
       isServerCompatible(
-        server("LobbyOnly", PROTOCOL_VERSION, LOBBY_PROTOCOL_VERSION - 1),
+        server("LobbyOnly", PROTOCOL_VERSION, MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL - 1),
       ),
     ).toBe(false);
     // Full servers ignore the lobby field entirely.
@@ -375,6 +378,139 @@ describe("multiplayerStore", () => {
         3,
       ),
     ).toEqual({ serverAddress: "wss://lobby.phase-rs.dev/ws" });
+  });
+
+  it("forwards a legacy 'On' loop-detection choice to Interactive", () => {
+    expect(
+      migrateLegacyLoopDetectionOn({
+        format: "Commander",
+        loopDetection: { type: "On" },
+      }),
+    ).toEqual({ format: "Commander", loopDetection: { type: "Interactive" } });
+  });
+
+  it("leaves Off/Interactive loop-detection choices unchanged", () => {
+    expect(
+      migrateLegacyLoopDetectionOn({ format: "Commander", loopDetection: { type: "Off" } }),
+    ).toEqual({ format: "Commander", loopDetection: { type: "Off" } });
+    expect(
+      migrateLegacyLoopDetectionOn({
+        format: "Commander",
+        loopDetection: { type: "Interactive" },
+      }),
+    ).toEqual({ format: "Commander", loopDetection: { type: "Interactive" } });
+  });
+
+  it("passes through a null lastHostConfig unchanged", () => {
+    expect(migrateLegacyLoopDetectionOn(null)).toBeNull();
+  });
+
+  it("rebuilds legacy host configurations from current engine defaults", () => {
+    const normalized = normalizeRememberedHostConfig({
+      format: "Commander",
+      formatConfig: {
+        format: "Commander",
+        starting_life: 25,
+        deck_size: 100,
+        commander_damage_threshold: 19,
+        allow_debug_actions: true,
+        uses_commander: false,
+      },
+      playerCount: 2,
+      matchType: "Bo3",
+      loopDetection: { type: "On" },
+      isPublic: false,
+      startWhenFull: false,
+      ranked: true,
+      aiSeats: [{ seatIndex: 1, difficulty: "Hard", deckName: "Deck" }],
+    });
+
+    expect(normalized).toEqual({
+      format: "Commander",
+      formatConfig: {
+        ...FORMAT_DEFAULTS.Commander,
+        starting_life: 25,
+        commander_damage_threshold: 19,
+        allow_debug_actions: true,
+      },
+      playerCount: 2,
+      matchType: "Bo3",
+      loopDetection: { type: "Interactive" },
+      isPublic: false,
+      startWhenFull: false,
+      ranked: false,
+      aiSeats: [{ seatIndex: 1, difficulty: "Hard", deckName: "Deck" }],
+    });
+  });
+
+  it("drops unknown persisted format names instead of indexing inherited object keys", () => {
+    expect(normalizeRememberedHostConfig({ format: "toString" })).toBeNull();
+  });
+
+  it("migrates v4 persisted settings before a stale format shape reaches hosting", () => {
+    expect(
+      migratePersistedMultiplayerState(
+        {
+          lastHostConfig: {
+            format: "Commander",
+            formatConfig: { deck_size: 100 },
+            playerCount: 2,
+            matchType: "Bo1",
+            loopDetection: { type: "Off" },
+            isPublic: true,
+            startWhenFull: true,
+            ranked: false,
+            aiSeats: [],
+          },
+        },
+        4,
+      ),
+    ).toEqual({
+      lastHostConfig: {
+        format: "Commander",
+        formatConfig: FORMAT_DEFAULTS.Commander,
+        playerCount: 2,
+        matchType: "Bo1",
+        loopDetection: { type: "Off" },
+        isPublic: true,
+        startWhenFull: true,
+        ranked: false,
+        aiSeats: [],
+      },
+    });
+  });
+
+  it("does not re-migrate a store already at v5", () => {
+    const state = { lastHostConfig: { format: "Commander", loopDetection: { type: "On" } } };
+    expect(migratePersistedMultiplayerState(state, 5)).toBe(state);
+  });
+
+  it("normalizes current-version persisted host settings during hydration", () => {
+    localStorage.setItem(
+      "phase-multiplayer",
+      JSON.stringify({
+        state: {
+          lastHostConfig: {
+            format: "Commander",
+            formatConfig: { deck_size: 100 },
+            playerCount: 2,
+            matchType: "Bo1",
+            loopDetection: { type: "Off" },
+            isPublic: true,
+            startWhenFull: true,
+            ranked: false,
+            aiSeats: [],
+          },
+        },
+        version: 5,
+      }),
+    );
+
+    act(() => useMultiplayerStore.persist.rehydrate());
+
+    expect(useMultiplayerStore.getState().lastHostConfig?.formatConfig).toEqual(
+      FORMAT_DEFAULTS.Commander,
+    );
   });
 
   it("strips AI seats from team-based server host settings", async () => {
