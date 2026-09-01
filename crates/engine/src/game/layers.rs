@@ -6138,11 +6138,15 @@ fn active_continuous_effects_from_static_definitions(
         // (below) already uses — so a definition with empty `active_zones`
         // correctly defaults to battlefield-only even when this source was
         // only visited because a DIFFERENT definition on it opts into a
-        // non-battlefield zone. A source that has since vanished from
-        // `state.objects` (`source_obj: None`) is treated as functioning
-        // nowhere, same as the door check above. `PreFilteredBaseStatic`
-        // already had this screening applied by its caller and must not be
-        // gated again (see `StaticZoneAdmission`).
+        // non-battlefield zone, UNLESS the definition is itself a CDA, which
+        // `static_functions_in_zone` admits unconditionally per CR 604.3
+        // (checked there, not duplicated here, so all six call sites that
+        // delegate to it — not just this one — get the CDA exception; see
+        // that function's doc comment for the full three-way split). A source
+        // that has since vanished from `state.objects` (`source_obj: None`)
+        // is treated as functioning nowhere, same as the door check above.
+        // `PreFilteredBaseStatic` already had this screening applied by its
+        // caller and must not be gated again (see `StaticZoneAdmission`).
         let admitted = match admission {
             StaticZoneAdmission::LiveSource => source_obj.is_some_and(|obj| {
                 crate::game::functioning_abilities::static_functions_in_zone(obj, def)
@@ -19142,6 +19146,46 @@ mod tests {
             !bear_obj.has_keyword(&Keyword::Haste),
             "Without a Mountain, the compound condition fails and Haste is not granted"
         );
+    }
+
+    /// CR 113.6a + CR 604.3: a characteristic-defining ability functions in
+    /// every zone.
+    /// This exercises the shared layer-source gather directly: a Hand source
+    /// with only an empty-`active_zones` CDA must survive both the off-zone
+    /// candidate pre-check and the LiveSource per-definition admission gate.
+    #[test]
+    fn live_layer_gather_admits_characteristic_defining_static_from_hand() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Off-Zone CDA".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![ContinuousModification::SetDynamicPower {
+                        value: QuantityExpr::Fixed { value: 7 },
+                    }])
+                    .cda(),
+            );
+
+        let effects = collect_shared_active_continuous_effects(&state);
+        assert!(effects.iter().any(|effect| {
+            effect.source_id == source
+                && effect.characteristic_defining
+                && matches!(
+                    &effect.modification,
+                    ContinuousModification::SetDynamicPower { .. }
+                )
+        }));
     }
 
     /// CR 709.5 + CR 123.6c + CR 613.1c: Room door-gated naming must precede
