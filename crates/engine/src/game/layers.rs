@@ -10769,6 +10769,42 @@ mod tests {
         );
     }
 
+    /// CR 604.3: the command-zone source walk must admit a non-emblem CDA
+    /// without requiring an explicit `active_zones: [Command]` opt-in. This
+    /// drives the normal source index and layer evaluation and observes the
+    /// CDA's continuous modification on a battlefield object.
+    #[test]
+    fn command_zone_cda_reaches_layer_pipeline() {
+        let mut state = setup();
+        let target_id = make_creature(&mut state, "CDA Observer", 2, 2, PlayerId(0));
+        let source_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Command CDA Source".to_string(),
+            Zone::Command,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            let cda = StaticDefinition::continuous()
+                .affected(TargetFilter::SpecificObject { id: target_id })
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying,
+                }])
+                .cda();
+            Arc::make_mut(&mut source.base_static_definitions).push(cda.clone());
+            source.static_definitions.push(cda);
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        assert!(
+            state.objects[&target_id].keywords.contains(&Keyword::Flying),
+            "a non-emblem Command-zone CDA must be collected and applied by the production layer pipeline"
+        );
+    }
+
     /// Helper: creatures you control filter
     fn creature_you_ctrl() -> TargetFilter {
         TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))

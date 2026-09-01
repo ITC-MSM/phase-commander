@@ -147,8 +147,9 @@ pub fn trigger_opts_in_to_command_zone(def: &TriggerDefinition) -> bool {
 /// contributes at least one static that functions from the command zone: an
 /// emblem (CR 114.3/114.4), a face-up conspiracy (CR 905.4), OR any non-emblem
 /// object (e.g. an ACTIVE PLANE / phenomenon, which remains in and functions
-/// from the command zone per CR 311.2 / CR 312.2) carrying a static that opts
-/// in via `active_zones.contains(Command)` (CR 113.6b). This is the single
+/// from the command zone per CR 311.2 / CR 312.2) carrying either a CDA (CR
+/// 604.3) or a static that opts in via `active_zones.contains(Command)` (CR
+/// 113.6b). This is the single
 /// authority consulted by every continuous-effect source gather (the
 /// static-source index and the layer gather + its fallback), so a plane's
 /// continuous statics (anthems, keyword grants) are visible exactly like an
@@ -160,10 +161,9 @@ pub fn object_sources_static_from_command_zone(obj: &GameObject) -> bool {
         return false;
     }
     obj.is_emblem
-        || obj
-            .static_definitions
-            .iter_all()
-            .any(|def| non_emblem_command_zone_static_functions(obj, def))
+        || obj.static_definitions.iter_all().any(|def| {
+            def.characteristic_defining || non_emblem_command_zone_static_functions(obj, def)
+        })
 }
 
 /// CR 113.6g: True when a `CantBeCountered`/`CantBeCopied` definition names
@@ -590,6 +590,11 @@ mod tests {
         assert!(!object_sources_static_from_command_zone(
             &battlefield_default
         ));
+
+        // CR 604.3: a CDA functions in all zones without an active-zones opt-in.
+        let mut cda = make_obj(5, Zone::Command);
+        cda.static_definitions = vec![StaticDefinition::new(StaticMode::Continuous).cda()].into();
+        assert!(object_sources_static_from_command_zone(&cda));
 
         // An emblem in the command zone is always admitted.
         let mut emblem = make_obj(3, Zone::Command);
