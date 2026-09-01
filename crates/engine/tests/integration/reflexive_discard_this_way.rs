@@ -1,7 +1,6 @@
-//! Regression coverage for the reflexive **"if/when you discard a card this
-//! way, <effect>"** trigger class created by a preceding "discard a card"
-//! instruction in the same ability (CR 603.12 reflexive triggered abilities;
-//! CR 701.9a discard = hand → graveyard).
+//! Regression coverage for **"if/when you discard a card this way, <effect>"**
+//! conditions following a preceding "discard a card" instruction in the same
+//! ability (CR 701.9a discard = hand → graveyard).
 //!
 //! Three cards motivate the class:
 //!
@@ -87,9 +86,9 @@
 //! moves the wrong object either way, and every positive assertion below flips.
 //!
 //! CR ANCHORS:
-//!   * CR 603.12 — reflexive triggered abilities ("when [something happens] this
-//!     way") are checked immediately after creation against events earlier in
-//!     the same resolution.
+//!   * CR 603.12 — only the `When` variants are reflexive triggered abilities;
+//!     they are checked immediately after creation against events earlier in the
+//!     same resolution.
 //!   * CR 701.9a — discard = move from hand to graveyard.
 //!   * CR 202.3 — mana value (The Ancient One's "its mana value").
 //!   * CR 608.2c — the controller follows a resolving ability's instructions in
@@ -124,6 +123,8 @@ const P1: PlayerId = PlayerId(1);
 const TALION_BODY: &str = "draw a card, then discard a card. When you discard a card this way, put a +1/+1 counter on target Faerie you control.";
 const ANCIENT_BODY: &str = "Draw a card, then discard a card. When you discard a card this way, target player mills cards equal to its mana value.";
 const SILVAN_REVELER_ORACLE: &str = "When this creature enters, draw a card, then discard a card. If you discard a land card this way, put it from your graveyard onto the battlefield tapped.";
+const CRAGGANWICK_BODY: &str = "discard a card at random. If you discard a creature card this way, this creature deals damage equal to that card's power to target player or planeswalker.";
+const NARSET_BODY: &str = "Draw a card, then you may discard a card. When you discard a nonland card this way, Narset deals damage equal to that card's mana value to target creature or planeswalker.";
 
 /// Set an explicit printed mana cost on an already-created object so its mana
 /// value is deterministic for "its mana value" assertions.
@@ -144,6 +145,96 @@ fn p1p1_on(runner: &GameRunner, id: ObjectId) -> u32 {
 
 fn graveyard_len(runner: &GameRunner, player: PlayerId) -> usize {
     runner.state().players[player.0 as usize].graveyard.len()
+}
+
+fn life_total(runner: &GameRunner, player: PlayerId) -> i32 {
+    runner.state().players[player.0 as usize].life
+}
+
+/// CR 601.2c + CR 603.12 + CR 701.9a — Cragganwick Cremator's reflexive
+/// damage keeps its independently selected player target. The discarded card
+/// is only the value referent for the damage amount; it is not the recipient.
+#[test]
+fn cragganwick_cremator_damages_selected_player_not_discarded_card() {
+    let mut scenario = GameScenario::new();
+    let source = scenario.add_creature(P0, "Cragganwick Cremator", 5, 4).id();
+    let discarded = scenario.add_card_to_hand(P0, "Force of Nature");
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&discarded)
+        .unwrap()
+        .card_types = CardType {
+        supertypes: vec![],
+        core_types: vec![CoreType::Creature],
+        subtypes: vec![],
+    };
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&discarded)
+        .unwrap()
+        .power = Some(6);
+
+    let def = parse_effect_chain(CRAGGANWICK_BODY, AbilityKind::Spell);
+    let ability = ResolvedAbility {
+        targets: vec![TargetRef::Player(P1)],
+        ..build_resolved_from_def(&def, source, P0)
+    };
+    let before = life_total(&runner, P1);
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
+        .expect("discard and reflexive damage resolve");
+
+    assert_eq!(life_total(&runner, P1), before - 6);
+    assert_eq!(runner.state().objects[&discarded].zone, Zone::Graveyard);
+}
+
+/// CR 601.2c + CR 603.12 + CR 701.9a — Narset's reflexive damage keeps its
+/// independently selected creature target while the discarded card supplies
+/// only the mana-value amount.
+#[test]
+fn narset_damages_selected_creature_not_discarded_card() {
+    let mut scenario = GameScenario::new();
+    let source = scenario
+        .add_creature(P0, "Narset of the Ancient Way", 1, 1)
+        .id();
+    let target = scenario.add_creature(P1, "Target Giant", 3, 10).id();
+    let discarded = scenario.add_card_to_hand(P0, "Nonland MV5");
+    scenario.with_library_top(P0, &["Drawn Card"]);
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&discarded)
+        .unwrap()
+        .card_types = CardType {
+        supertypes: vec![],
+        core_types: vec![CoreType::Sorcery],
+        subtypes: vec![],
+    };
+    set_mv(&mut runner, discarded, 5);
+
+    let def = parse_effect_chain(NARSET_BODY, AbilityKind::Spell);
+    let ability = ResolvedAbility {
+        targets: vec![TargetRef::Object(target)],
+        ..build_resolved_from_def(&def, source, P0)
+    };
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
+        .expect("draw resolves and optional discard is offered");
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("accept Narset's optional discard");
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![discarded],
+        })
+        .expect("choose the nonland card to discard");
+
+    assert_eq!(runner.state().objects[&target].damage_marked, 5);
+    assert_eq!(runner.state().objects[&discarded].zone, Zone::Graveyard);
 }
 
 /// CR 603.12 + CR 701.9a: Talion's Messenger — after the forced single discard,
@@ -483,7 +574,7 @@ fn silvan_reveler_ability() -> engine::types::ability::AbilityDefinition {
         .expect("the ETB trigger must carry a draw/discard/conditional-move effect chain")
 }
 
-/// CR 603.12 + CR 701.9a + CR 614.1d — Silvan Reveler (issue #8122), POSITIVE
+/// CR 701.9a + CR 614.1d — Silvan Reveler (issue #8122), POSITIVE
 /// case: the forced single discard is a land, so "If you discard a land card
 /// this way, put it from your graveyard onto the battlefield tapped." must
 /// move that exact card out of the graveyard and onto the battlefield tapped.
@@ -551,7 +642,7 @@ fn silvan_reveler_discards_land_onto_battlefield_tapped() {
     );
 }
 
-/// CR 603.12 + CR 701.9a — Silvan Reveler (issue #8122), NEGATIVE control: the
+/// CR 701.9a — Silvan Reveler (issue #8122), NEGATIVE control: the
 /// forced single discard is a NONLAND card, so the "if you discard a land card
 /// this way" gate must stay false and the card must remain in the graveyard —
 /// it must NOT be moved to the battlefield. Pairs with the positive test above
