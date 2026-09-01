@@ -15,9 +15,8 @@
 //! effect nor any zone move.
 //!
 //! Every test below drives the real `apply()` pipeline (GameScenario +
-//! GameRunner::cast + CR 601.2 announce/target followed by CR 608 resolution)
-//! and asserts battlefield/hand zone deltas — never AST shape — per the
-//! `card-test` skill.
+//! GameRunner::cast + CR 601.2 announce/target + CR 608 resolve) and asserts
+//! battlefield/hand zone deltas — never AST shape — per the `card-test` skill.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::types::phase::Phase;

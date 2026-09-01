@@ -13971,9 +13971,41 @@ fn resolve_chain_body(
             // so `change_zone::resolve` saw a non-empty (and wrong-zone)
             // target list, skipped its resolution-time hand scan entirely,
             // and silently moved nothing — no `EffectZoneChoice` prompt, no
-            // land onto the battlefield. Keep this classification at the
-            // private-zone choice seam: a resolution-window consumer such as
-            // Beseech the Mirror still needs its already-bound searched card.
+            // land onto the battlefield.
+            //
+            // NOT `!can_inherit_parent_targets(sub)` (reverted after PR #8259
+            // review): that predicate's `timing != Resolution` disjunct is
+            // rescued by `effect_refs_parent_target`, but has no rescue for a
+            // Resolution-timed sub that is bound through a DIFFERENT durable
+            // channel than `ParentTarget` — Beseech the Mirror's "put the
+            // exiled card into your hand if it wasn't cast this way" fallback
+            // (and its sibling bargained cast) resolve
+            // `Effect::CastFromZone`/`Effect::ChangeZoneAll` against
+            // `TargetFilter::TrackedSetFiltered { caused_by: Some(Exiled), .. }`
+            // — Resolution-timed and `!effect_refs_parent_target` exactly like
+            // Broken Bond's land-put, but a BOUND continuation over the same
+            // exiled card, not a fresh choice. The broad predicate stripped
+            // the exiled card's object target off Beseech's cast node, which
+            // made `optional_effect_is_infeasible`'s per-object `CastFromZone`
+            // probe fall through to its empty-bound-set whole-ability dry run
+            // — a land or mana-value-constrained "no eligible card" resolves
+            // there as a benign no-op instead of an infeasible optional, so
+            // the printed hand fallback never ran and the card stranded in
+            // Exile (`beseech_bargained_land_skips_cast_offer_and_runs_hand_fallback`,
+            // `beseech_bargained_mana_value_five_skips_cast_offer_and_runs_hand_fallback`).
+            //
+            // `TargetFilter::Typed(_)` is the precise, positive signal instead
+            // — the same allowlist shape the Heart-Shaped Herb fix (issue
+            // #8077, `if_you_do_object_anchor`) uses to tell a fresh
+            // resolution-time pool apart from an already-established
+            // referent: `Typed` is the only target shape that structurally
+            // introduces a NEW candidate set (a zone/type-filtered scan) at
+            // this sub's own resolution, whereas `ParentTarget`,
+            // `TrackedSet`/`TrackedSetFiltered`, `ExiledBySource`, `SelfRef`,
+            // etc. all name a referent some earlier instruction already
+            // bound. Broken Bond's land-put
+            // (`ChangeZone { target: Typed(Land ∧ InZone(Hand)), .. }`)
+            // matches; Beseech's tracked-set-bound cast and fallback do not.
             let has_independent_target_slot =
                 (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
                     && !effect_refs_parent_target(&sub.effect)
