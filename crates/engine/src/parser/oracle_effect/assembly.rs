@@ -36,7 +36,8 @@ use crate::types::zones::Zone;
 use super::conditions::ability_condition_to_static_condition;
 use super::lower::{
     append_remember_card_to_standalone_exiled_choice, apply_where_x_ability_expression,
-    apply_where_x_to_latest_def, attach_any_color_mana_rider_to_previous_play_from_exile,
+    apply_where_x_to_latest_def, attach_alt_ability_cost_to_previous_play_from_exile,
+    attach_any_color_mana_rider_to_previous_play_from_exile,
     attach_cast_cost_raise_to_previous_play_from_exile,
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
@@ -1756,7 +1757,21 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                 // def; emit no sibling. `modifier` selects which field/aspect.
                 match modifier {
                     PriorModifier::AltCost(cost) => {
-                        attach_alt_cost_to_prior_cast_from_zone(&mut defs, cost.clone());
+                        // CR 118.9 + CR 119.4: Xander's Pact / Nashi fold the
+                        // rider onto a preceding `CastFromZone` (their whole
+                        // grant is spell-only). Inside Information's preceding
+                        // grant is a plain "you may play those cards" —
+                        // `GrantCastingPermission { PlayFromExile }` — which
+                        // also authorizes land plays, so when no `CastFromZone`
+                        // is in scope, fall back to folding the cost onto that
+                        // grant's `alt_ability_cost` instead (land plays stay
+                        // unaffected — the field is spell-cast-only).
+                        if !attach_alt_cost_to_prior_cast_from_zone(&mut defs, cost.clone()) {
+                            attach_alt_ability_cost_to_previous_play_from_exile(
+                                &mut defs,
+                                cost.clone(),
+                            );
+                        }
                     }
                     PriorModifier::ManaRetention(expiry) => {
                         attach_mana_retention_to_prior_mana(&mut defs, *expiry);
@@ -3449,18 +3464,23 @@ fn normalize_linked_exile_cast_pair(
     }
     // CR 608.2c + CR 701.13a: Jodah, the Unifier — the head-aware companion
     // gate. `prev` is `ExileFromTopUntil { NextMatches }`; `chain` is its
-    // optional `CastFromZone { ParentTarget }` with the bottom cleanup already
-    // nested beneath it. Rewrite that cleanup to the linked exile set and make
-    // it the decline branch, preserving the hit in exile when the cast is
-    // declined.
-    if chain.optional {
-        if let Some(cleanup) = chain.sub_ability.as_deref().cloned() {
-            if is_exile_until_cast_bottom_cleanup(&prev.effect, &chain.effect, &cleanup.effect) {
-                if let Some(cleanup_mut) = chain.sub_ability.as_deref_mut() {
-                    normalize_exile_until_cast_bottom_cleanup(&mut cleanup_mut.effect);
+    // `CastFromZone { ParentTarget }` with the bottom cleanup already nested
+    // beneath it. Rewrite that cleanup to the linked exile set, preserving the
+    // hit in exile.
+    if let Some(cleanup) = chain.sub_ability.as_deref().cloned() {
+        if is_exile_until_cast_bottom_cleanup(&prev.effect, &chain.effect, &cleanup.effect) {
+            if let Some(cleanup_mut) = chain.sub_ability.as_deref_mut() {
+                // The "the rest of those exiled cards" rewrite is a property of
+                // the WORDING, so it runs for a standing permission too.
+                normalize_exile_until_cast_bottom_cleanup(&mut cleanup_mut.effect);
+                // CR 608.2d: only a resolution-time offer has a decline branch. A
+                // lingering permission (The Day of the Doctor) is never declined as
+                // the ability resolves, so an else branch there would publish a
+                // second, unreachable copy of the cleanup to the chain scanners.
+                if chain.optional {
                     chain.else_ability = Some(Box::new(cleanup_mut.clone()));
-                    return true;
                 }
+                return true;
             }
         }
     }

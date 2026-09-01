@@ -5,7 +5,7 @@
   "icon": "G",
   "format": "modern",
   "version": 1,
-  "updated": "2026-08-30T00:00:00Z",
+  "updated": "2026-09-01T00:00:00Z",
   "source": "https://www.mtggoldfish.com/metagame/modern",
   "decks": [
     {
@@ -294,6 +294,173 @@
       ]
     },
     {
+      "name": "Eldrazi",
+      "author": "MTGGoldfish",
+      "colors": [
+        "G",
+        "R"
+      ],
+      "tags": [
+        "metagame"
+      ],
+      "main": [
+        {
+          "count": 4,
+          "name": "Ancient Stirrings"
+        },
+        {
+          "count": 4,
+          "name": "Basking Broodscale"
+        },
+        {
+          "count": 3,
+          "name": "Blade of the Bloodchief"
+        },
+        {
+          "count": 1,
+          "name": "Boseiju, Who Endures"
+        },
+        {
+          "count": 2,
+          "name": "Cavern of Souls"
+        },
+        {
+          "count": 1,
+          "name": "Commercial District"
+        },
+        {
+          "count": 4,
+          "name": "Eldrazi Temple"
+        },
+        {
+          "count": 3,
+          "name": "Emrakul, the Promised End"
+        },
+        {
+          "count": 2,
+          "name": "Forest"
+        },
+        {
+          "count": 1,
+          "name": "Gemstone Caverns"
+        },
+        {
+          "count": 1,
+          "name": "Glaring Fleshraker"
+        },
+        {
+          "count": 4,
+          "name": "Grove of the Burnwillows"
+        },
+        {
+          "count": 1,
+          "name": "Haywire Mite"
+        },
+        {
+          "count": 4,
+          "name": "Kozilek's Command"
+        },
+        {
+          "count": 4,
+          "name": "Malevolent Rumble"
+        },
+        {
+          "count": 1,
+          "name": "Misty Rainforest"
+        },
+        {
+          "count": 1,
+          "name": "Soul-Guide Lantern"
+        },
+        {
+          "count": 4,
+          "name": "Sowing Mycospawn"
+        },
+        {
+          "count": 1,
+          "name": "Springleaf Drum"
+        },
+        {
+          "count": 1,
+          "name": "Stomping Ground"
+        },
+        {
+          "count": 2,
+          "name": "Unholy Heat"
+        },
+        {
+          "count": 4,
+          "name": "Urza's Saga"
+        },
+        {
+          "count": 1,
+          "name": "Verdant Catacombs"
+        },
+        {
+          "count": 2,
+          "name": "Vexing Bauble"
+        },
+        {
+          "count": 1,
+          "name": "Wooded Foothills"
+        },
+        {
+          "count": 2,
+          "name": "Writhing Chrysalis"
+        },
+        {
+          "count": 1,
+          "name": "Pithing Needle"
+        }
+      ],
+      "sideboard": [
+        {
+          "count": 1,
+          "name": "Ghost Quarter"
+        },
+        {
+          "count": 1,
+          "name": "Grafdigger's Cage"
+        },
+        {
+          "count": 1,
+          "name": "Kozilek's Return"
+        },
+        {
+          "count": 2,
+          "name": "Nature's Claim"
+        },
+        {
+          "count": 1,
+          "name": "Pyroclasm"
+        },
+        {
+          "count": 1,
+          "name": "Soulless Jailer"
+        },
+        {
+          "count": 2,
+          "name": "Thief of Existence"
+        },
+        {
+          "count": 2,
+          "name": "Unholy Heat"
+        },
+        {
+          "count": 2,
+          "name": "Warping Wail"
+        },
+        {
+          "count": 1,
+          "name": "Wrenn and Six"
+        },
+        {
+          "count": 1,
+          "name": "Vexing Bauble"
+        }
+      ]
+    },
+    {
       "name": "Izzet Prowess",
       "author": "MTGGoldfish",
       "colors": [
@@ -564,173 +731,6 @@
         {
           "count": 2,
           "name": "Wrath of the Skies"
-        }
-      ]
-    },
-    {
-      "name": "Eldrazi",
-      "author": "MTGGoldfish",
-      "colors": [
-        "G",
-        "R"
-      ],
-      "tags": [
-        "metagame"
-      ],
-      "main": [
-        {
-          "count": 4,
-          "name": "Ancient Stirrings"
-        },
-        {
-          "count": 4,
-          "name": "Basking Broodscale"
-        },
-        {
-          "count": 3,
-          "name": "Blade of the Bloodchief"
-        },
-        {
-          "count": 1,
-          "name": "Boseiju, Who Endures"
-        },
-        {
-          "count": 2,
-          "name": "Cavern of Souls"
-        },
-        {
-          "count": 1,
-          "name": "Commercial District"
-        },
-        {
-          "count": 4,
-          "name": "Eldrazi Temple"
-        },
-        {
-          "count": 3,
-          "name": "Emrakul, the Promised End"
-        },
-        {
-          "count": 2,
-          "name": "Forest"
-        },
-        {
-          "count": 1,
-          "name": "Gemstone Caverns"
-        },
-        {
-          "count": 1,
-          "name": "Glaring Fleshraker"
-        },
-        {
-          "count": 4,
-          "name": "Grove of the Burnwillows"
-        },
-        {
-          "count": 1,
-          "name": "Haywire Mite"
-        },
-        {
-          "count": 4,
-          "name": "Kozilek's Command"
-        },
-        {
-          "count": 4,
-          "name": "Malevolent Rumble"
-        },
-        {
-          "count": 1,
-          "name": "Misty Rainforest"
-        },
-        {
-          "count": 1,
-          "name": "Soul-Guide Lantern"
-        },
-        {
-          "count": 4,
-          "name": "Sowing Mycospawn"
-        },
-        {
-          "count": 1,
-          "name": "Springleaf Drum"
-        },
-        {
-          "count": 1,
-          "name": "Stomping Ground"
-        },
-        {
-          "count": 2,
-          "name": "Unholy Heat"
-        },
-        {
-          "count": 4,
-          "name": "Urza's Saga"
-        },
-        {
-          "count": 1,
-          "name": "Verdant Catacombs"
-        },
-        {
-          "count": 2,
-          "name": "Vexing Bauble"
-        },
-        {
-          "count": 1,
-          "name": "Wooded Foothills"
-        },
-        {
-          "count": 2,
-          "name": "Writhing Chrysalis"
-        },
-        {
-          "count": 1,
-          "name": "Pithing Needle"
-        }
-      ],
-      "sideboard": [
-        {
-          "count": 1,
-          "name": "Ghost Quarter"
-        },
-        {
-          "count": 1,
-          "name": "Grafdigger's Cage"
-        },
-        {
-          "count": 1,
-          "name": "Kozilek's Return"
-        },
-        {
-          "count": 2,
-          "name": "Nature's Claim"
-        },
-        {
-          "count": 1,
-          "name": "Pyroclasm"
-        },
-        {
-          "count": 1,
-          "name": "Soulless Jailer"
-        },
-        {
-          "count": 2,
-          "name": "Thief of Existence"
-        },
-        {
-          "count": 2,
-          "name": "Unholy Heat"
-        },
-        {
-          "count": 2,
-          "name": "Warping Wail"
-        },
-        {
-          "count": 1,
-          "name": "Wrenn and Six"
-        },
-        {
-          "count": 1,
-          "name": "Vexing Bauble"
         }
       ]
     },
@@ -1342,103 +1342,116 @@
       ]
     },
     {
-      "name": "Neobrand",
+      "name": "Ruby Storm",
       "author": "MTGGoldfish",
       "colors": [
+        "R",
         "G",
-        "U"
+        "W"
       ],
       "tags": [
         "metagame"
       ],
       "main": [
         {
-          "count": 4,
-          "name": "Neoform"
-        },
-        {
-          "count": 4,
-          "name": "Planar Genesis"
-        },
-        {
-          "count": 4,
-          "name": "Eldritch Evolution"
+          "count": 1,
+          "name": "Mountain"
         },
         {
           "count": 2,
-          "name": "Generous Ent"
+          "name": "Artist's Talent"
         },
         {
-          "count": 2,
-          "name": "Forest"
+          "count": 4,
+          "name": "Desperate Ritual"
         },
         {
           "count": 1,
-          "name": "Griselbrand"
+          "name": "Commercial District"
         },
         {
           "count": 1,
-          "name": "Preordain"
-        },
-        {
-          "count": 4,
-          "name": "Misty Rainforest"
-        },
-        {
-          "count": 3,
-          "name": "Hedge Maze"
-        },
-        {
-          "count": 4,
-          "name": "Allosaurus Rider"
+          "name": "Stomping Ground"
         },
         {
           "count": 2,
+          "name": "Arid Mesa"
+        },
+        {
+          "count": 1,
+          "name": "Gemstone Caverns"
+        },
+        {
+          "count": 1,
+          "name": "Strike It Rich"
+        },
+        {
+          "count": 4,
+          "name": "Hex Magic"
+        },
+        {
+          "count": 1,
+          "name": "Sacred Foundry"
+        },
+        {
+          "count": 1,
+          "name": "Mountain"
+        },
+        {
+          "count": 1,
           "name": "Scalding Tarn"
         },
         {
-          "count": 1,
-          "name": "Breeding Pool"
+          "count": 4,
+          "name": "Pyretic Ritual"
         },
         {
           "count": 4,
-          "name": "Consign to Memory"
+          "name": "Ral, Monsoon Mage"
         },
         {
-          "count": 1,
-          "name": "Island"
+          "count": 4,
+          "name": "Reckless Impulse"
         },
         {
-          "count": 1,
-          "name": "Hooting Mandrills"
+          "count": 4,
+          "name": "Ruby Medallion"
         },
         {
-          "count": 1,
-          "name": "Verdant Catacombs"
-        },
-        {
-          "count": 1,
-          "name": "Xenagos, God of Revels"
+          "count": 3,
+          "name": "Past in Flames"
         },
         {
           "count": 2,
-          "name": "Disciple of Freyalise"
-        },
-        {
-          "count": 2,
-          "name": "Veil of Summer"
-        },
-        {
-          "count": 2,
-          "name": "Ghalta, Stampede Tyrant"
-        },
-        {
-          "count": 2,
-          "name": "Nature's Claim"
+          "name": "Wooded Foothills"
         },
         {
           "count": 1,
-          "name": "Ureni, the Song Unending"
+          "name": "Sunbaked Canyon"
+        },
+        {
+          "count": 2,
+          "name": "Valakut Awakening"
+        },
+        {
+          "count": 2,
+          "name": "Wish"
+        },
+        {
+          "count": 4,
+          "name": "Wrenn's Resolve"
+        },
+        {
+          "count": 1,
+          "name": "Mountain"
+        },
+        {
+          "count": 1,
+          "name": "Mountain"
+        },
+        {
+          "count": 1,
+          "name": "Elegant Parlor"
         },
         {
           "count": 1,
@@ -1446,65 +1459,49 @@
         },
         {
           "count": 4,
-          "name": "Summoner's Pact"
+          "name": "Manamorphose"
         },
         {
-          "count": 3,
-          "name": "Pact of Negation"
-        },
-        {
-          "count": 1,
-          "name": "Bridgeworks Battle"
-        },
-        {
-          "count": 1,
-          "name": "Endurance"
-        },
-        {
-          "count": 1,
-          "name": "Atraxa, Grand Unifier"
+          "count": 2,
+          "name": "Bloodstained Mire"
         }
       ],
       "sideboard": [
         {
           "count": 1,
-          "name": "Elesh Norn, Grand Cenobite"
+          "name": "Stormscale Scion"
         },
         {
           "count": 1,
-          "name": "Nature's Claim"
+          "name": "Grapeshot"
         },
         {
           "count": 1,
-          "name": "Abhorrent Oculus"
+          "name": "Past in Flames"
         },
         {
-          "count": 4,
-          "name": "Mystical Dispute"
-        },
-        {
-          "count": 1,
-          "name": "Hooting Mandrills"
+          "count": 3,
+          "name": "Prismatic Ending"
         },
         {
           "count": 1,
-          "name": "Into the Flood Maw"
+          "name": "Wear // Tear"
         },
         {
           "count": 2,
-          "name": "Thundertrap Trainer"
+          "name": "Brotherhood's End"
         },
         {
           "count": 2,
-          "name": "Veil of Summer"
+          "name": "Untimely Malfunction"
+        },
+        {
+          "count": 3,
+          "name": "Silence"
         },
         {
           "count": 1,
-          "name": "Pact of Negation"
-        },
-        {
-          "count": 1,
-          "name": "Natural State"
+          "name": "Boseiju, Who Endures"
         }
       ]
     }
