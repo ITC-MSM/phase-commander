@@ -3010,10 +3010,16 @@ pub(crate) fn parse_optional_period_and_end(input: &str) -> Option<()> {
 ///
 /// The CR 611.2b "for as long as you control ~" duration is NOT encoded here:
 /// the clause shell peels that trailing duration onto the sub-ability frame
-/// (`Duration::UntilHostLeavesPlay`), and the `AddTargetReplacement` install
+/// (`Duration::WhileControllingHost`), and the `AddTargetReplacement` install
 /// chokepoint translates it into a `ControllerControlsSource` gate stamped with
 /// the real originating source/controller. A bare "can't become untapped" with
 /// no duration installs the permanent prohibition (no gate).
+///
+/// The two NON-control host wordings peel here just as readily
+/// (`WhileHostOnBattlefield`, `UntilHostLeavesPlay`), and that chokepoint
+/// REFUSES both: they survive a control change the gate would end them on, so
+/// the line is demoted to `Effect::Unimplemented` at
+/// `parser::oracle::demote_unenforceable_replacement_lifetimes`.
 fn try_parse_cant_become_untapped_target_rider(lower: &str) -> Option<Effect> {
     let (rest, _) = alt((
         tag::<_, _, OracleError<'_>>("that creature"),
@@ -5574,6 +5580,8 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
                         granted_to: None,
                         resolution_cleanup: None,
                         duration: None,
+                        // CR 611.2a: no duration, so no host to bind to.
+                        source_id: None,
                         graveyard_replacement: None,
                         enters_with_counter: None,
                         enters_with_modifications: Vec::new(),
@@ -17012,8 +17020,22 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
     // (`parse_each_of_target_distribution`), so it is the primary authority for
     // the DealDamage fixup below.
     let pending_damage_multi_target = ctx.pending_damage_multi_target.take();
+    // CR 611.2a: route the stripped trailing duration through the shared
+    // `with_clause_duration` building block instead of assigning `clause.duration`
+    // alone. The effects `with_clause_duration` patches (`CastFromZone`,
+    // `GenericEffect`, `GrantCastingPermission`, `BecomeCopy`) carry the
+    // permission's lifetime INSIDE the effect — `record_lingering_permissions`
+    // and the
+    // `is_lingering_cast_from_zone` optionality gate both read
+    // `Effect::CastFromZone.duration`, never the outer `AbilityDefinition`. A bare
+    // outer assignment left the effect's own slot empty, so a lasting play
+    // permission ("you may play that card for as long as you control ~") was
+    // classified as a one-shot resolution offer and its "may" became an
+    // `OptionalEffectChoice` whose decline destroyed the grant.
     if clause.duration.is_none() {
-        clause.duration = duration;
+        if let Some(duration) = duration {
+            clause = with_clause_duration(clause, duration);
+        }
     }
     // CR 611.2a: A during-resolution cast happens AS the ability resolves and
     // cannot carry a lingering play-window duration. When the anaphor branch set
@@ -32256,8 +32278,9 @@ pub(crate) fn parse_effect_chain_ir(
     let (text, chain_rounding) = strip_trailing_rounding_annotation(&text);
     let text = text.as_str();
     // CR 611.2b + CR 611.2a: A leading "For as long as <condition>," prefix that
-    // resolves to UntilHostLeavesPlay (either "you control ~" or "~ remains on the
-    // battlefield") scopes the ENTIRE following comma body, not just its first
+    // resolves to a host lifetime — `WhileControllingHost` from "you control ~",
+    // `WhileHostOnBattlefield` from "~ remains on the battlefield", both answered by
+    // `Duration::ends_when_host_leaves_play` — scopes the ENTIRE following comma body, not just its first
     // clause. When that body is HETEROGENEOUS — its first clause is a distinct effect
     // (e.g. "gain control of that permanent") the single-clause arm cannot merge with
     // the trailing static/restriction riders — starts_prefix_clause ("for as long as")
@@ -32267,13 +32290,13 @@ pub(crate) fn parse_effect_chain_ir(
     // duration is restamped onto every clause after the chunk loop.
     //
     // Gate is deliberately narrow (only Opportunistic Dragon fires across the full
-    // dataset): RESTRICTED to UntilHostLeavesPlay (excludes "until end of turn"
+    // dataset): RESTRICTED to the host lifetimes (excludes "until end of turn"
     // animations, which the single-clause arm MERGES into one GenericEffect) AND to
     // bodies whose first chunk is neither GenericEffect (homogeneous continuous-mod /
     // animate merge — Kitesail) nor GrantCastingPermission (play/mana permission merge
     // — Kotose), the two classes the single-clause arm merges across commas.
     let leading_host_lifetime_split = strip_leading_duration(text).and_then(|(dur, body)| {
-        if !matches!(dur, Duration::UntilHostLeavesPlay) {
+        if !dur.ends_when_host_leaves_play() {
             return None;
         }
         let body_chunks = split_clause_sequence(body);
