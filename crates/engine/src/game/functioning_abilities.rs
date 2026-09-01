@@ -16,9 +16,13 @@
 //! # Zone scope asymmetry
 //!
 //! - **Statics**: the full CR 113.6 zone-of-function gate lives in the shared
-//!   `static_functions_in_zone` predicate (empty `active_zones` defaults to
-//!   battlefield-only; a non-empty `active_zones` restricts to exactly the
-//!   listed zones; command-zone objects use the emblem-or-opt-in gate). Six
+//!   `static_functions_in_zone` predicate, which is a three-way split: a
+//!   characteristic-defining ability (`characteristic_defining`) functions in
+//!   all zones unconditionally per CR 604.3, independent of `active_zones`;
+//!   otherwise a non-empty `active_zones` restricts a static to exactly the
+//!   listed zones (an opt-in off-zone static, e.g. a cost reducer); otherwise
+//!   empty `active_zones` defaults to battlefield-only. Command-zone objects
+//!   use the emblem-or-opt-in gate for the latter two cases. Six
 //!   gathers delegate to it — `active_static_definitions` (which also layers
 //!   CR 113.6g's stack exception for self-referential
 //!   `CantBeCountered`/`CantBeCopied` on top, plus the CR 604.1 / CR 613.1
@@ -182,11 +186,26 @@ pub fn is_self_referential_prohibition(def: &StaticDefinition) -> bool {
 /// CR 113.6 + CR 113.6b + CR 114.3 / CR 114.4: Single-authority zone-of-
 /// function gate for a static definition, EXCLUDING the CR 113.6g
 /// self-referential `CantBeCountered`/`CantBeCopied` exception (the caller
-/// applies that first). Command-zone objects use the emblem-or-opt-in gate;
-/// every other zone uses the CR 113.6 default — empty `active_zones`
-/// restricts the static to the battlefield, non-empty restricts it to
-/// exactly the listed zones. Shared by the statics gathers that delegate to
-/// this predicate, including `layers::active_continuous_effects_from_static_definitions`'s
+/// applies that first). This is a three-way split, not two:
+///
+/// 1. **CDA** (`def.characteristic_defining`) — CR 604.3: "Characteristic-
+///    defining abilities function in all zones." This is unconditional and
+///    does not depend on `active_zones` being populated; a CDA's "all zones"
+///    behavior IS the CDA contract (CR 604.3a), so a bare CDA (P/T-setting,
+///    color-setting, etc. with empty `active_zones`) still functions off the
+///    battlefield, in the command zone, etc. Checked first so it short-
+///    circuits both other cases below.
+/// 2. **Opt-in off-zone static** (non-empty `active_zones`, no CDA flag) —
+///    e.g. a cost-reduction static that explicitly lists `[Hand, Stack, ...]`
+///    (Gwaihir the Windlord). Restricted to exactly the listed zones.
+/// 3. **Plain static** (empty `active_zones`, no CDA flag) — CR 113.6
+///    default: battlefield-only.
+///
+/// Command-zone objects route through the emblem-or-opt-in gate for cases 2
+/// and 3; case 1 (CDA) bypasses that gate entirely per CR 604.3's "in all
+/// zones" text having no command-zone carve-out. Shared by the statics
+/// gathers that delegate to this predicate, including
+/// `layers::active_continuous_effects_from_static_definitions`'s
 /// `StaticZoneAdmission::LiveSource` path (issue #8158); its
 /// `PreFilteredBaseStatic` path remains the documented exception because its
 /// caller already pre-filtered by zone (see the module doc above).
@@ -196,6 +215,18 @@ pub(crate) fn static_functions_in_zone(obj: &GameObject, def: &StaticDefinition)
     // half is unlocked (single authority: `room::door_text_functions`).
     if !crate::game::room::door_text_functions(obj, def.room_door) {
         return false;
+    }
+    // CR 604.3: a characteristic-defining ability functions in all zones,
+    // regardless of whether `active_zones` was ever populated for it — the
+    // "all zones" behavior is intrinsic to being a CDA, not an opt-in list a
+    // CDA needs to separately declare. This must be checked before the empty-
+    // `active_zones`-means-battlefield-only default below, or a CDA visited
+    // off-battlefield only because a SIBLING definition on the same source
+    // opts into that zone (e.g. Gwaihir the Windlord's cost reducer) would be
+    // wrongly rejected alongside that sibling instead of admitted on its own
+    // CR 604.3 authority.
+    if def.characteristic_defining {
+        return true;
     }
     match obj.zone {
         Zone::Command => obj.is_emblem || non_emblem_command_zone_static_functions(obj, def),
@@ -751,6 +782,64 @@ mod tests {
         let mut obj = make_obj(1, Zone::Graveyard);
         obj.static_definitions = vec![StaticDefinition::new(StaticMode::Continuous)].into();
         assert_eq!(active_static_definitions(&state, &obj).count(), 0);
+    }
+
+    /// CR 604.3: PR #8229 review (HIGH finding) building-block coverage.
+    /// `static_functions_in_zone` is a three-way split, not two: a
+    /// characteristic-defining ability (CDA) functions in every zone
+    /// unconditionally, regardless of `active_zones` being empty — the exact
+    /// opposite of the plain-static case immediately above, which shares the
+    /// same empty `active_zones` but is correctly rejected off-battlefield.
+    /// Distinguishing these two is the whole point of the
+    /// `characteristic_defining` flag on `static_functions_in_zone`; without
+    /// it, a CDA and an ordinary printed static with no explicit zone opt-in
+    /// are indistinguishable to the zone gate.
+    #[test]
+    fn cda_with_empty_active_zones_functions_in_every_zone() {
+        let state = new_state();
+        let cda_def = StaticDefinition::new(StaticMode::Continuous)
+            .affected(TargetFilter::SelfRef)
+            .cda();
+        for zone in [
+            Zone::Battlefield,
+            Zone::Hand,
+            Zone::Graveyard,
+            Zone::Exile,
+            Zone::Library,
+            Zone::Stack,
+        ] {
+            let mut obj = make_obj(1, zone);
+            obj.static_definitions = vec![cda_def.clone()].into();
+            assert_eq!(
+                active_static_definitions(&state, &obj).count(),
+                1,
+                "a CDA with empty active_zones must function from {zone:?} \
+                 per CR 604.3, unlike a plain static with the same empty \
+                 active_zones list"
+            );
+        }
+    }
+
+    /// CR 604.3 + CR 114.4: a CDA functions in the command zone too — CR
+    /// 604.3's "function in all zones" carries no command-zone carve-out, so
+    /// a CDA on a non-emblem command-zone object (e.g. an unusual commander
+    /// shape) is NOT subject to the emblem-or-opt-in gate that ordinary
+    /// command-zone statics need.
+    #[test]
+    fn cda_functions_in_command_zone_without_emblem_or_opt_in() {
+        let state = new_state();
+        let mut obj = make_obj(1, Zone::Command);
+        obj.is_emblem = false;
+        obj.static_definitions = vec![StaticDefinition::new(StaticMode::Continuous)
+            .affected(TargetFilter::SelfRef)
+            .cda()]
+        .into();
+        assert_eq!(
+            active_static_definitions(&state, &obj).count(),
+            1,
+            "a CDA must function in the command zone even on a non-emblem \
+             object with no active_zones opt-in"
+        );
     }
 
     /// CR 113.6g: A self-referential `CantBeCountered` (Carnage Tyrant's "This

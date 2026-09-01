@@ -5958,13 +5958,17 @@ fn for_each_static_effect_source(
         }
     }
 
-    // CR 113.6 + CR 113.6b: Statics that opt into non-battlefield functional
-    // zones (Incarnation cycle — Anger/Filth/Brawn/Wonder/Valor — "as long as
-    // this card is in your graveyard, ...") must be collected from wherever the
-    // source currently lives. `active_continuous_effects_from_static_definitions`
-    // applies the zone-of-function gate per-static, so scanning every object
-    // outside the battlefield / command-zone passes already covered above is
-    // safe: battlefield-default statics filter themselves out.
+    // CR 113.6 + CR 113.6b + CR 604.3: Statics that opt into non-battlefield
+    // functional zones (Incarnation cycle — Anger/Filth/Brawn/Wonder/Valor —
+    // "as long as this card is in your graveyard, ...") must be collected
+    // from wherever the source currently lives, and so must characteristic-
+    // defining abilities (CDAs), which function in all zones by definition
+    // (CR 604.3) rather than through an opt-in `active_zones` list.
+    // `active_continuous_effects_from_static_definitions` applies the
+    // zone-of-function gate per-static (including the CDA all-zones rule via
+    // `static_functions_in_zone`), so scanning every object outside the
+    // battlefield / command-zone passes already covered above is safe:
+    // battlefield-default statics filter themselves out.
     for obj in state.objects.values() {
         // Battlefield objects were already processed above (phased-out gate
         // included). Command-zone sources (emblems, face-up conspiracies, and
@@ -5979,12 +5983,18 @@ fn for_each_static_effect_source(
             continue;
         }
         // Cheap pre-check: only scan objects that carry at least one
-        // opt-in-zone static. Avoids iterating libraries/hands full of
-        // ordinary cards on every layer recomputation.
+        // opt-in-zone static OR a characteristic-defining ability. Avoids
+        // iterating libraries/hands full of ordinary cards on every layer
+        // recomputation. A CDA (`characteristic_defining`) must be included
+        // here even though it typically carries an empty `active_zones` list
+        // (CR 604.3: CDAs function in all zones by definition, not by opt-in
+        // list) — otherwise a source whose ONLY static is a bare CDA would
+        // never even reach `active_continuous_effects_from_static_definitions`
+        // to have that CDA evaluated off-battlefield.
         if !obj
             .static_definitions
             .iter_all()
-            .any(|def| !def.active_zones.is_empty())
+            .any(|def| !def.active_zones.is_empty() || def.characteristic_defining)
         {
             continue;
         }
@@ -6071,7 +6081,16 @@ fn static_condition_has_source_zone_gate(condition: &StaticCondition) -> bool {
 ///   Command, Graveyard, Exile, Library]`) leaked every OTHER definition on
 ///   that same source too — including one with empty `active_zones` that
 ///   should default to battlefield-only, like "Other Birds you control have
-///   vigilance." (issue #8158).
+///   vigilance." (issue #8158). `static_functions_in_zone` itself resolves
+///   this as a three-way split, not two: a characteristic-defining ability
+///   (`characteristic_defining`) functions in all zones unconditionally per
+///   CR 604.3 — even though it too carries empty `active_zones` — while a
+///   plain empty-`active_zones` definition without the CDA flag stays
+///   battlefield-only, and a non-empty `active_zones` list is the explicit
+///   opt-in case. So a CDA visited only because a sibling definition on the
+///   same source opts into a non-battlefield zone is correctly admitted on
+///   its own CR 604.3 authority rather than rejected alongside the plain
+///   battlefield-only case.
 /// - `active_continuous_effects_from_base_static_source` hands it
 ///   `base_static_definitions` already screened by
 ///   `base_static_can_source_off_zone_keyword_query`, which intentionally
@@ -10648,6 +10667,102 @@ mod tests {
                  graveyard still functions from the graveyard"
             );
         }
+    }
+
+    /// CR 604.3 + CR 113.6 + CR 113.6b: PR #8229 review (HIGH finding).
+    /// `static_functions_in_zone` is a three-way split — CDA (all zones,
+    /// unconditional), opt-in off-zone (non-empty `active_zones`), and plain
+    /// (empty `active_zones`, battlefield-only) — not the two-way split the
+    /// original #8158 fix assumed. A CDA carries an empty `active_zones` list
+    /// (see `parser/oracle_static/cda.rs`'s constructors: `.cda()` never
+    /// pairs with `.active_zones(...)`), so without the `characteristic_defining`
+    /// check, `static_functions_in_zone` would apply the plain battlefield-only
+    /// default to it — rejecting a CDA exactly like an ordinary printed static,
+    /// which contradicts CR 604.3's unconditional "function in all zones."
+    ///
+    /// Mirrors `combat_assignment_rule_effects_respect_zone_of_function_active_zones`
+    /// immediately above, and Gwaihir the Windlord's own real shape: a Hand
+    /// source with TWO static definitions, one opt-in off-zone (so
+    /// `for_each_static_effect_source`'s off-zone candidate scan visits the
+    /// source at all) and one that must be independently zone-gated on its
+    /// OWN terms (there, a plain empty-`active_zones` grant that must stay
+    /// battlefield-only; here, a CDA with empty `active_zones` that must
+    /// function anyway). Exercises both fixed call sites directly:
+    /// `for_each_static_effect_source`'s pre-check (bullet 1) via the
+    /// `visited` probe, and `StaticZoneAdmission::LiveSource` (bullet 2) via
+    /// `active_continuous_effects_from_static_source`'s returned modifications.
+    #[test]
+    fn cda_admitted_off_battlefield_via_sibling_broad_zone_static() {
+        let mut state = setup();
+        let source_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Hand CDA Source".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&source_id).unwrap();
+            // Sibling opt-in off-zone static (mirrors Gwaihir's cost
+            // reducer): non-empty `active_zones` including Hand. Its mode
+            // and effect are irrelevant to this test — only its presence,
+            // which is what makes `for_each_static_effect_source`'s
+            // pre-check visit this Hand source at all.
+            let sibling = StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }])
+                .active_zones(vec![Zone::Hand]);
+            Arc::make_mut(&mut obj.base_static_definitions).push(sibling.clone());
+            obj.static_definitions.push(sibling);
+
+            // The CDA under test: empty `active_zones` (as every real CDA
+            // constructor emits — see `parser/oracle_static/cda.rs`),
+            // `characteristic_defining: true`.
+            let cda = StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::SetDynamicPower {
+                    value: QuantityExpr::Fixed { value: 3 },
+                }])
+                .cda();
+            Arc::make_mut(&mut obj.base_static_definitions).push(cda.clone());
+            obj.static_definitions.push(cda);
+        }
+        crate::types::game_state::StaticSourceIndex::rebuild_from_state(&mut state);
+
+        // Bullet 1: the off-zone candidate scan must visit this Hand source
+        // because of its sibling's non-empty `active_zones`, exactly as
+        // Gwaihir's cost reducer admits Gwaihir itself.
+        let mut visited = Vec::new();
+        for_each_static_effect_source(&state, |_state, obj| visited.push(obj.id));
+        assert!(
+            visited.contains(&source_id),
+            "the off-zone candidate scan must visit a Hand source that \
+             carries a sibling static with non-empty `active_zones`"
+        );
+
+        // Bullet 2: `StaticZoneAdmission::LiveSource` must admit the CDA
+        // definition specifically — not just visit the source. Before this
+        // fix, `static_functions_in_zone` rejected it under the plain
+        // empty-`active_zones` battlefield-only default.
+        let source_obj = state.objects.get(&source_id).unwrap();
+        let effects = active_continuous_effects_from_static_source(&state, source_obj);
+        assert!(
+            effects.iter().any(|e| {
+                e.characteristic_defining
+                    && matches!(
+                        e.modification,
+                        ContinuousModification::SetDynamicPower { .. }
+                    )
+            }),
+            "CR 604.3: a characteristic-defining ability functions in all \
+             zones — the CDA's `SetDynamicPower` modification must be \
+             admitted while its source sits in Hand, reached via its OWN \
+             CR 604.3 authority rather than rejected under the plain \
+             empty-`active_zones` battlefield-only default that correctly \
+             still applies to its non-CDA sibling shape"
+        );
     }
 
     /// Helper: creatures you control filter
