@@ -2476,6 +2476,20 @@ pub struct PendingContinuation {
     pub(crate) player_scope_queue_end: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// CR 608.2c + CR 616.1: Exact progress for an `ExileFromTopUntil` loop whose
+/// current library-to-exile event paused for a replacement choice.
+pub struct PendingExileFromTopUntil {
+    /// Card whose replacement-resolved destination must be classified on resume.
+    pub pending_card: ObjectId,
+    /// Original library snapshot after `pending_card`, in iteration order.
+    pub remaining: Vec<ObjectId>,
+    /// Current-resolution exile incarnations completed before the pause.
+    pub linked_batch: Vec<ObjectIncarnationRef>,
+    /// Cumulative property total completed before the pause.
+    pub cumulative: i32,
+}
+
 impl PendingContinuation {
     pub(crate) fn player_scope_queue_end(
         placeholder: Box<ResolvedAbility>,
@@ -18429,6 +18443,9 @@ declare_game_state! {
     /// box.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_discard_batch: Option<Box<PendingDiscardBatch>>,
+    /// CR 608.2c + CR 616.1: Progress for a replacement-suspended exile loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_exile_from_top_until: Option<Box<PendingExileFromTopUntil>>,
     /// CR 401.4: Remaining per-owner library-order batches for a mass
     /// `ChangeZoneAll` instruction paused on `EffectZoneChoice`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -23279,6 +23296,7 @@ impl GameState {
             pending_player_scope_sacrifice_choice: None,
             pending_player_scope_unless_payment: None,
             pending_discard_batch: None,
+            pending_exile_from_top_until: None,
             pending_mass_library_order_choice: None,
             pending_scoped_library_search: None,
             pending_library_search_delivery: None,
@@ -25425,6 +25443,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_player_scope_sacrifice_choice: _,
         pending_player_scope_unless_payment: _,
         pending_discard_batch: _,
+        pending_exile_from_top_until: _,
         pending_mass_library_order_choice: _,
         pending_scoped_library_search: _,
         pending_library_search_delivery: _,
@@ -25644,6 +25663,7 @@ impl PartialEq for GameState {
             && self.pending_player_scope_unless_payment
                 == other.pending_player_scope_unless_payment
             && self.pending_discard_batch == other.pending_discard_batch
+            && self.pending_exile_from_top_until == other.pending_exile_from_top_until
             && self.pending_combat_lifelink == other.pending_combat_lifelink
             && self.pending_mass_library_order_choice
                 == other.pending_mass_library_order_choice

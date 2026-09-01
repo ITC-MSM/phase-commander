@@ -9141,7 +9141,7 @@ fn publish_player_scope_clause_results(
 
 /// CR 400.7 + CR 608.2f: capture only current incarnations exiled by this
 /// completed slice of a multi-player instruction, preserving event order.
-fn linked_exile_batch_from_events(
+pub(super) fn linked_exile_batch_from_events(
     state: &GameState,
     source_id: ObjectId,
     events: &[GameEvent],
@@ -9181,7 +9181,6 @@ fn extend_linked_exile_batch(
         }
     }
 }
-
 fn linked_exile_producer_barrier(ability: &ResolvedAbility) -> bool {
     this_way_cause_for_effect(&ability.effect) == Some(ThisWayCause::Exiled)
         || matches!(
@@ -9203,10 +9202,13 @@ fn linked_exile_producer_barrier(ability: &ResolvedAbility) -> bool {
 /// CR 608.2f: append one completed seat's exact exile batch to the single
 /// resolution window after a synthesized APNAP continuation. Independent exile
 /// producers remain barriers; only player-scope siblings may be crossed.
-fn bind_resolution_exile_batch_paths(
+pub(super) fn bind_resolution_exile_batch_paths(
     ability: &mut ResolvedAbility,
     batch: &[ObjectIncarnationRef],
 ) {
+    if batch.is_empty() {
+        return;
+    }
     let eligible = matches!(
         &ability.effect,
         Effect::CastFromZone { target, driver: CastFromZoneDriver::ResolutionWindow { .. }, .. }
@@ -21289,7 +21291,6 @@ mod tests {
             vec![PlayerId(1), PlayerId(2)],
             vec![PlayerId(0), PlayerId(1), PlayerId(2), PlayerId(3)],
         ));
-
         let mut events = Vec::new();
         drain_pending_discard_batch(&mut state, &mut events).unwrap();
 

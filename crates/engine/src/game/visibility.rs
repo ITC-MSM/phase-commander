@@ -843,6 +843,10 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     // `EffectZoneChoice` is projected below; its execution-only successor
     // carrier must never be shipped to any viewer, including a future owner.
     filtered.pending_mass_library_order_choice = None;
+    // CR 400.2 + CR 616.1: the replacement-suspended exile iterator retains
+    // the exact remaining library order and current-resolution incarnation
+    // pins. The ReplacementChoice prompt is its complete public surface.
+    filtered.pending_exile_from_top_until = None;
     // CR 510.2 + CR 616.1: the parked combat-damage batch is server authority.
     // Its `batch_events` can carry rider-created `ZoneChanged` records and other
     // effect events that `filter_events_for_viewer` would redact in the live
@@ -6828,6 +6832,49 @@ mod tests {
             state.pending_discard_batch.is_some(),
             "filtering must not alter the authoritative server carrier"
         );
+    }
+
+    /// CR 400.2 + CR 616.1: an exile-until replacement continuation carries
+    /// hidden library order and is server-only for every viewer.
+    #[test]
+    fn parked_exile_from_top_until_is_absent_from_every_viewer_projection() {
+        let mut state = GameState::new_two_player(42);
+        let pending = create_object(
+            &mut state,
+            CardId(70_008),
+            PlayerId(0),
+            "Pending Secret".to_string(),
+            Zone::Library,
+        );
+        let remaining = create_object(
+            &mut state,
+            CardId(70_009),
+            PlayerId(0),
+            "Remaining Secret".to_string(),
+            Zone::Library,
+        );
+        state.pending_exile_from_top_until = Some(Box::new(
+            crate::types::game_state::PendingExileFromTopUntil {
+                pending_card: pending,
+                remaining: vec![remaining],
+                linked_batch: Vec::new(),
+                cumulative: 0,
+            },
+        ));
+        let authoritative = serde_json::to_string(&state.pending_exile_from_top_until)
+            .expect("authoritative continuation serializes");
+        assert!(authoritative.contains(&remaining.0.to_string()));
+
+        for viewer in [PlayerId(0), PlayerId(1)] {
+            let view = filter_state_for_viewer(&state, viewer);
+            assert!(view.pending_exile_from_top_until.is_none());
+            let wire = serde_json::to_string(&view).expect("filtered state serializes");
+            assert!(
+                !wire.contains("pendingExileFromTopUntil")
+                    && !wire.contains("pending_exile_from_top_until")
+            );
+        }
+        assert!(state.pending_exile_from_top_until.is_some());
     }
 
     /// CR 510.2 + CR 616.1: `pending_combat_lifelink` is the parked
