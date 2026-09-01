@@ -3116,6 +3116,45 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
             && !effect_refs_parent_target(&sub.effect))
 }
 
+/// CR 608.2d (issue #8123 / PR #8259 review): whether `sub` opens a GENUINE
+/// fresh resolution-time object pool, as distinct from a Resolution-timed sub
+/// that is merely BOUND to an earlier instruction's referent through a
+/// non-`ParentTarget` durable channel (a tracked set, an exile link, ...).
+///
+/// This is deliberately NARROWER than `can_inherit_parent_targets` and is NOT
+/// a substitute for it: `can_inherit_parent_targets` answers "should the
+/// parent's ALREADY-CHOSEN targets overwrite this sub's own (empty)
+/// targets?", which correctly says yes for a `TrackedSetFiltered`/
+/// `ExiledBySource` continuation (its own resolution reads the tracked set,
+/// not `.targets`, so inheriting is harmless) — reusing it to answer the
+/// different question this predicate answers ("does propagating strip
+/// information the sub needs?") is exactly the defect PR #8259 review found:
+/// Beseech the Mirror's bargained cast and "put the exiled card into your
+/// hand if it wasn't cast this way" fallback both resolve
+/// `TargetFilter::TrackedSetFiltered { caused_by: Some(Exiled), .. }` —
+/// Resolution-timed and `!effect_refs_parent_target` exactly like Broken
+/// Bond's land-put — but stripping their inherited object target broke
+/// `optional_effect_is_infeasible`'s per-object `CastFromZone` probe (it fell
+/// through to a whole-ability dry run that treats "no eligible card" as a
+/// benign no-op instead of an infeasible optional), so the printed hand
+/// fallback never ran and the exiled card stranded in Exile.
+///
+/// `TargetFilter::Typed(_)` is the positive allowlist — the same shape the
+/// Heart-Shaped Herb fix (issue #8077, `if_you_do_object_anchor`) uses to
+/// distinguish a fresh resolution-time choice from an already-established
+/// referent: it is the only target shape that structurally introduces a NEW
+/// zone/type-filtered candidate set at the sub's own resolution, whereas
+/// `ParentTarget`, `TrackedSet`/`TrackedSetFiltered`, `ExiledBySource`,
+/// `SelfRef`, etc. all name a referent some earlier instruction already
+/// bound. Broken Bond's "put a land card from your hand onto the
+/// battlefield" (`ChangeZone { target: Typed(Land ∧ InZone(Hand)), .. }`)
+/// matches; Beseech's tracked-set-bound cast and fallback do not.
+fn sub_has_independent_typed_resolution_choice(sub: &ResolvedAbility) -> bool {
+    sub.target_choice_timing == TargetChoiceTiming::Resolution
+        && !effect_refs_parent_target(&sub.effect)
+        && matches!(sub.effect.target_filter(), Some(TargetFilter::Typed(_)))
+}
+
 /// CR 701.3a + CR 303.4f: `forward_result` ChangeZone nesting Attach→ParentTarget
 /// carries the parent's chosen host (not a fresh Resolution-time object pick).
 fn change_zone_forwards_chosen_attach_host(sub: &ResolvedAbility) -> bool {
@@ -13952,10 +13991,41 @@ fn resolve_chain_body(
             // so `change_zone::resolve` saw a non-empty (and wrong-zone)
             // target list, skipped its resolution-time hand scan entirely,
             // and silently moved nothing — no `EffectZoneChoice` prompt, no
-            // land onto the battlefield. `can_inherit_parent_targets` is the
-            // single authority for this exact axis (Kathril, Aspect Warper,
-            // issue #6321 / PR #6533); reuse it here instead of leaving this
-            // arm blind to `target_choice_timing`.
+            // land onto the battlefield.
+            //
+            // NOT `!can_inherit_parent_targets(sub)` (reverted after PR #8259
+            // review): that predicate's `timing != Resolution` disjunct is
+            // rescued by `effect_refs_parent_target`, but has no rescue for a
+            // Resolution-timed sub that is bound through a DIFFERENT durable
+            // channel than `ParentTarget` — Beseech the Mirror's "put the
+            // exiled card into your hand if it wasn't cast this way" fallback
+            // (and its sibling bargained cast) resolve
+            // `Effect::CastFromZone`/`Effect::ChangeZoneAll` against
+            // `TargetFilter::TrackedSetFiltered { caused_by: Some(Exiled), .. }`
+            // — Resolution-timed and `!effect_refs_parent_target` exactly like
+            // Broken Bond's land-put, but a BOUND continuation over the same
+            // exiled card, not a fresh choice. The broad predicate stripped
+            // the exiled card's object target off Beseech's cast node, which
+            // made `optional_effect_is_infeasible`'s per-object `CastFromZone`
+            // probe fall through to its empty-bound-set whole-ability dry run
+            // — a land or mana-value-constrained "no eligible card" resolves
+            // there as a benign no-op instead of an infeasible optional, so
+            // the printed hand fallback never ran and the card stranded in
+            // Exile (`beseech_bargained_land_skips_cast_offer_and_runs_hand_fallback`,
+            // `beseech_bargained_mana_value_five_skips_cast_offer_and_runs_hand_fallback`).
+            //
+            // `TargetFilter::Typed(_)` is the precise, positive signal instead
+            // — the same allowlist shape the Heart-Shaped Herb fix (issue
+            // #8077, `if_you_do_object_anchor`) uses to tell a fresh
+            // resolution-time pool apart from an already-established
+            // referent: `Typed` is the only target shape that structurally
+            // introduces a NEW candidate set (a zone/type-filtered scan) at
+            // this sub's own resolution, whereas `ParentTarget`,
+            // `TrackedSet`/`TrackedSetFiltered`, `ExiledBySource`, `SelfRef`,
+            // etc. all name a referent some earlier instruction already
+            // bound. Broken Bond's land-put
+            // (`ChangeZone { target: Typed(Land ∧ InZone(Hand)), .. }`)
+            // matches; Beseech's tracked-set-bound cast and fallback do not.
             let has_independent_target_slot =
                 (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
                     && !effect_refs_parent_target(&sub.effect)
@@ -13965,7 +14035,7 @@ fn resolve_chain_body(
                         .target_filter()
                         .is_some_and(TargetFilter::references_exiled_by_source)
                         && !effect_refs_parent_target(&sub.effect))
-                    || !can_inherit_parent_targets(sub);
+                    || sub_has_independent_typed_resolution_choice(sub);
             sub_with_targets.targets = ability
                 .targets
                 .iter()
