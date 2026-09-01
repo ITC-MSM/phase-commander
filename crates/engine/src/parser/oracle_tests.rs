@@ -13235,7 +13235,7 @@ fn heart_shaped_herb_activated_ability_grants_monarch_as_continuation() {
 fn optional_artifact_sacrifice_keeps_counter_recipient_on_source() {
     let def = parse_effect_chain(
         "You may sacrifice another artifact. If you do, put two +1/+1 counters on this creature and it assembles a Contraption.",
-        AbilityKind::Triggered,
+        AbilityKind::Spell,
     );
 
     assert!(
@@ -13268,7 +13268,7 @@ fn optional_artifact_sacrifice_keeps_counter_recipient_on_source() {
 fn optional_blood_sacrifice_keeps_bare_pronoun_on_source() {
     let def = parse_effect_chain(
         "You may sacrifice a Blood token. If you do, it gets +2/+2 until end of turn.",
-        AbilityKind::Triggered,
+        AbilityKind::Spell,
     );
 
     assert!(
