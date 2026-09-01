@@ -84,6 +84,49 @@ jobs:
           grep -q 'kind: PodMonitor' /tmp/scaleout-render.yaml
           grep -q 'kind: ServiceMonitor' /tmp/scaleout-render.yaml
 
+      # Compression must stay on ordinary HTTP routes but off WebSocket
+      # upgrades in both chart shapes. Assert the rendered route documents,
+      # not just the templates, so middleware wiring regressions fail CI.
+      - name: assert the compression routing boundary
+        run: |
+          extract_doc() {
+            awk -v kind="$1" -v name="$2" '
+              BEGIN { RS = "---"; ORS = "" }
+              $0 ~ "kind: " kind "\\n" && $0 ~ "metadata:\\n  name: " name "\\n" { print }
+            ' "$3"
+          }
+
+          extract_doc Ingress phase-server /tmp/default.yaml > /tmp/default-health.yaml
+          extract_doc Ingress phase-server-ws /tmp/default.yaml > /tmp/default-ws.yaml
+          extract_doc Ingress phase-server-backup /tmp/default.yaml > /tmp/default-backup.yaml
+          test -s /tmp/default-health.yaml
+          test -s /tmp/default-ws.yaml
+          test -s /tmp/default-backup.yaml
+          grep -q 'path: /health' /tmp/default-health.yaml
+          grep -q -- '-compress@kubernetescrd' /tmp/default-health.yaml
+          grep -q 'path: /p2p-draft-backup' /tmp/default-backup.yaml
+          grep -q -- '-compress@kubernetescrd' /tmp/default-backup.yaml
+          grep -q 'path: /ws' /tmp/default-ws.yaml
+          if grep -q -- '-compress@kubernetescrd' /tmp/default-ws.yaml; then
+            echo 'WebSocket Ingress unexpectedly carries compression'; exit 1
+          fi
+
+          assert_ingressroute_pair() {
+            extract_doc IngressRoute "$1" /tmp/scaleout-render.yaml > "$2"
+            test -s "$2"
+            awk '/^    - kind: Rule/{route++} route == 1' "$2" > "$2-ws"
+            awk '/^    - kind: Rule/{route++} route == 2' "$2" > "$2-http"
+            grep -q 'PathPrefix(`/ws`)' "$2-ws"
+            if grep -q 'name: phase-server-compress' "$2-ws"; then
+              echo "$1 WebSocket route unexpectedly carries compression"; exit 1
+            fi
+            grep -q 'name: phase-server-compress' "$2-http"
+          }
+
+          # Entry route plus a representative ordinal route.
+          assert_ingressroute_pair phase-server /tmp/scaleout-entry.yaml
+          assert_ingressroute_pair phase-server-0 /tmp/scaleout-ordinal.yaml
+
       # With no prometheus-operator CRDs the operator path must FAIL rather than
       # render: hpa.yaml would otherwise install an HPA whose only producer of
       # `phase:wanted_replicas` — the PrometheusRule — was silently skipped.
