@@ -3149,6 +3149,15 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
 /// bound. Broken Bond's "put a land card from your hand onto the
 /// battlefield" (`ChangeZone { target: Typed(Land ∧ InZone(Hand)), .. }`)
 /// matches; Beseech's tracked-set-bound cast and fallback do not.
+///
+/// Deliberately effect-agnostic (unlike a `ChangeZone`-only restriction): the
+/// same shape covers a hypothetical graveyard-origin resolution-time pick
+/// ("return a creature card from your graveyard to your hand") exactly as it
+/// covers Broken Bond's hand-origin one — the CR 608.2d question is "does
+/// this sub introduce a fresh typed pool," not "which zone or effect variant
+/// does it use." A `ChangeZone`-only, Hand/Library-only restriction would
+/// silently reproduce this exact bug for a same-shaped graveyard/exile
+/// variant of the class.
 fn sub_has_independent_typed_resolution_choice(sub: &ResolvedAbility) -> bool {
     sub.target_choice_timing == TargetChoiceTiming::Resolution
         && !effect_refs_parent_target(&sub.effect)
