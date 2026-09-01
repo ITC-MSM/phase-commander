@@ -15963,6 +15963,73 @@ mod tests {
     }
 
     #[test]
+    fn reflexive_typed_zone_change_resolves_inherited_parent_object() {
+        let mut state = GameState::new_two_player(42);
+        let target = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Chosen Creature".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&target)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let decoy = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Graveyard Decoy".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&decoy)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let child_definition = crate::parser::oracle_effect::parse_effect_chain(
+            "Return target creature card from your graveyard to the battlefield.",
+            AbilityKind::Spell,
+        );
+        let mut child = build_resolved_from_def(&child_definition, ObjectId(100), PlayerId(0));
+        child.target_choice_timing = crate::types::ability::TargetChoiceTiming::Resolution;
+        child.condition = Some(AbilityCondition::ZoneChangedThisWay {
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            destination: Some(Zone::Graveyard),
+        });
+
+        let parent_definition = crate::parser::oracle_effect::parse_effect_chain(
+            "Put target creature card from your hand into your graveyard.",
+            AbilityKind::Spell,
+        );
+        let mut parent = build_resolved_from_def(&parent_definition, ObjectId(100), PlayerId(0));
+        parent.targets = vec![TargetRef::Object(target)];
+        parent.sub_ability = Some(Box::new(child));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &parent, &mut events, 0)
+            .expect("the parent move and reflexive continuation must resolve");
+
+        assert_eq!(
+            state.objects[&target].zone,
+            Zone::Battlefield,
+            "the typed reflexive continuation must retain and return the parent's chosen object"
+        );
+        assert_eq!(state.objects[&decoy].zone, Zone::Graveyard);
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "the continuation is context-bound and must not open a fresh graveyard choice"
+        );
+    }
+
+    #[test]
     fn bound_attach_remainder_requires_exact_producer_provenance() {
         let state = GameState::new_two_player(42);
         let first = ObjectIncarnationRef::of(ObjectId(1), 0);
