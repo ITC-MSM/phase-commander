@@ -3096,13 +3096,15 @@ pub(crate) fn trigger_event_unreachable_in_phase(def: &TriggerDefinition, phase:
 /// that the SAME spell sacrificed before she was put back onto the
 /// battlefield).
 ///
-/// `battlefield_entry_index` maps each object to the LAST index in `events`
-/// at which `ZoneChanged { to: Battlefield }` fired for it. An object with no
-/// entry recorded was already on the battlefield before the batch began (the
-/// caller already restricts candidates to objects currently on the
+/// `battlefield_entry_index` maps each object to the observation boundary of
+/// its LAST `ZoneChanged { to: Battlefield }` in `events`. The boundary also
+/// includes contiguous same-object counter events published immediately before
+/// that entry record for "enters with counters" replacements. An object with
+/// no entry recorded was already on the battlefield before the batch began
+/// (the caller already restricts candidates to objects currently on the
 /// battlefield), so it is present for every event in the batch. An object
-/// that DID (re-)enter mid-batch is present only from that entry's index
-/// onward — CR 400.7 treats a permanent that changes zones as a new object
+/// that DID (re-)enter mid-batch is present only from that boundary onward —
+/// CR 400.7 treats a permanent that changes zones as a new object
 /// with no memory of its prior incarnation, so even an earlier temporary
 /// presence within the SAME batch (a blink-and-return) does not extend
 /// backward past the most recent entry. This subsumes the original
@@ -3117,6 +3119,43 @@ fn live_battlefield_source_was_present_at_event(
     battlefield_entry_index
         .get(&source_id)
         .is_none_or(|&entry_idx| event_idx >= entry_idx)
+}
+
+/// Return each entrant's observation boundary within a resolved event batch.
+///
+/// An "enters with counters" replacement is applied while the object enters,
+/// but token creation currently publishes those contiguous `CounterAdded`
+/// events immediately before its journaled `ZoneChanged` event. They are part
+/// of the entry lifetime, so the boundary includes that same-object counter
+/// prefix. It deliberately stops at the first different event, keeping an
+/// unrelated event that occurred before entry outside the observer's lifetime.
+fn battlefield_entry_observation_indices(
+    events: &[GameEvent],
+) -> std::collections::HashMap<ObjectId, usize> {
+    let mut boundaries = std::collections::HashMap::new();
+    for (entry_idx, event) in events.iter().enumerate() {
+        let GameEvent::ZoneChanged {
+            object_id,
+            to: Zone::Battlefield,
+            ..
+        } = event
+        else {
+            continue;
+        };
+
+        let mut boundary = entry_idx;
+        while boundary > 0
+            && matches!(
+                &events[boundary - 1],
+                GameEvent::CounterAdded { object_id: countered_id, .. }
+                    if countered_id == object_id
+            )
+        {
+            boundary -= 1;
+        }
+        boundaries.insert(*object_id, boundary);
+    }
+    boundaries
 }
 
 fn storm_copy_count_before_cast(state: &GameState) -> i32 {
@@ -4101,18 +4140,7 @@ fn collect_pending_triggers_with_collection(
     // otherwise a permanent returned to the battlefield later in the chain
     // retroactively "sees" a sacrifice/etc. that occurred earlier in the same
     // chain, before it was there to observe it (issue #8160).
-    let mut battlefield_entry_index: std::collections::HashMap<ObjectId, usize> =
-        std::collections::HashMap::new();
-    for (idx, ev) in events.iter().enumerate() {
-        if let GameEvent::ZoneChanged {
-            object_id,
-            to: Zone::Battlefield,
-            ..
-        } = ev
-        {
-            battlefield_entry_index.insert(*object_id, idx);
-        }
-    }
+    let battlefield_entry_index = battlefield_entry_observation_indices(events);
 
     for (event_idx, event) in events.iter().enumerate() {
         // CR 603.2 / CR 603.3: Per-event dedup. A single printed trigger definition
@@ -15616,6 +15644,48 @@ pub mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    #[test]
+    fn saga_entry_counter_is_inside_entry_boundary_but_prior_event_is_not() {
+        let saga = ObjectId(10);
+        let events = vec![
+            GameEvent::PermanentSacrificed {
+                object_id: ObjectId(9),
+                player_id: PlayerId(0),
+            },
+            GameEvent::CounterAdded {
+                object_id: saga,
+                counter_type: CounterType::Lore,
+                count: 1,
+                actor: PlayerId(0),
+            },
+            GameEvent::ZoneChanged {
+                object_id: saga,
+                from: None,
+                to: Zone::Battlefield,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    saga,
+                    None,
+                    Zone::Battlefield,
+                )),
+            },
+        ];
+        let boundaries = battlefield_entry_observation_indices(&events);
+
+        assert!(
+            !live_battlefield_source_was_present_at_event(0, saga, &boundaries),
+            "the entering Saga must not observe an unrelated pre-entry sacrifice"
+        );
+        assert!(
+            live_battlefield_source_was_present_at_event(1, saga, &boundaries),
+            "the Saga's intrinsic lore counter belongs to its entry lifetime"
+        );
+        assert!(live_battlefield_source_was_present_at_event(
+            2,
+            saga,
+            &boundaries
+        ));
     }
 
     #[test]
