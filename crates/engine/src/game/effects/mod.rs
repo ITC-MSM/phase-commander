@@ -3135,6 +3135,22 @@ fn has_resolution_owned_zone_choice(sub: &ResolvedAbility) -> bool {
         && !effect_refs_parent_target(&sub.effect)
 }
 
+/// Whether a child owns an object-selection slot independent of its parent's
+/// already-bound object. Reflexive continuations retain their context-owned
+/// referent even when their effect is a resolution-time typed zone choice.
+fn sub_has_independent_object_target_slot(sub: &ResolvedAbility) -> bool {
+    (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
+        && !effect_refs_parent_target(&sub.effect)
+        && !sub_ability_target_belongs_to_reflexive_context(sub))
+        || (sub
+            .effect
+            .target_filter()
+            .is_some_and(TargetFilter::references_exiled_by_source)
+            && !effect_refs_parent_target(&sub.effect))
+        || (has_resolution_owned_zone_choice(sub)
+            && !sub_ability_target_belongs_to_reflexive_context(sub))
+}
+
 /// CR 701.3a + CR 303.4f: `forward_result` ChangeZone nesting Attach→ParentTarget
 /// carries the parent's chosen host (not a fresh Resolution-time object pick).
 fn change_zone_forwards_chosen_attach_host(sub: &ResolvedAbility) -> bool {
@@ -14006,16 +14022,7 @@ fn resolve_chain_body(
             // bound. Broken Bond's land-put
             // (`ChangeZone { target: Typed(Land ∧ InZone(Hand)), .. }`)
             // matches; Beseech's tracked-set-bound cast and fallback do not.
-            let has_independent_target_slot =
-                (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
-                    && !effect_refs_parent_target(&sub.effect)
-                    && !sub_ability_target_belongs_to_reflexive_context(sub))
-                    || (sub
-                        .effect
-                        .target_filter()
-                        .is_some_and(TargetFilter::references_exiled_by_source)
-                        && !effect_refs_parent_target(&sub.effect))
-                    || has_resolution_owned_zone_choice(sub);
+            let has_independent_target_slot = sub_has_independent_object_target_slot(sub);
             sub_with_targets.targets = ability
                 .targets
                 .iter()
@@ -15928,6 +15935,31 @@ mod tests {
             PlayerId(0),
         )
         .condition(AbilityCondition::WhenYouDo)
+    }
+
+    #[test]
+    fn reflexive_typed_resolution_choice_keeps_parent_referent() {
+        let definition = crate::parser::oracle_effect::parse_effect_chain(
+            "Return target creature card from your graveyard to the battlefield.",
+            AbilityKind::Spell,
+        );
+        let mut child = build_resolved_from_def(&definition, ObjectId(100), PlayerId(0));
+        child.target_choice_timing = crate::types::ability::TargetChoiceTiming::Resolution;
+
+        assert!(
+            has_resolution_owned_zone_choice(&child),
+            "the typed graveyard move must reach the new zone-choice classifier"
+        );
+        assert!(
+            sub_has_independent_object_target_slot(&child),
+            "an ordinary resolution-owned zone choice must reject an unrelated parent object"
+        );
+
+        child.condition = Some(AbilityCondition::WhenYouDo);
+        assert!(
+            !sub_has_independent_object_target_slot(&child),
+            "a WhenYouDo continuation owns the inherited referent, so the dispatcher must retain it"
+        );
     }
 
     #[test]
