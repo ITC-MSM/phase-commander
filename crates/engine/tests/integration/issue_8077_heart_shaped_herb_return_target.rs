@@ -25,7 +25,7 @@
 //! plus that the monarch changes hands. Fails on pre-fix HEAD (Heart-Shaped
 //! Herb itself would come back with the counters instead).
 
-use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
@@ -52,18 +52,21 @@ fn plus1plus1_counters(state: &GameState, obj: ObjectId) -> u32 {
 }
 
 /// Board: Heart-Shaped Herb plus TWO creatures (Solemn Simulacrum and a
-/// second, unrelated creature) so the optional sacrifice's "which creature"
-/// choice is genuinely interactive — the returned object must be the one the
-/// player actually picked, not merely "the only eligible creature".
-fn board() -> Option<(GameRunner, ObjectId, ObjectId, ObjectId)> {
-    let db = load_db()?;
+/// P1-owned creature controlled by P0) so the optional sacrifice's "which
+/// creature" choice is genuinely interactive — the returned object must be
+/// the one the player actually picked, not merely "the only eligible creature".
+fn board() -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let db = load_db().expect("integration card fixture must load");
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
     let herb = scenario.add_real_card(P0, "Heart-Shaped Herb", Zone::Battlefield, db);
     let solemn = scenario.add_creature(P0, "Solemn Simulacrum", 2, 2).id();
-    let other = scenario.add_creature(P0, "Bystander Bear", 2, 2).id();
+    let other = scenario
+        .add_creature(P1, "Bystander Bear", 2, 2)
+        .controlled_by(P0)
+        .id();
 
     // {2} generic for the activation cost — pre-funded so mana payment never
     // surfaces a prompt and the test stays focused on the sacrifice/return
@@ -73,7 +76,7 @@ fn board() -> Option<(GameRunner, ObjectId, ObjectId, ObjectId)> {
     let mut runner = scenario.build();
     engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
 
-    Some((runner, herb, solemn, other))
+    (runner, herb, solemn, other)
 }
 
 /// Drive Heart-Shaped Herb's activated ability to completion, accepting the
@@ -130,9 +133,7 @@ fn activate_and_choose(runner: &mut GameRunner, herb: ObjectId, chosen: ObjectId
 /// activation's own cost payment. Also asserts the monarch changes hands.
 #[test]
 fn heart_shaped_herb_returns_the_sacrificed_creature_not_itself() {
-    let Some((mut runner, herb, solemn, other)) = board() else {
-        return;
-    };
+    let (mut runner, herb, solemn, other) = board();
 
     assert_eq!(runner.state().monarch, None, "precondition: no monarch yet");
 
@@ -192,9 +193,18 @@ fn heart_shaped_herb_returns_the_sacrificed_creature_not_itself() {
 /// single hardcoded object.
 #[test]
 fn heart_shaped_herb_returns_whichever_creature_was_chosen() {
-    let Some((mut runner, herb, solemn, other)) = board() else {
-        return;
-    };
+    let (mut runner, herb, solemn, other) = board();
+
+    let other_before = runner
+        .state()
+        .objects
+        .get(&other)
+        .expect("the P1-owned creature must exist before activation");
+    assert_eq!(other_before.owner, P1, "fixture must preserve P1 ownership");
+    assert_eq!(
+        other_before.controller, P0,
+        "fixture must make P0 the creature's controller and therefore able to sacrifice it"
+    );
 
     activate_and_choose(&mut runner, herb, other);
 
@@ -219,6 +229,14 @@ fn heart_shaped_herb_returns_whichever_creature_was_chosen() {
         other_obj.zone
     );
     assert_eq!(plus1plus1_counters(runner.state(), other), 3);
+    assert_eq!(
+        other_obj.owner, P1,
+        "the returned card must retain its original owner"
+    );
+    assert_eq!(
+        other_obj.controller, P1,
+        "the return effect must place the sacrificed creature under its owner's control"
+    );
 
     // Solemn Simulacrum, not chosen this time, must be untouched.
     assert!(runner.state().battlefield.contains(&solemn));

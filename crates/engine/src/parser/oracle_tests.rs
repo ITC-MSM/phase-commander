@@ -13227,6 +13227,73 @@ fn heart_shaped_herb_activated_ability_grants_monarch_as_continuation() {
     );
 }
 
+/// CR 608.2c: Chipper Chopper and Riveting Rigger have the same optional typed-sacrifice
+/// continuation: "If you do, put two +1/+1 counters on this creature". The
+/// sacrifice introduces a resolution-local object, but this-creature must
+/// remain the triggered ability's source rather than that sacrificed artifact.
+#[test]
+fn optional_artifact_sacrifice_keeps_counter_recipient_on_source() {
+    let def = parse_effect_chain(
+        "You may sacrifice another artifact. If you do, put two +1/+1 counters on this creature and it assembles a Contraption.",
+        AbilityKind::Triggered,
+    );
+
+    assert!(
+        matches!(*def.effect, Effect::Sacrifice { .. }),
+        "the optional sacrifice must remain the head effect, got {:?}",
+        def.effect,
+    );
+    let counters = def
+        .sub_ability
+        .as_deref()
+        .expect("the successful sacrifice must continue to the counter effect");
+    assert!(
+        matches!(
+            *counters.effect,
+            Effect::PutCounter {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            }
+        ),
+        "the counter recipient must stay the source creature, got {:?}",
+        counters.effect,
+    );
+}
+
+/// CR 608.2c: Bloodcrazed Socialite's bare "it" is the attacking source, not the Blood
+/// token sacrificed by the preceding optional effect. This guards the
+/// `CostPaidObject` anchor from leaking into the bare-pronoun grammar.
+#[test]
+fn optional_blood_sacrifice_keeps_bare_pronoun_on_source() {
+    let def = parse_effect_chain(
+        "You may sacrifice a Blood token. If you do, it gets +2/+2 until end of turn.",
+        AbilityKind::Triggered,
+    );
+
+    assert!(
+        matches!(*def.effect, Effect::Sacrifice { .. }),
+        "the optional sacrifice must remain the head effect, got {:?}",
+        def.effect,
+    );
+    let pump = def
+        .sub_ability
+        .as_deref()
+        .expect("the successful sacrifice must continue to the pump effect");
+    assert!(
+        matches!(
+            *pump.effect,
+            Effect::Pump {
+                target: TargetFilter::SelfRef,
+                power: PtValue::Fixed(2),
+                toughness: PtValue::Fixed(2),
+            }
+        ),
+        "the pump recipient must stay the source creature, got {:?}",
+        pump.effect,
+    );
+}
+
 /// CR 725.1 + CR 608.2c: Fall from Favor — "When this Aura enters, tap
 /// enchanted creature and you become the monarch." Before the splitter arm the
 /// conjunct was isolated by `try_split_targeted_compound` (mod.rs) but
