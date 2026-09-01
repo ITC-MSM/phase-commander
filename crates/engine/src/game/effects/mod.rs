@@ -13576,6 +13576,22 @@ fn resolve_chain_body(
             // hit and exclude it — treating it as independent here stranded
             // that exclusion, sweeping the hit itself to the library bottom
             // alongside the misses.
+            // CR 608.2d (issue #8123, Broken Bond): a `Resolution`-timed sub
+            // makes its OWN untargeted choice at its own resolution — it is
+            // independent of the parent's already-chosen OBJECT target even
+            // though `extract_target_filter_from_effect` returns `None` for
+            // it (that `None` means "not a CR 601 stack-time target", not
+            // "shares the parent's target"). Without this arm, "Destroy
+            // target artifact or enchantment. You may put a land card from
+            // your hand onto the battlefield." propagated the destroyed
+            // artifact's object id onto the land-put sub as its `targets`,
+            // so `change_zone::resolve` saw a non-empty (and wrong-zone)
+            // target list, skipped its resolution-time hand scan entirely,
+            // and silently moved nothing — no `EffectZoneChoice` prompt, no
+            // land onto the battlefield. `can_inherit_parent_targets` is the
+            // single authority for this exact axis (Kathril, Aspect Warper,
+            // issue #6321 / PR #6533); reuse it here instead of leaving this
+            // arm blind to `target_choice_timing`.
             let has_independent_target_slot =
                 (crate::game::triggers::extract_target_filter_from_effect(&sub.effect).is_some()
                     && !effect_refs_parent_target(&sub.effect)
@@ -13584,7 +13600,8 @@ fn resolve_chain_body(
                         .effect
                         .target_filter()
                         .is_some_and(TargetFilter::references_exiled_by_source)
-                        && !effect_refs_parent_target(&sub.effect));
+                        && !effect_refs_parent_target(&sub.effect))
+                    || !can_inherit_parent_targets(sub);
             sub_with_targets.targets = ability
                 .targets
                 .iter()
