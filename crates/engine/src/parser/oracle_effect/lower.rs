@@ -2148,11 +2148,11 @@ pub(super) fn rebind_zone_changed_this_way_pronoun_to_moved_object(def: &mut Abi
                     ..
                 })
             ) {
-                each_target_filter_mut(sub.effect.as_mut(), &mut |target| {
+                if let Effect::ChangeZone { target, .. } = sub.effect.as_mut() {
                     if *target == TargetFilter::ParentTarget {
                         *target = TargetFilter::LastZoneChanged;
                     }
-                });
+                }
             }
         }
     }

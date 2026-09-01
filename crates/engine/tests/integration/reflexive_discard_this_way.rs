@@ -80,6 +80,8 @@ const P1: PlayerId = PlayerId(1);
 const TALION_BODY: &str = "draw a card, then discard a card. When you discard a card this way, put a +1/+1 counter on target Faerie you control.";
 const ANCIENT_BODY: &str = "Draw a card, then discard a card. When you discard a card this way, target player mills cards equal to its mana value.";
 const SILVAN_REVELER_ORACLE: &str = "When this creature enters, draw a card, then discard a card. If you discard a land card this way, put it from your graveyard onto the battlefield tapped.";
+const CRAGGANWICK_BODY: &str = "discard a card at random. If you discard a creature card this way, this creature deals damage equal to that card's power to target player or planeswalker.";
+const NARSET_BODY: &str = "Draw a card, then you may discard a card. When you discard a nonland card this way, Narset deals damage equal to that card's mana value to target creature or planeswalker.";
 
 /// Set an explicit printed mana cost on an already-created object so its mana
 /// value is deterministic for "its mana value" assertions.
@@ -100,6 +102,96 @@ fn p1p1_on(runner: &GameRunner, id: ObjectId) -> u32 {
 
 fn graveyard_len(runner: &GameRunner, player: PlayerId) -> usize {
     runner.state().players[player.0 as usize].graveyard.len()
+}
+
+fn life_total(runner: &GameRunner, player: PlayerId) -> i32 {
+    runner.state().players[player.0 as usize].life
+}
+
+/// CR 601.2c + CR 603.12 + CR 701.9a — Cragganwick Cremator's reflexive
+/// damage keeps its independently selected player target. The discarded card
+/// is only the value referent for the damage amount; it is not the recipient.
+#[test]
+fn cragganwick_cremator_damages_selected_player_not_discarded_card() {
+    let mut scenario = GameScenario::new();
+    let source = scenario.add_creature(P0, "Cragganwick Cremator", 5, 4).id();
+    let discarded = scenario.add_card_to_hand(P0, "Force of Nature");
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&discarded)
+        .unwrap()
+        .card_types = CardType {
+        supertypes: vec![],
+        core_types: vec![CoreType::Creature],
+        subtypes: vec![],
+    };
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&discarded)
+        .unwrap()
+        .power = Some(6);
+
+    let def = parse_effect_chain(CRAGGANWICK_BODY, AbilityKind::Spell);
+    let ability = ResolvedAbility {
+        targets: vec![TargetRef::Player(P1)],
+        ..build_resolved_from_def(&def, source, P0)
+    };
+    let before = life_total(&runner, P1);
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
+        .expect("discard and reflexive damage resolve");
+
+    assert_eq!(life_total(&runner, P1), before - 6);
+    assert_eq!(runner.state().objects[&discarded].zone, Zone::Graveyard);
+}
+
+/// CR 601.2c + CR 603.12 + CR 701.9a — Narset's reflexive damage keeps its
+/// independently selected creature target while the discarded card supplies
+/// only the mana-value amount.
+#[test]
+fn narset_damages_selected_creature_not_discarded_card() {
+    let mut scenario = GameScenario::new();
+    let source = scenario
+        .add_creature(P0, "Narset of the Ancient Way", 1, 1)
+        .id();
+    let target = scenario.add_creature(P1, "Target Giant", 3, 10).id();
+    let discarded = scenario.add_card_to_hand(P0, "Nonland MV5");
+    scenario.with_library_top(P0, &["Drawn Card"]);
+    let mut runner = scenario.build();
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&discarded)
+        .unwrap()
+        .card_types = CardType {
+        supertypes: vec![],
+        core_types: vec![CoreType::Sorcery],
+        subtypes: vec![],
+    };
+    set_mv(&mut runner, discarded, 5);
+
+    let def = parse_effect_chain(NARSET_BODY, AbilityKind::Spell);
+    let ability = ResolvedAbility {
+        targets: vec![TargetRef::Object(target)],
+        ..build_resolved_from_def(&def, source, P0)
+    };
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &ability, &mut events, 0)
+        .expect("draw resolves and optional discard is offered");
+    runner
+        .act(GameAction::DecideOptionalEffect { accept: true })
+        .expect("accept Narset's optional discard");
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![discarded],
+        })
+        .expect("choose the nonland card to discard");
+
+    assert_eq!(runner.state().objects[&target].damage_marked, 5);
+    assert_eq!(runner.state().objects[&discarded].zone, Zone::Graveyard);
 }
 
 /// CR 603.12 + CR 701.9a: Talion's Messenger — after the forced single discard,
