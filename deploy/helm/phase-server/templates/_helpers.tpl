@@ -77,6 +77,7 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- $list = append $list (include "phase-server.crdRef" (dict "ctx" . "suffix" "ratelimit")) -}}
 {{- $list = append $list (include "phase-server.crdRef" (dict "ctx" . "suffix" "inflight")) -}}
 {{- $list = append $list (include "phase-server.crdRef" (dict "ctx" . "suffix" "headers")) -}}
+{{- $list = append $list (include "phase-server.crdRef" (dict "ctx" . "suffix" "compress")) -}}
 {{- end -}}
 {{- $list = concat $list (default (list) .Values.traefik.middlewares.extra) -}}
 {{- join "," $list -}}
@@ -169,6 +170,7 @@ traefik.ingress.kubernetes.io/router.tls.options: {{ include "phase-server.crdRe
 - name: {{ $fullname }}-ratelimit
 - name: {{ $fullname }}-inflight
 - name: {{ $fullname }}-headers
+- name: {{ $fullname }}-compress
 {{- end }}
 {{- range .Values.scaleOut.extraMiddlewareRefs }}
 - name: {{ .name }}

@@ -84,6 +84,7 @@ use server_core::takeback::RewindOption;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 use url::Url;
@@ -2244,17 +2245,6 @@ async fn serve() {
         info!(public_url = %url, "advertising public URL for join-code sharing");
     }
 
-    // Public, client-facing HTTP surface. `/p2p-draft-backup*` is part of the
-    // normal P2P draft flow; only the administrative `/admin/*` routes are gated.
-    let mut app = Router::new()
-        .route("/ws", get(ws_handler))
-        .route("/health", get(health))
-        .route("/p2p-draft-backup", post(admin::p2p_backup_store))
-        .route(
-            "/p2p-draft-backup/{code}",
-            get(admin::p2p_backup_get).delete(admin::p2p_backup_delete),
-        );
-
     // Administrative endpoints are destructive and information-disclosing, and
     // reachable through the same reverse proxy as `/ws` (see deploy nginx).
     // Mount them only when PHASE_ADMIN_TOKEN is set; otherwise absent (404).
@@ -2262,9 +2252,6 @@ async fn serve() {
     match admin_token.as_deref() {
         Some(_) => info!("admin HTTP endpoints enabled (bearer-token authenticated)"),
         None => info!("admin HTTP endpoints disabled (set PHASE_ADMIN_TOKEN to enable)"),
-    }
-    if let Some(token) = admin_token.as_deref().filter(|t| !t.is_empty()) {
-        app = mount_admin_routes(app, token);
     }
 
     let app_state = AppState {
@@ -2285,7 +2272,11 @@ async fn serve() {
         allowed_origin: cli.allowed_origin.clone(),
     };
 
-    let app = app.layer(cors).with_state(app_state.clone());
+    // `/p2p-draft-backup*` is part of the normal P2P draft flow; only the
+    // administrative `/admin/*` routes are gated. `build_router` keeps `/ws`
+    // out from under `CompressionLayer` (see its doc comment) while every
+    // other public and admin response gets compressed.
+    let app = build_router(app_state.clone(), cors, admin_token.as_deref());
 
     // Rejected before anything binds. Left alone this surfaces later as "address
     // in use" on one of the two listeners, which reads like a stale process
@@ -2723,6 +2714,38 @@ fn admin_token_from_env() -> Option<String> {
         .ok()
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty())
+}
+
+/// Assembles the public HTTP/WS surface. `/ws` is kept on its own sub-router,
+/// deliberately outside `CompressionLayer`: the WebSocket upgrade response
+/// (`101 Switching Protocols`) carries no body to compress, and axum's
+/// upgrade takes the connection over via `hyper`'s `OnUpgrade` extension
+/// rather than through the response body a compressing layer would wrap —
+/// keeping the layer off that route entirely removes any dependence on that
+/// implementation detail continuing to hold across axum/tower-http upgrades.
+/// Every other route (health check, the P2P draft backup API, and — when
+/// `admin_token` is set — the bearer-guarded `/admin/*` routes) is served
+/// through gzip `CompressionLayer` so JSON/text responses shrink whenever the
+/// client advertises `Accept-Encoding: gzip`.
+fn build_router(app_state: AppState, cors: CorsLayer, admin_token: Option<&str>) -> Router {
+    let ws_router: Router<AppState> = Router::new().route("/ws", get(ws_handler));
+
+    let mut http_router: Router<AppState> = Router::new()
+        .route("/health", get(health))
+        .route("/p2p-draft-backup", post(admin::p2p_backup_store))
+        .route(
+            "/p2p-draft-backup/{code}",
+            get(admin::p2p_backup_get).delete(admin::p2p_backup_delete),
+        );
+    if let Some(token) = admin_token.filter(|t| !t.is_empty()) {
+        http_router = mount_admin_routes(http_router, token);
+    }
+    let http_router = http_router.layer(CompressionLayer::new());
+
+    ws_router
+        .merge(http_router)
+        .layer(cors)
+        .with_state(app_state)
 }
 
 /// Mount bearer-guarded `/admin/*` routes on a router that will receive `AppState`.
@@ -12935,6 +12958,220 @@ mod admin_auth_tests {
             get_admin_drafts(&base_url, Some(&format!("Bearer {TOKEN}"))).await,
             StatusCode::OK
         );
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod compression_tests {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+
+    use lobby_broker::Broker;
+    use server_core::draft_session::DraftSessionManager;
+    use server_core::session::SessionManager;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex;
+    use tower_http::cors::CorsLayer;
+    use url::Url;
+
+    use super::{build_router, draft_pools, persistence, AppState, ServerContext, ServerMode};
+
+    fn test_app_state(temp_dir: &tempfile::TempDir) -> AppState {
+        let game_db_path = temp_dir.path().join("games.db");
+        let game_db = Arc::new(
+            persistence::GameDb::open(&game_db_path, persistence::SessionRetention::Multiplayer)
+                .expect("game db"),
+        );
+        AppState {
+            sessions: Arc::new(Mutex::new(SessionManager::new())),
+            draft_sessions: Arc::new(Mutex::new(DraftSessionManager::new())),
+            draft_pools: Arc::new(draft_pools::DraftPools::default()),
+            connections: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            db: Arc::new(engine::database::CardDatabase::default()),
+            lobby: Arc::new(Mutex::new(Broker::new())),
+            lobby_subscribers: Arc::new(Mutex::new(Vec::new())),
+            player_count: Arc::new(AtomicU32::new(0)),
+            game_db,
+            draft_spectators: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            game_spectators: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            mode: ServerMode::Full,
+            context: ServerContext::default(),
+            public_url: None,
+            allowed_origin: None,
+        }
+    }
+
+    async fn spawn_compressed_test_server(
+        temp_dir: &tempfile::TempDir,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app_state = test_app_state(temp_dir);
+        let app = build_router(app_state, CorsLayer::permissive(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        (format!("{addr}"), handle)
+    }
+
+    /// Issues a raw `GET` (no client library in the way of the exact bytes on
+    /// the wire) and splits the response into its lowercased header block and
+    /// raw body, the same way the admin-auth tests above talk to the server.
+    /// A compressed response has no length known up front, so axum sends it
+    /// `Transfer-Encoding: chunked`; this unwraps that framing so callers see
+    /// the same payload bytes a real client's HTTP stack would hand them.
+    async fn raw_http_get(
+        addr: &str,
+        path: &str,
+        extra_headers: &[(&str, &str)],
+    ) -> (String, Vec<u8>) {
+        let url = Url::parse(&format!("http://{addr}{path}")).expect("url");
+        let host = url.host_str().expect("host");
+        let port = url.port().expect("port");
+        let mut stream = tokio::net::TcpStream::connect((host, port))
+            .await
+            .expect("connect");
+        let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n");
+        for (name, value) in extra_headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.expect("write");
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.expect("read");
+        let split_at = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header/body separator");
+        let headers = String::from_utf8_lossy(&buf[..split_at]).to_ascii_lowercase();
+        let raw_body = &buf[split_at + 4..];
+        let body = if headers.contains("transfer-encoding: chunked") {
+            dechunk(raw_body)
+        } else {
+            raw_body.to_vec()
+        };
+        (headers, body)
+    }
+
+    /// Minimal HTTP/1.1 chunked-transfer-coding decoder (RFC 9112 §7.1) —
+    /// just enough to reassemble a `raw_http_get` body for assertions, not a
+    /// general-purpose client.
+    fn dechunk(mut body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Some(line_end) = body.windows(2).position(|w| w == b"\r\n") {
+            let size_line = std::str::from_utf8(&body[..line_end]).unwrap_or("0");
+            let size = usize::from_str_radix(size_line.trim(), 16).unwrap_or(0);
+            body = &body[line_end + 2..];
+            if size == 0 || body.len() < size {
+                break;
+            }
+            out.extend_from_slice(&body[..size]);
+            body = &body[size..];
+            body = body.strip_prefix(b"\r\n".as_slice()).unwrap_or(body);
+        }
+        out
+    }
+
+    /// `CompressionLayer`'s default predicate skips bodies below a minimum
+    /// size (compressing a couple of bytes would grow, not shrink, the
+    /// response once gzip's own framing overhead is counted) — so `/health`'s
+    /// two-byte `"ok"` body is *correctly* left alone even with the layer
+    /// present and `Accept-Encoding: gzip` on the request. This test pins
+    /// that expectation; `large_json_response_is_gzip_compressed_when_accepted`
+    /// below exercises the case the layer exists for.
+    #[tokio::test]
+    async fn health_response_is_uncompressed_regardless_of_accept_encoding() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (addr, server) = spawn_compressed_test_server(&temp_dir).await;
+
+        let (headers, body) = raw_http_get(&addr, "/health", &[("Accept-Encoding", "gzip")]).await;
+
+        assert!(
+            !headers.contains("content-encoding"),
+            "did not expect a Content-Encoding header on a response this small, got:\n{headers}"
+        );
+        assert_eq!(body, b"ok");
+
+        server.abort();
+    }
+
+    /// Exercises `CompressionLayer` against a response large enough to clear
+    /// the default minimum-size predicate: a P2P draft backup snapshot, the
+    /// same JSON API surface the issue's audit called out as uncompressed at
+    /// origin.
+    #[tokio::test]
+    async fn large_json_response_is_gzip_compressed_when_accepted() {
+        const DRAFT_CODE: &str = "GZIP01";
+        const HOST_PEER: &str = "peer-compression-test";
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_state = test_app_state(&temp_dir);
+        // A highly compressible payload comfortably over the predicate's
+        // minimum size, matching the redactor's "JSON object" requirement.
+        let padding = "a".repeat(4096);
+        let snapshot_json = format!(r#"{{"status":"Drafting","padding":"{padding}"}}"#);
+        app_state
+            .game_db
+            .save_p2p_backup(DRAFT_CODE, HOST_PEER, &snapshot_json)
+            .expect("seed backup");
+        let uncompressed_len = snapshot_json.len();
+
+        let app = build_router(app_state, CorsLayer::permissive(), None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("test server");
+        });
+        let addr = format!("{addr}");
+
+        let (headers, body) = raw_http_get(
+            &addr,
+            &format!("/p2p-draft-backup/{DRAFT_CODE}?host_peer_id={HOST_PEER}"),
+            &[("Accept-Encoding", "gzip")],
+        )
+        .await;
+
+        assert!(
+            headers.contains("content-encoding: gzip"),
+            "expected a gzip Content-Encoding header, got:\n{headers}"
+        );
+        assert_eq!(
+            body.get(..2),
+            Some([0x1f, 0x8b].as_slice()),
+            "response body does not start with the gzip magic bytes"
+        );
+        assert!(
+            body.len() < uncompressed_len,
+            "gzip body ({} bytes) should be smaller than the uncompressed JSON it wraps ({} bytes)",
+            body.len(),
+            uncompressed_len
+        );
+
+        server.abort();
+    }
+
+    /// Guards the exact regression this fix must not introduce — a
+    /// `CompressionLayer` applied broadly enough to wrap the `/ws` upgrade
+    /// response. `build_router` keeps `/ws` on its own uncompressed
+    /// sub-router; this asserts the handshake still completes when served
+    /// from the very `Router` that also carries compression.
+    #[tokio::test]
+    async fn ws_upgrade_still_succeeds_through_the_compressed_router() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (addr, server) = spawn_compressed_test_server(&temp_dir).await;
+
+        let connected = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await;
+        assert!(
+            connected.is_ok(),
+            "WebSocket upgrade failed through the compressed router: {:?}",
+            connected.err()
+        );
+
         server.abort();
     }
 }
