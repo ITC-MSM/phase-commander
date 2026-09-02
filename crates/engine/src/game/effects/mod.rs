@@ -3116,7 +3116,7 @@ pub(crate) fn can_inherit_parent_targets(sub: &ResolvedAbility) -> bool {
             && !effect_refs_parent_target(&sub.effect))
 }
 
-/// CR 115.1 + CR 608.2d: a nontargeted zone choice announced while the effect
+/// CR 115.10 + CR 608.2d: a nontargeted zone choice announced while the effect
 /// resolves owns a fresh object choice instead of consuming an object selected
 /// by an earlier instruction. The explicit zone set is the provenance marker:
 /// it covers both scalar `InZone` (Broken Bond) and mixed `InAnyZone`
