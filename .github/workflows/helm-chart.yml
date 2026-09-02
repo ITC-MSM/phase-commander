@@ -84,6 +84,12 @@ jobs:
           grep -q 'kind: PodMonitor' /tmp/scaleout-render.yaml
           grep -q 'kind: ServiceMonitor' /tmp/scaleout-render.yaml
 
+      # The compression boundary has deliberately different HTTP and WebSocket
+      # paths. Exercise the dedicated assertion after both canonical renders
+      # exist so a middleware-list regression cannot pass template-only CI.
+      - name: assert compression boundary
+        run: deploy/helm/phase-server/tests/assert-compression-boundary.sh /tmp/default.yaml /tmp/scaleout-render.yaml
+
       # With no prometheus-operator CRDs the operator path must FAIL rather than
       # render: hpa.yaml would otherwise install an HPA whose only producer of
       # `phase:wanted_replicas` — the PrometheusRule — was silently skipped.
