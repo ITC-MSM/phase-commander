@@ -11732,10 +11732,6 @@ mod issue_4548_full_create_tests {
                 recv_enveloped_server_message(&mut socket).await,
                 ServerMessage::LobbyUpdate { .. }
             ));
-            while tokio::time::timeout(Duration::from_millis(20), socket.next())
-                .await
-                .is_ok()
-            {}
             for _ in 0..RATE_LIMIT_MESSAGES {
                 socket
                     .send(WsMessage::Binary(vec![0x01, 1, 2, 3].into()))
@@ -11743,11 +11739,18 @@ mod issue_4548_full_create_tests {
                     .expect("send malformed gzip");
             }
             send_test_message(&mut socket, &ClientMessage::Ping { timestamp: 7 }, true).await;
-            assert!(
-                tokio::time::timeout(Duration::from_millis(100), socket.next())
-                    .await
-                    .is_err()
-            );
+            let pong = tokio::time::timeout(Duration::from_millis(100), async {
+                loop {
+                    if matches!(
+                        recv_enveloped_server_message(&mut socket).await,
+                        ServerMessage::Pong { .. }
+                    ) {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(pong.is_err());
         })
         .await;
         server.abort();
