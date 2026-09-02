@@ -42,12 +42,12 @@ export async function decodeJsonEnvelope(bytes: Uint8Array): Promise<string> {
     if (payload.length > WIRE_MAX_DECODED_BYTES) {
       throw new Error("wire message exceeds decoded size limit");
     }
-    return new TextDecoder().decode(payload);
+    return new TextDecoder("utf-8", { fatal: true }).decode(payload);
   }
   if (format === FORMAT_GZIP) {
     const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream("gzip"));
     const reader = stream.getReader();
-    const decoder = new TextDecoder();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
     let decodedBytes = 0;
     let decoded = "";
 
