@@ -58,13 +58,14 @@ use super::lower::{
     parse_controlled_by_different_players_target_constraint,
     parse_same_zone_owner_target_constraint, parse_total_mana_value_target_constraint,
     patch_choose_from_zone_counter_continuation_target, patch_population_head_tap_anaphor,
-    patch_self_ref_head_tap_anaphor, relink_gated_token_referent_consumers,
-    resolve_populated_token_anaphors, resolve_populated_unsuspect_anaphors,
-    resolve_those_tokens_anaphors, rewire_result_anchored_subchain,
-    rewrite_counter_instead_target_from_antecedent, rewrite_else_event_context_to_stable,
-    rewrite_else_parent_target_to_self_ref, rewrite_player_anaphor_targets_in_definition,
-    rewrite_those_tokens_from_antecedent, rewrite_two_target_counter_chain,
-    target_choice_timing_for_clause, thread_chosen_damage_source_into_oneshot_effects,
+    patch_self_ref_head_tap_anaphor, rebind_zone_changed_this_way_pronoun_to_moved_object,
+    relink_gated_token_referent_consumers, resolve_populated_token_anaphors,
+    resolve_populated_unsuspect_anaphors, resolve_those_tokens_anaphors,
+    rewire_result_anchored_subchain, rewrite_counter_instead_target_from_antecedent,
+    rewrite_else_event_context_to_stable, rewrite_else_parent_target_to_self_ref,
+    rewrite_player_anaphor_targets_in_definition, rewrite_those_tokens_from_antecedent,
+    rewrite_two_target_counter_chain, target_choice_timing_for_clause,
+    thread_chosen_damage_source_into_oneshot_effects,
 };
 use super::sequence::{apply_clause_continuation, def_bears_retargetable_copy};
 use super::{
@@ -3279,6 +3280,14 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // attaching object.
     rewire_result_anchored_subchain(&mut result);
     fold_enters_this_way_counter_rider(&mut result);
+    // CR 608.2c + CR 701.9a + CR 701.21a: a discard/sacrifice-this-way gated
+    // sub-ability's bare "it" pronoun parses to the generic `ParentTarget`
+    // fallback, but there is no declared parent target to fall back on
+    // (unlike the battlefield-entry/into-hand "this way" siblings
+    // `fold_enters_this_way_counter_rider` folds above) — rebind it to the
+    // moved object instead, and do so before `oracle_trigger::lower_trigger_ir`
+    // can otherwise blindly lift that same `ParentTarget` to `TriggeringSource`.
+    rebind_zone_changed_this_way_pronoun_to_moved_object(&mut result);
     // CR 603.7a + CR 608.2c + CR 702.170c: fold the exile-instead "If you do,
     // ..." continuation (Feather's return-to-hand, Lilah's become-plotted) onto
     // the exile-resolving carrier's typed `on_exile` rider so the consequence is
