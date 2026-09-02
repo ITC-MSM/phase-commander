@@ -4,6 +4,7 @@ mod draft_pools;
 mod logging;
 mod metrics;
 mod persistence;
+mod wire;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -67,8 +68,8 @@ use server_core::lobby::RegisterGameRequest;
 use server_core::lobby_subscriber_wire_guard::guard_lobby_subscriber_capacity;
 use server_core::protocol::{
     build_commit, resolve_draft_source_intent, ClientMessage, RankedPlayerResult, ServerMessage,
-    ServerMode, LOBBY_MIN_SUPPORTED_PROTOCOL, LOBBY_PROTOCOL_VERSION, MIN_SUPPORTED_LOBBY_PROTOCOL,
-    MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
+    ServerMode, WireFormat, LOBBY_MIN_SUPPORTED_PROTOCOL, LOBBY_PROTOCOL_VERSION,
+    MIN_SUPPORTED_LOBBY_PROTOCOL, MIN_SUPPORTED_PROTOCOL, PROTOCOL_VERSION,
 };
 use server_core::resolve_deck;
 use server_core::seat_mutation_wire_guard::guard_seat_mutation;
@@ -995,7 +996,10 @@ struct SocketIdentity {
 struct ClientHelloInfo {
     client_version: String,
     build_commit: String,
+    wire_format: Option<WireFormat>,
 }
+
+const MAX_ADVERTISED_WIRE_FORMATS: usize = 8;
 
 /// Outcome of evaluating the handshake gate against an incoming message.
 /// Extracted into a pure function so the gate's invariants can be unit-tested
@@ -1084,6 +1088,7 @@ fn classify_hello_gate(
                 build_commit,
                 protocol_version,
                 lobby_protocol_version,
+                wire_formats,
             },
         ) => {
             // The `server` field on RejectProtocol surfaces the version this
@@ -1093,12 +1098,19 @@ fn classify_hello_gate(
                 acceptance.reject(*protocol_version, *lobby_protocol_version)
             {
                 HelloGateOutcome::RejectProtocol { client, server }
+            } else if wire_formats.len() > MAX_ADVERTISED_WIRE_FORMATS {
+                HelloGateOutcome::RejectInvalidHello(
+                    "ClientHello advertises too many wire formats".to_string(),
+                )
             } else if let Err(reason) = guard_client_hello(client_version, build_commit) {
                 HelloGateOutcome::RejectInvalidHello(reason)
             } else {
                 HelloGateOutcome::Accept(ClientHelloInfo {
                     client_version: client_version.clone(),
                     build_commit: build_commit.clone(),
+                    wire_format: wire_formats
+                        .contains(&WireFormat::GzipEnvelopeV1)
+                        .then_some(WireFormat::GzipEnvelopeV1),
                 })
             }
         }
@@ -3248,6 +3260,47 @@ struct ConnectionSlot {
     armed: bool,
 }
 
+/// Per-connection WebSocket writer. Once the text handshake negotiates a wire
+/// format, every later JSON text send passes through the same envelope path —
+/// including direct errors as well as queued broadcasts.
+struct NegotiatedSocket {
+    inner: WebSocket,
+    wire_format: Option<WireFormat>,
+}
+
+impl NegotiatedSocket {
+    fn new(inner: WebSocket) -> Self {
+        Self {
+            inner,
+            wire_format: None,
+        }
+    }
+
+    fn set_wire_format(&mut self, wire_format: Option<WireFormat>) {
+        self.wire_format = wire_format;
+    }
+
+    fn uses_gzip_envelope(&self) -> bool {
+        self.wire_format == Some(WireFormat::GzipEnvelopeV1)
+    }
+
+    async fn send(&mut self, message: Message) -> Result<(), axum::Error> {
+        let message = match message {
+            Message::Text(json) => {
+                wire::encode_json_message(json.to_string(), self.uses_gzip_envelope())
+                    .await
+                    .map_err(axum::Error::new)?
+            }
+            other => other,
+        };
+        self.inner.send(message).await
+    }
+
+    async fn recv(&mut self) -> Option<Result<Message, axum::Error>> {
+        self.inner.recv().await
+    }
+}
+
 impl ConnectionSlot {
     fn new(player_count: SharedPlayerCount) -> Self {
         Self {
@@ -3271,7 +3324,7 @@ impl Drop for ConnectionSlot {
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     state: SharedState,
     draft_state: SharedDraftState,
     draft_pools: SharedDraftPools,
@@ -3289,6 +3342,7 @@ async fn handle_socket(
     online_count: u32,
     slot: ConnectionSlot,
 ) {
+    let mut socket = NegotiatedSocket::new(socket);
     let (tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     // The slot was reserved before the upgrade; from here the two `fetch_sub`
@@ -3331,6 +3385,7 @@ async fn handle_socket(
         mode,
         lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
         public_url,
+        wire_formats: vec![WireFormat::GzipEnvelopeV1],
     };
     if let Ok(json) = serde_json::to_string(&hello) {
         if socket.send(Message::text(json)).await.is_err() {
@@ -3345,9 +3400,7 @@ async fn handle_socket(
             biased;
             Some(msg) = rx.recv() => {
                 if let Ok(json) = serde_json::to_string(&msg) {
-                    if socket.send(Message::text(json)).await.is_err() {
-                        break;
-                    }
+                    if socket.send(Message::text(json)).await.is_err() { break; }
                 }
             }
 
@@ -3356,6 +3409,15 @@ async fn handle_socket(
                     Some(Ok(msg)) => {
                         let text = match msg {
                             Message::Text(t) => t.to_string(),
+                            Message::Binary(bytes) if socket.uses_gzip_envelope() => {
+                                match wire::decode_client_envelope(bytes.to_vec(), MAX_WS_MESSAGE_BYTES).await {
+                                    Ok(text) => text,
+                                    Err(error) => {
+                                        warn!(%error, "failed to decode client binary envelope");
+                                        continue;
+                                    }
+                                }
+                            }
                             Message::Close(_) => break,
                             _ => continue,
                         };
@@ -3544,6 +3606,9 @@ fn to_server_message(m: lobby_broker::LobbyServerMessage) -> ServerMessage {
             // LobbyOnly brokers run no server-side game, so there is no
             // game-server URL to advertise for a `<code>@<host>` share string.
             public_url: None,
+            // Socket negotiation uses the canonical ServerHello sent directly
+            // by handle_socket; broker-originated hellos are only projections.
+            wire_formats: Vec::new(),
         },
         L::GameCreated {
             game_code,
@@ -3639,6 +3704,7 @@ fn to_lobby_client_message(msg: &ClientMessage) -> Option<lobby_broker::LobbyCli
             build_commit,
             protocol_version,
             lobby_protocol_version,
+            wire_formats: _,
         } => L::ClientHello {
             client_version: client_version.clone(),
             build_commit: build_commit.clone(),
@@ -4827,7 +4893,7 @@ async fn broadcast_game_started(
     broadcast_ai_failure(connections, game_code, ai_failure).await;
 }
 
-async fn require_host(identity: &SocketIdentity, socket: &mut WebSocket) -> Result<(), ()> {
+async fn require_host(identity: &SocketIdentity, socket: &mut NegotiatedSocket) -> Result<(), ()> {
     if identity.player_id != Some(PlayerId(0)) {
         let msg = ServerMessage::error("Only the host can modify seats.".to_string());
         if let Ok(json) = serde_json::to_string(&msg) {
@@ -4852,7 +4918,7 @@ fn is_joining_current_game(identity: &SocketIdentity, target_game_code: &str) ->
 async fn reject_joining_current_game(
     identity: &SocketIdentity,
     target_game_code: &str,
-    socket: &mut WebSocket,
+    socket: &mut NegotiatedSocket,
 ) -> Result<(), ()> {
     if !is_joining_current_game(identity, target_game_code) {
         return Ok(());
@@ -5329,7 +5395,7 @@ impl GameSubmission {
 #[allow(clippy::too_many_arguments)]
 async fn handle_full_game_submission(
     submission: GameSubmission,
-    socket: &mut WebSocket,
+    socket: &mut NegotiatedSocket,
     state: &SharedState,
     db: &SharedDb,
     draft_state: &SharedDraftState,
@@ -5960,7 +6026,7 @@ async fn handle_resolve_all(
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_message(
     client_msg: ClientMessage,
-    socket: &mut WebSocket,
+    socket: &mut NegotiatedSocket,
     state: &SharedState,
     draft_state: &SharedDraftState,
     draft_pools: &SharedDraftPools,
@@ -5990,6 +6056,7 @@ async fn handle_client_message(
                 commit = %info.build_commit,
                 "ClientHello accepted"
             );
+            socket.set_wire_format(info.wire_format);
             identity.client_hello = Some(info);
             return;
         }
@@ -11536,6 +11603,7 @@ mod issue_4548_full_create_tests {
                 build_commit: build_commit().to_string(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             };
             socket
                 .send(WsMessage::Text(
@@ -11595,6 +11663,63 @@ mod issue_4548_full_create_tests {
     }
 
     #[tokio::test]
+    async fn negotiated_gzip_envelope_accepts_and_returns_binary_frames() {
+        let (url, server, _temp_dir, _game_db) = spawn_full_mode_server().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut socket, _) = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("connect");
+
+            let server_hello = recv_server_message(&mut socket).await;
+            assert!(matches!(
+                server_hello,
+                ServerMessage::ServerHello { wire_formats, .. }
+                    if wire_formats.contains(&WireFormat::GzipEnvelopeV1)
+            ));
+
+            let hello = ClientMessage::ClientHello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                build_commit: build_commit().to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: vec![WireFormat::GzipEnvelopeV1],
+            };
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&hello).expect("hello json").into(),
+                ))
+                .await
+                .expect("send hello");
+
+            let subscribe =
+                serde_json::to_vec(&ClientMessage::SubscribeLobby).expect("subscribe json");
+            let binary = [vec![0x00], subscribe].concat();
+            socket
+                .send(WsMessage::Binary(binary.into()))
+                .await
+                .expect("send binary subscribe");
+
+            let frame = socket
+                .next()
+                .await
+                .expect("server response")
+                .expect("server frame");
+            let WsMessage::Binary(bytes) = frame else {
+                panic!("negotiated response must be binary, got {frame:?}");
+            };
+            let json = wire::decode_client_envelope(bytes.to_vec(), MAX_WS_MESSAGE_BYTES)
+                .await
+                .expect("decode server envelope");
+            let message: ServerMessage = serde_json::from_str(&json).expect("server message");
+            assert!(matches!(message, ServerMessage::LobbyUpdate { .. }));
+        })
+        .await;
+        server.abort();
+
+        assert!(result.is_ok(), "binary envelope roundtrip timed out");
+    }
+
+    #[tokio::test]
     async fn full_mode_create_rejects_format_invalid_host_deck() {
         let (url, server, _temp_dir, _game_db) = spawn_full_mode_server().await;
         let result = tokio::time::timeout(Duration::from_secs(2), async {
@@ -11612,6 +11737,7 @@ mod issue_4548_full_create_tests {
                 build_commit: build_commit().to_string(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             };
             socket
                 .send(WsMessage::Text(
@@ -11678,6 +11804,7 @@ mod issue_4548_full_create_tests {
                 build_commit: build_commit().to_string(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             };
             socket
                 .send(WsMessage::Text(
@@ -11810,6 +11937,7 @@ mod game_submission_tests {
             build_commit: build_commit().to_string(),
             protocol_version: PROTOCOL_VERSION,
             lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+            wire_formats: Vec::new(),
         };
         socket
             .send(WsMessage::Text(
@@ -12344,6 +12472,7 @@ mod game_submission_tests {
                 build_commit: build_commit().to_string(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             };
             socket
                 .send(WsMessage::Text(
@@ -12508,6 +12637,7 @@ mod mode_gate_tests {
                 build_commit: "abc".into(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             },
             ClientMessage::SubscribeLobby,
             ClientMessage::UnsubscribeLobby,
@@ -12903,6 +13033,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -12911,6 +13042,30 @@ mod handshake_tests {
             HelloGateOutcome::Accept(ClientHelloInfo {
                 client_version: "0.1.11".into(),
                 build_commit: "abc1234".into(),
+                wire_format: None,
+            })
+        );
+    }
+
+    #[test]
+    fn negotiates_gzip_envelope_from_client_hello_capability() {
+        let outcome = classify_hello_gate(
+            false,
+            &ClientMessage::ClientHello {
+                client_version: "0.1.11".into(),
+                build_commit: "abc1234".into(),
+                protocol_version: PROTOCOL_VERSION,
+                lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: vec![WireFormat::GzipEnvelopeV1],
+            },
+            hello_acceptance(ServerMode::Full),
+        );
+        assert_eq!(
+            outcome,
+            HelloGateOutcome::Accept(ClientHelloInfo {
+                client_version: "0.1.11".into(),
+                build_commit: "abc1234".into(),
+                wire_format: Some(WireFormat::GzipEnvelopeV1),
             })
         );
     }
@@ -12931,6 +13086,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -12955,6 +13111,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::LobbyOnly),
         );
@@ -12975,6 +13132,7 @@ mod handshake_tests {
                 // Far outside LOBBY_MIN_SUPPORTED_PROTOCOL..=PROTOCOL_VERSION.
                 protocol_version: PROTOCOL_VERSION.saturating_sub(9),
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::LobbyOnly),
         );
@@ -12995,6 +13153,7 @@ mod handshake_tests {
                 build_commit: "future12".into(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION + 5),
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::LobbyOnly),
         );
@@ -13016,6 +13175,7 @@ mod handshake_tests {
                 build_commit: "ancient1".into(),
                 protocol_version: PROTOCOL_VERSION,
                 lobby_protocol_version: Some(below),
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::LobbyOnly),
         );
@@ -13041,6 +13201,7 @@ mod handshake_tests {
                 build_commit: "old1234".into(),
                 protocol_version: previous,
                 lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -13065,6 +13226,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -13088,6 +13250,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -13111,6 +13274,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -13128,6 +13292,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -13178,6 +13343,7 @@ mod handshake_tests {
                 // Legacy client: predates the lobby-owned version, so the
                 // gate must fall back to the `protocol_version` window.
                 lobby_protocol_version: None,
+                wire_formats: Vec::new(),
             },
             hello_acceptance(ServerMode::Full),
         );
@@ -14623,6 +14789,7 @@ mod metrics_tests {
             build_commit: build_commit().to_string(),
             protocol_version: PROTOCOL_VERSION,
             lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+            wire_formats: Vec::new(),
         };
         socket
             .send(WsMessage::Text(
