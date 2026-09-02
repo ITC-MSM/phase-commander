@@ -6,11 +6,22 @@
      `phase-server.commonMiddlewares` for why. Traefik's IngressRoute has no
      path-based routing to a separate resource the way the plain Ingress
      does (it matches by Host() only, see the entry route below), so the
-     split happens as a second, more specific `routes[]` rule instead: a
-     `PathPrefix("/ws")` match wins over the plain Host() match because
-     Traefik's default rule-based priority favors the longer/more specific
-     rule string, but `priority:` is set explicitly below so that ordering
-     never depends on that computation. */}}
+     split happens as a second, more specific `routes[]` rule instead:
+     `Host(...) && PathPrefix("/ws")` wins over the plain `Host(...)` match
+     under Traefik's default priority, which sorts routers on an entrypoint
+     by descending rule-string length when no router sets an explicit
+     `priority:`. The `/ws` rule is the `Host(...)` rule's text plus a fixed
+     ` && PathPrefix(`/ws`)` suffix, so it is unconditionally longer — for
+     every possible host value — and therefore unconditionally higher
+     priority under that default. Deliberately no `priority:` field is set
+     on either rule: `priority` is scoped to the whole entrypoint (shared
+     with every other IngressRoute/Ingress Traefik watches, not just this
+     chart's own pair), so pinning an explicit low value here (e.g. `1` for
+     the general rule) would rank this route below any other router on the
+     entrypoint that keeps the (near-universal) default, which is a much
+     larger blast radius than the ordering problem it would "fix". See
+     `deploy/helm/phase-server/tests/assert-compression-boundary.sh` for the
+     rendered-length assertion that keeps this contract honest. */}}
 {{- $wsMw := include "phase-server.middlewareRefs" (dict "ctx" . "excludeCompress" true) }}
 {{- /* Every route below terminates TLS unconditionally, so an advertised
      `http://` ordinal URL names an address this chart does not serve. `http`
@@ -45,7 +56,6 @@ spec:
   routes:
     - kind: Rule
       match: Host(`{{ $host }}`) && PathPrefix(`/ws`)
-      priority: 100
       {{- with $wsMw | trim }}
       middlewares:
         {{- . | nindent 8 }}
@@ -64,7 +74,6 @@ spec:
           {{- end }}
     - kind: Rule
       match: Host(`{{ $host }}`)
-      priority: 1
       {{- with $mw | trim }}
       middlewares:
         {{- . | nindent 8 }}
@@ -107,7 +116,6 @@ spec:
   routes:
     - kind: Rule
       match: Host(`{{ include "phase-server.ordinalHost" (dict "ctx" $ "ordinal" $i) }}`) && PathPrefix(`/ws`)
-      priority: 100
       {{- with $wsMw | trim }}
       middlewares:
         {{- . | nindent 8 }}
@@ -117,7 +125,6 @@ spec:
           port: {{ $.Values.service.port }}
     - kind: Rule
       match: Host(`{{ include "phase-server.ordinalHost" (dict "ctx" $ "ordinal" $i) }}`)
-      priority: 1
       {{- with $mw | trim }}
       middlewares:
         {{- . | nindent 8 }}
