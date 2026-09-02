@@ -53,7 +53,10 @@ export class GzipEnvelopeSocket implements PhaseSocketTransport {
         const encoded = await encodeJsonEnvelope(data);
         (this.socket as unknown as { send(data: Uint8Array): void }).send(encoded);
       })
-      .catch(() => this.socket.close());
+      .catch(() => {
+        this.onerror?.(new Event("error"));
+        this.socket.close();
+      });
   }
 
   close(): void {

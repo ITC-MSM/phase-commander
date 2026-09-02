@@ -114,6 +114,23 @@ describe("openPhaseSocket", () => {
     expect(received.mock.calls[0][0].data).toBe('{"type":"Pong"}');
   });
 
+  it("reports a queued binary send failure before closing", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const raw = MockWebSocket.instances[0];
+    raw.deliverMessage(helloFrame({ wire_formats: ["GzipEnvelopeV1"] }));
+
+    const socket = await promise;
+    const onerror = vi.fn();
+    socket.ws.onerror = onerror;
+    raw.send.mockImplementationOnce(() => {
+      throw new Error("socket closed before queued send");
+    });
+    socket.ws.send('{"type":"Ping"}');
+
+    await vi.waitFor(() => expect(onerror).toHaveBeenCalledOnce());
+    expect(raw.close).toHaveBeenCalled();
+  });
+
   it("rejects with protocol_mismatch when versions diverge and closes the socket", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];

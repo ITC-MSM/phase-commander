@@ -102,8 +102,19 @@ mod tests {
             .unwrap_err()
             .contains("unknown"));
 
+        assert!(decode_envelope(&[FORMAT_GZIP, 1, 2, 3], 8)
+            .unwrap_err()
+            .contains("invalid gzip"));
+
         let oversized = [vec![FORMAT_RAW], vec![b'x'; 9]].concat();
         assert!(decode_envelope(&oversized, 8)
+            .unwrap_err()
+            .contains("exceeds"));
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&[b'x'; 9]).unwrap();
+        let oversized_gzip = [vec![FORMAT_GZIP], encoder.finish().unwrap()].concat();
+        assert!(decode_envelope(&oversized_gzip, 8)
             .unwrap_err()
             .contains("exceeds"));
     }

@@ -11585,6 +11585,24 @@ mod issue_4548_full_create_tests {
         }
     }
 
+    async fn recv_enveloped_server_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let frame = socket
+            .next()
+            .await
+            .expect("websocket message")
+            .expect("websocket frame");
+        let WsMessage::Binary(bytes) = frame else {
+            panic!("expected binary server message, got {frame:?}");
+        };
+        let json = wire::decode_client_envelope(bytes.to_vec(), MAX_WS_MESSAGE_BYTES)
+            .await
+            .expect("decode server envelope");
+        serde_json::from_str(&json).expect("server message")
+    }
+
     #[tokio::test]
     async fn full_mode_create_sends_slots_after_game_created() {
         let (url, server, _temp_dir, _game_db) = spawn_full_mode_server().await;
@@ -11717,6 +11735,87 @@ mod issue_4548_full_create_tests {
         server.abort();
 
         assert!(result.is_ok(), "binary envelope roundtrip timed out");
+    }
+
+    #[tokio::test]
+    async fn lobby_broadcast_uses_each_clients_negotiated_frame_format() {
+        let (url, server, _temp_dir, _game_db) = spawn_full_mode_server().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            let (mut compressed, _) = tokio_tungstenite::connect_async(&url)
+                .await
+                .expect("connect compressed client");
+            assert!(matches!(
+                recv_server_message(&mut compressed).await,
+                ServerMessage::ServerHello { .. }
+            ));
+            let (mut legacy, _) = tokio_tungstenite::connect_async(&url)
+                .await
+                .expect("connect legacy client");
+            assert!(matches!(
+                recv_server_message(&mut legacy).await,
+                ServerMessage::ServerHello { .. }
+            ));
+
+            let hello = |wire_formats| ClientMessage::ClientHello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                build_commit: build_commit().to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats,
+            };
+            compressed
+                .send(WsMessage::Text(
+                    serde_json::to_string(&hello(vec![WireFormat::GzipEnvelopeV1]))
+                        .expect("hello json")
+                        .into(),
+                ))
+                .await
+                .expect("send compressed hello");
+            legacy
+                .send(WsMessage::Text(
+                    serde_json::to_string(&hello(Vec::new()))
+                        .expect("hello json")
+                        .into(),
+                ))
+                .await
+                .expect("send legacy hello");
+
+            let subscribe =
+                serde_json::to_vec(&ClientMessage::SubscribeLobby).expect("subscribe json");
+            compressed
+                .send(WsMessage::Binary(
+                    [vec![0x00], subscribe.clone()].concat().into(),
+                ))
+                .await
+                .expect("subscribe compressed client");
+            legacy
+                .send(WsMessage::Text(
+                    String::from_utf8(subscribe).expect("subscribe utf8").into(),
+                ))
+                .await
+                .expect("subscribe legacy client");
+
+            for _ in 0..2 {
+                recv_enveloped_server_message(&mut compressed).await;
+                recv_server_message(&mut legacy).await;
+            }
+
+            let (_trigger, _) = tokio_tungstenite::connect_async(&url)
+                .await
+                .expect("connect broadcast trigger");
+            while !matches!(
+                recv_enveloped_server_message(&mut compressed).await,
+                ServerMessage::PlayerCount { count: 3 }
+            ) {}
+            while !matches!(
+                recv_server_message(&mut legacy).await,
+                ServerMessage::PlayerCount { count: 3 }
+            ) {}
+        })
+        .await;
+        server.abort();
+
+        assert!(result.is_ok(), "mixed-version lobby broadcast timed out");
     }
 
     #[tokio::test]
