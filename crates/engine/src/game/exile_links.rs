@@ -39,10 +39,27 @@ pub(crate) fn should_track_exiled_by_source(
     ability: &ResolvedAbility,
 ) -> bool {
     ability_contains_linked_exile_consumer(ability)
-        || state
-            .objects
-            .get(&source_id)
-            .is_some_and(source_contains_linked_exile_consumer)
+        || source_is_linked_exile_consumer(state, source_id)
+}
+
+/// CR 607.2b: True when `source_id`'s own printed abilities (activated,
+/// triggered, replacement, or static — current or base) contain a linked-
+/// exile-consumer reference (e.g. "cards exiled with [this object]"),
+/// independent of whatever ability chain is currently resolving.
+///
+/// Shared by [`should_track_exiled_by_source`] (the ability-chain-aware
+/// caller, which additionally checks whether the *resolving* ability itself
+/// references the linked exile) and by
+/// `zone_pipeline::apply_zone_delivery_tail`'s auto-detect for callers with no
+/// `ResolvedAbility` in scope at all — a bare replacement-pipeline redirect
+/// (SBA-driven death, `Effect::Destroy`, `Effect::Sacrifice` deliveries) has
+/// no resolving effect chain to inspect, only the redirecting replacement's
+/// source object.
+pub(crate) fn source_is_linked_exile_consumer(state: &GameState, source_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&source_id)
+        .is_some_and(source_contains_linked_exile_consumer)
 }
 
 pub(crate) fn push_tracked_by_source(
@@ -56,6 +73,9 @@ pub(crate) fn push_tracked_by_source(
 /// CR 607.2a + CR 406.6: Record an exiled→source link with an explicit
 /// `ExileLinkKind`, deduped on the `(exiled_id, source_id)` pair (mirrors
 /// `push_tracked_by_source`, which delegates here for the plain tracked kind).
+/// A later, more specific link upgrades an existing `TrackedBySource` entry;
+/// this is required when automatic linked-exile detection runs before a
+/// mechanic-specific continuation such as Hideaway concealment.
 /// Used by Hideaway (`ExileLinkKind::HideawayLookable`, CR 702.75a) to mark the
 /// exiled card as look-permitted for the source's controller while keeping it
 /// discoverable by the kind-agnostic `ExiledBySource` companion-ability filter.
@@ -65,11 +85,16 @@ pub(crate) fn push_with_kind(
     source_id: ObjectId,
     kind: ExileLinkKind,
 ) {
-    if state
+    if let Some(existing) = state
         .exile_links
-        .iter()
-        .any(|link| link.exiled_id == exiled_id && link.source_id == source_id)
+        .iter_mut()
+        .find(|link| link.exiled_id == exiled_id && link.source_id == source_id)
     {
+        if matches!(&existing.kind, ExileLinkKind::TrackedBySource)
+            && !matches!(&kind, ExileLinkKind::TrackedBySource)
+        {
+            existing.kind = kind;
+        }
         return;
     }
     state.exile_links.push(ExileLink {
@@ -748,5 +773,101 @@ mod tests {
         );
 
         assert!(contains_linked_exile_consumer(&ability));
+    }
+
+    /// CR 607.2a + CR 702.75a: automatic source tracking may create a plain
+    /// link before Hideaway's conceal continuation marks the same card as
+    /// lookable. The mechanic-specific kind must replace the plain marker,
+    /// and a later generic push must not downgrade it again.
+    #[test]
+    fn specific_link_upgrades_plain_tracking_without_later_downgrade() {
+        let mut state = GameState::new_two_player(1);
+        let exiled = ObjectId(10);
+        let source = ObjectId(20);
+
+        push_with_kind(&mut state, exiled, source, ExileLinkKind::TrackedBySource);
+        push_with_kind(&mut state, exiled, source, ExileLinkKind::HideawayLookable);
+        push_with_kind(&mut state, exiled, source, ExileLinkKind::TrackedBySource);
+
+        assert_eq!(state.exile_links.len(), 1);
+        assert!(matches!(
+            state.exile_links[0].kind,
+            ExileLinkKind::HideawayLookable
+        ));
+    }
+
+    /// CR 607.2b: `source_is_linked_exile_consumer` must detect a linked-exile
+    /// reference living on an object's OWN printed ability (e.g. an activated
+    /// ability targeting `TargetFilter::ExiledBySource`), independent of any
+    /// currently-resolving ability chain — this is the primitive
+    /// `zone_pipeline::apply_zone_delivery_tail` relies on for callers with no
+    /// `ResolvedAbility` in scope (SBA-driven death, `Effect::Destroy`,
+    /// `Effect::Sacrifice`).
+    #[test]
+    fn source_is_linked_exile_consumer_detects_own_exiled_by_source_ability() {
+        use crate::game::zones::create_object;
+        use crate::types::ability::TypedFilter;
+        use crate::types::identifiers::CardId;
+
+        let mut state = GameState::new_two_player(1);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "The Darkness Crystal (test)".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.abilities = std::sync::Arc::new(vec![AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::ChangeZone {
+                origin: Some(Zone::Exile),
+                destination: Zone::Battlefield,
+                target: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::Typed(TypedFilter::creature()),
+                        TargetFilter::ExiledBySource,
+                    ],
+                },
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Tapped,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        )]);
+
+        assert!(
+            source_is_linked_exile_consumer(&state, source),
+            "an object with an ExiledBySource-targeting ability must be detected as a linked-exile consumer"
+        );
+
+        // NEGATIVE: an unrelated ability (no ExiledBySource reference anywhere)
+        // must not be detected.
+        let unrelated = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Unrelated Permanent".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&unrelated).unwrap();
+        obj.abilities = std::sync::Arc::new(vec![AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+        )]);
+
+        assert!(
+            !source_is_linked_exile_consumer(&state, unrelated),
+            "an object with no ExiledBySource reference must not be a linked-exile consumer"
+        );
     }
 }
