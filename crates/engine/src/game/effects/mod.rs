@@ -8081,9 +8081,24 @@ pub(crate) fn ability_uses_relative_controller_scoped(ability: &ResolvedAbility)
 }
 
 pub(crate) fn controller_for_relative_filter(
+    state: &GameState,
     ability: &ResolvedAbility,
     target_filter: &TargetFilter,
 ) -> PlayerId {
+    // CR 608.2c + CR 608.2d: a typed private-zone choice scoped to the
+    // parent target's controller belongs to that snapshotted player, even
+    // though the new object itself is chosen at resolution (Metamorphose).
+    // This is distinct from an ordinary Resolution-timed "you" filter below.
+    if target_filter_controller_scope(target_filter) == Some(ControllerRef::ParentTargetController)
+    {
+        if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
+            state,
+            ability,
+            &TargetFilter::ParentTargetController,
+        ) {
+            return player;
+        }
+    }
     // CR 503.1a + CR 608.2d (issue #1535): a filter scoped to the per-iteration
     // scoped player ("that player ... from their hand" under "each player's
     // upkeep") resolves to that scoped player, not the ability's controller.
@@ -8290,6 +8305,22 @@ pub(crate) fn optional_prompt_player(state: &GameState, ability: &ResolvedAbilit
         }
     }
     if let Effect::Sacrifice { target, .. } = &ability.effect {
+        if target_filter_controller_scope(target) == Some(ControllerRef::ParentTargetController) {
+            if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
+                state,
+                ability,
+                &TargetFilter::ParentTargetController,
+            ) {
+                return player;
+            }
+        }
+    }
+    // CR 608.2d: "That player/opponent may put a permanent card from their
+    // hand onto the battlefield" is a subject-anchored ChangeZone choice.
+    // The candidate filter names the earlier target's controller, so route
+    // the optional prompt through the same LKI-aware player resolver before
+    // opening the subsequent EffectZoneChoice (Metamorphose, Divine Gambit).
+    if let Effect::ChangeZone { target, .. } = &ability.effect {
         if target_filter_controller_scope(target) == Some(ControllerRef::ParentTargetController) {
             if let Some(player) = crate::game::targeting::resolve_effect_player_ref(
                 state,
