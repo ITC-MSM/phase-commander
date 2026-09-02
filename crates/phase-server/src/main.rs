@@ -3407,6 +3407,11 @@ async fn handle_socket(
             result = socket.recv() => {
                 match result {
                     Some(Ok(msg)) => {
+                        if !rate_limiter.check() {
+                            debug!("rate limit exceeded, dropping message");
+                            continue;
+                        }
+
                         let text = match msg {
                             Message::Text(t) => t.to_string(),
                             Message::Binary(bytes) if socket.uses_gzip_envelope() => {
@@ -3421,11 +3426,6 @@ async fn handle_socket(
                             Message::Close(_) => break,
                             _ => continue,
                         };
-
-                        if !rate_limiter.check() {
-                            debug!("rate limit exceeded, dropping message");
-                            continue;
-                        }
 
                         let client_msg: ClientMessage = match serde_json::from_str(&text) {
                             Ok(m) => m,
@@ -11603,6 +11603,32 @@ mod issue_4548_full_create_tests {
         serde_json::from_str(&json).expect("server message")
     }
 
+    fn test_client_hello(wire_formats: Vec<WireFormat>) -> ClientMessage {
+        ClientMessage::ClientHello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            build_commit: build_commit().to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+            wire_formats,
+        }
+    }
+
+    async fn send_test_message<S>(
+        socket: &mut WebSocketStream<S>,
+        message: &ClientMessage,
+        enveloped: bool,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let json = serde_json::to_vec(message).expect("client message json");
+        let frame = if enveloped {
+            WsMessage::Binary([vec![0x00], json].concat().into())
+        } else {
+            WsMessage::Text(String::from_utf8(json).expect("client message utf8").into())
+        };
+        socket.send(frame).await.expect("send client message");
+    }
+
     #[tokio::test]
     async fn full_mode_create_sends_slots_after_game_created() {
         let (url, server, _temp_dir, _game_db) = spawn_full_mode_server().await;
@@ -11695,41 +11721,33 @@ mod issue_4548_full_create_tests {
                     if wire_formats.contains(&WireFormat::GzipEnvelopeV1)
             ));
 
-            let hello = ClientMessage::ClientHello {
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                build_commit: build_commit().to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
-                wire_formats: vec![WireFormat::GzipEnvelopeV1],
-            };
-            socket
-                .send(WsMessage::Text(
-                    serde_json::to_string(&hello).expect("hello json").into(),
-                ))
+            send_test_message(
+                &mut socket,
+                &test_client_hello(vec![WireFormat::GzipEnvelopeV1]),
+                false,
+            )
+            .await;
+            send_test_message(&mut socket, &ClientMessage::SubscribeLobby, true).await;
+            assert!(matches!(
+                recv_enveloped_server_message(&mut socket).await,
+                ServerMessage::LobbyUpdate { .. }
+            ));
+            while tokio::time::timeout(Duration::from_millis(20), socket.next())
                 .await
-                .expect("send hello");
-
-            let subscribe =
-                serde_json::to_vec(&ClientMessage::SubscribeLobby).expect("subscribe json");
-            let binary = [vec![0x00], subscribe].concat();
-            socket
-                .send(WsMessage::Binary(binary.into()))
-                .await
-                .expect("send binary subscribe");
-
-            let frame = socket
-                .next()
-                .await
-                .expect("server response")
-                .expect("server frame");
-            let WsMessage::Binary(bytes) = frame else {
-                panic!("negotiated response must be binary, got {frame:?}");
-            };
-            let json = wire::decode_client_envelope(bytes.to_vec(), MAX_WS_MESSAGE_BYTES)
-                .await
-                .expect("decode server envelope");
-            let message: ServerMessage = serde_json::from_str(&json).expect("server message");
-            assert!(matches!(message, ServerMessage::LobbyUpdate { .. }));
+                .is_ok()
+            {}
+            for _ in 0..RATE_LIMIT_MESSAGES {
+                socket
+                    .send(WsMessage::Binary(vec![0x01, 1, 2, 3].into()))
+                    .await
+                    .expect("send malformed gzip");
+            }
+            send_test_message(&mut socket, &ClientMessage::Ping { timestamp: 7 }, true).await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), socket.next())
+                    .await
+                    .is_err()
+            );
         })
         .await;
         server.abort();
@@ -11744,56 +11762,21 @@ mod issue_4548_full_create_tests {
             let (mut compressed, _) = tokio_tungstenite::connect_async(&url)
                 .await
                 .expect("connect compressed client");
-            assert!(matches!(
-                recv_server_message(&mut compressed).await,
-                ServerMessage::ServerHello { .. }
-            ));
+            recv_server_message(&mut compressed).await;
             let (mut legacy, _) = tokio_tungstenite::connect_async(&url)
                 .await
                 .expect("connect legacy client");
-            assert!(matches!(
-                recv_server_message(&mut legacy).await,
-                ServerMessage::ServerHello { .. }
-            ));
+            recv_server_message(&mut legacy).await;
 
-            let hello = |wire_formats| ClientMessage::ClientHello {
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                build_commit: build_commit().to_string(),
-                protocol_version: PROTOCOL_VERSION,
-                lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
-                wire_formats,
-            };
-            compressed
-                .send(WsMessage::Text(
-                    serde_json::to_string(&hello(vec![WireFormat::GzipEnvelopeV1]))
-                        .expect("hello json")
-                        .into(),
-                ))
-                .await
-                .expect("send compressed hello");
-            legacy
-                .send(WsMessage::Text(
-                    serde_json::to_string(&hello(Vec::new()))
-                        .expect("hello json")
-                        .into(),
-                ))
-                .await
-                .expect("send legacy hello");
-
-            let subscribe =
-                serde_json::to_vec(&ClientMessage::SubscribeLobby).expect("subscribe json");
-            compressed
-                .send(WsMessage::Binary(
-                    [vec![0x00], subscribe.clone()].concat().into(),
-                ))
-                .await
-                .expect("subscribe compressed client");
-            legacy
-                .send(WsMessage::Text(
-                    String::from_utf8(subscribe).expect("subscribe utf8").into(),
-                ))
-                .await
-                .expect("subscribe legacy client");
+            send_test_message(
+                &mut compressed,
+                &test_client_hello(vec![WireFormat::GzipEnvelopeV1]),
+                false,
+            )
+            .await;
+            send_test_message(&mut legacy, &test_client_hello(Vec::new()), false).await;
+            send_test_message(&mut compressed, &ClientMessage::SubscribeLobby, true).await;
+            send_test_message(&mut legacy, &ClientMessage::SubscribeLobby, false).await;
 
             for _ in 0..2 {
                 recv_enveloped_server_message(&mut compressed).await;

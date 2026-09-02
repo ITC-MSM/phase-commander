@@ -106,12 +106,16 @@ describe("openPhaseSocket", () => {
     const binary = raw.send.mock.calls.find(([value]) => value instanceof Uint8Array)?.[0];
     expect(binary?.[0]).toBe(0x00);
 
-    const received = vi.fn();
+    const order: string[] = [];
+    const received = vi.fn((_event: MessageEvent<string>) => order.push("message"));
     socket.ws.onmessage = received;
+    socket.ws.addEventListener("close", () => order.push("close"));
     const response = new TextEncoder().encode(JSON.stringify({ type: "Pong" }));
     raw.deliverMessage(new Uint8Array([0x00, ...response]).buffer);
+    raw.close();
     await vi.waitFor(() => expect(received).toHaveBeenCalledOnce());
-    expect(received.mock.calls[0][0].data).toBe('{"type":"Pong"}');
+    expect(received).toHaveBeenCalledWith(expect.objectContaining({ data: '{"type":"Pong"}' }));
+    expect(order).toEqual(["message", "close"]);
   });
 
   it("reports a queued binary send failure before closing", async () => {

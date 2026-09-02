@@ -3,11 +3,7 @@ import type { PhaseSocketTransport } from "./openPhaseSocket";
 
 type MessageListener = (event: MessageEvent<string>) => void;
 
-/**
- * Keeps the WebSocket-shaped API used by the adapters while serializing the
- * asynchronous CompressionStream work. Both queues are FIFO so compression
- * cannot reorder actions or authoritative state updates.
- */
+/** Serializes async envelope work without reordering socket events. */
 export class GzipEnvelopeSocket implements PhaseSocketTransport {
   onopen: ((event: Event) => void) | null = null;
   onmessage: MessageListener | null = null;
@@ -15,8 +11,10 @@ export class GzipEnvelopeSocket implements PhaseSocketTransport {
   onclose: ((event: CloseEvent) => void) | null = null;
 
   private readonly messageListeners = new Map<MessageListener, boolean>();
+  private readonly closeListeners = new Map<(event: CloseEvent) => void, boolean>();
   private sendQueue = Promise.resolve();
   private receiveQueue = Promise.resolve();
+  private closeQueued = false;
 
   constructor(private readonly socket: PhaseSocketTransport) {
     if ("binaryType" in socket) {
@@ -24,7 +22,17 @@ export class GzipEnvelopeSocket implements PhaseSocketTransport {
     }
     socket.onopen = (event) => this.onopen?.(event);
     socket.onerror = (event) => this.onerror?.(event);
-    socket.onclose = (event) => this.onclose?.(event);
+    socket.onclose = (event) => {
+      if (this.closeQueued) return;
+      this.closeQueued = true;
+      this.receiveQueue = this.receiveQueue.then(() => {
+        this.onclose?.(event);
+        for (const [listener, once] of this.closeListeners) {
+          listener(event);
+          if (once) this.closeListeners.delete(listener);
+        }
+      });
+    };
     socket.onmessage = (event) => {
       this.receiveQueue = this.receiveQueue
         .then(async () => this.decodeIncoming(event.data as unknown))
@@ -36,10 +44,7 @@ export class GzipEnvelopeSocket implements PhaseSocketTransport {
             if (once) this.messageListeners.delete(listener);
           }
         })
-        .catch(() => {
-          // A malformed envelope is an untrusted wire frame. Drop it just as
-          // openPhaseSocket drops malformed JSON during the handshake.
-        });
+        .catch(() => undefined);
     };
   }
 
@@ -82,7 +87,8 @@ export class GzipEnvelopeSocket implements PhaseSocketTransport {
       const once = typeof options === "object" && options.once === true;
       this.messageListeners.set(listener as MessageListener, once);
     } else {
-      this.socket.addEventListener("close", listener as (event: CloseEvent) => void, options);
+      const once = typeof options === "object" && options.once === true;
+      this.closeListeners.set(listener as (event: CloseEvent) => void, once);
     }
   }
 
@@ -98,7 +104,7 @@ export class GzipEnvelopeSocket implements PhaseSocketTransport {
     if (type === "message") {
       this.messageListeners.delete(listener as MessageListener);
     } else {
-      this.socket.removeEventListener("close", listener as (event: CloseEvent) => void);
+      this.closeListeners.delete(listener as (event: CloseEvent) => void);
     }
   }
 
