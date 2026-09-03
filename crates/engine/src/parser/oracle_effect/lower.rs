@@ -2109,18 +2109,20 @@ pub(super) fn fold_enters_this_way_counter_rider(def: &mut AbilityDefinition) {
     }
 }
 
-/// CR 608.2c + CR 701.9a + CR 701.21a: Rebind the parser's generic bare-pronoun
-/// default (`TargetFilter::ParentTarget` — no chosen target and no clearer
-/// antecedent reached the clause parser, per `resolve_pronoun_target`'s
+/// CR 608.2c + CR 701.9a + CR 701.21a + CR 701.25a: Rebind the parser's generic
+/// bare-pronoun default (`TargetFilter::ParentTarget` — no chosen target and no
+/// clearer antecedent reached the clause parser, per `resolve_pronoun_target`'s
 /// fallthrough arm) to the moved object (`TargetFilter::LastZoneChanged`) in a
-/// sub-ability gated by a discard/sacrifice-this-way reflexive condition
-/// (`AbilityCondition::ZoneChangedThisWay { destination: None, .. }`) whose
-/// PARENT effect is the `Discard`/`Sacrifice` that created the reflexive gate.
+/// sub-ability gated by a discard/sacrifice/surveil-this-way reflexive
+/// condition (`AbilityCondition::ZoneChangedThisWay { .. }`) whose PARENT
+/// effect is the `Discard`/`Sacrifice`/`Surveil` that created the reflexive
+/// gate. See `reflexive_gate_destination_matches_parent` for the per-parent
+/// `destination` shape each of the three verbs requires.
 ///
-/// Neither `Effect::Discard.target` (the ACTING PLAYER) nor
-/// `Effect::Sacrifice.target` (the ELIGIBILITY filter for what may be
-/// sacrificed) names the specific card/permanent that actually moved — that
-/// object is known only once the move resolves
+/// Neither `Effect::Discard.target` (the ACTING PLAYER), `Effect::Sacrifice
+/// .target` (the ELIGIBILITY filter for what may be sacrificed), nor
+/// `Effect::Surveil.target` (WHO surveils) names the specific card/permanent
+/// that actually moved — that object is known only once the move resolves
 /// (`state.last_zone_changed_ids`). This is why the sibling battlefield-entry
 /// "this way" class (`fold_enters_this_way_counter_rider`,
 /// `destination: Some(Zone::Battlefield)`) stays on `TargetFilter::ParentTarget`
@@ -2165,6 +2167,13 @@ pub(super) fn fold_enters_this_way_counter_rider(def: &mut AbilityDefinition) {
 /// resolves to `TriggeringSource` (Silvan Reveler itself, already on the
 /// battlefield), so the land never leaves the graveyard.
 ///
+/// Chandra, Chill of Compliance: "Surveil 1. If you put a noncreature,
+/// nonland card into your graveyard this way, put that card into your hand."
+/// (Enlightened Confidant shares the shape.) Without this rewrite, "that
+/// card" resolves to bare `ParentTarget`, which names nothing — `Surveil`
+/// declares no card-shaped target of its own (`Effect::Surveil.target` is WHO
+/// surveils, a player) — so the card silently stays in the graveyard.
+///
 /// SCOPE — narrowed to `Effect::ChangeZone`'s own `target` field only (#8250
 /// review): `TargetFilter::ParentTarget` is not exclusive to "no antecedent
 /// reached the parser" — it is also the standing representation for "this
@@ -2190,19 +2199,18 @@ pub(super) fn fold_enters_this_way_counter_rider(def: &mut AbilityDefinition) {
 /// a `DealDamage` (or any other effect) sibling in the same gated rider is
 /// left untouched, preserving its own independently-resolved target.
 pub(super) fn rebind_zone_changed_this_way_pronoun_to_moved_object(def: &mut AbilityDefinition) {
-    let parent_is_discard_or_sacrifice = matches!(
-        *def.effect,
-        Effect::Discard { .. } | Effect::Sacrifice { .. }
-    );
-    if parent_is_discard_or_sacrifice {
-        if let Some(sub) = def.sub_ability.as_deref_mut() {
-            if matches!(
-                sub.condition,
-                Some(AbilityCondition::ZoneChangedThisWay {
-                    destination: None,
-                    ..
-                })
-            ) {
+    // Computed up front (before borrowing `def.sub_ability` below) purely to
+    // keep the two borrows disjoint and obviously so — see
+    // `ReflexiveGateParent`'s doc comment for what each variant requires of
+    // the paired `ZoneChangedThisWay.destination`.
+    let parent_kind = ReflexiveGateParent::from_effect(&def.effect);
+    if let Some(sub) = def.sub_ability.as_deref_mut() {
+        let gate_destination = match &sub.condition {
+            Some(AbilityCondition::ZoneChangedThisWay { destination, .. }) => Some(*destination),
+            _ => None,
+        };
+        if let Some(destination) = gate_destination {
+            if parent_kind.destination_matches(destination) {
                 // Narrow to `ChangeZone`'s own target field — see the SCOPE
                 // note above. Do NOT widen to `each_target_filter_mut`: that
                 // walker also visits `DealDamage`/`Discard`/`Mill`/etc.
@@ -2221,6 +2229,47 @@ pub(super) fn rebind_zone_changed_this_way_pronoun_to_moved_object(def: &mut Abi
     }
     if let Some(els) = def.else_ability.as_deref_mut() {
         rebind_zone_changed_this_way_pronoun_to_moved_object(els);
+    }
+}
+
+/// Which reflexive-gate-producing verb (if any) `def.effect` is, for
+/// `rebind_zone_changed_this_way_pronoun_to_moved_object`'s parent/gate
+/// pairing check. Discard and Sacrifice are cause-bound — CR 701.9a makes the
+/// graveyard inherent to "discard", CR 701.21a inherent to "sacrifice" — so
+/// their gates parse with `destination: None`
+/// (`parse_you_discard_this_way_clause` / `parse_you_sacrifice_this_way_clause`).
+/// Surveil's gate is destination-bound — CR 701.25a: the surveilled card's
+/// fate is a genuine graveyard-or-library choice, not implied by the verb —
+/// so it parses with `destination: Some(Zone::Graveyard)`
+/// (`parse_you_put_into_graveyard_this_way_clause`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReflexiveGateParent {
+    DiscardOrSacrifice,
+    Surveil,
+    Other,
+}
+
+impl ReflexiveGateParent {
+    fn from_effect(effect: &Effect) -> Self {
+        match effect {
+            Effect::Discard { .. } | Effect::Sacrifice { .. } => Self::DiscardOrSacrifice,
+            Effect::Surveil { .. } => Self::Surveil,
+            _ => Self::Other,
+        }
+    }
+
+    /// Whether a `ZoneChangedThisWay.destination` value is the shape THIS
+    /// parent's own grammar produces — a mismatch (e.g. `DiscardOrSacrifice`
+    /// paired with `Some(Zone::Battlefield)`) cannot occur from this parser's
+    /// own output but guards against a future reflexive-gate producer being
+    /// added without updating this match; the pronoun is then left alone for
+    /// another pass (or `swallow_check`) to handle.
+    fn destination_matches(self, destination: Option<crate::types::zones::Zone>) -> bool {
+        match self {
+            Self::DiscardOrSacrifice => destination.is_none(),
+            Self::Surveil => destination == Some(crate::types::zones::Zone::Graveyard),
+            Self::Other => false,
+        }
     }
 }
 

@@ -1394,6 +1394,7 @@ mod razorkin_needlehead_opponent_draw_damage_2869;
 mod reflexive_body_token_referent;
 mod reflexive_discard_this_way;
 mod reflexive_if_rider;
+mod reflexive_surveil_this_way;
 mod reflexive_this_way_delayed_s25;
 mod regenerate_card_shields_creature;
 mod remove_all_counters_transform;
