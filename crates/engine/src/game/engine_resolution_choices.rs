@@ -4054,7 +4054,7 @@ pub(super) fn handle_resolution_choice(
             let completion = crate::types::game_state::BatchCompletion::SurveilKeepOnTop {
                 player,
                 top_cards,
-                graveyard_bound: to_graveyard.clone(),
+                graveyard_bound: to_graveyard,
             };
             crate::game::zone_pipeline::move_objects_simultaneously_then(
                 state,
