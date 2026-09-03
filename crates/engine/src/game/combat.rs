@@ -1227,6 +1227,29 @@ fn validate_per_defender_attacker_caps(
             ));
         }
     }
+    // CR 508.1c + CR 508.5: defender-PERMANENT-scoped caps
+    // (`MaxAttackersEachCombat { defender: Some(ThisPermanent) }`, e.g. The
+    // Eternal Wanderer's "No more than one creature can attack ~ each
+    // combat"). Each such static limits only creatures attacking the static's
+    // own source object, so the source's controller and every other
+    // player/planeswalker/battle may still be attacked freely.
+    for (protected_permanent, max) in per_permanent_defender_caps(state) {
+        let count = attacks
+            .iter()
+            .filter(|(_, target)| {
+                matches!(
+                    target,
+                    AttackTarget::Planeswalker(id) | AttackTarget::Battle(id)
+                        if *id == protected_permanent
+                )
+            })
+            .count() as u32;
+        if count > max {
+            return Err(format!(
+                "No more than {max} creature(s) can attack {protected_permanent:?} each combat (CR 508.1c)"
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1244,6 +1267,36 @@ fn per_defender_caps(state: &GameState) -> Vec<(PlayerId, u32)> {
                 max,
                 defender: Some(AttackDefenderScope::Controller),
             } => Some((source.controller, max)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// CR 508.1c + CR 508.5: The active per-permanent attacker caps
+/// (`MaxAttackersEachCombat { defender: Some(ThisPermanent) }`, e.g. The
+/// Eternal Wanderer), as `(protected_permanent, max)` pairs. Distinct from
+/// [`per_defender_caps`] (player-scoped): this restricts attacks declared
+/// against the static's own source object specifically, never against the
+/// source's controller or any other permanent that controller defends.
+///
+/// NOTE: unlike `per_defender_caps`, this cap set is consulted ONLY by the
+/// strict validator (`validate_per_defender_attacker_caps`) — the CR 508.1d
+/// "maximum obeyable requirements" solver (`max_no_payment` /
+/// `best_free_declaration` / `dp_best_suffix`) does not yet model
+/// permanent-scoped caps. Every real attack declaration is still rejected if
+/// it violates this cap (the strict validator runs unconditionally), so no
+/// illegal attack can ever be accepted; the only residual gap is a
+/// vanishingly rare double-card interaction (a *different* card that grants a
+/// "must attack" requirement resolving alongside a `ThisPermanent` cap) where
+/// the solver's optimality bar could disagree with what the cap allows. No
+/// printed card grants both effects simultaneously today.
+fn per_permanent_defender_caps(state: &GameState) -> Vec<(ObjectId, u32)> {
+    super::functioning_abilities::battlefield_active_statics(state)
+        .filter_map(|(source, def)| match def.mode {
+            StaticMode::MaxAttackersEachCombat {
+                max,
+                defender: Some(AttackDefenderScope::ThisPermanent),
+            } => Some((source.id, max)),
             _ => None,
         })
         .collect()
@@ -4524,6 +4577,15 @@ fn max_no_payment(constraints: &AttackDeclarationConstraints, state: &GameState)
     // Separable fast path: with no coupling constraint, each creature's obeyed
     // requirements depend only on its own chosen (free) target, so the optimum is
     // the per-creature sum of best single-target scores.
+    //
+    // NOTE: `per_permanent_defender_caps` (`MaxAttackersEachCombat { defender:
+    // Some(ThisPermanent) }`, The Eternal Wanderer) is intentionally NOT a
+    // coupling input here — this solver only computes the CR 508.1d
+    // "maximum obeyable `MustAttack*` requirements" bar, and no printed card
+    // combines a `ThisPermanent` cap with a `MustAttack*` grant. The cap
+    // itself is still always enforced by `validate_per_defender_attacker_caps`
+    // regardless of this solver, so no illegal declaration can be accepted;
+    // widen this if such a combination is ever printed.
     let coupled = constraints.global_cap.is_some()
         || !constraints.per_defender_caps.is_empty()
         || !constraints.needs_companion.is_empty()
