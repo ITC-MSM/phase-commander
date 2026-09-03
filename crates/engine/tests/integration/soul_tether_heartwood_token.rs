@@ -60,6 +60,12 @@ fn soul_tether_creates_a_heartwood_token_with_a_two_color_mana_ability() {
     let outcome = runner.cast(spell).resolve();
 
     // ── reach guard #1: the resolution actually created a token ──
+    assert_eq!(
+        outcome.state().last_created_token_ids.len(),
+        1,
+        "Soul Tether creates exactly one Heartwood token, not {:?}",
+        outcome.state().last_created_token_ids
+    );
     let token_id = *outcome
         .state()
         .last_created_token_ids
