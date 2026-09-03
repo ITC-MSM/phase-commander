@@ -11059,6 +11059,20 @@ fn effect_chain_lose_life_and_amass_keeps_both_clauses() {
     }
 }
 
+#[test]
+fn effect_target_player_amasses_surfaces_the_player_target() {
+    let effect = parse_effect("target player amasses Goblins 2");
+    assert_eq!(
+        effect,
+        Effect::Amass {
+            subtype: "Goblin".to_string(),
+            count: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Player,
+        }
+    );
+    assert_eq!(effect.target_filter(), Some(&TargetFilter::Player));
+}
+
 // CR 701.63: Endure — every printed card prefixes a self-referential
 // subject ("it endures N", "this creature endures N", "~ endures N" after
 // card-name normalization). The subject layer must strip the subject so the
