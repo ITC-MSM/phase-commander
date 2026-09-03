@@ -276,9 +276,68 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_quantity_quantity_comparison,
         parse_zone_conditions,
         parse_there_are_counters_on_source,
+        // CR 105.2 + CR 611.3a: "<color> is the most common color among all
+        // permanents [or is tied for most common]" (Invasion Djinn cycle).
+        parse_color_is_most_common_among_permanents_condition,
         parse_remaining_state_presence_conditions_tail,
     ))
     .parse(input)
+}
+
+/// CR 105.2 + CR 611.3a: "<color> is the most common color among all
+/// permanents[ or is tied for most common]" — the Invasion Djinn cycle (Sulam
+/// Djinn, Goham Djinn, Ruham Djinn, Zanam Djinn, Halam Djinn): "This creature
+/// gets -2/-2 as long as [color] is the most common color among all
+/// permanents or is tied for most common."
+///
+/// Maps to a `QuantityComparison` between the battlefield-wide count of
+/// permanents with the named color (`QuantityRef::ObjectCount`) and the
+/// largest such count across every color (`QuantityRef::ObjectCountBySharedQuality`
+/// grouped by `SharedQuality::Color`, CR 109.3's grouped-aggregate shape).
+/// `Comparator::GE` already admits ties, so the optional "or is tied for most
+/// common" tail is redundant text discarded here — both phrasings collapse to
+/// the same comparison, mirroring how `parse_shares_most_common_color_condition`
+/// treats Heroic Defiance's analogous "or a color tied for most common" tail.
+/// Deliberately composed from existing generic `QuantityRef` building blocks
+/// rather than a new `StaticCondition` variant — the named-color population
+/// and the "most common among all colors" aggregate are both already-typed
+/// axes, so no new leaf is needed.
+fn parse_color_is_most_common_among_permanents_condition(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, color) = parse_color(input)?;
+    let (rest, _) = tag(" is the most common color among all permanents").parse(rest)?;
+    let (rest, _) = opt(tag(" or is tied for most common")).parse(rest)?;
+
+    let all_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: Vec::new(),
+    });
+    let colored_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: vec![FilterProp::HasColor { color }],
+    });
+
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: colored_permanents,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCountBySharedQuality {
+                    filter: all_permanents,
+                    quality: SharedQuality::Color,
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+        },
+    ))
 }
 
 /// Keeps the remaining state-presence grammar below nom's tuple-arity limit
