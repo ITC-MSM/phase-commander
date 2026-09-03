@@ -52,6 +52,7 @@ mod aura_token_attach_guard;
 mod aurification_gold_counter_defender_cant_attack;
 mod awaken_runtime;
 mod awe_strike_prevention;
+mod azog_morias_ruin_amass_lki;
 mod azors_gateway_transform_condition;
 mod backup_becomes_target_trigger;
 mod balance_equalization;
