@@ -274,6 +274,11 @@ export function GamePage() {
   const roomNameParam = searchParams.get("roomName");
   const sourceParam = searchParams.get("source") ?? undefined;
   const draftIdParam = searchParams.get("draftId") ?? undefined;
+  // The lobby authority this join/spectate was launched from. Produced by
+  // our own navigation from a canonical `LobbySource.url`; a hand-edited
+  // value surfaces through the adapter's existing handshake error path, the
+  // same way a hand-edited `code` does.
+  const serverParam = searchParams.get("server") ?? undefined;
   const playerCount = playersParam ? Number(playersParam) : undefined;
   const activeGameMeta = useMemo(
     () => (gameId ? loadActiveGame() : null),
@@ -552,11 +557,14 @@ export function GamePage() {
             deckRejected: true,
             reason: event.reason,
             joinCode,
+            // Carry the origin back: the retry must re-join the same server,
+            // not whichever one this client hosts on.
+            server: serverParam,
           },
         });
         break;
     }
-  }, [gameId, navigate, joinCode, isOnlineMode, t]);
+  }, [gameId, navigate, joinCode, serverParam, isOnlineMode, t]);
 
   const handleP2PEvent = useCallback((event: P2PAdapterEvent) => {
     switch (event.type) {
@@ -762,6 +770,7 @@ export function GamePage() {
       roomName={roomNameParam ?? undefined}
       source={sourceParam}
       draftId={draftIdParam}
+      serverUrl={serverParam}
       onWsEvent={mode === "ai" || mode === "online" || mode === "spectate" ? handleWsEvent : undefined}
       onP2PEvent={
         mode === "p2p-host" || mode === "p2p-join" ? handleP2PEvent : undefined
@@ -1004,6 +1013,7 @@ function GamePageContent({
   );
   const debugPanelOpen = useUiStore((s) => s.debugPanelOpen);
   const debugClickModeButtonVisible = useUiStore((s) => s.debugClickModeButtonVisible);
+  const logPanelOpen = useUiStore((s) => s.logPanelOpen);
   const toggleDebugClickModeButtonVisible = useUiStore(
     (s) => s.toggleDebugClickModeButtonVisible,
   );
@@ -1730,6 +1740,8 @@ function GamePageContent({
         isOnlineMode={isOnlineMode}
         showAiHand={showAiHand}
         onToggleAiHand={() => setShowAiHand((v) => !v)}
+        logPanelOpen={logPanelOpen}
+        onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
         multiplayerBoardLayout={
           seatCount > 2 && !untapForcedSplit ? resolvedMultiplayerBoardLayout : undefined
         }
