@@ -13,7 +13,7 @@ use super::super::oracle_nom::enters_under::{
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::primitives::parse_keyword_name;
 use super::super::oracle_target::{parse_target, parse_target_with_ctx, parse_type_phrase};
-use super::super::oracle_util::{contains_possessive, parse_count_expr, TextPair};
+use super::super::oracle_util::{contains_possessive, parse_count_expr, parse_ordinal, TextPair};
 use super::{apply_where_x_to_filter, strip_trailing_where_x};
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
@@ -205,6 +205,52 @@ fn is_search_result_put_onto_battlefield_restatement(lower: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// CR 701.24b + CR 608.2c: Parse a later search-result instruction that puts
+/// the found card or cards at a specific position in the searched library.
+/// Verb agreement, result referent, and library position are independent
+/// grammar axes so controller and inherited player subjects share one
+/// production.
+fn parse_search_result_library_position_restatement(
+    input: &str,
+) -> OracleResult<'_, LibraryPosition> {
+    let (input, _) = alt((tag::<_, _, OracleError<'_>>("put "), tag("puts "))).parse(input)?;
+    let (input, _) = alt((
+        tag("that card "),
+        tag("it "),
+        tag("the card "),
+        tag("them "),
+        tag("those cards "),
+        tag("the chosen cards "),
+    ))
+    .parse(input)?;
+    alt((
+        value(LibraryPosition::Top, tag("on top")),
+        map_opt(
+            terminated(
+                take_until::<_, _, OracleError<'_>>(" from the top"),
+                tag(" from the top"),
+            ),
+            |ordinal_text| {
+                parse_ordinal(ordinal_text).and_then(|(n, rest)| {
+                    rest.trim()
+                        .is_empty()
+                        .then_some(LibraryPosition::NthFromTop { n })
+                })
+            },
+        ),
+    ))
+    .parse(input)
+}
+
+fn has_search_result_library_position_restatement(lower: &str) -> bool {
+    let bare = strip_search_result_subject(lower.trim().trim_end_matches('.'));
+    parse_search_result_library_position_restatement(bare).is_ok()
+        || nom_primitives::scan_at_word_boundaries(lower, |input| {
+            parse_search_result_library_position_restatement(strip_search_result_subject(input))
+        })
+        .is_some()
+}
+
 fn has_conditional_search_result_destination(lower: &str) -> bool {
     fn parse_clause(input: &str) -> Result<(&str, ()), nom::Err<OracleError<'_>>> {
         let (input, _) = parse_search_result_put_onto_battlefield_restatement(input)?;
@@ -353,6 +399,59 @@ pub(super) fn parse_rest_cards_reference(
     .parse(input)
 }
 
+/// CR 202.3 + CR 608.2c: "if its mana value is <comparator> <dynamic
+/// quantity>, put it onto <zone>[. otherwise, put it into <zone>]." — a
+/// card-property branch on the RevealUntil hit card's own mana value,
+/// distinct from the player-choice `kept_optional_to` shape ("you may put
+/// that card onto the battlefield"). Covers Part in Friendship ("If its mana
+/// value is less than or equal to the number of lands you control, put it
+/// onto the battlefield. Otherwise, put it into your hand."). The RHS
+/// quantity delegates to the shared `nom_quantity::parse_quantity`
+/// combinator, so this covers the whole class of dynamic-threshold
+/// conditional-destination reveal-until cards — not just "lands you
+/// control" — and the trailing "otherwise" clause is optional so the
+/// combinator also matches when the two sentences are split into separate
+/// continuation chunks (the second chunk then falls through to the existing
+/// bare "put it" absorption, which harmlessly refines `kept_destination` to
+/// the same "otherwise" zone).
+fn parse_reveal_until_conditional_kept(input: &str) -> OracleResult<'_, ContinuationAst> {
+    fn kept_zone_phrase(i: &str) -> OracleResult<'_, Zone> {
+        let (i, zone) = preceded(
+            alt((tag("onto the "), tag("into your "), tag("into "))),
+            crate::parser::oracle_target::parse_zone_word,
+        )
+        .parse(i)?;
+        let (i, _) = crate::parser::oracle_target::peek_zone_boundary(i)?;
+        Ok((i, zone))
+    }
+
+    let (i, _) = tag("if its mana value is ").parse(input)?;
+    let (i, comparator) = crate::parser::oracle_nom::condition::parse_life_total_comparator(i)?;
+    let (i, rhs) = crate::parser::oracle_nom::quantity::parse_quantity(i)?;
+    let (i, _) = tag(", put it ").parse(i)?;
+    let (i, if_true_destination) = kept_zone_phrase(i)?;
+    let (i, otherwise_destination) =
+        opt(preceded(tag(". otherwise, put it "), kept_zone_phrase)).parse(i)?;
+
+    let filter = TargetFilter::Typed(TypedFilter {
+        type_filters: Vec::new(),
+        controller: None,
+        properties: vec![FilterProp::Cmc {
+            comparator,
+            value: rhs,
+        }],
+    });
+
+    Ok((
+        i,
+        ContinuationAst::RevealUntilConditionalKept {
+            filter: Box::new(filter),
+            if_true_destination,
+            otherwise_destination,
+        },
+    ))
+}
+
 /// CR 701.20a: Detect the rest-pile zone in a `RevealUntil` continuation
 /// chunk. The "rest" subject may be phrased as "the rest" / "all other cards
 /// revealed this way" / "the other cards" — and may be governed by an
@@ -483,15 +582,25 @@ fn append_definition_to_sub_chain(ability: &mut AbilityDefinition, mut next: Abi
             {
                 super::lower::normalize_linked_exile_cast_bottom_cleanup(&mut next.effect);
                 cursor.else_ability = Some(Box::new(next.clone()));
-            } else if cursor.optional
-                && super::lower::is_exile_until_cast_bottom_cleanup(
-                    &head_effect,
-                    &cursor.effect,
-                    &next.effect,
-                )
-            {
+            } else if super::lower::is_exile_until_cast_bottom_cleanup(
+                &head_effect,
+                &cursor.effect,
+                &next.effect,
+            ) {
+                // CR 608.2c + CR 701.13a: "the rest of those exiled cards" excludes
+                // the hit whether the cast is a resolution-time offer or a standing
+                // permission — the rewrite is a property of the WORDING, not of the
+                // cast's optionality, so it runs either way.
                 super::lower::normalize_exile_until_cast_bottom_cleanup(&mut next.effect);
-                cursor.else_ability = Some(Box::new(next.clone()));
+                // CR 608.2d: the decline branch exists only where there is a
+                // decline — a resolution-time optional cast. A lingering permission
+                // (The Day of the Doctor: "for as long as this Saga remains on the
+                // battlefield") is never accepted or declined as the ability
+                // resolves, so stashing an else branch would publish a second,
+                // unreachable copy of the cleanup to the chain scanners.
+                if cursor.optional {
+                    cursor.else_ability = Some(Box::new(next.clone()));
+                }
             }
             cursor.sub_ability = Some(Box::new(next));
             break;
@@ -3975,11 +4084,14 @@ pub(super) fn apply_clause_continuation(
                 ..
             } = &mut *previous.effect
             {
-                // CR 611.2 + CR 611.2a: "that permanent loses all abilities for
-                // as long as this creature remains on the battlefield" rider.
+                // CR 611.2b + CR 702.26f: "that permanent loses all abilities
+                // for as long as this creature remains on the battlefield"
+                // rider (Tishana's Tidebinder) — the printed wording is the
+                // presence-bound state reading, so the rider's effect ends on
+                // a phase-out of this creature, not only on its exit.
                 *existing = Some(CounterSourceRider::LosesAbilities {
                     static_def: source_static,
-                    duration: Box::new(Duration::UntilHostLeavesPlay),
+                    duration: Box::new(Duration::WhileHostOnBattlefield),
                 });
             }
         }
@@ -5103,6 +5215,35 @@ pub(super) fn apply_clause_continuation(
                 *rest_destination = destination;
             }
         }
+        // CR 202.3 + CR 608.2c: "If its mana value is <comparator> <dynamic
+        // quantity>, put it onto <zone>[. Otherwise, put it into <zone>]." —
+        // populates the card-property-driven `kept_destination_if` branch
+        // (Part in Friendship). `kept_destination` (the "otherwise" branch)
+        // is refined only when the trailing "otherwise" clause was captured
+        // in the same sentence; when the two sentences are separate
+        // continuation chunks, the following bare "put it" chunk refines
+        // `kept_destination` on its own (identical to the Songbirds'
+        // Blessing "you may … / if you don't …" GAP-1 precedent).
+        ContinuationAst::RevealUntilConditionalKept {
+            filter,
+            if_true_destination,
+            otherwise_destination,
+        } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if let Effect::RevealUntil {
+                kept_destination,
+                kept_destination_if,
+                ..
+            } = &mut *previous.effect
+            {
+                *kept_destination_if = Some((filter, if_true_destination));
+                if let Some(otherwise) = otherwise_destination {
+                    *kept_destination = otherwise;
+                }
+            }
+        }
         // CR 406.3 + CR 701.20e: Rewrite the preceding private `Dig` (the
         // "look at the top N cards of <player>'s library" look step) into an
         // `Effect::ExileTop` so the looked-at card(s) actually leave the
@@ -5439,6 +5580,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::GrantExtraTurnAfterControlledTurn => true,
         ContinuationAst::RevealUntilKept { .. } => true,
         ContinuationAst::RevealUntilAllToZone { .. } => true,
+        ContinuationAst::RevealUntilConditionalKept { .. } => true,
         // Recognition was already gated on a preceding `Dig` in
         // parse_followup_continuation_ast; the "exile it [face down]" clause is
         // folded into that Dig (rewritten to ExileTop) and emits no sibling def.
@@ -5491,19 +5633,11 @@ pub(super) fn parse_intrinsic_continuation_ast(
             if has_conditional_search_result_destination(&full_lower) {
                 return None;
             }
-            // CR 701.24b: If later clauses contain "put on top", suppress the default
-            // ChangeZone(→Hand) — the card stays in the library and a separate
-            // PutAtLibraryPosition effect in the chain handles placement.
-            // Also suppress for "Nth from the top" (Long-Term Plans, etc.)
-            let has_positional_put =
-                nom_primitives::scan_contains(&full_lower, "put that card on top")
-                    || nom_primitives::scan_contains(&full_lower, "put it on top")
-                    || nom_primitives::scan_contains(&full_lower, "put the card on top")
-                    || nom_primitives::scan_contains(&full_lower, "put them on top")
-                    || nom_primitives::scan_contains(&full_lower, "put those cards on top")
-                    || nom_primitives::scan_contains(&full_lower, "put the chosen cards on top")
-                    || (nom_primitives::scan_contains(&full_lower, "put that card")
-                        && nom_primitives::scan_contains(&full_lower, "from the top"));
+            // CR 701.24b + CR 608.2c: If later clauses put the found card(s) in a
+            // specified library position, suppress the default ChangeZone(→Hand).
+            // The found cards stay outside the shuffled subset, and the separate
+            // PutAtLibraryPosition effect applies the later positional instruction.
+            let has_positional_put = has_search_result_library_position_restatement(&full_lower);
             if has_positional_put {
                 return None;
             }
@@ -7205,6 +7339,20 @@ pub(super) fn parse_followup_continuation_ast(
                 reorder_all: false,
                 rest_order: DigRestOrder::Preserve,
             })
+        }
+        // CR 202.3 + CR 608.2c: "If its mana value is <comparator> <dynamic
+        // quantity>, put it onto <zone>. [Otherwise, put it into <zone>.]" — a
+        // card-property branch on the hit card's own mana value (Part in
+        // Friendship). Checked BEFORE the bare "put it" arm below: that arm's
+        // substring scan for "onto the battlefield" cannot see the leading
+        // "if" condition and would otherwise treat the whole conditional
+        // sentence as an unconditional kept-destination override, silently
+        // dropping the "if" (and, per the DynamicQty swallow detector, its
+        // dynamic quantity).
+        Effect::RevealUntil { .. } if parse_reveal_until_conditional_kept(lower.trim()).is_ok() => {
+            parse_reveal_until_conditional_kept(lower.trim())
+                .ok()
+                .map(|(_, continuation)| continuation)
         }
         // CR 701.20a + CR 608.2c: "Put any number of those [filter] cards onto the
         // battlefield, then put the rest … on the bottom … in a random order"
@@ -9057,6 +9205,184 @@ mod tests {
     }
 
     #[test]
+    fn search_result_library_position_restatement_composes_all_grammar_axes() {
+        let verbs = ["put ", "puts "];
+        let referents = [
+            "that card ",
+            "it ",
+            "the card ",
+            "them ",
+            "those cards ",
+            "the chosen cards ",
+        ];
+        let positions = [
+            ("on top", LibraryPosition::Top),
+            ("third from the top", LibraryPosition::NthFromTop { n: 3 }),
+        ];
+
+        for verb in verbs {
+            for referent in referents {
+                for (position_text, expected_position) in &positions {
+                    let phrase = format!("{verb}{referent}{position_text}");
+                    let (rest, position) =
+                        parse_search_result_library_position_restatement(&phrase)
+                            .unwrap_or_else(|_| panic!("failed to parse {phrase:?}"));
+                    assert!(
+                        rest.is_empty(),
+                        "parser must consume the positional production for {phrase:?}, leftover {rest:?}"
+                    );
+                    assert_eq!(
+                        position,
+                        expected_position.clone(),
+                        "wrong position for {phrase:?}"
+                    );
+                }
+            }
+        }
+
+        for phrase in [
+            "that player puts that card on top",
+            "that player puts that card third from the top of their library",
+            "those players put those cards on top of their libraries",
+            "each player puts them on top",
+        ] {
+            assert!(
+                has_search_result_library_position_restatement(phrase),
+                "expected subject-aware positional match for {phrase:?}"
+            );
+        }
+
+        for phrase in [
+            "put that card into your hand",
+            "puts that card onto the battlefield",
+            "put the rest on the bottom",
+            "target player puts that card banana from the top",
+        ] {
+            assert!(
+                !has_search_result_library_position_restatement(phrase),
+                "must not match non-positional search result instruction {phrase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_positional_destination_suppresses_only_the_default_hand_move() {
+        use super::super::parse_effect_chain;
+
+        fn effects_in_order(def: &AbilityDefinition) -> Vec<&Effect> {
+            let mut effects = Vec::new();
+            let mut node = Some(def);
+            while let Some(current) = node {
+                effects.push(current.effect.as_ref());
+                node = current.sub_ability.as_deref();
+            }
+            effects
+        }
+
+        // SHAPE: Exact Varragoth effect text exercises third-person `puts`.
+        // CR 701.24b + CR 608.2c requires Search -> Shuffle -> PutAt, with no
+        // synthetic Library -> Hand move before the later positional instruction.
+        let varragoth = parse_effect_chain(
+            "Target player searches their library for a card, then shuffles and puts that card on top.",
+            AbilityKind::Activated,
+        );
+        let effects = effects_in_order(&varragoth);
+        assert_eq!(effects.len(), 3, "unexpected Varragoth chain: {effects:?}");
+        assert!(matches!(effects[0], Effect::SearchLibrary { .. }));
+        assert!(matches!(effects[1], Effect::Shuffle { .. }));
+        assert!(matches!(
+            effects[2],
+            Effect::PutAtLibraryPosition {
+                position: LibraryPosition::Top,
+                ..
+            }
+        ));
+
+        // Existing first-person sibling remains covered by the same grammar.
+        let enlightened = parse_effect_chain(
+            "Search your library for an artifact or enchantment card, reveal it, then shuffle and put that card on top.",
+            AbilityKind::Spell,
+        );
+        let effects = effects_in_order(&enlightened);
+        assert_eq!(
+            effects.len(),
+            3,
+            "unexpected Enlightened Tutor chain: {effects:?}"
+        );
+        assert!(matches!(effects[0], Effect::SearchLibrary { .. }));
+        assert!(matches!(effects[1], Effect::Shuffle { .. }));
+        assert!(matches!(
+            effects[2],
+            Effect::PutAtLibraryPosition {
+                position: LibraryPosition::Top,
+                ..
+            }
+        ));
+
+        // Third-person ordinal wording shares the same verb/referent grammar
+        // as Varragoth's top placement and must not synthesize a hand move.
+        let third_person_ordinal = parse_effect_chain(
+            "Target player searches their library for a card, then shuffles and puts that card third from the top.",
+            AbilityKind::Activated,
+        );
+        let effects = effects_in_order(&third_person_ordinal);
+        assert_eq!(
+            effects.len(),
+            3,
+            "unexpected third-person ordinal chain: {effects:?}"
+        );
+        assert!(matches!(effects[0], Effect::SearchLibrary { .. }));
+        assert!(matches!(effects[1], Effect::Shuffle { .. }));
+        assert!(matches!(
+            effects[2],
+            Effect::PutAtLibraryPosition {
+                position: LibraryPosition::NthFromTop { n: 3 },
+                ..
+            }
+        ));
+
+        // Preserve the independent ordinal branch used by Long-Term Plans.
+        let long_term_plans = parse_effect_chain(
+            "Search your library for a card, then shuffle and put that card third from the top.",
+            AbilityKind::Spell,
+        );
+        let effects = effects_in_order(&long_term_plans);
+        assert_eq!(
+            effects.len(),
+            3,
+            "unexpected Long-Term Plans chain: {effects:?}"
+        );
+        assert!(matches!(effects[0], Effect::SearchLibrary { .. }));
+        assert!(matches!(effects[1], Effect::Shuffle { .. }));
+        assert!(matches!(
+            effects[2],
+            Effect::PutAtLibraryPosition {
+                position: LibraryPosition::NthFromTop { n: 3 },
+                ..
+            }
+        ));
+
+        // Positive reach guard for the negative grammar case: an ordinary
+        // search still receives the intrinsic Library -> Hand destination.
+        let ordinary = parse_effect_chain("Search your library for a card.", AbilityKind::Spell);
+        let effects = effects_in_order(&ordinary);
+        assert_eq!(
+            effects.len(),
+            2,
+            "unexpected ordinary tutor chain: {effects:?}"
+        );
+        assert!(matches!(effects[0], Effect::SearchLibrary { .. }));
+        assert!(matches!(
+            effects[1],
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Hand,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn multi_zone_search_put_restatement_absorbed_after_origin_none_destination() {
         let previous = Effect::ChangeZone {
             origin: None,
@@ -9733,9 +10059,11 @@ mod tests {
         );
     }
 
-    /// CR 701.15b + CR 611.2b: Saga-scoped goad persists while the Saga remains.
+    /// CR 701.15b + CR 611.2b: Saga-scoped goad persists while the Saga
+    /// remains — the presence-bound state reading, so a phase-out of the Saga
+    /// ends it (CR 702.26f).
     #[test]
-    fn tokens_goaded_continuation_after_create_token_until_host_leaves_play() {
+    fn tokens_goaded_continuation_after_create_token_while_host_on_battlefield() {
         let token_effect = Effect::Token {
             name: "Warrior".to_string(),
             power: PtValue::Fixed(1),
@@ -9759,7 +10087,7 @@ mod tests {
                 &mut ParseContext::default(),
             ),
             Some(ContinuationAst::GoadLastCreated {
-                duration: Some(Duration::UntilHostLeavesPlay),
+                duration: Some(Duration::WhileHostOnBattlefield),
             })
         );
     }
@@ -9846,7 +10174,7 @@ mod tests {
                 end_cost: _,
             } => {
                 assert_eq!(*target, Some(TargetFilter::LastCreated));
-                assert_eq!(*duration, Some(Duration::UntilHostLeavesPlay));
+                assert_eq!(*duration, Some(Duration::WhileHostOnBattlefield));
                 assert!(static_abilities[0].modifications.iter().any(|m| matches!(
                     m,
                     ContinuousModification::AddStaticMode {
@@ -10083,6 +10411,7 @@ mod tests {
             enters_attacking: false,
             kept_optional_to: None,
             enters_under: None,
+            kept_destination_if: None,
         };
         let result = parse_followup_continuation_ast(
             "Put those land cards onto the battlefield tapped and the rest on the bottom of your library in a random order.",
@@ -12613,18 +12942,23 @@ mod tests {
         };
         assert_eq!(counter_type, CounterType::Plus1Plus1);
         let expected_qty = QuantityExpr::Ref {
-            qty: QuantityRef::Aggregate {
-                function: AggregateFunction::Sum,
-                property: ObjectProperty::Power,
-                filter: TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::Typed(
-                            TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
-                        ),
-                        TargetFilter::ExiledBySource,
-                    ],
-                },
-            },
+            qty: QuantityRef::PropertyAggregate(
+                crate::types::ability::PropertyAggregate::new(
+                    AggregateFunction::Sum,
+                    ObjectProperty::Power,
+                    crate::types::ability::CardTypeSetSource::Objects {
+                        filter: TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::Typed(
+                                    TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                                ),
+                                TargetFilter::ExiledBySource,
+                            ],
+                        },
+                    },
+                )
+                .expect("statically valid property aggregate"),
+            ),
         };
         assert_eq!(count, expected_qty);
     }

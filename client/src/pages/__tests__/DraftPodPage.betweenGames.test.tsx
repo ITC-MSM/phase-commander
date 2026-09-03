@@ -32,7 +32,7 @@ const { captured, draftState, intergameWorkspace, playerView, sideboardPrompt } 
     loserSeat: 1,
     timerMs: 60_000,
   };
-  return { captured: { shellMode: "", builderProps: null as null | {
+  return { captured: { shellMode: "", menuShell: null as null | { compactTopPadding?: boolean }, builderProps: null as null | {
     responsiveLayout?: string;
     responsiveHeightMode?: string;
   } }, intergameWorkspace, playerView, sideboardPrompt, draftState: {
@@ -79,8 +79,17 @@ vi.mock("../../components/chrome/ScreenChrome", () => ({ ScreenChrome: () => nul
 vi.mock("../../components/chrome/ShellContext", () => ({
   useDraftShellChrome: (mode: string) => { captured.shellMode = mode; },
 }));
-vi.mock("../../components/menu/MenuShell", () => ({ MenuShell: ({ children }: { children: ReactNode }) => <>{children}</> }));
-vi.mock("../../components/draft/HostControls", () => ({ HostControls: () => null }));
+vi.mock("../../components/menu/MenuShell", () => ({ MenuShell: (props: { children: ReactNode; compactTopPadding?: boolean }) => {
+  captured.menuShell = props;
+  return <>{props.children}</>;
+} }));
+vi.mock("../../components/draft/HostControls", () => {
+  const emptyTopActions: readonly [] = [];
+  return {
+    HostControls: () => null,
+    useHostDraftTopActions: (_options: { enabled: boolean }) => emptyTopActions,
+  };
+});
 vi.mock("../../components/draft/LimitedDeckBuilder", () => ({
   LimitedDeckBuilder: (props: {
     local: { capabilities?: { kind: string }; onSubmitDeck: () => void };
@@ -124,6 +133,7 @@ describe("DraftPodPage betweenGames", () => {
     draftState.intergameWorkspaceState = intergameWorkspace;
     draftState.submitSideboard.mockClear();
     captured.shellMode = "";
+    captured.menuShell = null;
     captured.builderProps = null;
   });
 
@@ -164,10 +174,11 @@ describe("DraftPodPage betweenGames", () => {
       responsiveLayout: layout,
       responsiveHeightMode: "container",
     });
+    expect(captured.menuShell).toMatchObject({ compactTopPadding: true });
     const builder = screen.getByTestId("limited-builder");
     expect(builder.parentElement).toHaveClass("min-h-0", "flex-1", "overflow-hidden");
     expect(builder.parentElement?.parentElement).toHaveClass(
-      "h-[calc(100dvh_-_8rem)]",
+      "h-[calc(100dvh_-_4rem)]",
       "min-h-0",
       "max-w-none",
       "overflow-hidden",
@@ -188,5 +199,6 @@ describe("DraftPodPage betweenGames", () => {
     renderPage();
 
     expect(captured.shellMode).toBe("default");
+    expect(captured.menuShell).toMatchObject({ compactTopPadding: false });
   });
 });

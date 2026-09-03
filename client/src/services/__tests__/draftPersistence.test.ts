@@ -91,6 +91,27 @@ describe("draftPersistence", () => {
       expect(loaded).toEqual({ ...testSession, perSeatWorkspaceSnapshots: {} });
     });
 
+    it("retains validated absolute reconnect deadlines", async () => {
+      const deadline = Date.now() + 60_000;
+      await saveDraftHostSession("deadline-session", {
+        ...testSession,
+        reconnectDeadlines: { 1: deadline },
+      });
+
+      await expect(loadDraftHostSession("deadline-session")).resolves.toMatchObject({
+        reconnectDeadlines: { 1: deadline },
+      });
+    });
+
+    it("rejects malformed reconnect deadlines", async () => {
+      mockStore.set("phase-draft-host:bad-deadline", {
+        ...testSession,
+        reconnectDeadlines: { 1: "later" },
+      });
+
+      await expect(loadDraftHostSession("bad-deadline")).resolves.toBeNull();
+    });
+
     it("returns null for non-existent session", async () => {
       const loaded = await loadDraftHostSession("nonexistent");
       expect(loaded).toBeNull();
@@ -169,6 +190,25 @@ describe("draftPersistence", () => {
       expect(loaded?.poolInput.type).toBe("Cube");
     });
 
+    it("retains a Chaos candidate input for host-local recovery", async () => {
+      const chaosSession: PersistedDraftHostSession = {
+        ...testSession,
+        poolInput: {
+          type: "Chaos",
+          data: {
+            pools: [{ code: "ISD" }, { code: "DKA" }],
+            candidate_codes: ["ISD", "DKA"],
+          },
+        },
+      };
+      await saveDraftHostSession("chaos-1", chaosSession);
+
+      await expect(loadDraftHostSession("chaos-1")).resolves.toEqual({
+        ...chaosSession,
+        perSeatWorkspaceSnapshots: {},
+      });
+    });
+
     it("retains durable deck-submission receipts alongside workspace snapshots", async () => {
       const session = {
         ...testSession,
@@ -184,7 +224,7 @@ describe("draftPersistence", () => {
       await expect(loadDraftHostSession("receipt-and-workspace")).resolves.toEqual(session);
     });
 
-    it("rejects persisted Set and Cube snapshots missing data used by resume", async () => {
+    it("rejects persisted Set, Chaos, and Cube snapshots missing data used by resume", async () => {
       mockStore.set("phase-draft-host:bad-set", {
         ...testSession,
         poolInput: { type: "Set", data: {} },
@@ -200,9 +240,14 @@ describe("draftPersistence", () => {
           },
         },
       });
+      mockStore.set("phase-draft-host:bad-chaos", {
+        ...testSession,
+        poolInput: { type: "Chaos", data: { pools: [], candidate_codes: [] } },
+      });
 
       await expect(loadDraftHostSession("bad-set")).resolves.toBeNull();
       await expect(loadDraftHostSession("bad-cube")).resolves.toBeNull();
+      await expect(loadDraftHostSession("bad-chaos")).resolves.toBeNull();
     });
 
     /**

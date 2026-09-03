@@ -15,6 +15,7 @@ import { useCardImage } from "../../../hooks/useCardImage";
 import { PoolPanel } from "../PoolPanel";
 import { CardPoolBoard } from "./CardPoolBoard";
 import { CompactSideboard } from "./CompactSideboard";
+import { DeckTypeCounts } from "./DeckTypeCounts";
 import type { DraftWorkspaceDragController } from "./useDraftWorkspaceDrag";
 import { normalizeWorkspaceForBoardGeometry } from "./workspacePlacement";
 import type { DraftWorkspaceFilter, DraftWorkspaceState, DraftZone } from "./types";
@@ -35,6 +36,24 @@ import {
 const DRAG_PREVIEW_SCALE = 0.55;
 const DRAG_PREVIEW_GAP = 4;
 const DRAG_PREVIEW_OFFSET = 12;
+const DESKTOP_DRAFT_COLLAPSED_SIDEBOARD_SCALE = 0.8;
+
+type VisualColumnCapOrientation = "portrait" | "landscape";
+type VisualColumnCapPreferenceTarget = "phoneDeckVisualColumnCaps" | "tabletDeckVisualColumnCaps";
+
+interface VisualColumnCapDescriptor {
+  value: number;
+  maximum: number;
+  orientation: VisualColumnCapOrientation;
+  target: VisualColumnCapPreferenceTarget;
+}
+
+export function shouldShowDraftWorkspaceDeck(
+  deckCollapsed: boolean,
+  builderCompact: boolean,
+): boolean {
+  return !deckCollapsed || builderCompact;
+}
 
 function dragPreviewPosition(
   clientX: number,
@@ -104,6 +123,7 @@ export interface DraftWorkspaceProps {
   interactionLocked?: boolean;
   dragController?: DraftWorkspaceDragController;
   deckControls?: ReactNode;
+  compactDeckControls?: ReactNode;
   onWorkspaceChange(next: DraftWorkspaceState): void;
   onPreferencesChange(next: DraftWorkspacePreferences): void;
   onCardHover?(info: CardHoverInfo | null): void;
@@ -111,7 +131,6 @@ export interface DraftWorkspaceProps {
   mobileOverlay?: boolean;
   mobileWorkspaceOpen?: boolean;
   onMobileWorkspaceOpenChange?(open: boolean): void;
-  mobileSummaryAccessory?: ReactNode;
   responsiveContext?: "draft" | "builder";
 }
 
@@ -123,6 +142,7 @@ export function DraftWorkspace({
   interactionLocked = false,
   dragController,
   deckControls,
+  compactDeckControls,
   onWorkspaceChange,
   onPreferencesChange,
   onCardHover,
@@ -130,7 +150,6 @@ export function DraftWorkspace({
   mobileOverlay = false,
   mobileWorkspaceOpen = false,
   onMobileWorkspaceOpenChange,
-  mobileSummaryAccessory,
   responsiveContext = "draft",
 }: DraftWorkspaceProps) {
   const { t } = useTranslation(["draft", "common"]);
@@ -208,11 +227,34 @@ export function DraftWorkspace({
     responsiveLayout,
     responsiveContext,
     preferences.phoneDeckVisualColumnCaps,
+    preferences.tabletDeckVisualColumnCaps,
   );
+  const visualColumnCapDescriptor: VisualColumnCapDescriptor | undefined = visualColumnCap === undefined
+    ? undefined
+    : {
+      value: visualColumnCap,
+      maximum: 10,
+      orientation: responsiveLayout === "phone-portrait" || responsiveLayout === "tablet-portrait"
+        ? "portrait"
+        : "landscape",
+      target: responsiveContext === "builder" && tabletLayout
+        ? "tabletDeckVisualColumnCaps"
+        : "phoneDeckVisualColumnCaps",
+    };
   const touchDragEnabled = responsiveLayout !== "desktop";
   const mobileOverlayActive = mobileOverlay && phoneLayout;
   const tabletLandscapeLayout = responsiveLayout === "tablet-landscape";
-  const collapsedCompositionClass = tabletPortraitLayout
+  const builderPhoneOrTabletLayout = responsiveContext === "builder" && (phoneLayout || tabletLayout);
+  const builderCompact = builderPhoneOrTabletLayout && renderedView === "compact";
+  const showDeckContents = shouldShowDraftWorkspaceDeck(deckCollapsed, builderCompact);
+  const collapsedSideboardCardWidth = responsiveContext === "draft" && responsiveLayout === "desktop"
+    ? `clamp(${208 * DESKTOP_DRAFT_COLLAPSED_SIDEBOARD_SCALE}px, 16vw, ${DRAFT_WORKSPACE_COLLAPSED_SIDEBOARD_CARD_WIDTH_PX * DESKTOP_DRAFT_COLLAPSED_SIDEBOARD_SCALE}px)`
+    : `${DRAFT_WORKSPACE_COLLAPSED_SIDEBOARD_CARD_WIDTH_PX}px`;
+  const collapsedCompositionClass = builderCompact
+    ? tabletLayout
+      ? "flex h-full min-h-0 min-w-0 flex-col overflow-hidden"
+      : "h-full min-h-0 min-w-0"
+    : tabletPortraitLayout
     ? sideboardCollapsed
       ? "grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_48px] gap-2"
       : "relative h-full min-h-0 min-w-0"
@@ -241,6 +283,29 @@ export function DraftWorkspace({
           ? "grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_auto] gap-2"
           : "grid h-full min-h-0 min-w-0 grid-rows-[minmax(0,1fr)_150px] gap-2"
         : "grid h-full min-h-0 min-w-0 grid-cols-[minmax(0,1fr)_48px] gap-2";
+
+  const compactBuilderPrimaryControls = responsiveContext === "builder" ? compactDeckControls : undefined;
+  const compactBuilderCount = builderPhoneOrTabletLayout ? (
+    <DeckTypeCounts counts={deckTypeCounts} compact={builderPhoneLayout} />
+  ) : undefined;
+  const compactBuilderTrailingControls = responsiveContext === "builder" ? (
+    <button
+      type="button"
+      onClick={() => onPreferencesChange({ ...preferences, explicitView: "board" })}
+      className={`${builderPhoneOrTabletLayout ? "min-h-11" : "min-h-8"} shrink-0 whitespace-nowrap px-2 text-xs font-medium text-jade`}
+    >
+      {t("limitedDeck.visualBuilder")}
+    </button>
+  ) : undefined;
+  const visualBuilderControls = builderPhoneOrTabletLayout ? (
+    <button
+      type="button"
+      onClick={() => onPreferencesChange({ ...preferences, explicitView: "compact" })}
+      className="ml-auto min-h-11 shrink-0 whitespace-nowrap px-2 text-xs font-medium text-jade"
+    >
+      {t("limitedDeck.textBuilder")}
+    </button>
+  ) : undefined;
 
   useEffect(() => {
     if (normalized === workspace) {
@@ -303,17 +368,22 @@ export function DraftWorkspace({
     <section
       aria-label={t("workspace.zone.deck")}
       data-zone="deck"
-      className={builderPhonePortraitLayout
+      className={builderCompact
+        ? "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+        : builderPhonePortraitLayout
         ? "min-w-0 shrink-0"
         : `min-h-0 min-w-0 flex-1 ${(
-          tabletLayout || phoneWorkspaceOverlayOpen
+          tabletLayout || phoneWorkspaceOverlayOpen || builderPhoneLandscapeLayout
         ) ? "overflow-y-auto overscroll-contain" : ""}`}
     >
       {renderedView === "board" ? (
         <CardPoolBoard
-          heading={phoneLayout ? undefined : t("workspace.count.deck", { count: counts.deck })}
+          heading={phoneLayout || (responsiveContext === "builder" && tabletLayout)
+            ? undefined
+            : t("workspace.count.deck", { count: counts.deck })}
           deckTypeCounts={deckTypeCounts}
           deckControls={deckControls}
+          trailingControls={visualBuilderControls}
           zone="deck"
           pool={pool}
           poolGroups={poolGroups}
@@ -333,16 +403,20 @@ export function DraftWorkspace({
           forceShowHeaders={phoneLayout}
           phoneToolbar={phoneLayout || tabletLayout}
           phoneLayoutDialog={phoneLayout || tabletLayout}
+          phonePortraitDeckToolbar={responsiveLayout === "phone-portrait"}
           tabletMode={tabletLayout}
-          phoneDeckVisualColumnCap={visualColumnCap}
-          onPhoneDeckVisualColumnCapChange={(next) => {
+          compactDeckTypeCounts={phoneLayout}
+          visualColumnCapValue={visualColumnCapDescriptor?.value}
+          visualColumnCapMax={visualColumnCapDescriptor?.maximum}
+          onVisualColumnCapChange={(next) => {
             if (interactionLocked) return;
-            const layout = responsiveLayout === "phone-portrait" || responsiveLayout === "tablet-portrait"
-              ? "portrait"
-              : "landscape";
+            if (visualColumnCapDescriptor === undefined) return;
             onPreferencesChange({
               ...preferences,
-              phoneDeckVisualColumnCaps: { ...preferences.phoneDeckVisualColumnCaps, [layout]: next },
+              [visualColumnCapDescriptor.target]: {
+                ...preferences[visualColumnCapDescriptor.target],
+                [visualColumnCapDescriptor.orientation]: next,
+              },
             });
           }}
           touchDragEnabled={touchDragEnabled}
@@ -366,13 +440,17 @@ export function DraftWorkspace({
                 onFilterChange: setFilter,
                 onSortChange: setCompactSort,
                 onWorkspaceChange: (next) => { if (!interactionLocked) onWorkspaceChange(next); },
+                compactPrimaryControls: compactBuilderPrimaryControls,
+                compactCount: compactBuilderCount,
+                compactTrailingControls: compactBuilderTrailingControls,
+                builderCompact,
               }}
             />
           </>
         ) : <>
-          {!phoneLayout && <h2 className="flex items-center gap-2 border-b border-hairline bg-surface-panel px-4 py-3 font-display text-base font-semibold text-fg">
+          {!phoneLayout && !builderCompact && <h2 className="flex items-center gap-2 border-b border-hairline bg-surface-panel px-4 py-3 font-display text-base font-semibold text-fg">
             <span className="min-w-0 flex-1 truncate">{t("workspace.count.deck", { count: counts.deck })}</span>
-            {tabletLayout && (
+            {tabletLayout && !builderCompact && (
               <button
                 type="button"
                 data-deck-collapse-toggle
@@ -385,7 +463,7 @@ export function DraftWorkspace({
               </button>
             )}
           </h2>}
-          {!deckCollapsed && (
+          {showDeckContents && (
             <PoolPanel
               onCardHover={onCardHover}
               controlledWorkspace={{
@@ -398,6 +476,10 @@ export function DraftWorkspace({
                 onFilterChange: setFilter,
                 onSortChange: setCompactSort,
                 onWorkspaceChange: (next) => { if (!interactionLocked) onWorkspaceChange(next); },
+                compactPrimaryControls: compactBuilderPrimaryControls,
+                compactCount: compactBuilderCount,
+                compactTrailingControls: compactBuilderTrailingControls,
+                builderCompact,
               }}
             />
           )}
@@ -451,12 +533,12 @@ export function DraftWorkspace({
           <div
             data-workspace-composition="collapsed"
             style={{
-              "--collapsed-sideboard-card-width": `${DRAFT_WORKSPACE_COLLAPSED_SIDEBOARD_CARD_WIDTH_PX}px`,
+              "--collapsed-sideboard-card-width": collapsedSideboardCardWidth,
             } as CSSProperties}
             className={collapsedCompositionClass}
           >
             {deck}
-            {!deckCollapsed && <section
+            {!deckCollapsed && !builderCompact && <section
               ref={dragController?.registerCollapsedSideboard}
               aria-label={t("workspace.zone.sideboard")}
               data-zone="sideboard"
@@ -570,16 +652,6 @@ export function DraftWorkspace({
     </section>
     {mobileOverlayActive && (
       <>
-      {mobileSummaryAccessory && (
-        <div
-          data-mobile-summary-accessory
-          className={responsiveLayout === "phone-landscape"
-            ? "fixed bottom-[58px] right-[9px] z-[42] w-[50vw]"
-            : "fixed bottom-[calc(112px_+_env(safe-area-inset-bottom))] right-[9px] z-[42] w-[50vw]"}
-        >
-          {mobileSummaryAccessory}
-        </div>
-      )}
       <div
         data-mobile-workspace-summary
         className={responsiveLayout === "phone-landscape"

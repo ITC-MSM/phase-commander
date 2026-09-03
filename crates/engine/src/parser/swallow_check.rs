@@ -365,6 +365,34 @@ fn detect_replacement(
     // `effect_is_replacement_carrier` matcher: that deliberately finite matcher does
     // not enumerate these CR 614.1c carrier variants. Typed evidence reaches all
     // fields, including Yuna's `Effect::CreateDelayedTrigger` inner definition.
+    //
+    // CR 614.1c: a graveyard/exile cast permission that
+    // carries an `enters_with_counter` rider ("You may cast this card from your
+    // graveyard. If you do, it enters with a finality counter on it." — Hundred-
+    // Battle Veteran and siblings Undead Sprinter, Intrepid Paleontologist,
+    // Noctis Prince of Lucis, Leonardo, Sewer Samurai) IS the represented CR
+    // 614.1c replacement: the linked "it enters with ..." rider is folded onto
+    // the cast-permission static mode rather than emitted as a standalone
+    // `ReplacementDefinition`. Kept in sync with the sibling detector
+    // `enters_with_finality_this_way_is_only_if_marker` below, which already
+    // accepts this exact carrier shape — both detectors must agree on what
+    // counts as "represented" for the same AST shape.
+    //
+    // Scoped to the carrier's OWN sentence, not the whole unit: a unit is one per
+    // SOURCE LINE (`audit_units` in `oracle_ir/feature.rs`), and can absorb several
+    // physical lines when no new item starts one — a card could plausibly print a
+    // represented graveyard/exile-cast-with-counter clause and a separate,
+    // genuinely unrepresented "enters with" rider (e.g. CR 614.1c's bare "[This
+    // permanent] enters with . . ." template) sharing that same unit.
+    // `evidence.any_static_mode` alone cannot see which sentence the carrier came
+    // from, so it would silently swallow the second, unrelated rider too.
+    // `enters_with_counter_carrier_is_only_enters_with_marker` removes only the
+    // carrier's own recognized sentence before re-checking for a residual "enters
+    // with" marker, mirroring the identical technique the sibling Condition_If
+    // detector already uses for this exact carrier shape.
+    if enters_with_counter_carrier_is_only_enters_with_marker(cleaned, evidence) {
+        return;
+    }
     if evidence.any_static_mode(|m| {
         matches!(
             m,
@@ -393,6 +421,91 @@ fn detect_replacement(
         OracleSemanticFeature::Replacement.detector_label(),
         truncate(original, 140),
     ));
+}
+
+/// CR 614.1c: conservative cardinality guard shared by every detector that
+/// exempts a `StaticMode::{GraveyardCastPermission,ExileCastPermission}
+/// { enters_with_counter: Some(_), .. }` carrier's OWN sentence from its
+/// residual marker scan.
+///
+/// `evidence` only proves the unit contains AT LEAST ONE such carrier — it
+/// carries no sentence-level provenance linking that carrier to a SPECIFIC
+/// "if you cast it this way, it enters with ..." sentence. When exactly one
+/// sentence in the unit matches `parse_cast_this_way_enters_with_counter`'s
+/// syntactic shape, evidence and syntax necessarily agree on which sentence
+/// produced the carrier, so it is sound to remove exactly that sentence and
+/// hand the caller the residual for its own marker scan (`Some`). When two or
+/// more sentences match, evidence cannot distinguish "the represented
+/// carrier's sentence" from "an unrelated, unrepresented rider that happens
+/// to parse the same way" — removing every matching sentence in that case
+/// would silently swallow the unlinked rider, so `None` is returned instead
+/// and no sentence is removed, keeping every matching sentence visible to the
+/// caller's residual scan (which then keeps raising its diagnostic for the
+/// unlinked rider).
+///
+/// Shared by `enters_with_counter_carrier_is_only_enters_with_marker`
+/// (Replacement) and `enters_with_finality_this_way_is_only_if_marker`
+/// (Condition_If) — both detectors gate on the identical carrier shape and
+/// must not drift apart on what counts as "the carrier's clause".
+fn enters_with_counter_rider_residual_sentences(cleaned: &str) -> Option<Vec<&str>> {
+    let sentences = crate::parser::oracle_nom::primitives::split_sentence_units(cleaned);
+    let matching_rider_count = sentences
+        .iter()
+        .filter(|sentence| {
+            crate::parser::oracle_effect::parse_cast_this_way_enters_with_counter(sentence)
+                .is_some()
+        })
+        .count();
+    if matching_rider_count != 1 {
+        return None;
+    }
+    Some(
+        sentences
+            .into_iter()
+            .filter(|sentence| {
+                crate::parser::oracle_effect::parse_cast_this_way_enters_with_counter(sentence)
+                    .is_none()
+            })
+            .collect(),
+    )
+}
+
+/// CR 614.1c: true when the unit's `GraveyardCastPermission`/`ExileCastPermission{
+/// enters_with_counter: Some(_)}` carrier accounts for EVERY "enters with" marker in
+/// the unit — i.e. it is safe to suppress the `Replacement` expectation entirely.
+/// False when a distinct, unrepresented "enters with ..." clause survives after the
+/// carrier's own sentence is removed, even if that clause shares the carrier's source
+/// line (a unit owns every line up to the next item's start, so two "enters with"
+/// sentences CAN legitimately share one unit) — and also false when a SECOND
+/// sentence syntactically matches the carrier's own shape, since `evidence` cannot
+/// prove which of the two matching sentences the carrier actually came from (see
+/// `enters_with_counter_rider_residual_sentences`).
+fn enters_with_counter_carrier_is_only_enters_with_marker(
+    cleaned: &str,
+    evidence: &UnitEvidence,
+) -> bool {
+    if !evidence.any_static_mode(|mode| {
+        matches!(
+            mode,
+            StaticMode::GraveyardCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            } | StaticMode::ExileCastPermission {
+                enters_with_counter: Some(_),
+                ..
+            }
+        )
+    }) {
+        return false;
+    }
+
+    let Some(residual_sentences) = enters_with_counter_rider_residual_sentences(cleaned) else {
+        return false;
+    };
+    residual_sentences.into_iter().all(|sentence| {
+        // allow-noncombinator: swallow detector marker scan on classified text
+        !sentence.contains("enters with ") || enters_with_is_trigger_filter(sentence)
+    })
 }
 
 // ── Detector A: Replacement_Instead ─────────────────────────────────────
@@ -451,7 +564,7 @@ fn detect_replacement_instead(
 
 // ── Detector B: ActivateOnlyDuring ──────────────────────────────────────
 
-/// CR 605.1c: "Activate only during X" — restricted activation timing.
+/// CR 602.5: "Activate only during X" — restricted activation timing.
 /// Must be represented as an activation constraint on the parsed ability.
 fn detect_activate_only_during(
     cleaned: &str,
@@ -1700,6 +1813,57 @@ fn any_ability_has_cast_from_zone_alt_ability_cost(parsed: &ParsedAbilities) -> 
         })
 }
 
+/// CR 118.9 + CR 119.4 + CR 305.1: Inside Information class — the "[if you
+/// cast a spell this way,] pay <cost> rather than pay its mana cost" rider
+/// folds onto a plain `PlayFromExile` grant's `alt_ability_cost` (not a
+/// `CastFromZone`) when the preceding grant is a "you may PLAY those cards"
+/// permission that must also authorize land plays. Mirrors
+/// `def_tree_has_cast_from_zone_alt_ability_cost` for that sibling shape.
+fn def_tree_has_play_from_exile_alt_ability_cost(def: &AbilityDefinition) -> bool {
+    if let Effect::GrantCastingPermission {
+        permission:
+            CastingPermission::PlayFromExile {
+                alt_ability_cost: Some(_),
+                ..
+            },
+        ..
+    } = &*def.effect
+    {
+        return true;
+    }
+    if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+        if def_tree_has_play_from_exile_alt_ability_cost(effect) {
+            return true;
+        }
+    }
+    if let Some(ref sub) = def.sub_ability {
+        if def_tree_has_play_from_exile_alt_ability_cost(sub) {
+            return true;
+        }
+    }
+    if let Some(ref else_ab) = def.else_ability {
+        if def_tree_has_play_from_exile_alt_ability_cost(else_ab) {
+            return true;
+        }
+    }
+    def.mode_abilities
+        .iter()
+        .any(def_tree_has_play_from_exile_alt_ability_cost)
+}
+
+fn any_ability_has_play_from_exile_alt_ability_cost(parsed: &ParsedAbilities) -> bool {
+    parsed
+        .abilities
+        .iter()
+        .any(def_tree_has_play_from_exile_alt_ability_cost)
+        || parsed.triggers.iter().any(|trigger| {
+            trigger
+                .execute
+                .as_deref()
+                .is_some_and(def_tree_has_play_from_exile_alt_ability_cost)
+        })
+}
+
 fn any_replacement_has_may_cost_decline(parsed: &ParsedAbilities) -> bool {
     parsed.replacements.iter().any(|repl| {
         matches!(
@@ -2192,6 +2356,113 @@ fn twice_is_activation_limit(cleaned: &str, evidence: &UnitEvidence) -> bool {
         && !cleaned.contains("twice x")
 }
 
+/// The dynamic-quantity markers this line actually raises an expectation for.
+///
+/// Shared by the detector's own gate and by
+/// [`dynamic_markers_are_all_recorded_unrecognized`] so the two can never
+/// disagree about which occurrences count: a " twice " that
+/// [`twice_is_activation_limit`] classifies as a fixed-count activation limit
+/// raises no dynamic expectation and must not appear in either view.
+fn active_dynamic_markers(cleaned: &str, evidence: &UnitEvidence) -> Vec<&'static str> {
+    let mut markers: Vec<&'static str> = OTHER_DYNAMIC_MARKERS
+        .iter()
+        .copied()
+        // allow-noncombinator: swallow detector marker scan on classified text
+        .filter(|m| cleaned.contains(m))
+        .collect();
+    // CR 702.142a + CR 602.5b: "Activate ... twice each turn" / "can [keyword]
+    // twice ... rather than once" is a fixed-count activation limit (handled by
+    // ActivateLimit / ModifyActivationLimit), not a dynamic quantity.
+    // allow-noncombinator: swallow detector marker scan on classified text
+    if cleaned.contains(" twice ") && !twice_is_activation_limit(cleaned, evidence) {
+        markers.push(" twice ");
+    }
+    markers
+}
+
+/// CR 604.1 + CR 611.3: true when every dynamic-quantity marker this line raises
+/// sits inside text the parser EXPLICITLY recorded as unparsed.
+///
+/// `StaticCondition::Unrecognized { text }` in a `condition` slot is the
+/// static-ability twin of `Effect::Unimplemented`: the parser routed the clause
+/// into a condition slot and preserved the source it could not model, coverage
+/// demotes the card on it (`StaticCondition::contains_unrecognized`), and the
+/// text is reported verbatim. Re-reporting the same span as a *swallowed* clause
+/// double-counts one defect — the identical rule the card-wide
+/// `any_ability_has_unimplemented` guard in [`check_swallowed_clauses`] applies,
+/// and the same `Unrecognized`-condition leg `detect_duration_this_turn`
+/// already carries.
+///
+/// The live producer is `oracle_static::static_helpers::gate_static_condition`:
+/// when a CR 118.12a `UnlessPay` gate lands on a mode whose enforcement point
+/// never offers the payment, the whole condition is deferred to this marker.
+/// Awesome Presence is the printed case — its "pays {3} **for each** creature
+/// they control that's blocking it" scaling used to be carried by
+/// `UnlessPayScaling::PerAffectedCreature` (the suppression leg below), and once
+/// the gate defers the condition that carrier is gone by design, not by
+/// accident.
+///
+/// MARKER-level rather than span-level (the raw audit text and the recorded
+/// condition text disagree on punctuation and case, so a byte-span association
+/// is not available here), but **occurrence-counted**, not set-like. That
+/// distinction is the whole safety property:
+///
+/// A predicate of the shape "some recorded text contains this marker" answers
+/// the question *does this marker appear anywhere in recorded text?* — which is
+/// a question about the marker's TYPE, not about its OCCURRENCES. A unit whose
+/// text raises `"for each "` twice, from two independent clauses, of which only
+/// ONE was recorded as an `Unrecognized` gap, satisfied that predicate and had
+/// BOTH occurrences suppressed. The second clause's dropped dynamic quantity was
+/// then reported by nothing at all: the `Unrecognized` gap names only the first
+/// clause's text, so the second is a silent false green, exactly the failure
+/// mode this detector exists to prevent.
+///
+/// So each marker is CONSUMED: suppression requires the recorded text to supply
+/// at least as many occurrences of that marker as the audited text raises. One
+/// recorded `for each` discharges one raised `for each` and no more. The
+/// residual that remains is one-directional and bounded — an unrecorded clause
+/// that happens to sit alongside enough recorded occurrences of the same marker
+/// is still absorbed — but the *cardinality* channel, the one that hid a whole
+/// second clause, is closed.
+///
+/// The recorded side reads `StaticCondition::unrecognized_texts`, the single
+/// authority for `And`/`Or`/`Not` recursion over a condition tree, so a gap
+/// marker stored `Not`-wrapped (the shape `parse_unless_static_condition`
+/// produces) counts the same as a bare one.
+fn dynamic_markers_are_all_recorded_unrecognized(
+    cleaned: &str,
+    markers: &[&'static str],
+    evidence: &UnitEvidence,
+) -> bool {
+    if markers.is_empty() {
+        return false;
+    }
+    // Key- AND type-anchored on the `StaticDefinition` carrier: the bare JSON key
+    // `condition` also carries `ReplacementCondition`, whose `Unrecognized` variant is
+    // field-identical to the static one, so a replacement effect's recorded gap text
+    // would otherwise discharge a static's suppression. See
+    // `swallow_evidence::STATIC_DEFINITION_KEYS`.
+    let recorded: Vec<String> = evidence
+        .static_definition_conditions()
+        .iter()
+        .flat_map(StaticCondition::unrecognized_texts)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if recorded.is_empty() {
+        return false;
+    }
+    markers.iter().all(|marker| {
+        // allow-noncombinator: swallow detector marker scan on classified text
+        let raised = cleaned.matches(marker).count();
+        let accounted: usize = recorded
+            .iter()
+            // allow-noncombinator: swallow detector marker scan on classified text
+            .map(|text| text.matches(marker).count())
+            .sum();
+        raised > 0 && accounted >= raised
+    })
+}
+
 /// Oracle text contains dynamic-quantity grammar ("equal to", "for each",
 /// "twice", "where x is", "the number of", "half [poss]") but the parsed
 /// AST contains no dynamic carrier (Ref, Multiply, DivideRounded, Offset,
@@ -2205,12 +2476,14 @@ fn detect_dynamic_qty(
     evidence: &UnitEvidence,
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
-    // CR 702.142a + CR 602.5b: "Activate ... twice each turn" / "can [keyword]
-    // twice ... rather than once" is a fixed-count activation limit (handled by
-    // ActivateLimit / ModifyActivationLimit), not a dynamic quantity.
-    let has_marker = (cleaned.contains(" twice ") && !twice_is_activation_limit(cleaned, evidence)) // allow-noncombinator: swallow detector marker scan on classified text
-        || OTHER_DYNAMIC_MARKERS.iter().any(|m| cleaned.contains(m));
-    if !has_marker {
+    let markers = active_dynamic_markers(cleaned, evidence);
+    if markers.is_empty() {
+        return;
+    }
+    // Not swallowed — explicitly recorded. Checked before the carrier probes
+    // because it is a claim about REPORTING (the defect is already on the card),
+    // not about representation.
+    if dynamic_markers_are_all_recorded_unrecognized(cleaned, &markers, evidence) {
         return;
     }
     // ── Typed dynamic-quantity carriers ─────────────────────────────────
@@ -2679,36 +2952,51 @@ fn decline_iteration_prefix(input: &str) -> bool {
     .is_ok()
 }
 
+/// The counter-multiplier phrases whose ×2 is carried intrinsically by the
+/// resolver: the "+1/+1 counters" form (`Effect::MultiplyCounter`) and the
+/// "each kind of counter" form (`Effect::Double { DoubleTarget::Counters }`,
+/// counter.rs). Each phrase CONTAINS the marker "the number of ", which is why
+/// it accounts for one occurrence of it.
+const COUNTER_MULTIPLIER_PHRASES: &[&str] = &[
+    "double the number of +1/+1 counters",
+    "double the number of each kind of counter",
+];
+
+/// CR 701.10e: True when the ONLY dynamic-quantity marker in `cleaned` is the
+/// one a counter-multiplier phrase carries intrinsically.
+///
+/// RESIDUAL-based, not set-based, and for the same reason
+/// [`dynamic_markers_are_all_recorded_unrecognized`] counts occurrences: the
+/// accepted phrase accounts for exactly the occurrence of `"the number of "` it
+/// contains, and for no other. The earlier form checked `contains(phrase)` and
+/// then scanned for the other markers with `"the number of "` OMITTED from the
+/// scanned list — so one counter multiplier discharged EVERY `"the number of "`
+/// on the unit, and a second, independent, genuinely-swallowed
+/// `"the number of …"` clause ("Double the number of +1/+1 counters on target
+/// creature. Draw the number of cards …") was hidden with no marker left to
+/// report it.
+///
+/// Stripping every accepted phrase and re-scanning the residual against the FULL
+/// marker vocabulary is the same shape
+/// [`cleaned_twice_damage_double_is_only_dynamic_marker`] already uses, and it
+/// makes the accounting positional instead of type-level.
 fn cleaned_has_only_counter_multiplier_dynamic(cleaned: &str) -> bool {
-    // The counter multiplier phrase: either the "+1/+1 counters" form
-    // (`Effect::MultiplyCounter`) or the "each kind of counter" form
-    // (`Effect::Double { DoubleTarget::Counters }`, counter.rs).
-    let has_counter_multiplier = [
-        "double the number of +1/+1 counters",
-        "double the number of each kind of counter",
-    ]
-    .iter()
-    // allow-noncombinator: swallow detector phrase scan on classified text
-    .any(|phrase| cleaned.contains(phrase));
+    let has_counter_multiplier = COUNTER_MULTIPLIER_PHRASES
+        .iter()
+        // allow-noncombinator: swallow detector phrase scan on classified text
+        .any(|phrase| cleaned.contains(phrase));
     if !has_counter_multiplier {
         return false;
     }
-    // The counter multiplier itself accounts for "the number of". If another
-    // dynamic marker is present, keep the warning because that second marker
-    // may be a real uncaptured clause.
-    ![
-        " equal to ",
-        "for each ",
-        " twice ",
-        "where x is ",
-        "half your ",
-        "half their ",
-        "half its ",
-        "half the ",
-    ]
-    .iter()
+    // Strip every accepted phrase (all occurrences — two multipliers account for
+    // two markers), then require NO dynamic marker to remain.
+    let residual = COUNTER_MULTIPLIER_PHRASES
+        .iter()
+        .fold(cleaned.to_string(), |text, phrase| {
+            text.replace(phrase, " ")
+        });
     // allow-noncombinator: swallow detector marker scan on classified text
-    .any(|marker| cleaned.contains(marker))
+    !(residual.contains(" twice ") || OTHER_DYNAMIC_MARKERS.iter().any(|m| residual.contains(m)))
 }
 
 /// True when " twice " is the ONLY dynamic-quantity marker in `cleaned` (and
@@ -3183,10 +3471,13 @@ fn conditional_enter_counters_if_is_only_if_marker(
     !has_other_if
 }
 
-/// CR 607.1 + CR 614.1c + CR 122.1: a cast-permission static with an
+/// CR 614.1c: a cast-permission static with an
 /// `enters_with_counter` rider represents "if you cast a spell this way, that
 /// permanent enters with a counter". Suppress only that represented sentence;
 /// a separate conditional in the same item must remain visible to the audit.
+/// Also stays visible when a SECOND sentence in the unit syntactically matches
+/// the carrier's own shape — see `enters_with_counter_rider_residual_sentences`
+/// for why cardinality (not just presence) of the carrier evidence matters.
 fn enters_with_finality_this_way_is_only_if_marker(
     stripped: &str,
     evidence: &UnitEvidence,
@@ -3206,17 +3497,101 @@ fn enters_with_finality_this_way_is_only_if_marker(
         return false;
     }
 
-    // Same single segmentation authority as the sibling detector above;
-    // `parse_cast_this_way_enters_with_counter` trims its own leading whitespace
-    // and does not require full consumption, so a unit's terminal '.' is inert.
-    let residual: String = crate::parser::oracle_nom::primitives::split_sentence_units(stripped)
-        .into_iter()
+    // Same single segmentation + cardinality-guard authority as the sibling
+    // Replacement detector above; `parse_cast_this_way_enters_with_counter`
+    // trims its own leading whitespace and does not require full consumption,
+    // so a unit's terminal '.' is inert.
+    let Some(residual_sentences) = enters_with_counter_rider_residual_sentences(stripped) else {
+        return false;
+    };
+    let residual = residual_sentences.join(" ");
+    let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
+    !has_other_if
+}
+
+/// CR 118.9 + CR 607.1 + CR 608.2c: conservative cardinality guard shared by
+/// every detector that exempts an alternative-cost-rider carrier's OWN
+/// sentence ("[if you cast a spell / it this way,] pay <cost> rather than pay
+/// its mana cost") from its residual " if " marker scan.
+///
+/// Mirrors `enters_with_counter_rider_residual_sentences` (PR #7970 /
+/// Hundred-Battle Veteran, `a8042ab56`) for this sibling carrier shape: the
+/// caller's structural evidence — a `GraveyardCastPermission`/
+/// `ExileCastPermission { extra_cost: Some(Alternative), .. }` static, or a
+/// `PlayFromExile { alt_ability_cost: Some(_), .. }` grant — only proves the
+/// unit contains AT LEAST ONE such carrier. It carries no sentence-level
+/// provenance linking that carrier to a SPECIFIC "cast ... this way, pay ..."
+/// sentence. When exactly one sentence in the unit matches
+/// `try_parse_alt_cost_rider`'s syntactic shape, evidence and syntax
+/// necessarily agree on which sentence produced the carrier, so it is sound
+/// to remove exactly that sentence and hand the caller the residual for its
+/// own " if " marker scan (`Some`). When two or more sentences match,
+/// evidence cannot distinguish "the represented carrier's sentence" from "an
+/// unrelated, unrepresented second rider that happens to parse the same way"
+/// — removing every matching sentence in that case would silently swallow
+/// the unlinked rider, so `None` is returned instead and no sentence is
+/// removed, keeping every matching sentence's `if` visible to the caller's
+/// residual scan.
+///
+/// Shared by `cast_this_way_alt_cost_is_only_if_marker` (extra_cost on a
+/// `GraveyardCastPermission`/`ExileCastPermission`) and
+/// `play_from_exile_alt_ability_cost_is_only_if_marker`
+/// (`PlayFromExile.alt_ability_cost`) — both gate on the identical
+/// "cast ... this way, pay ..." rider shape and must not drift apart on what
+/// counts as "the carrier's clause".
+fn alt_cost_rider_residual_sentences(stripped: &str) -> Option<Vec<&str>> {
+    let sentences = crate::parser::oracle_nom::primitives::split_sentence_units(stripped);
+    let matching_rider_count = sentences
+        .iter()
         .filter(|sentence| {
-            crate::parser::oracle_effect::parse_cast_this_way_enters_with_counter(sentence)
-                .is_none()
+            let sentence = sentence.trim_start();
+            (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
+                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
+                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some()
         })
-        .collect::<Vec<_>>()
-        .join(" ");
+        .count();
+    if matching_rider_count != 1 {
+        return None;
+    }
+    Some(
+        sentences
+            .into_iter()
+            .filter(|sentence| {
+                let trimmed = sentence.trim_start();
+                let is_rider = (trimmed.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
+                    || trimmed.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
+                    && crate::parser::oracle_effect::try_parse_alt_cost_rider(trimmed).is_some();
+                !is_rider
+            })
+            .collect(),
+    )
+}
+
+/// CR 118.9 + CR 119.4 + CR 701.18b: Inside Information class — mirrors
+/// `cast_this_way_alt_cost_is_only_if_marker`'s text-scoped exemption for the
+/// sibling `PlayFromExile.alt_ability_cost` shape. Structural presence of the
+/// field (`any_ability_has_play_from_exile_alt_ability_cost`) only proves the
+/// card HAS a folded "pay <cost> rather than pay its mana cost" rider
+/// somewhere — it must not exempt the whole parse unit from `detect_condition_if`.
+/// Only the sentence that represents the rider is stripped before scanning
+/// for a residual, unrepresented " if " so an unrelated conditional on the
+/// same card (or unit) is still caught. Also stays visible when a SECOND
+/// sentence in the unit syntactically matches the rider's own shape — see
+/// `alt_cost_rider_residual_sentences` for why cardinality (not just
+/// presence) of the carrier evidence matters.
+fn play_from_exile_alt_ability_cost_is_only_if_marker(
+    stripped: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    if !any_ability_has_play_from_exile_alt_ability_cost(parsed) {
+        return false;
+    }
+    let Some(residual_sentences) = alt_cost_rider_residual_sentences(stripped) else {
+        return false;
+    };
+    let residual = residual_sentences.join(" ");
     let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -3226,6 +3601,9 @@ fn enters_with_finality_this_way_is_only_if_marker(
 /// CR 118.9 + CR 607.1 + CR 608.2c: an alternative-cost rider on a cast
 /// permission represents its linked "if you cast a spell this way, pay …"
 /// clause. Additional-cost riders deliberately remain outside this exemption.
+/// Also stays visible when a SECOND sentence in the unit syntactically
+/// matches the rider's own shape — see `alt_cost_rider_residual_sentences`
+/// for why cardinality (not just presence) of the carrier evidence matters.
 fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvidence) -> bool {
     if !evidence.any_static_mode(|mode| {
         matches!(
@@ -3242,17 +3620,10 @@ fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvide
         return false;
     }
 
-    let residual: String = stripped
-        .split('.')
-        .filter(|sentence| {
-            let sentence = sentence.trim_start();
-            let is_rider = (sentence.contains("cast a spell this way") // allow-noncombinator: swallow detector marker scan on classified text
-                || sentence.contains("cast it this way")) // allow-noncombinator: swallow detector marker scan on classified text
-                && crate::parser::oracle_effect::try_parse_alt_cost_rider(sentence).is_some();
-            !is_rider
-        })
-        .collect::<Vec<_>>()
-        .join(".");
+    let Some(residual_sentences) = alt_cost_rider_residual_sentences(stripped) else {
+        return false;
+    };
+    let residual = residual_sentences.join(" ");
     let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
         && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
@@ -3312,8 +3683,9 @@ fn detect_condition_if(
     // Strip CR-implicit "if" phrases that aren't real conditional gates
     // before scanning. These are built-in rules of their parent effect, not
     // separate conditions:
-    //   CR 701.19f: "If you search your library this way, shuffle." — search
-    //               always-shuffles is built into the search effect.
+    //   "If you search your library this way, shuffle." — no CR makes this
+    //   implicit; the engine's SearchLibrary effect auto-shuffles, so the
+    //   "if" gates nothing.
     //   CR 305.9 :  "If you don't, [it/this/this land] enters tapped." — the
     //               mana-payment alternative is encoded as a replacement
     //               with `ReplacementMode::Optional { decline: Tap(SelfRef) }`,
@@ -3388,6 +3760,9 @@ fn detect_condition_if(
         return;
     }
     if cast_this_way_alt_cost_is_only_if_marker(&stripped, evidence) {
+        return;
+    }
+    if play_from_exile_alt_ability_cost_is_only_if_marker(&stripped, parsed) {
         return;
     }
     // CR 615.5: "If damage is prevented this way, [effect]" is not an
@@ -3556,12 +3931,14 @@ fn detect_condition_if(
     // conditional representation.
     //   CR 305.9   on_decline                        — "if you don't" alternative
     //   CR 701.20a kept_optional_to                  — RevealUntil decline branch
+    //   CR 202.3 + CR 608.2c kept_destination_if     — RevealUntil card-property destination branch
     //   CR 614.1a  graveyard_destination_replacement — "exile it instead" rider
     //   CR 705     win_effect / lose_effect          — flip branches
     //   CR 701.6   source_rider                      — "if countered this way, ..."
     //   CR 701.6a  countered_spell_zone              — countered-spell destination
     if evidence.has_slot("on_decline")
         || evidence.has_slot("kept_optional_to")
+        || evidence.has_slot("kept_destination_if")
         || evidence.has_slot("graveyard_destination_replacement")
         || evidence.has_slot("win_effect")
         || evidence.has_slot("lose_effect")
@@ -3589,7 +3966,8 @@ fn strip_cr_implicit_if_phrases(cleaned: &str) -> String {
         if s.is_empty() {
             continue;
         }
-        // CR 701.19f: search-shuffle implicit.
+        // Search-shuffle implicit: SearchLibrary auto-shuffles (engine
+        // convention, no CR).
         // allow-noncombinator: swallow detector phrase scan on classified text
         if s.contains("if you search your library this way") {
             continue;
@@ -3872,7 +4250,10 @@ fn detect_condition_as_long_as(
     if evidence.any_duration(|d| {
         matches!(
             d,
-            Duration::ForAsLongAs { .. } | Duration::UntilHostLeavesPlay
+            Duration::ForAsLongAs { .. }
+                | Duration::UntilHostLeavesPlay
+                | Duration::WhileControllingHost
+                | Duration::WhileHostOnBattlefield
         )
     }) {
         return;
@@ -4335,7 +4716,7 @@ fn detect_duration_this_turn(
     //       CR 615.1   PreventDamage / CreateDamageReplacement — prevention shields
     //       CR 614.11  CreateDrawReplacement — "next time you would draw ... instead"
     //       CR 614.1a  AddTargetReplacement
-    //       CR 603.7c  CreateDelayedTrigger — delayed triggers from spells expire at EOT
+    //       CR 603.7b  CreateDelayedTrigger — delayed triggers from spells expire at EOT
     //       CR 601.2f  ReduceNextSpellCost — consumed by the next cast
     //       CR 509.1c  ForceBlock — a one-turn combat requirement
     //       CR 601.2   CastFromZone — a cast permission, not a duration
@@ -4354,7 +4735,7 @@ fn detect_duration_this_turn(
     }) {
         return;
     }
-    // (j) CR 603.7c: a `WhenNextEvent` delayed-trigger condition IS the "next [event] this
+    // (j) CR 603.7b: a `WhenNextEvent` delayed-trigger condition IS the "next [event] this
     //     turn" scope (Chandra, the Firebrand -2; Doublecast).
     if evidence.any::<DelayedTriggerCondition>(|c| {
         matches!(c, DelayedTriggerCondition::WhenNextEvent { .. })
@@ -4685,13 +5066,15 @@ mod tests {
 
     use super::{
         any_ability_has_unimplemented, def_tree_has_optional, def_tree_has_unimplemented,
+        detect_replacement, dynamic_markers_are_all_recorded_unrecognized,
         effect_has_internal_optionality, trigger_tree_has_optional, twice_is_activation_limit,
     };
     use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ContinuousModification, DamageModification, Effect,
-        OutsideGameSourcePool, PlayerFilter, QuantityExpr, TargetFilter, TriggerCondition,
+        OutsideGameSourcePool, PlayerFilter, QuantityExpr, StaticCondition, StaticDefinition,
+        TargetFilter, TriggerCondition,
     };
     use crate::types::identifiers::TrackedSetId;
     use crate::types::keywords::Keyword;
@@ -7754,6 +8137,261 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         );
     }
 
+    /// Evidence carrying exactly one static whose condition is the honest gap
+    /// marker `gate_static_condition` produces, `Not`-wrapped the way the
+    /// `"unless"` polarity stores it. Mirrors the hand-built evidence helpers
+    /// above; the `Not` wrapper is deliberate, because the recorded text must be
+    /// found at any nesting depth, not only at the root.
+    fn recorded_unrecognized_evidence(text: &str) -> UnitEvidence {
+        recorded_unrecognized_evidence_multi(&[text], &[])
+    }
+
+    /// The general form: one `Not`-wrapped `StaticCondition::Unrecognized` per
+    /// entry in `static_texts`, plus one `ReplacementCondition::Unrecognized`
+    /// per entry in `replacement_texts`.
+    ///
+    /// Two axes, because two distinct suppression hazards need pinning: several
+    /// static gaps on one unit (does the predicate COUNT occurrences, or merely
+    /// detect the marker's type?) and a replacement gap alongside them (can a
+    /// CR 614.1 condition discharge a CR 604.1 static's suppression, given the
+    /// two `Unrecognized` variants are field-identical and share the JSON key
+    /// `condition`?).
+    fn recorded_unrecognized_evidence_multi(
+        static_texts: &[&str],
+        replacement_texts: &[&str],
+    ) -> UnitEvidence {
+        use crate::types::ability::{ReplacementCondition, ReplacementDefinition};
+        use crate::types::replacements::ReplacementEvent;
+
+        let statics = static_texts
+            .iter()
+            .map(|text| {
+                let mut def = StaticDefinition::new(StaticMode::CantBeBlocked);
+                def.condition = Some(StaticCondition::Not {
+                    condition: Box::new(StaticCondition::Unrecognized {
+                        text: (*text).to_string(),
+                    }),
+                });
+                def
+            })
+            .collect();
+        let replacements = replacement_texts
+            .iter()
+            .map(|text| {
+                let mut def = ReplacementDefinition::new(ReplacementEvent::Moved);
+                def.condition = Some(ReplacementCondition::Unrecognized {
+                    text: (*text).to_string(),
+                });
+                def
+            })
+            .collect();
+
+        UnitEvidence::of(&crate::parser::oracle::ParsedAbilities {
+            abilities: Vec::new(),
+            triggers: Vec::new(),
+            statics,
+            replacements,
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        })
+    }
+
+    /// CR 604.1 + CR 611.3: text the parser explicitly recorded as unparsed is
+    /// reported, not swallowed — the same architectural rule the card-wide
+    /// `Effect::Unimplemented` guard applies, expressed for the static-ability
+    /// twin `StaticCondition::Unrecognized`.
+    ///
+    /// Pinned at the predicate rather than only end-to-end, because all three
+    /// answers matter and only the first has a printed card behind it today.
+    #[test]
+    fn recorded_unrecognized_text_discharges_only_the_markers_it_contains() {
+        let clause = "defending player pays {3} for each creature blocking";
+        let recorded = recorded_unrecognized_evidence(clause);
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(clause, &["for each "], &recorded),
+            "a marker INSIDE the recorded text is already reported by the gap itself"
+        );
+
+        // Same recorded gap, but the audited unit ALSO drops a quantity the gap
+        // says nothing about.
+        let with_sibling = "defending player pays {3} for each creature blocking. \
+                            draw cards equal to your life total.";
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                with_sibling,
+                &[" equal to "],
+                &recorded
+            ),
+            "a marker the recorded text does NOT contain is still a live swallow: \
+             suppressing it would hide an unrelated dropped quantity on the same line"
+        );
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                with_sibling,
+                &["for each ", " equal to "],
+                &recorded
+            ),
+            "ALL markers must be accounted for — one recorded marker must not excuse \
+             an unrecorded sibling"
+        );
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                clause,
+                &["for each "],
+                &no_activation_limit_evidence()
+            ),
+            "with no Unrecognized condition anywhere, nothing was recorded and the \
+             marker is a genuine swallow"
+        );
+    }
+
+    /// CR 107.3 + CR 604.1: one recorded gap discharges ONE raised occurrence of
+    /// its marker, not the marker's whole type on the unit.
+    ///
+    /// Regression for a set-like suppression predicate ("does some recorded text
+    /// contain this marker?"). A unit raising `"for each "` twice, from two
+    /// independent clauses of which only one was recorded as an `Unrecognized`
+    /// gap, satisfied that predicate — and the second clause's dropped dynamic
+    /// quantity was then reported by nothing at all, because the `Unrecognized`
+    /// gap names only the first clause's text. That is a silent false green of
+    /// exactly the shape this detector exists to prevent.
+    #[test]
+    fn a_second_same_marker_clause_is_not_discharged_by_the_first() {
+        let first = "defending player pays {3} for each creature blocking";
+        let second = "its controller loses 1 life for each card in their graveyard";
+        let both_raised = format!("{first}. {second}.");
+
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                &both_raised,
+                &["for each "],
+                &recorded_unrecognized_evidence(first)
+            ),
+            "the SECOND independently swallowed 'for each' is unrepresented and \
+             unrecorded — one recorded occurrence must not account for two raised ones"
+        );
+
+        // Both occurrences recorded inside a single gap: fully accounted, suppress.
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(
+                &both_raised,
+                &["for each "],
+                &recorded_unrecognized_evidence(&both_raised)
+            ),
+            "when the recorded text supplies as many occurrences as the unit raises, \
+             every one of them is already reported verbatim by the gap"
+        );
+
+        // Both occurrences recorded, but split across two separate gap markers —
+        // counting is over the recorded SET, not over any single recorded text.
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(
+                &both_raised,
+                &["for each "],
+                &recorded_unrecognized_evidence_multi(&[first, second], &[])
+            ),
+            "two independently recorded gaps account for two raised occurrences"
+        );
+    }
+
+    /// CR 604.1 vs CR 614.1: a REPLACEMENT effect's recorded gap must not
+    /// discharge a STATIC ability's suppression.
+    ///
+    /// `ReplacementCondition::Unrecognized { text }` and
+    /// `StaticCondition::Unrecognized { text }` are field-identical and both
+    /// serialize under the bare JSON key `condition`, so a key-only
+    /// `collect_at::<StaticCondition>(&["condition"])` deserialized the
+    /// replacement's node as a static condition and accepted an unrelated rule's
+    /// gap text as proof. The collection is now anchored on the
+    /// `StaticDefinition` carrier — path AND type — so the two kinds cannot be
+    /// confused.
+    #[test]
+    fn a_replacement_gap_does_not_discharge_a_static_conditions_suppression() {
+        let clause = "defending player pays {3} for each creature blocking";
+
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                clause,
+                &["for each "],
+                &recorded_unrecognized_evidence_multi(&[], &[clause])
+            ),
+            "only a CR 614.1 replacement gap was recorded; the static's dynamic \
+             quantity is still swallowed and must stay reported"
+        );
+
+        // Cross-kind: the replacement records one marker, the static records a
+        // DIFFERENT one. The marker the static did not record stays live.
+        let unit = "defending player pays {3} for each creature blocking. \
+                    draw cards equal to your life total.";
+        assert!(
+            !dynamic_markers_are_all_recorded_unrecognized(
+                unit,
+                &["for each ", " equal to "],
+                &recorded_unrecognized_evidence_multi(
+                    &["draw cards equal to your life total"],
+                    &[clause],
+                )
+            ),
+            "the replacement gap must not stand in for the static's unrecorded \
+             'for each' — the genuinely swallowed static quantity must still report"
+        );
+
+        // Positive control on the same shape: with the static gap actually
+        // recording BOTH markers, suppression is restored, so the guard above is
+        // discriminating rather than a blanket rejection.
+        assert!(
+            dynamic_markers_are_all_recorded_unrecognized(
+                unit,
+                &["for each ", " equal to "],
+                &recorded_unrecognized_evidence_multi(&[unit], &[clause]),
+            ),
+            "a static gap that records every raised marker still suppresses, \
+             replacement gap or not"
+        );
+    }
+
+    /// End-to-end half of the predicate test above, on the printed card that
+    /// produced the CI diagnostic delta this PR had to explain.
+    ///
+    /// CR 118.12a: Awesome Presence's "for each creature they control that's
+    /// blocking it" scaling used to be carried by
+    /// `UnlessPayScaling::PerAffectedCreature`. Once
+    /// `gate_static_condition` defers the whole unofferable payment gate (no
+    /// block-declaration prompt exists for `CantBeBlocked`), that carrier is
+    /// gone BY DESIGN and the clause is instead reported verbatim on the
+    /// `Unrecognized` node. Emitting a `DynamicQty` swallow on top of it would
+    /// report one defect twice — the card is already demoted from "supported" by
+    /// the gap itself.
+    #[test]
+    fn dynamic_qty_not_double_reported_when_the_gate_recorded_the_whole_clause() {
+        let parsed = parse_named(
+            "Enchanted creature can't be blocked unless defending player pays {3} for each creature they control that's blocking it.",
+            "Awesome Presence",
+            &["Enchantment"],
+        );
+        assert!(
+            parsed.statics.iter().any(|def| def
+                .condition
+                .as_ref()
+                .is_some_and(StaticCondition::contains_unrecognized)),
+            "reach guard: the gate must have deferred the payment condition, else this \
+             test proves nothing. Statics: {:?}",
+            parsed.statics
+        );
+        assert!(
+            !has_swallowed_detector(&parsed, "DynamicQty"),
+            "the 'for each' scaling lives inside the clause the parser already reported \
+             as unrecognized; re-reporting it double-counts one defect. Warnings: {:?}",
+            parsed.parse_warnings
+        );
+    }
+
     #[test]
     fn dynamic_qty_accepts_counter_multiplier_carrier() {
         let parsed = parse(
@@ -9081,6 +9719,18 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     /// when-you-next-cast trigger (Yuna) and the cast-this-way graveyard rider
     /// (Osteomancer Adept).
     ///
+    /// CR 614.1c: a THIRD grammar — a printed static
+    /// `StaticMode::GraveyardCastPermission`/`ExileCastPermission` that carries
+    /// `enters_with_counter: Some(_)` directly (no separate rider clause; the
+    /// counter rides the permission static itself) — was ALSO a false positive
+    /// until `detect_replacement`'s carrier-acceptance closure was brought into
+    /// consistency with the sibling detector `enters_with_finality_this_way_is_only_if_marker`,
+    /// which already accepted this exact shape. This is the Hundred-Battle
+    /// Veteran class: "You may cast this card from your graveyard. If you do,
+    /// it enters with a finality counter on it." — and its confirmed siblings
+    /// Undead Sprinter, Intrepid Paleontologist, Noctis, Prince of Lucis,
+    /// Leonardo, Sewer Samurai.
+    ///
     /// The negative assertions cannot be vacuous: the detector only fires when the
     /// "enters with " marker is present AND no carrier is found, and the POSITIVE CONTROL
     /// below carries the same marker with no carrier — it must still fire. If the control
@@ -9108,20 +9758,325 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             "the cast-this-way graveyard rider is the same CR 614.1c carrier"
         );
 
+        // Hundred-Battle Veteran itself: `StaticMode::GraveyardCastPermission`
+        // carrying `enters_with_counter: Some(Finality)` directly on the
+        // printed static (no separate rider clause). This is the shape
+        // `detect_replacement`'s new match arm accepts.
+        let hundred_battle_veteran = parse_named(
+            "As long as there are three or more different kinds of counters among creatures you control, this creature gets +2/+4.\nYou may cast this card from your graveyard. If you do, it enters with a finality counter on it. (If a creature with a finality counter on it would die, exile it instead.)",
+            "Hundred-Battle Veteran",
+            &["Creature"],
+        );
+        assert!(
+            hundred_battle_veteran
+                .statics
+                .iter()
+                .any(|static_def| matches!(
+                    &static_def.mode,
+                    StaticMode::GraveyardCastPermission {
+                        enters_with_counter: Some(_),
+                        ..
+                    }
+                )),
+            "Hundred-Battle Veteran must parse to the graveyard-cast enters-with-counter carrier"
+        );
+        assert!(
+            !has_swallowed_detector(&hundred_battle_veteran, "Replacement"),
+            "Hundred-Battle Veteran's printed GraveyardCastPermission{{enters_with_counter}} \
+             IS the CR 614.1c replacement — it must not be reported as swallowed"
+        );
+
         // POSITIVE CONTROL: the same "enters with" marker with NO carrier the parser can
-        // build. Undead Sprinter is a MEASURED true positive of this detector (its
-        // cast-permission is a STATIC, and the static path has no enters-with rider hook —
-        // see the CR 614.1c static-path gap). The detector MUST still fire on it, or the
-        // two assertions above prove nothing.
+        // build. `StaticMode::TopOfLibraryCastPermission` has no `enters_with_counter`
+        // field at all (unlike its Graveyard/Exile siblings), so a rider clause
+        // attached to it has nowhere to land and the whole sentence collapses into
+        // the static's `description` with no typed carrier — a MEASURED true
+        // positive, structurally guaranteed to remain unrepresented (not merely an
+        // arm this fix happened to skip). The detector MUST still fire on it, or the
+        // assertions above prove nothing.
         let uncarried = parse_named(
-            "Trample, haste\nYou may cast this card from your graveyard if a non-Zombie creature died this turn. If you do, this creature enters with a +1/+1 counter on it.",
-            "Undead Sprinter",
+            "You may cast creature spells from the top of your library. If you cast a spell this way, it enters with a +1/+1 counter on it.",
+            "Probe Prospector",
             &["Creature"],
         );
         assert!(
             has_swallowed_detector(&uncarried, "Replacement"),
             "positive control: an enters-with clause with NO carrier must still be reported \
              — if this goes quiet the detector is dead and the assertions above are vacuous"
+        );
+    }
+
+    /// Per-clause audit independence (CR 614.1c boundary): a synthetic card with
+    /// TWO enters-with-counter clauses on separate lines — one a REPRESENTED
+    /// `GraveyardCastPermission{enters_with_counter: Some(_)}` carrier (accepted
+    /// by this fix), the other the genuinely unrepresented
+    /// `TopOfLibraryCastPermission` shape from the positive control above — must
+    /// report the swallow for the second clause ONLY. A represented clause must
+    /// not suppress the audit of a sibling clause on the same card, and an
+    /// unrepresented clause must not retroactively flag the represented one.
+    #[test]
+    fn replacement_carrier_acceptance_is_per_clause_not_per_card() {
+        let text = "You may cast this card from your graveyard. If you do, it enters with a finality counter on it.\nYou may cast creature spells from the top of your library. If you cast a spell this way, it enters with a +1/+1 counter on it.";
+        let parsed = parse_named(text, "Split-Rider Chimera", &["Creature"]);
+
+        let replacement_swallows: Vec<_> = parsed
+            .parse_warnings
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replacement_swallows.len(),
+            1,
+            "expected exactly one Replacement swallow (the unrepresented top-of-library \
+             rider), got {replacement_swallows:?}"
+        );
+        assert!(
+            replacement_swallows[0].contains("top of your library"), // allow-noncombinator: test assertion on diagnostic output text, not Oracle-text parsing dispatch
+            "the swallow must be attributed to the unrepresented clause, not the \
+             represented graveyard-cast rider: got {replacement_swallows:?}"
+        );
+    }
+
+    /// Same-UNIT mixed-rider regression (CR 614.1c boundary, maintainer finding on
+    /// PR #7970): the represented carrier and a second, genuinely unrepresented
+    /// "enters with" replacement clause in the SAME audit unit (one `UnitEvidence`,
+    /// one `detect_replacement` call) — the shape the maintainer's finding says the
+    /// existing per-clause test (above, two separate lines / two separate units)
+    /// does not exercise. `evidence.any_static_mode(..)` alone cannot see which
+    /// sentence produced the carrier; a naive unit-wide exemption would suppress
+    /// the `Replacement` diagnostic for the WHOLE unit merely because the carrier
+    /// is present somewhere in it, silently hiding the second, unrelated rider.
+    ///
+    /// Constructed directly against `detect_replacement` (mirroring the
+    /// `no_activation_limit_evidence` / `repeat_for_without_activation_limit_evidence`
+    /// direct-`UnitEvidence` pattern above) rather than through `parse_named`: the
+    /// real front-end recognizes at most one ability grammar per physical source
+    /// line, so two unrelated cast-permission abilities cannot be forced onto one
+    /// line through the public parser entry point. A single `AuditUnit` spanning
+    /// two independent "enters with" clauses is still reachable in production,
+    /// though — `audit_units` (`oracle_ir/feature.rs`) grants a unit every line up
+    /// to the next line that starts a NEW item, so a second, unparseable "enters
+    /// with" line following a cast-permission line on the same card is absorbed
+    /// into the cast-permission's own unit. Driving `detect_replacement` directly
+    /// exercises that exact unit shape without depending on which Oracle-text
+    /// layout produces it.
+    ///
+    /// The second clause deliberately does NOT reuse the "if you cast ... this
+    /// way, it enters with a [counter] counter on it" rider grammar the carrier
+    /// itself is built from (`parse_cast_this_way_enters_with_counter` matches on
+    /// TEXT, not on which static a sentence is actually linked to, so an identical
+    /// second rider sentence would be filtered out of the residual regardless of
+    /// which static it truly belongs to — a pre-existing characteristic shared
+    /// with the sibling `enters_with_finality_this_way_is_only_if_marker` detector
+    /// this fix mirrors, not a new gap this fix introduces). It instead uses CR
+    /// 614.1c's own bare first template ("[This permanent] enters with . . .",
+    /// `docs/MagicCompRules.txt` 3064), which is structurally distinct from the
+    /// rider grammar and has no carrier of any kind in this fixture's evidence.
+    #[test]
+    fn replacement_carrier_scoping_ignores_a_second_enters_with_clause_in_the_same_unit() {
+        use crate::types::ability::{CardPlayMode, StaticDefinition};
+        use crate::types::counter::CounterType;
+        use crate::types::statics::CastFrequency;
+
+        // The represented carrier, built exactly as the real parser builds it for
+        // Hundred-Battle Veteran: `GraveyardCastPermission{enters_with_counter: Some(_)}`.
+        let carrier = StaticDefinition::new(StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: Some(CounterType::Finality),
+        });
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: Vec::new(),
+            triggers: Vec::new(),
+            statics: vec![carrier],
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+
+        // REACH GUARD: the carrier must actually be visible to `evidence.any_static_mode`,
+        // or the suppression this test is probing never engages and the assertion below
+        // would be vacuous.
+        assert!(
+            evidence.any_static_mode(|mode| matches!(
+                mode,
+                StaticMode::GraveyardCastPermission {
+                    enters_with_counter: Some(_),
+                    ..
+                }
+            )),
+            "fixture evidence must expose the GraveyardCastPermission carrier"
+        );
+
+        let cleaned = "you may cast this card from your graveyard. if you do, it enters with \
+                        a finality counter on it. this permanent also enters with a shield \
+                        counter on it.";
+        let mut diagnostics = Vec::new();
+        detect_replacement(cleaned, cleaned, &parsed, &evidence, &mut diagnostics);
+
+        let replacement_swallows: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replacement_swallows.len(),
+            1,
+            "expected exactly one Replacement swallow (the unrepresented bare \"enters with\" \
+             clause sharing the carrier's unit), got {replacement_swallows:?} — a unit-wide \
+             carrier exemption would report zero here"
+        );
+    }
+
+    /// Second maintainer finding on PR #7970 (review submitted 2026-08-28): the
+    /// PRECEDING test proves the fix handles a second rider that does NOT match the
+    /// carrier's own syntactic shape. It does not prove anything about a second
+    /// rider that DOES match that shape — `parse_cast_this_way_enters_with_counter`
+    /// recognizes text, not linkage, so `evidence.any_static_mode(..)` proving "a
+    /// carrier exists somewhere in this unit" cannot distinguish "the one matching
+    /// sentence that produced it" from "a second, syntactically identical sentence
+    /// that produced no carrier at all" (e.g. a rider on a cast mode the parser does
+    /// not yet lower to a typed carrier). Before this fix, BOTH matching sentences
+    /// were stripped from the residual regardless of which one the single `evidence`
+    /// carrier actually came from, so the second, unrepresented rider was silently
+    /// swallowed. `evidence` here (like the sibling test above) carries exactly ONE
+    /// carrier static — proving the two matching sentences in `cleaned` cannot both
+    /// be "the" carrier's sentence.
+    #[test]
+    fn replacement_carrier_scoping_does_not_swallow_a_second_matching_rider_in_the_same_unit() {
+        use crate::types::ability::{CardPlayMode, StaticDefinition};
+        use crate::types::counter::CounterType;
+        use crate::types::statics::CastFrequency;
+
+        // Exactly one carrier in evidence — the graveyard-cast Finality rider.
+        let carrier = StaticDefinition::new(StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: Some(CounterType::Finality),
+        });
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: Vec::new(),
+            triggers: Vec::new(),
+            statics: vec![carrier],
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+
+        // The unit's text carries TWO sentences that both match
+        // `parse_cast_this_way_enters_with_counter`'s syntactic shape ("if you do, it
+        // enters with a <counter> counter on it"), but only the FIRST corresponds to
+        // the single typed carrier above — the second is a rider on a cast mode this
+        // fixture's `parsed.statics` never produced a carrier for.
+        let cleaned = "you may cast this card from your graveyard. if you do, it enters with \
+                        a finality counter on it. you may cast this card from exile. if you \
+                        do, it enters with a shield counter on it.";
+        let mut diagnostics = Vec::new();
+        detect_replacement(cleaned, cleaned, &parsed, &evidence, &mut diagnostics);
+
+        let replacement_swallows: Vec<_> = diagnostics
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            replacement_swallows.len(),
+            1,
+            "expected exactly one Replacement swallow (the second, unlinked \"enters with a \
+             shield counter\" rider) — a cardinality-blind carrier exemption strips BOTH \
+             syntactically matching sentences and reports zero here, got \
+             {replacement_swallows:?}"
+        );
+    }
+
+    /// Real-card regression (found while landing the fix above): Undead Sprinter's
+    /// PRINTED Oracle text is self-granting and self-referential — "You may cast
+    /// this card from your graveyard if a non-Zombie creature died this turn. If
+    /// you do, THIS CREATURE enters with a +1/+1 counter on it." — using the
+    /// literal `SELF_REF_TYPE_PHRASES` wording "this creature", never the
+    /// anaphoric "it"/"that creature" forms the other carrier fixtures above use.
+    ///
+    /// `swallow_check`'s audit units are sliced from RAW, un-normalized
+    /// `source_text` (deliberately — see the comment on the CR 614.1c template
+    /// match above: "the unit text carries the card's REAL name, not the
+    /// normalized ~"), so `enters_with_counter_carrier_is_only_enters_with_marker`
+    /// sees "this creature enters with", not the `~`-normalized form the main
+    /// parse pipeline builds the actual `StaticMode` from. The shared
+    /// `parse_cast_this_way_enters_with_counter` recognizer must accept the
+    /// literal "this creature"/"this permanent"/"this artifact" subject forms
+    /// too, or this exact carrier shape regresses to a false-positive
+    /// `Swallow:Replacement` the moment the scoping fix above starts reading
+    /// per-sentence text instead of the old unit-wide `any_static_mode` check
+    /// (caught via `client/public/coverage-data.json` showing Undead Sprinter
+    /// drop to `supported:false` after that change — this test pins the fix at
+    /// the unit level so it can't regress silently again).
+    #[test]
+    fn replacement_carrier_scoping_accepts_the_literal_self_reference_form() {
+        let parsed = parse_named(
+            "Trample, haste\nYou may cast this card from your graveyard if a non-Zombie \
+             creature died this turn. If you do, this creature enters with a +1/+1 counter \
+             on it.",
+            "Undead Sprinter",
+            &["Creature"],
+        );
+
+        let replacement_swallows: Vec<_> = parsed
+            .parse_warnings
+            .iter()
+            .filter_map(|w| match w {
+                OracleDiagnostic::SwallowedClause {
+                    detector,
+                    description,
+                    ..
+                } if detector == "Replacement" => Some(description.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            replacement_swallows.is_empty(),
+            "the literal \"this creature enters with\" self-reference form must be \
+             recognized as the represented CR 614.1c carrier, got {replacement_swallows:?}"
         );
     }
 
@@ -9266,6 +10221,40 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         assert!(!super::cleaned_has_only_counter_multiplier_dynamic(
             "double the number of each kind of counter on target creature for each card in your hand"
         ));
+    }
+
+    /// CR 701.10e + CR 107.3: the counter-multiplier escape hatch accounts for
+    /// the `"the number of "` occurrence its OWN phrase contains, and for no
+    /// other occurrence of that same marker on the unit.
+    ///
+    /// Regression for a set-like escape hatch. The recognizer used to test
+    /// `contains(<multiplier phrase>)` and then scan for "other" dynamic markers
+    /// with `"the number of "` deliberately omitted from the scanned list —
+    /// because the accepted phrase contains it. That omission was unconditional,
+    /// so ONE multiplier discharged EVERY `"the number of "` on the unit and a
+    /// second, independent, genuinely swallowed one was left reported by
+    /// nothing. Same failure shape as the `for each` marker suppression in
+    /// `a_second_same_marker_clause_is_not_discharged_by_the_first`.
+    #[test]
+    fn counter_multiplier_does_not_discharge_a_second_the_number_of_clause() {
+        assert!(
+            !super::cleaned_has_only_counter_multiplier_dynamic(
+                "double the number of +1/+1 counters on target creature, \
+                 then draw the number of cards in your graveyard"
+            ),
+            "the SECOND 'the number of' is an independent dynamic quantity the \
+             MultiplyCounter resolver does not carry — it must stay reported"
+        );
+
+        // Two multiplier phrases account for two occurrences: still clean.
+        assert!(
+            super::cleaned_has_only_counter_multiplier_dynamic(
+                "double the number of +1/+1 counters on target creature, \
+                 then double the number of each kind of counter on it"
+            ),
+            "each accepted phrase accounts for the one marker occurrence it \
+             contains, so two phrases account for two"
+        );
     }
 
     /// FIX1 end-to-end (CR 701.10e): the "each kind of counter" doubling form no
@@ -9677,6 +10666,218 @@ mod detect_condition_if_replacement_exemption_tests {
             has_condition_if_swallow(&diagnostics),
             "a second, independent 'if' clause riding on an otherwise-represented \
              replacement sentence must still be flagged; diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Sibling of the Replacement-detector cardinality regression above
+    /// (`replacement_carrier_scoping_does_not_swallow_a_second_matching_rider_in_the_same_unit`):
+    /// `enters_with_finality_this_way_is_only_if_marker` shares the same
+    /// `enters_with_counter_rider_residual_sentences` cardinality guard, so it must
+    /// exhibit the identical fix — a unit with TWO sentences matching
+    /// `parse_cast_this_way_enters_with_counter`'s syntactic shape, but only ONE
+    /// backed by a typed carrier in `evidence`, must not have its "if you do"
+    /// swallowed for the second, unlinked rider.
+    #[test]
+    fn condition_if_carrier_scoping_does_not_swallow_a_second_matching_rider_in_the_same_unit() {
+        use crate::types::ability::{CardPlayMode, StaticDefinition};
+        use crate::types::counter::CounterType;
+        use crate::types::statics::CastFrequency;
+
+        let carrier = StaticDefinition::new(StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            graveyard_destination_replacement: None,
+            extra_cost: None,
+            enters_with_counter: Some(CounterType::Finality),
+        });
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: Vec::new(),
+            triggers: Vec::new(),
+            statics: vec![carrier],
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+
+        let text = "you may cast this card from your graveyard. if you do, it enters with \
+                     a finality counter on it. you may cast this card from exile. if you do, \
+                     it enters with a shield counter on it.";
+        let cleaned = text.to_ascii_lowercase();
+        let mut diagnostics = Vec::new();
+        detect_condition_if(&cleaned, text, &evidence, &parsed, &mut diagnostics);
+
+        assert!(
+            has_condition_if_swallow(&diagnostics),
+            "the second, unlinked \"if you do, it enters with a shield counter\" rider must \
+             still be flagged as a swallowed Condition_If — a cardinality-blind carrier \
+             exemption strips BOTH matching sentences and reports nothing; \
+             diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Second maintainer finding on PR #8007 (review submitted 2026-08-28,
+    /// following the earlier cost-pipeline + card-wide-exemption fix in
+    /// `42137f9f5`): `play_from_exile_alt_ability_cost_is_only_if_marker`
+    /// proved only that the unit's `parsed.abilities` tree contains SOME
+    /// `PlayFromExile { alt_ability_cost: Some(_), .. }` carrier, then
+    /// stripped EVERY sentence matching `try_parse_alt_cost_rider`'s syntactic
+    /// shape from the residual scan — exactly the same cardinality blindness
+    /// `enters_with_counter_rider_residual_sentences` fixed for the
+    /// Hundred-Battle Veteran carrier shape in PR #7970 (`95df03a75`,
+    /// mirrored here as `alt_cost_rider_residual_sentences`). Structural
+    /// `evidence` proves "at least one" carrier exists but carries no
+    /// sentence-level provenance, so a unit with ONE typed carrier and TWO
+    /// syntactically matching "cast ... this way, pay ..." sentences must not
+    /// have BOTH stripped — the second, unlinked rider must keep raising its
+    /// `Condition_If` diagnostic.
+    #[test]
+    fn play_from_exile_alt_cost_carrier_scoping_does_not_swallow_a_second_matching_rider_in_the_same_unit(
+    ) {
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, CardPlayMode, PlayFromExileProvenance,
+            QuantityExpr,
+        };
+        use crate::types::player::PlayerId;
+        use crate::types::statics::CastFrequency;
+        use crate::types::zones::EtbTapState;
+
+        let permission = CastingPermission::PlayFromExile {
+            provenance: PlayFromExileProvenance::Impulse,
+            duration: Duration::UntilEndOfTurn,
+            granted_to: PlayerId(0),
+            mode: CardPlayMode::Play,
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_raise: None,
+            alt_ability_cost: Some(AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 0 },
+            }),
+            land_enter_tapped: EtbTapState::Unspecified,
+            invalidation: None,
+        };
+        let ability = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GrantCastingPermission {
+                permission,
+                target: crate::types::ability::default_target_filter_any(),
+                grantee: crate::types::ability::PermissionGrantee::AbilityController,
+            },
+        );
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: vec![ability],
+            triggers: Vec::new(),
+            statics: Vec::new(),
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+
+        // The unit's text carries TWO sentences that both match
+        // `try_parse_alt_cost_rider`'s syntactic shape ("if you cast a spell
+        // this way, pay ... rather than pay its mana cost"), but only the
+        // FIRST corresponds to the single typed `PlayFromExile.alt_ability_cost`
+        // carrier above — the second is a rider on a batch this fixture's
+        // `parsed.abilities` never produced a carrier for (e.g. a second
+        // exile-and-play grant the parser failed to lower).
+        let text = "exile the top three cards of target opponent's library. you may play those \
+                     cards this turn. if you cast a spell this way, pay life equal to its mana \
+                     value rather than pay its mana cost. exile the top two cards of your own \
+                     library. you may play those cards this turn. if you cast a spell this way, \
+                     pay life equal to its mana value rather than pay its mana cost.";
+        let cleaned = text.to_ascii_lowercase();
+        let mut diagnostics = Vec::new();
+        detect_condition_if(&cleaned, text, &evidence, &parsed, &mut diagnostics);
+
+        assert!(
+            has_condition_if_swallow(&diagnostics),
+            "the second, unlinked \"if you cast a spell this way, pay life equal to its mana \
+             value\" rider must still be flagged as a swallowed Condition_If — a \
+             cardinality-blind carrier exemption strips BOTH matching sentences and reports \
+             nothing; diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn play_from_exile_alt_cost_residual_scans_newline_separated_conditions() {
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, CardPlayMode, PlayFromExileProvenance,
+            QuantityExpr,
+        };
+        use crate::types::player::PlayerId;
+        use crate::types::statics::CastFrequency;
+        use crate::types::zones::EtbTapState;
+
+        let permission = CastingPermission::PlayFromExile {
+            provenance: PlayFromExileProvenance::Impulse,
+            duration: Duration::UntilEndOfTurn,
+            granted_to: PlayerId(0),
+            mode: CardPlayMode::Play,
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_raise: None,
+            alt_ability_cost: Some(AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 0 },
+            }),
+            land_enter_tapped: EtbTapState::Unspecified,
+            invalidation: None,
+        };
+        let parsed = crate::parser::oracle::ParsedAbilities {
+            abilities: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GrantCastingPermission {
+                    permission,
+                    target: crate::types::ability::default_target_filter_any(),
+                    grantee: crate::types::ability::PermissionGrantee::AbilityController,
+                },
+            )],
+            triggers: Vec::new(),
+            statics: Vec::new(),
+            replacements: Vec::new(),
+            extracted_keywords: Vec::new(),
+            modal: None,
+            additional_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            solve_condition: None,
+            strive_cost: None,
+            parse_warnings: Vec::new(),
+        };
+        let evidence = UnitEvidence::of(&parsed);
+        let text = "you may play those cards this turn. if you cast a spell this way, pay life \
+                    equal to its mana value rather than pay its mana cost.\nif you control an \
+                    artifact, draw a card.";
+        let cleaned = text.to_ascii_lowercase();
+        let mut diagnostics = Vec::new();
+        detect_condition_if(&cleaned, text, &evidence, &parsed, &mut diagnostics);
+
+        assert!(
+            has_condition_if_swallow(&diagnostics),
+            "the newline-separated unrepresented condition must remain visible after the rider \
+             is removed; diagnostics: {diagnostics:?}"
         );
     }
 

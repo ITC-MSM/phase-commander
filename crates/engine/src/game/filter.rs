@@ -180,6 +180,9 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        // CR 701.47c: fixed resolution-local object ref — never whole-board
+        // population (mirrors `CostPaidObject`).
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -457,6 +460,7 @@ pub(crate) fn target_filter_characteristic_reads_at(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -833,6 +837,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -1609,6 +1614,7 @@ pub(crate) fn filter_contains(filter: &TargetFilter, leaf: &dyn Fn(&TargetFilter
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -3435,6 +3441,14 @@ fn filter_inner_for_object(
                     .or(ability.effect_context_object.as_ref())
             })
             .is_some_and(|snapshot| snapshot.object_id == object_id),
+        // CR 701.47c: "the amassed Army" / "the Army you amassed" — the Army
+        // creature the current amass instruction chose, threaded via
+        // `ability.amassed_army_object` (mirrors `CostPaidObject` immediately
+        // above, minus the effect-context-object fallback: amass has no such
+        // secondary carrier).
+        TargetFilter::AmassedArmy => ability
+            .and_then(|ability| ability.amassed_army_object.as_ref())
+            .is_some_and(|snapshot| snapshot.object_id == object_id),
         // CR 613.1f + CR 611.2c + CR 400.7: the FILTER source's last-remembered
         // card (`ChosenAttribute::Card`, written by `Effect::RememberCard`). Read
         // live each layer pass against `source_id` (the permanent that HAS the
@@ -3593,13 +3607,12 @@ fn filter_inner_for_object(
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::DefendingPlayer => false,
-        // CR 603.2 + CR 120.1 + CR 603.4: "that creature"/"that permanent" bound
-        // to the damaged object of the current trigger event. Matches only the
-        // specific object that received this trigger's damage, so an
-        // intervening-`if` like "if that creature was dealt excess damage this
-        // turn" (Maarika) never fires off an unrelated creature's earlier excess
-        // hit. Resolves through the same event-extraction authority as
-        // `ObjectScope::EventTarget`; inert (matches nothing) outside a trigger.
+        // CR 603.2 + CR 603.4: "that creature"/"that permanent" bound to the
+        // object target carried by the current trigger event. Matches only that
+        // specific object (including a BecomesTarget object), so an
+        // intervening-`if` never fires from an unrelated event. Resolves through
+        // the same event-extraction authority as `ObjectScope::EventTarget`;
+        // inert (matches nothing) outside a trigger.
         TargetFilter::EventTarget => crate::game::quantity::triggering_event_target_object(state)
             .is_some_and(|damaged| damaged == object_id),
         // CR 400.7 + CR 603.7c: a parent object can be the member predicate of
@@ -3950,6 +3963,7 @@ fn zone_change_filter_inner(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -4277,6 +4291,7 @@ pub fn spell_record_matches_filter(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
@@ -4591,6 +4606,7 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }

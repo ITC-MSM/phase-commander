@@ -26,6 +26,7 @@ import type { DraftMatchDeckPayload, DraftMatchLaunch, DraftMatchSettlement, Dra
 import { MAX_MATERIALIZED_VIRTUAL_BASICS } from "../components/draft/workspace/types";
 import type { DraftCardPlacement, DraftWorkspaceState } from "../components/draft/workspace/types";
 import {
+  appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
   reconcileWorkspaceState,
@@ -43,7 +44,9 @@ import {
 import type { AISeatBinding } from "../game/controllers/aiController";
 import { createGameLoopController, type GameLoopController } from "../game/controllers/gameLoopController";
 import { processRemoteUpdate } from "../game/dispatch";
+import { debugLog } from "../game/debugLog";
 import { reportStructuredActionRejection } from "../game/actionRejectionReporter";
+import { resyncFromAdapterSafely } from "../game/staleStateWatchdog";
 import { DRAFT_DECK_SESSION_KEY } from "./draftStore";
 import { useGameStore } from "./gameStore";
 import {
@@ -305,8 +308,9 @@ interface MultiplayerDraftActions {
   requestPause: () => void;
   /** Host: resume the draft. */
   requestResume: () => void;
-  /** Both: tear down the connection and reset state. */
-  leave: (preserveSession?: boolean) => Promise<void>;
+  /** Both: tear down the connection and reset state. Lifecycle callers retain
+   * recovery; an explicit leave revokes it only after host acknowledgement. */
+  leave: (preserveRecovery?: boolean) => Promise<void>;
   /** Reset store to initial state (without network cleanup). */
   reset: () => void;
   /** Both: start the match for the current pairing. */
@@ -465,8 +469,7 @@ function applyDestination(
   for (const instanceId of instanceIds) {
     const placement = next.placements[instanceId];
     if (!placement) continue;
-    next = updateWorkspacePlacement(next, pool, instanceId, {
-      ...placement,
+    next = appendWorkspaceInstanceToResolvedDestination(next, pool, instanceId, {
       zone: destination,
       column: placementHint?.column ?? placement.column,
       row: placementHint?.row ?? placement.row,
@@ -1363,6 +1366,7 @@ export const useMultiplayerDraftStore = create<
   }),
 
   selectCard: (cardInstanceId) => {
+    if (get().pickInteractionLocked) return;
     set({ selectedCard: cardInstanceId });
   },
 
@@ -1488,7 +1492,7 @@ export const useMultiplayerDraftStore = create<
     if (
       role !== "host" ||
       !view ||
-      view.kind !== "CommanderDraft" ||
+      view.launch_capability !== "CommanderMultiplayer" ||
       view.status !== "Complete" ||
       seatIndex === null ||
       !activeHostAdapter
@@ -1567,7 +1571,12 @@ export const useMultiplayerDraftStore = create<
             resolveRoomFull();
           }
           if (event.type === "stateChanged") {
-            void processRemoteUpdate(event.snapshot, event.events, event.logEntries);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries).catch((err) => {
+              // A rejected delivery is otherwise gone and the screen freezes
+              // on the previous state — surface it and re-sync immediately.
+              debugLog(`draft-match remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
           }
           if (event.type === "stateChanged") {
             const wf = event.snapshot.state?.waiting_for;
@@ -1653,7 +1662,12 @@ export const useMultiplayerDraftStore = create<
 
         matchAdapter.onEvent((event) => {
           if (event.type === "stateChanged") {
-            void processRemoteUpdate(event.snapshot, event.events, event.logEntries);
+            processRemoteUpdate(event.snapshot, event.events, event.logEntries).catch((err) => {
+              // A rejected delivery is otherwise gone and the screen freezes
+              // on the previous state — surface it and re-sync immediately.
+              debugLog(`draft-match remote update failed: ${err instanceof Error ? err.message : String(err)}`);
+              resyncFromAdapterSafely("delivery rejected");
+            });
           }
           if (event.type === "stateChanged") {
             const wf = event.snapshot.state?.waiting_for;
@@ -1897,20 +1911,31 @@ export const useMultiplayerDraftStore = create<
     });
   },
 
-  leave: async (preserveSession = false) => {
+  leave: async (preserveRecovery = false) => {
+    const host = activeHostAdapter;
+    const guest = activeGuestAdapter;
+
+    // An explicit guest leave is host-acknowledged. Until that completes, the
+    // live adapter remains the recovery owner; tearing down the lifecycle here
+    // would discard the session that must reconnect after a dropped ACK.
+    if (host) {
+      await host.dispose({ preserveSession: preserveRecovery });
+    }
+    if (guest) {
+      await guest.dispose({ preserveRecovery });
+    }
+
     beginDraftLifecycle();
-    // Dispose match adapter first (game P2P connection)
+    // The pod session has now ended, so its game transport can follow it.
     disposeMatchAdapter(set);
 
-    if (activeHostAdapter) {
-      await activeHostAdapter.dispose({ preserveSession });
+    if (activeHostAdapter === host) {
       activeHostAdapter = null;
-      if (!preserveSession) {
+      if (!preserveRecovery) {
         clearActiveDraftPod();
       }
     }
-    if (activeGuestAdapter) {
-      await activeGuestAdapter.dispose();
+    if (activeGuestAdapter === guest) {
       activeGuestAdapter = null;
     }
     set({ ...initialState, interactionGeneration: lifecycleGeneration });

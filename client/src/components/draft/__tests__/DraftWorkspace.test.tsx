@@ -1,6 +1,5 @@
 import { useState } from "react";
 import {
-  act,
   cleanup,
   fireEvent,
   render,
@@ -9,14 +8,12 @@ import {
   within,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router";
 
 import type { DraftCardInstance, DraftPoolGroups } from "../../../adapter/draft-adapter";
 import { useMultiplayerDraftStore } from "../../../stores/multiplayerDraftStore";
 import { usePreferencesStore } from "../../../stores/preferencesStore";
-import { HostControls } from "../HostControls";
 import { CompactSideboard } from "../workspace/CompactSideboard";
-import { DraftWorkspace } from "../workspace/DraftWorkspace";
+import { DraftWorkspace, shouldShowDraftWorkspaceDeck } from "../workspace/DraftWorkspace";
 import {
   useDraftWorkspaceDrag,
   type DraftWorkspaceDragController,
@@ -25,6 +22,7 @@ import {
 import type { DraftWorkspaceState } from "../workspace/types";
 import {
   createDefaultDraftWorkspacePreferences,
+  DRAFT_WORKSPACE_COLLAPSED_SIDEBOARD_CARD_WIDTH_PX,
   DRAFT_WORKSPACE_PACK_SCALE_MAX,
   type DraftWorkspacePreferences,
 } from "../workspace/workspacePreferences";
@@ -246,6 +244,8 @@ function StatefulWorkspace({
   poolGroups,
   interactionLocked = false,
   dragController,
+  responsiveLayout,
+  responsiveContext,
 }: {
   cards: readonly DraftCardInstance[];
   initialWorkspace: DraftWorkspaceState;
@@ -256,6 +256,8 @@ function StatefulWorkspace({
   poolGroups?: DraftPoolGroups;
   interactionLocked?: boolean;
   dragController?: DraftWorkspaceDragController;
+  responsiveLayout?: "phone-portrait" | "phone-landscape" | "tablet-portrait" | "tablet-landscape" | "desktop";
+  responsiveContext?: "draft" | "builder";
 }) {
   const [workspace, setWorkspace] = useState(initialWorkspace);
   const [workspacePreferences, setPreferences] = useState(initialPreferences);
@@ -267,6 +269,8 @@ function StatefulWorkspace({
       preferences={workspacePreferences}
       interactionLocked={interactionLocked}
       dragController={dragController}
+      responsiveLayout={responsiveLayout}
+      responsiveContext={responsiveContext}
       onWorkspaceChange={(next) => {
         workspaceChanges(next);
         setWorkspace(next);
@@ -316,6 +320,47 @@ function TouchDragWorkspace({
 }
 
 describe("draft workspace shell", () => {
+  it.each([
+    ["draft phone", "phone-landscape", "draft", "phoneDeckVisualColumnCaps", "landscape"],
+    ["draft tablet", "tablet-portrait", "draft", "phoneDeckVisualColumnCaps", "portrait"],
+    ["builder phone", "phone-portrait", "builder", "phoneDeckVisualColumnCaps", "portrait"],
+    ["builder tablet", "tablet-landscape", "builder", "tabletDeckVisualColumnCaps", "landscape"],
+  ] as const)("caps %s visual builder controls at ten columns", (
+    _label,
+    responsiveLayout,
+    responsiveContext,
+    target,
+    orientation,
+  ) => {
+    const cards = [card("deck-card")];
+    const preferenceChanges = vi.fn();
+    const initialPreferences = preferences();
+    initialPreferences[target][orientation] = 9;
+    render(
+      <StatefulWorkspace
+        cards={cards}
+        initialWorkspace={state({ "deck-card": { zone: "deck", row: 0, column: 0, order: 0 } })}
+        initialPreferences={initialPreferences}
+        preferenceChanges={preferenceChanges}
+        responsiveLayout={responsiveLayout}
+        responsiveContext={responsiveContext}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Layout" }));
+    const increase = screen.getByRole("button", { name: "Increase max columns per row" });
+    const decrease = screen.getByRole("button", { name: "Decrease max columns per row" });
+    expect(increase).toHaveClass("h-11", "w-11");
+    expect(decrease).toHaveClass("h-11", "w-11");
+    fireEvent.click(increase);
+
+    expect(screen.getByRole("group", { name: "Max columns per row" })).toHaveTextContent("10");
+    expect(preferenceChanges).toHaveBeenLastCalledWith(expect.objectContaining({
+      [target]: expect.objectContaining({ [orientation]: 10 }),
+    }));
+    expect(increase).toBeDisabled();
+  });
+
   it("uses the draft visual preview setting without showing a workspace control", () => {
     const cards = [card("deck-card"), card("side-card")];
     const preferenceChanges = vi.fn();
@@ -362,7 +407,6 @@ describe("draft workspace shell", () => {
         mobileOverlay
         mobileWorkspaceOpen={false}
         onMobileWorkspaceOpenChange={vi.fn()}
-        mobileSummaryAccessory={<div data-testid="summary-accessory">Accessory</div>}
         onWorkspaceChange={vi.fn()}
         onPreferencesChange={preferenceChanges}
       />,
@@ -397,75 +441,9 @@ describe("draft workspace shell", () => {
     expect(preferenceChanges).toHaveBeenCalledTimes(1);
 
     const summary = container.querySelector<HTMLElement>("[data-mobile-workspace-summary]")!;
-    const accessory = container.querySelector<HTMLElement>("[data-mobile-summary-accessory]")!;
-    expect(accessory).toHaveClass(
-      "right-[9px]",
-      "w-[50vw]",
-      "bottom-[calc(112px_+_env(safe-area-inset-bottom))]",
-    );
-    expect(accessory.nextElementSibling).toBe(summary);
-    expect(within(accessory).getByTestId("summary-accessory")).toBeInTheDocument();
     expect(summary).toHaveClass("overflow-x-auto", "whitespace-nowrap");
     expect(within(summary).getByRole("button", { name: "Show Deck workspace" }))
       .toHaveClass("shrink-0", "whitespace-nowrap");
-  });
-
-  it("positions_the_phone_landscape_summary_accessory_above_the_full_bottom_row", () => {
-    const { container } = render(
-      <DraftWorkspace
-        pool={[]}
-        poolGroups={groups([])}
-        workspace={state({})}
-        preferences={preferences()}
-        responsiveLayout="phone-landscape"
-        mobileOverlay
-        mobileSummaryAccessory={<div>Accessory</div>}
-        onWorkspaceChange={vi.fn()}
-        onPreferencesChange={vi.fn()}
-      />,
-    );
-
-    const accessory = container.querySelector<HTMLElement>("[data-mobile-summary-accessory]")!;
-    const summary = container.querySelector<HTMLElement>("[data-mobile-workspace-summary]")!;
-    expect(accessory).toHaveClass("bottom-[58px]", "right-[9px]", "w-[50vw]");
-    expect(accessory.nextElementSibling).toBe(summary);
-  });
-
-  it("collapses_integrated_host_controls_and_exposes_drafting_actions_only_for_the_host", () => {
-    const requestPause = vi.fn();
-    const requestResume = vi.fn();
-    useMultiplayerDraftStore.setState({
-      role: "host",
-      phase: "drafting",
-      paused: false,
-      requestPause,
-      requestResume,
-    });
-    const rendered = render(<MemoryRouter><HostControls presentation="integrated" /></MemoryRouter>);
-
-    const toggle = screen.getByRole("button", { name: "Host Controls" });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-    expect(toggle).toHaveTextContent("▲");
-    expect(screen.queryByRole("button", { name: "Pause Draft" })).not.toBeInTheDocument();
-
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(toggle).toHaveTextContent("▼");
-    fireEvent.click(screen.getByRole("button", { name: "Pause Draft" }));
-    expect(requestPause).toHaveBeenCalledOnce();
-    expect(screen.getByRole("button", { name: "End Draft" })).toBeInTheDocument();
-
-    act(() => useMultiplayerDraftStore.setState({ paused: true }));
-    fireEvent.click(screen.getByRole("button", { name: "Resume Draft" }));
-    expect(requestResume).toHaveBeenCalledOnce();
-
-    act(() => useMultiplayerDraftStore.setState({ role: "guest" }));
-    expect(document.querySelector("[data-integrated-host-controls]")).not.toBeInTheDocument();
-    rendered.unmount();
-
-    useMultiplayerDraftStore.setState({ role: "host", phase: "deckbuilding" });
-    render(<MemoryRouter><HostControls presentation="integrated" /></MemoryRouter>);
-    expect(document.querySelector("[data-integrated-host-controls]")).not.toBeInTheDocument();
   });
 
   it("opens_the_phone_workspace_overlay_as_a_board_without_persisting_the_default_view", () => {
@@ -561,7 +539,7 @@ describe("draft workspace shell", () => {
     fireEvent.click(portraitOpen);
     const portraitClose = within(portrait).getByRole("button", { name: "Hide sideboard" });
     expect(portraitClose).toHaveTextContent("▼");
-    expect(portrait.querySelector("[data-sideboard-body]")).toHaveClass("overflow-visible");
+    expect(portrait.querySelector("[data-sideboard-body]")).toHaveClass("overflow-y-auto", "touch-pan-y");
 
     rerender(<BuilderWorkspace key="landscape" responsiveLayout="phone-landscape" />);
     const landscape = screen.getByRole("region", { name: "Compact sideboard" });
@@ -578,9 +556,10 @@ describe("draft workspace shell", () => {
     fireEvent.click(landscapeOpen);
     expect(within(landscape).getByRole("button", { name: "Hide sideboard" })).toHaveTextContent("▼");
     expect(landscape.querySelector("[data-sideboard-body]")).toHaveClass("overflow-y-auto", "touch-pan-y");
-    expect(landscape.querySelector("[data-card-stack]")).toHaveClass("flex", "flex-col");
-    expect(landscape.querySelectorAll<HTMLElement>("[data-card-stack] > [data-instance-id]")[1].style.marginTop)
-      .toBe("-72%");
+    expect(landscape.querySelector("[data-card-stack]")).toHaveClass("relative");
+    expect(landscape.querySelector("[data-card-stack]")).toHaveAttribute("data-sideboard-column-count", "1");
+    expect(landscape.querySelector<HTMLElement>("[data-sideboard-row='1'][data-sideboard-column='0'] [data-instance-id]")!.style.top)
+      .toBe("32px");
   });
 
   it("moves_cards_between_the_phone_board_and_compact_sideboard_with_touch_drags", () => {
@@ -675,7 +654,7 @@ describe("draft workspace shell", () => {
     const sideboard = () => screen.getByRole("region", { name: "Compact sideboard" });
     expect(deckCard()).toHaveClass("touch-none");
     expect(within(sideboard()).getByRole("button", { name: "Inspect side" })).toHaveClass("touch-pan-y");
-    expect(sideboard().querySelector("[data-card-stack]")).toHaveClass("grid-cols-2");
+    expect(sideboard().querySelector("[data-card-stack]")).toHaveClass("relative");
     expect(within(sideboard()).getByRole("heading", { name: "Sideboard" })).toBeInTheDocument();
     expect(within(sideboard()).queryByText("Sideboard (1 card)")).not.toBeInTheDocument();
 
@@ -685,7 +664,7 @@ describe("draft workspace shell", () => {
 
     rerender(<DraftWorkspace {...baseProps} responsiveLayout="tablet-landscape" />);
     expect(deckCard()).toHaveClass("touch-pan-y");
-    expect(sideboard().querySelector("[data-card-stack]")).toHaveClass("grid-cols-1");
+    expect(sideboard().querySelector("[data-card-stack]")).toHaveClass("relative");
     expect(sideboard().querySelector("[data-card-stack]")).not.toHaveClass("grid-cols-2");
     expect(within(sideboard()).getByRole("heading", { name: /Sideboard/ })).toBeInTheDocument();
     const expandedToggle = within(sideboard()).getByRole("button", { name: "Hide sideboard" });
@@ -698,10 +677,57 @@ describe("draft workspace shell", () => {
     expect(collapsedToggle.querySelector("span")).toHaveClass("-rotate-90");
 
     rerender(<DraftWorkspace {...baseProps} responsiveLayout="tablet-portrait" />);
-    expect(sideboard().querySelector("[data-card-stack]")).toHaveClass("grid-cols-3");
+    expect(sideboard().querySelector("[data-card-stack]")).toHaveClass("relative");
 
     rerender(<DraftWorkspace {...baseProps} responsiveLayout="phone-portrait" responsiveContext="builder" />);
     expect(deckCard()).toHaveClass("touch-pan-y");
+  });
+
+  it("lays_out_the_draft_sideboard_in_ordered_overlapping_responsive_columns", () => {
+    const cards = Array.from({ length: 7 }, (_, index) => card(`side-${index}`));
+    const workspace = state(Object.fromEntries(cards.map((entry, index) => [
+      entry.instance_id,
+      { zone: "sideboard" as const, row: 0 as const, column: 0, order: index },
+    ])));
+    const props = {
+      pool: cards,
+      poolGroups: groups(cards),
+      workspace,
+      preferences: preferences({ sideboardCollapsed: false }),
+      onWorkspaceChange: vi.fn(),
+      onPreferencesChange: vi.fn(),
+    };
+    const { rerender } = render(<DraftWorkspace {...props} responsiveLayout="phone-portrait" />);
+    const stack = () => screen.getByRole("region", { name: "Compact sideboard" })
+      .querySelector<HTMLElement>("[data-card-stack]")!;
+    const positions = () => [...stack().querySelectorAll<HTMLElement>("[data-sideboard-column]")]
+      .map((node) => [node.dataset.sideboardColumn, node.dataset.sideboardRow]);
+    const cardAt = (row: number, column: number) => stack()
+      .querySelector<HTMLElement>(`[data-sideboard-row="${row}"][data-sideboard-column="${column}"] [data-instance-id]`)!;
+
+    expect(stack()).toHaveAttribute("data-sideboard-column-count", "2");
+    expect(positions().slice(0, 4)).toEqual([["0", "0"], ["1", "0"], ["0", "1"], ["1", "1"]]);
+    expect(cardAt(1, 0).style.top).toBe("56px");
+    expect(cardAt(0, 1).style.left).toBe("calc(50% + 4px)");
+    expect(stack().querySelector<HTMLElement>("[data-sideboard-stack-spacer]")!.style.marginBottom).toBe("168px");
+
+    rerender(<DraftWorkspace {...props} responsiveLayout="phone-landscape" />);
+    expect(stack()).toHaveAttribute("data-sideboard-column-count", "1");
+    expect(positions().slice(0, 3)).toEqual([["0", "0"], ["0", "1"], ["0", "2"]]);
+    expect(cardAt(1, 0).style.top).toBe("32px");
+    expect(stack().querySelector<HTMLElement>("[data-sideboard-stack-spacer]")!.style.marginBottom).toBe("192px");
+
+    rerender(<DraftWorkspace {...props} responsiveLayout="tablet-portrait" />);
+    expect(stack()).toHaveAttribute("data-sideboard-column-count", "3");
+    expect(positions().slice(0, 4)).toEqual([["0", "0"], ["1", "0"], ["2", "0"], ["0", "1"]]);
+    expect(cardAt(1, 0).style.top).toBe("72px");
+    expect(stack().querySelector<HTMLElement>("[data-sideboard-stack-spacer]")!.style.marginBottom).toBe("144px");
+
+    rerender(<DraftWorkspace {...props} responsiveLayout="tablet-landscape" />);
+    expect(stack()).toHaveAttribute("data-sideboard-column-count", "1");
+    expect(positions().slice(0, 3)).toEqual([["0", "0"], ["0", "1"], ["0", "2"]]);
+    expect(cardAt(1, 0).style.top).toBe("40px");
+    expect(stack().querySelector<HTMLElement>("[data-sideboard-stack-spacer]")!.style.marginBottom).toBe("240px");
   });
 
   it("renders_one_fixed_ordered_pointer_following_overlay", () => {
@@ -709,6 +735,7 @@ describe("draft workspace shell", () => {
     const source = {
       kind: "draft-effect" as const,
       authorityId: "effect",
+      sourceInstanceId: "effect-a",
       instanceIds: ["effect-a", "effect-b"] as const,
       cards,
       sourceIndices: [0, 1],
@@ -761,6 +788,7 @@ describe("draft workspace shell", () => {
     const source = {
       kind: "draft-effect" as const,
       authorityId: "effect",
+      sourceInstanceId: "effect-a",
       instanceIds: ["effect-a", "effect-b"] as const,
       cards,
       sourceIndices: [0, 1],
@@ -816,6 +844,7 @@ describe("draft workspace shell", () => {
     const source = {
       kind: "pick" as const,
       authorityId: "single",
+      sourceInstanceId: "single",
       instanceIds: ["single"] as const,
       cards,
       sourceIndices: [0],
@@ -872,6 +901,7 @@ describe("draft workspace shell", () => {
     const source = {
       kind: "draft-effect" as const,
       authorityId: "effect",
+      sourceInstanceId: "effect-a",
       instanceIds: ["effect-a", "effect-b"] as const,
       cards,
       sourceIndices: [0, 1],
@@ -953,7 +983,7 @@ describe("draft workspace shell", () => {
     expect(tinyCardHeight).toBeLessThanOrEqual(1);
   });
 
-  it("keeps_only_live_width_breakpoints_and_cleans_them_up", async () => {
+  it("keeps_the_desktop_board_visible_across_width_changes_and_cleans_them_up", async () => {
     const harness = installBrowserHarness({ width: 1023 });
     const windowAdd = vi.spyOn(window, "addEventListener");
     const windowRemove = vi.spyOn(window, "removeEventListener");
@@ -970,7 +1000,7 @@ describe("draft workspace shell", () => {
 
     expect(screen.queryByRole("group", { name: "Workspace view" })).not.toBeInTheDocument();
     expect(screen.queryByText("Build your deck")).not.toBeInTheDocument();
-    expect(screen.queryByRole("toolbar", { name: "Board layout" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "Show sideboard (0 cards)" })).toBeInTheDocument();
     expect(container.querySelector('[data-safe-area-probe="true"]')).not.toBeInTheDocument();
     expect(screen.queryByRole("separator")).not.toBeInTheDocument();
@@ -980,10 +1010,10 @@ describe("draft workspace shell", () => {
 
     Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1024 });
     harness.mediaQueries.get("(min-width: 1024px)")!.dispatchEvent(new Event("change"));
-    await waitFor(() => expect(screen.getAllByRole("toolbar", { name: "Board layout" }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(1));
     Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 1023 });
     harness.mediaQueries.get("(min-width: 1024px)")!.dispatchEvent(new Event("change"));
-    await waitFor(() => expect(screen.queryAllByRole("toolbar", { name: "Board layout" })).toHaveLength(0));
+    await waitFor(() => expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(1));
 
     const resizeRegistration = windowAdd.mock.calls.find(([type]) => type === "resize")!;
     unmount();
@@ -1097,10 +1127,12 @@ describe("draft workspace shell", () => {
     );
 
     const first = container.querySelector<HTMLElement>('[data-instance-id="shared-a"]')!;
-    fireEvent.click(within(first).getByRole("button", { name: "Move Shared Name to Sideboard" }));
+    fireEvent.keyDown(within(first).getByRole("button", { name: "Inspect Shared Name" }), {
+      key: "ArrowDown",
+      ctrlKey: true,
+      shiftKey: true,
+    });
     expect(screen.getByText("Deck (1 card)")).toBeInTheDocument();
-    expect(within(screen.getByRole("region", { name: "Compact sideboard" }))
-      .getByText("Sideboard (1 card)")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Show sideboard (1 card)" })).toBeInTheDocument();
     expect(lastWorkspaceChange(workspaceChanges).placements["shared-a"].zone).toBe("sideboard");
     expect(lastWorkspaceChange(workspaceChanges).placements["shared-b"].zone).toBe("deck");
@@ -1188,7 +1220,7 @@ describe("draft workspace shell", () => {
     expect(within(summary).getByLabelText("1 Creature")).toBeInTheDocument();
   });
 
-  it("preserves_compact_deck_and_board_deck_while_expanded_sideboard_stays_complete", () => {
+  it("keeps_the_desktop_board_visible_when_a_compact_preference_is_restored", () => {
     const cards = [card("one")];
     const workspaceChanges = vi.fn();
     const workspace = state({ one: { zone: "deck", row: 0, column: 0, order: 0 } });
@@ -1207,10 +1239,158 @@ describe("draft workspace shell", () => {
     );
 
     expect(screen.queryByRole("group", { name: "Workspace view" })).not.toBeInTheDocument();
-    expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(1);
+    expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(2);
     rerender(<DraftWorkspace {...props} preferences={preferences({ explicitView: "board" })} />);
     expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(2);
     expect(workspaceChanges).not.toHaveBeenCalled();
+  });
+
+  it("switches_builder_phone_compact_and_visual_views_without_a_compact_landscape_sideboard", () => {
+    const preferenceChanges = vi.fn();
+    const props = {
+      pool: [card("one")],
+      poolGroups: groups([card("one")]),
+      workspace: state({ one: { zone: "deck", row: 0, column: 0, order: 0 } }),
+      onWorkspaceChange: vi.fn(),
+      onPreferencesChange: preferenceChanges,
+      compactDeckControls: <button type="button">Add Lands</button>,
+      responsiveLayout: "phone-landscape" as const,
+      responsiveContext: "builder" as const,
+    };
+    const { container, rerender } = render(
+      <DraftWorkspace {...props} preferences={preferences({ explicitView: null })} />,
+    );
+
+    expect(screen.getByRole("button", { name: "Visual builder" })).toHaveClass("min-h-11");
+    const phonePrimary = container.querySelector<HTMLElement>("[data-compact-pool-primary-controls]")!;
+    expect(within(phonePrimary).getAllByRole("button").map((button) => button.textContent))
+      .toEqual(["Group", "Add Lands", "Visual builder"]);
+    expect(phonePrimary.children[2]).toHaveAttribute("data-deck-type-counts");
+    expect(container.querySelector("[data-compact-pool-trailing-controls]")).toHaveClass("ml-auto");
+    expect(container.querySelector("[data-deck-type-counts]")).toHaveClass("text-[0.65625rem]");
+    expect(screen.queryByRole("region", { name: "Compact sideboard" })).not.toBeInTheDocument();
+    expect(container.querySelector<HTMLElement>("[data-zone='deck']")).toHaveClass("overflow-hidden");
+    fireEvent.click(screen.getByRole("button", { name: "Visual builder" }));
+    expect(preferenceChanges).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "board" }));
+
+    rerender(<DraftWorkspace {...props} preferences={preferences({ explicitView: "board" })} />);
+    expect(screen.getByRole("button", { name: "Text builder" })).toHaveClass("ml-auto", "min-h-11");
+    expect(screen.getByRole("region", { name: "Compact sideboard" })).toBeInTheDocument();
+    expect(container.querySelector<HTMLElement>("[data-zone='deck']")).toHaveClass("overflow-y-auto", "overscroll-contain");
+    fireEvent.click(screen.getByRole("button", { name: "Text builder" }));
+    expect(preferenceChanges).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "compact" }));
+
+    rerender(<DraftWorkspace
+      {...props}
+      responsiveLayout="desktop"
+      preferences={preferences({ explicitView: "compact" })}
+    />);
+    expect(screen.queryByRole("button", { name: "Visual builder" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("toolbar", { name: "Board layout" })).toHaveLength(2);
+
+    rerender(<DraftWorkspace
+      {...props}
+      responsiveLayout="phone-portrait"
+      preferences={preferences({ explicitView: "compact" })}
+    />);
+    expect(screen.queryByRole("region", { name: "Compact sideboard" })).not.toBeInTheDocument();
+
+    rerender(<DraftWorkspace
+      {...props}
+      responsiveLayout="phone-portrait"
+      preferences={preferences({ explicitView: "board" })}
+    />);
+    expect(screen.getByRole("region", { name: "Compact sideboard" })).toBeInTheDocument();
+    expect(screen.getByRole("toolbar", { name: "Board layout" })).toHaveClass("px-2");
+    expect(container.querySelector("[data-deck-type-counts]")).toHaveClass("text-[0.65625rem]");
+
+    rerender(<DraftWorkspace
+      {...props}
+      responsiveLayout="tablet-portrait"
+      preferences={preferences({ explicitView: "compact" })}
+    />);
+    const tabletPrimary = container.querySelector<HTMLElement>("[data-compact-pool-primary-controls]")!;
+    expect(within(tabletPrimary).getAllByRole("button").map((button) => button.textContent))
+      .toEqual(["Group", "Add Lands", "Visual builder"]);
+    expect(within(tabletPrimary).getByRole("button", { name: "Visual builder" })).toHaveClass("min-h-11");
+    expect(container.querySelector("[data-deck-type-counts]")).toHaveClass("text-sm");
+    expect(container.querySelector<HTMLElement>("[data-zone='deck']")).toHaveClass("overflow-hidden");
+    expect(container.querySelector("[data-workspace-composition='collapsed']"))
+      .toHaveClass("flex", "h-full", "min-h-0", "flex-col", "overflow-hidden");
+    expect(screen.queryByRole("heading", { name: "Deck (1 card)", level: 2 })).not.toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "Compact sideboard" })).not.toBeInTheDocument();
+    fireEvent.click(within(tabletPrimary).getByRole("button", { name: "Group" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Color" }));
+    expect(within(tabletPrimary).getByRole("button", { name: "Group" })).toBeInTheDocument();
+
+    rerender(<DraftWorkspace
+      {...props}
+      responsiveLayout="tablet-portrait"
+      preferences={preferences({ explicitView: "board" })}
+    />);
+    expect(screen.getByRole("button", { name: "Text builder" })).toHaveClass("min-h-11");
+    expect(screen.getByRole("toolbar", { name: "Board layout" })).toHaveClass("px-4");
+    expect(container.querySelector("[data-deck-type-counts]")).toHaveClass("text-sm");
+
+    rerender(<DraftWorkspace
+      {...props}
+      responsiveLayout="tablet-landscape"
+      preferences={preferences({ explicitView: "board" })}
+    />);
+    expect(screen.getByRole("button", { name: "Text builder" })).toHaveClass("min-h-11");
+  });
+
+  it.each(["tablet-portrait", "tablet-landscape"] as const)(
+    "keeps builder compact content reachable after collapsing the %s visual deck",
+    (responsiveLayout) => {
+      const preferenceChanges = vi.fn();
+      const props = {
+        pool: [card("one")],
+        poolGroups: groups([card("one")]),
+        workspace: state({ one: { zone: "deck", row: 0, column: 0, order: 0 } }),
+        onWorkspaceChange: vi.fn(),
+        onPreferencesChange: preferenceChanges,
+        compactDeckControls: <button type="button">Add Lands</button>,
+        responsiveLayout,
+        responsiveContext: "builder" as const,
+      };
+      expect(shouldShowDraftWorkspaceDeck(true, true)).toBe(true);
+      const { rerender } = render(
+        <DraftWorkspace {...props} preferences={preferences({ explicitView: "board" })} />,
+      );
+
+      fireEvent.click(screen.getByRole("button", { name: "Text builder" }));
+      expect(preferenceChanges).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "compact" }));
+
+      rerender(<DraftWorkspace {...props} preferences={preferences({ explicitView: "compact" })} />);
+      expect(screen.getByRole("button", { name: "Group" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Add Lands" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Visual builder" })).toBeInTheDocument();
+      expect(screen.getByText("one")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Visual builder" }));
+      expect(preferenceChanges).toHaveBeenLastCalledWith(expect.objectContaining({ explicitView: "board" }));
+    },
+  );
+
+  it("uses_a_responsive_collapsed_sideboard_width_only_for_desktop_draft", () => {
+    const props = {
+      pool: [] as DraftCardInstance[],
+      poolGroups: groups([]),
+      workspace: state({}),
+      preferences: preferences({ explicitView: "compact", sideboardCollapsed: true }),
+      onWorkspaceChange: vi.fn(),
+      onPreferencesChange: vi.fn(),
+      responsiveLayout: "desktop" as const,
+    };
+    const { container, rerender } = render(<DraftWorkspace {...props} />);
+    expect(container.querySelector<HTMLElement>("[data-workspace-composition='collapsed']")!.style
+      .getPropertyValue("--collapsed-sideboard-card-width")).toBe(
+        `clamp(166.4px, 16vw, ${DRAFT_WORKSPACE_COLLAPSED_SIDEBOARD_CARD_WIDTH_PX * 0.8}px)`,
+      );
+
+    rerender(<DraftWorkspace {...props} responsiveContext="builder" />);
+    expect(container.querySelector<HTMLElement>("[data-workspace-composition='collapsed']")!.style
+      .getPropertyValue("--collapsed-sideboard-card-width")).toBe("240.89999999999998px");
   });
 
   it("renders_collapsed_sideboard_cards_with_preview_empty_state_and_move_to_deck", () => {
@@ -1256,8 +1436,9 @@ describe("draft workspace shell", () => {
           { basic: { zone: "sideboard", row: 0, column: 0, order: 0 } },
           [{ instanceId: "basic", name: "Island" }],
         )}
-        initialPreferences={preferences({ explicitView: "compact", sideboardCollapsed: true })}
+        initialPreferences={preferences({ explicitView: "compact", sideboardCollapsed: false })}
         workspaceChanges={workspaceChanges}
+        responsiveLayout="phone-landscape"
         preferenceChanges={vi.fn()}
       />,
     );
@@ -1419,8 +1600,9 @@ describe("draft workspace shell", () => {
       <StatefulWorkspace
         cards={cards}
         initialWorkspace={state({ moving: { zone: "deck", row: 0, column: 0, order: 0 } })}
-        initialPreferences={preferences({ explicitView: "compact", sideboardCollapsed: true })}
+        initialPreferences={preferences({ explicitView: "compact", sideboardCollapsed: false })}
         workspaceChanges={workspaceChanges}
+        responsiveLayout="phone-landscape"
       />,
     );
 
@@ -1666,6 +1848,15 @@ describe("draft workspace shell", () => {
     );
     fireEvent.click(cardButton);
     expect(lastWorkspaceChange(workspaceChanges).placements.side.zone).toBe("deck");
+    controller.consumeCompatibilityActivation.mockReturnValue(true);
+    fireEvent.doubleClick(screen.getByRole("button", { name: "Inspect side" }), { detail: 2 });
+    expect(controller.consumeCompatibilityActivation).toHaveBeenLastCalledWith(expect.objectContaining({
+      kind: "double-click",
+      detail: 2,
+      pointerId: null,
+      surface: "workspace",
+      sourceInstanceId: "side",
+    }));
   });
 
   it("returns_collapsed_sideboard_cards_to_the_sorted_deck_column", () => {

@@ -679,30 +679,19 @@ pub struct DerivedViews {
     pub legend_candidate_identities: BTreeMap<ObjectId, LegendCandidateIdentity>,
 
     /// CR 115.1 + CR 601.2c: what the LIVE target announcement is offering the
-    /// announcing player to choose from, classified over CR 115.1's
-    /// object/player axis. Derived from
-    /// `TargetSelectionProgress::current_legal_targets` — the same array the
-    /// client turns into clickable controls, so the sentence naming the choice
-    /// and the controls answering it cannot name different populations.
+    /// announcing player, classified over CR 115.1's object/player axis. Derived
+    /// from `TargetSelectionProgress::current_legal_targets` — deliberately the
+    /// OFFERED set, not the slot's declared `legal_targets` or `TargetFilter`,
+    /// which `legal_targets_for_slot` narrows by cross-slot constraint validation
+    /// (CR 115.3) and completion feasibility; naming that superset would let the
+    /// sentence and the clickable controls describe different populations.
     ///
-    /// Deliberately the OFFERED set, not the slot's declared `legal_targets`
-    /// and not its declared `TargetFilter`. `legal_targets_for_slot` narrows
-    /// the declared set by cross-slot constraint validation (CR 115.3) and by
-    /// completion feasibility, so the declared set is a SUPERSET of what is on
-    /// screen; naming it would let the sentence and the controls describe
-    /// different populations.
-    ///
-    /// Consolidation note: `game::interaction::target_sequence_projection`
-    /// reads the same array and is the natural long-term home for this. It is
-    /// not folded there only because `TargetingOverlay` does not consume
-    /// `viewerInteraction`. If that changes, move this onto
-    /// `TargetSequenceProjection` and delete this field rather than keeping
-    /// two authorities for one classification.
-    ///
-    /// Absent unless a `TargetSelection` or `TriggerTargetSelection` prompt is
-    /// live. Where a viewer's characteristics are redacted (CR 400.2) the
-    /// classifier degrades to `Object` deliberately, rather than answering
-    /// confidently from the subset of the offer it can still resolve.
+    /// `game::interaction::target_sequence_projection` reads the same array and is
+    /// the long-term home for this; fold it there and delete this field once
+    /// `TargetingOverlay` consumes `viewerInteraction`. Absent unless a
+    /// `TargetSelection` or `TriggerTargetSelection` prompt is live; where a viewer's
+    /// characteristics are redacted (CR 400.2) it degrades to `Object` rather than
+    /// answering confidently from the subset of the offer it can still resolve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_target_kind: Option<TargetChoiceKind>,
 
@@ -739,6 +728,12 @@ pub struct DerivedViews {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub stack_entry_details: HashMap<ObjectId, StackEntryDisplay>,
 
+    /// CR 702.40a: the public number of copies the current Storm trigger will
+    /// create, or that a newly cast Storm spell would create when no Storm
+    /// trigger is pending. It is table-wide; spell copies never increment it.
+    #[serde(default)]
+    pub storm_count: u32,
+
     /// CR 702.40a: copy counts for Storm spells in the viewing player's hand.
     /// Keyed only by that viewer's hand object ids so hidden opponents' card
     /// abilities and the table-wide spell ledger cannot leak through the view.
@@ -765,6 +760,20 @@ pub struct DerivedViews {
     /// no granting static, or no qualifying card.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub web_slinging_costs: HashMap<ObjectId, ManaCost>,
+
+    /// CR 709.5b + CR 709.5e + CR 707.2: both halves of each battlefield Room,
+    /// resolved through `room::effective_room_halves` so a permanent that is a
+    /// COPY of a Room reports the halves it COPIED. The unlock special action
+    /// names a half and costs that half's mana cost, and for a copy neither is
+    /// on the recipient's own printed card — its `back_face` is empty and its
+    /// printed name is its own. Deriving printed order is engine work besides
+    /// (`room::live_face_door` reads `modal_back_face`, the CR 709.5d mapping),
+    /// so the frontend is handed the resolved pair and only formats it.
+    ///
+    /// Face-down permanents are excluded: CR 708.2a gives them no name or mana
+    /// cost to publish.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub room_half_identities: HashMap<ObjectId, crate::types::ability::RoomCopiableHalves>,
 
     /// Player-affecting continuous conditions (CR 104.2b / 119.7 / 119.8 /
     /// 118.3 / 101.2 / 702.50b) the HUD renders as status icons. Aggregates
@@ -1049,10 +1058,22 @@ impl<'a> ClientGameStateRef<'a> {
     }
 }
 
-/// Owned counterpart for deserialize paths (round-trip tests, any future
-/// state-restore flow that ingests the wire format). The JSON shape matches
+/// Owned counterpart for deserialize paths. The JSON shape matches
 /// `ClientGameStateRef` exactly — fields named identically, no
 /// `#[serde(flatten)]` — so serialize/deserialize round-trip is lossless.
+///
+/// A [`ClientGameStateRef::wrap_filtered`] payload is a VIEWER PROJECTION: its
+/// `state` half carries `viewer_projection: Some(..)`. That decodes fine here —
+/// displaying a projection is exactly what this type is for.
+///
+/// What a projection may NOT do is come back as a saved game. A state-restore
+/// flow must ingest an authoritative snapshot through the
+/// `TrustedGameStateEnvelope` / `PersistedGameState` route, where
+/// `reject_viewer_projection_as_authority` refuses a marked projection. That is
+/// deliberate: a projection has had the RNG seed zeroed, the rules journal
+/// cleared and every private resume cursor blanked while its public
+/// `waiting_for` survives, so installing one leaves a prompt no player can
+/// answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientGameState {
     pub state: GameState,
@@ -1401,6 +1422,7 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         debug_library_cards: debug_library_cards(state, viewer),
         current_target_kind: current_target_kind(state),
         dungeon_rooms: dungeon_rooms(state),
+        storm_count: storm_count(state),
         ..DerivedViews::default()
     };
 
@@ -1438,6 +1460,14 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
         }
         if let Some(source_id) = temporary_cant_be_blocked_source(state, obj_id) {
             views.temporary_cant_be_blocked.insert(obj_id, source_id);
+        }
+        // CR 709.5b + CR 708.2a: publish a Room's two halves for the unlock
+        // offer. Room-ness is this caller's gate — `effective_room_halves` is a
+        // pure projection and does not check it (see its doc).
+        if !obj.face_down && obj.card_types.subtypes.iter().any(|s| s == "Room") {
+            views
+                .room_half_identities
+                .insert(obj_id, crate::game::room::effective_room_halves(obj));
         }
         if obj.card_types.core_types.contains(&CoreType::Creature)
             && crate::game::combat::has_cant_be_blocked_static_from_precomputed(
@@ -1553,13 +1583,8 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
                             .iter()
                             .any(|keyword| matches!(keyword, Keyword::Storm)))
                 {
-                    let copy_count = *copy_count.get_or_insert_with(|| {
-                        state
-                            .spells_cast_this_turn_by_player
-                            .values()
-                            .map(|records| records.len())
-                            .sum::<usize>() as u32
-                    });
+                    let copy_count =
+                        *copy_count.get_or_insert_with(|| spells_cast_this_turn(state));
                     views.prospective_storm_counts.insert(hand_id, copy_count);
                 }
             }
@@ -1780,6 +1805,12 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
             // read here, deliberately not the display-filtered one: `object_growth_backing`
             // returns `None` for `Mana(_)` today, so the two happen to agree — an accident
             // between two functions, not an invariant either of them states.
+            //
+            // A mana axis now reaches here with `accepted_axes` HOLDING it, so its row is kept
+            // solely by `object_growth_backing`'s `None` arm. If that arm ever moves, `Mana(_)`
+            // rows start disappearing during the accept→boundary window — decide it there,
+            // deliberately. Pinned by
+            // `combo_infinite_pile::low3_mixed_axis_replay_collapses_only_the_deferred_life_axis`.
             if !accepted_axes.contains_key(&axis)
                 && object_growth_backing(state, controller, axis) == Some(false)
             {
@@ -1981,6 +2012,41 @@ pub fn derive_filtered_views(
     // combat records unrelated to rendering.
     views.blocker_assignment_pairs = blocker_assignment_pairs(authoritative_state);
     views
+}
+
+/// CR 702.40a: Storm counts each other spell cast before it this turn. A
+/// pending Storm trigger carries the cast-time snapshot that the production
+/// trigger uses, so it excludes its own spell even though that spell is already
+/// in the cast ledger. With no pending Storm trigger, the ledger total is the
+/// number a newly cast Storm spell would snapshot.
+fn storm_count(state: &GameState) -> u32 {
+    state
+        .stack
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::TriggeredAbility {
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count }),
+                ..
+            } => Some(*copy_count),
+            StackEntryKind::Spell { .. }
+            | StackEntryKind::ActivatedAbility { .. }
+            | StackEntryKind::TriggeredAbility { .. }
+            | StackEntryKind::KeywordAction { .. } => None,
+        })
+        .unwrap_or_else(|| spells_cast_this_turn(state))
+}
+
+/// The table-wide count of spells actually cast this turn. This is intentionally
+/// private: public Storm presentation must use [`storm_count`] so an active
+/// Storm trigger uses its cast-time snapshot rather than including itself.
+fn spells_cast_this_turn(state: &GameState) -> u32 {
+    state
+        .spells_cast_this_turn_by_player
+        .values()
+        .fold(0, |count, records| {
+            count.saturating_add(records.len() as u32)
+        })
 }
 
 fn visible_exile_object_ids(state: &GameState) -> BTreeMap<PlayerId, Vec<ObjectId>> {
@@ -2204,13 +2270,17 @@ fn accepted_collapse_axes(
 /// promise is false the moment it is made; this one can only become false later, which is why the
 /// two are handled differently.
 ///
-/// Note this exclusion is also NOT "no materialization touches mana": a `DriveSequence` names the
-/// loop's whole `proposal.unbounded` set, so `clear_collapsed_materializations` really does drop
-/// the `Mana(_)` axis when that collapse applies. (On the production path that drop is usually a
-/// no-op, because `turns::drain_pending_phase_transition_progress` has already removed the mana
-/// axis at CR 500.5 before the prompt that reaches it; it stays live for `debug_infinite_mana`
-/// seats, which that clear excludes.) The badge still must not promise a bound the player's
-/// spendable pool never had.
+/// This exclusion answers a DIFFERENT question from the collapse filter at the registration site:
+/// what the badge may PROMISE during the accept→boundary window, versus which authority ends the
+/// axis. The collapse no longer drops the `Mana(_)` axis at all —
+/// `game::engine::materialize_object_growth_shortcut` stores only `DeferredAccrual` axes in a
+/// `DriveSequence`'s `collapsed_axes` (`analysis::resource::ResourceAxis::unbounded_mark_kind`),
+/// and the batched items never named one — so no `PersistentAxisMaterialization` kind can schedule
+/// a `Mana(_)` axis, and this `retain` is a no-op on every production path today.
+///
+/// It is kept deliberately, as DEFENSE IN DEPTH: a future stash kind that scheduled a mana axis
+/// would otherwise silently start promising a bound on a pool the player is already spending
+/// without bound. The badge must not promise a bound the player's spendable pool never had.
 fn scheduled_display_axes(
     accepted: &BTreeMap<ResourceAxis, CollapseCertainty>,
 ) -> BTreeMap<ResourceAxis, CollapseCertainty> {
@@ -2782,6 +2852,26 @@ fn trigger_event_display(state: &GameState, event: &GameEvent) -> Option<Trigger
             object_id: Some(*object_id),
             player: Some(record.controller),
         }),
+        // CR 701.17a: an action-worded mill trigger's event slot holds only
+        // `Milled`, so this is the arm the stack tooltip reads. `fallback` is
+        // deliberately empty: `visible_zone_change_object_name` returns the live
+        // object's name when present and otherwise "Hidden Card" whenever `from`
+        // or `to` is hidden — and `from` is the library on every `Milled` event
+        // by construction, so the label never degrades to empty.
+        GameEvent::Milled {
+            player_id,
+            object_id,
+            to,
+        } => Some(TriggerContextDisplay {
+            label: format!(
+                "{} milled {} to {}",
+                player_label(state, *player_id),
+                visible_zone_change_object_name(state, *object_id, "", Some(Zone::Library), *to),
+                zone_label(Some(*to))
+            ),
+            object_id: Some(*object_id),
+            player: Some(*player_id),
+        }),
         GameEvent::CardsRevealed {
             player, card_ids, ..
         } => Some(TriggerContextDisplay {
@@ -2911,6 +3001,62 @@ mod tests {
     use crate::types::statics::ActivationExemption;
     use crate::types::zones::Zone;
     use std::collections::HashMap;
+
+    /// CR 701.17a: after the mill re-key, a `TriggerMode::Milled*` trigger's
+    /// event slot holds only `Milled`, so `trigger_event_display` must answer for
+    /// it or the stack tooltip disappears (`trigger_event_display` ends in
+    /// `_ => None`, which the compiler never asks about).
+    #[test]
+    fn trigger_event_display_labels_a_milled_event() {
+        let mut state = GameState::new_two_player(42);
+        let card = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Milled Card".to_string(),
+            Zone::Graveyard,
+        );
+
+        let display = trigger_event_display(
+            &state,
+            &GameEvent::Milled {
+                player_id: PlayerId(1),
+                object_id: card,
+                to: Zone::Graveyard,
+            },
+        )
+        .expect("a mill trigger's context must render");
+        assert_eq!(display.object_id, Some(card));
+        assert_eq!(display.player, Some(PlayerId(1)));
+        assert!(display.label.contains("Milled Card"));
+
+        // Live control: the zone-change surface this arm inherits from still
+        // renders, and an explicit abstain still abstains — so a blanket `Some`
+        // cannot pass this row.
+        assert!(trigger_event_display(
+            &state,
+            &GameEvent::ZoneChanged {
+                object_id: card,
+                from: Some(Zone::Library),
+                to: Zone::Graveyard,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    card,
+                    Some(Zone::Library),
+                    Zone::Graveyard,
+                )),
+            },
+        )
+        .is_some());
+        assert!(trigger_event_display(
+            &state,
+            &GameEvent::HiddenSearchViewed {
+                searcher: PlayerId(1),
+                cards: Vec::new(),
+                audience: Vec::new(),
+            },
+        )
+        .is_none());
+    }
 
     fn setup_commander_game(num_players: u8) -> GameState {
         let mut state = GameState::new(FormatConfig::commander(), num_players, 42);
@@ -3133,7 +3279,12 @@ mod tests {
             if accepted {
                 state.register_pending_materialization(
                     p0,
-                    PersistentAxisMaterialization::Tokens(family_test_token_profile()),
+                    PersistentAxisMaterialization::Tokens(Box::new(
+                        crate::types::game_state::TokenGrowth {
+                            profile: family_test_token_profile(),
+                            per_cycle_delta: 1,
+                        },
+                    )),
                 );
             }
             let mut events: Vec<GameEvent> = Vec::new();
@@ -3443,10 +3594,15 @@ mod tests {
             Some(PlayerId(0)),
         ))
         .expect("serialize filtered client state");
-        let client: ClientGameState =
-            serde_json::from_str(&json).expect("deserialize filtered client state");
+        // A `wrap_filtered` payload is a viewer projection, which
+        // `reject_viewer_projection_as_authority` refuses at decode — so decode the
+        // `derived` half alone, which is what this test asserts on anyway.
+        let wire: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialize filtered client wire");
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered derived views");
         assert_eq!(
-            client.derived.blocker_assignment_pairs,
+            derived.blocker_assignment_pairs,
             vec![(blocker, attacker)],
             "the authoritative public blocking pair survives the filtered viewer wire path"
         );
@@ -3514,19 +3670,27 @@ mod tests {
             Some(PlayerId(0)),
         ))
         .expect("serialize filtered debug viewer state");
-        let client: ClientGameState =
-            serde_json::from_str(&wire).expect("deserialize filtered debug viewer state");
+        // A `wrap_filtered` payload is a viewer projection and no longer decodes as a
+        // whole `ClientGameState`. Neither claim below needs a `GameState` to exist: the
+        // redaction claim is about the WIRE, so read it off the wire directly (the idiom
+        // `temporary_cant_be_blocked_view.rs` already uses), and decode only `derived`.
+        let wire: serde_json::Value =
+            serde_json::from_str(&wire).expect("inspect filtered debug viewer wire");
 
         assert_eq!(
-            client.state.objects[&own].name, "Hidden Card",
+            wire["state"]["objects"][own.0.to_string()]["name"],
+            "Hidden Card",
             "normal filtered library objects must remain hidden"
         );
         assert_eq!(
-            client.state.objects[&opponent].name, "Hidden Card",
+            wire["state"]["objects"][opponent.0.to_string()]["name"],
+            "Hidden Card",
             "an opponent's library must remain hidden"
         );
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered debug derived views");
         assert_eq!(
-            client.derived.debug_library_cards,
+            derived.debug_library_cards,
             vec![
                 DebugLibraryCardView {
                     object_id: own,
@@ -3547,7 +3711,7 @@ mod tests {
             serde_json::from_str(&local_wire).expect("deserialize local debug viewer state");
         assert_eq!(
             local.derived.debug_library_cards,
-            client.derived.debug_library_cards
+            derived.debug_library_cards
         );
 
         let unauthorized = derive_views(&state, Some(PlayerId(1)));
@@ -3699,7 +3863,7 @@ mod tests {
         let values = crate::game::printed_cards::intrinsic_copiable_values(
             state.objects.get(&target).unwrap(),
         );
-        let tce_id = state.add_transient_continuous_effect(
+        let tce_id = state.add_transient_continuous_effect_with_bindings(
             source,
             PlayerId(0),
             Duration::ForAsLongAs {
@@ -3715,10 +3879,19 @@ mod tests {
                 token_image_ref: None,
             }],
             None,
+            crate::types::game_state::TransientContinuousEffectBindings {
+                affected_recipient: Some(
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&source],
+                    ),
+                ),
+                duration_subject: Some(
+                    crate::types::identifiers::ObjectIncarnationRef::from_object(
+                        &state.objects[&target],
+                    ),
+                ),
+            },
         );
-        // CR 611.2b: the duration tracks the copy TARGET's tap state, not the
-        // source's — the same binding the layer engine uses.
-        state.set_transient_duration_subject(tce_id, target);
 
         assert_eq!(
             derive_views(&state, None).copied_permanents,
@@ -4358,6 +4531,104 @@ mod tests {
     }
 
     #[test]
+    fn storm_count_uses_the_current_storm_trigger_snapshot_table_wide() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new_n_player(3, 42);
+        scenario.at_phase(Phase::PreCombatMain);
+        let p0_prior = scenario
+            .add_spell_to_hand(P0, "P0 prior spell", true)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let p1_prior = scenario
+            .add_spell_to_hand(P1, "P1 prior spell", true)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let storm_spell = scenario
+            .add_spell_to_hand(P0, "Storm spell", true)
+            .with_keyword(Keyword::Storm)
+            .with_mana_cost(ManaCost::zero())
+            .id();
+        let mut runner = scenario.build();
+
+        runner.cast(p0_prior).resolve();
+        runner.state_mut().priority_player = P1;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
+        runner.cast(p1_prior).resolve();
+        runner.state_mut().priority_player = P0;
+        runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+
+        // This exercises the full cast pipeline: the current Storm spell is
+        // already in the ledger when its production trigger snapshots the two
+        // earlier table-wide casts.
+        let committed = runner.cast(storm_spell).commit();
+        let state = committed.state();
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&P0)
+                .map_or(0, im::Vector::len),
+            2,
+            "the current Storm spell is recorded alongside P0's earlier cast"
+        );
+        assert_eq!(
+            state
+                .spells_cast_this_turn_by_player
+                .get(&P1)
+                .map_or(0, im::Vector::len),
+            1,
+            "an opponent's earlier cast contributes to Storm"
+        );
+        assert!(state.stack.iter().any(|entry| matches!(
+            &entry.kind,
+            StackEntryKind::TriggeredAbility {
+                provenance: Some(SyntheticTriggerProvenance::Storm { copy_count: 2 }),
+                ..
+            }
+        )));
+        for viewer in [P0, P1, PlayerId(2)] {
+            assert_eq!(derive_views(state, Some(viewer)).storm_count, 2);
+        }
+        assert_eq!(
+            serde_json::to_value(derive_views(state, Some(PlayerId(2))))
+                .expect("serialize public storm projection")["storm_count"],
+            2,
+        );
+
+        let outcome = committed.resolve();
+        assert_eq!(
+            outcome
+                .events()
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::SpellCopied { original_id, .. } if *original_id == storm_spell
+                ))
+                .count(),
+            2,
+            "the production Storm trigger creates one copy for each prior spell"
+        );
+        assert_eq!(
+            outcome
+                .state()
+                .spells_cast_this_turn_by_player
+                .values()
+                .map(im::Vector::len)
+                .sum::<usize>(),
+            3,
+            "the generated spell copies do not enter the cast ledger"
+        );
+
+        // The turn-transition authority clears the table-wide cast ledger.
+        crate::game::turns::start_next_turn(runner.state_mut(), &mut Vec::new());
+        assert!(runner.state().spells_cast_this_turn_by_player.is_empty());
+        assert_eq!(
+            derive_views(runner.state(), Some(PlayerId(2))).storm_count,
+            0
+        );
+    }
+
+    #[test]
     fn prospective_storm_counts_include_effectively_granted_storm() {
         use crate::types::ability::{ControllerRef, StaticDefinition, TypeFilter, TypedFilter};
 
@@ -4692,9 +4963,13 @@ mod tests {
             Some(PlayerId(1)),
         ))
         .expect("serialize filtered opponent view");
-        let client: ClientGameState = serde_json::from_str(&json).expect("deserialize client view");
-        let details = client
-            .derived
+        // A `wrap_filtered` payload is a viewer projection; decode only the `derived`
+        // half, which is the half this test asserts on.
+        let wire: serde_json::Value =
+            serde_json::from_str(&json).expect("deserialize filtered client wire");
+        let derived: DerivedViews = serde_json::from_value(wire["derived"].clone())
+            .expect("deserialize filtered derived views");
+        let details = derived
             .stack_entry_details
             .get(&spell)
             .expect("public pending spell has stack details");
@@ -4999,6 +5274,12 @@ mod tests {
         ))
         .expect("serialize filtered client state");
 
+        // BOTH wires are refused for the SAME reason: client redaction drops
+        // `pending_trigger_firing` while `pending_trigger` stands. The
+        // `viewer_projection` marker rides along on the filtered wire but does NOT
+        // refuse here — this is the transport decode path, which carries projections
+        // on purpose. The marker only refuses on the persistence ingress; see
+        // `tests/integration/viewer_projection_ingest_gate.rs`.
         for client_state in [&client["state"], &filtered_client["state"]] {
             let error = serde_json::from_value::<GameState>(client_state.clone())
                 .expect_err("redacted client state must not restore as trusted authority");
@@ -5006,7 +5287,8 @@ mod tests {
                 error
                     .to_string()
                     .contains("pending trigger has no firing carrier"),
-                "client redaction must fail only because it removes private trigger authority: {error}"
+                "client redaction must fail only because it removes private trigger \
+                 authority: {error}"
             );
             for private_field in [
                 "next_delayed_trigger_token",
@@ -5239,6 +5521,98 @@ mod tests {
         assert!(
             afflicted.contains(&PlayerId(0)) && afflicted.contains(&PlayerId(2)),
             "both opponents (P0, P2) should be cast-locked",
+        );
+    }
+
+    /// CR 709.5b + CR 707.2 + CR 708.2a: the published halves come from the
+    /// EFFECTIVE form. A permanent that copies a Room has no `back_face` of its
+    /// own, so a projection off its printed shape would report a single half
+    /// named after the recipient — the copied pair is the only correct answer.
+    /// A face-down permanent publishes nothing, and a non-Room is absent.
+    ///
+    /// Revert-failing assertions: the copy's two halves (drop
+    /// `effective_room_halves` for `own_room_halves` and both names are wrong)
+    /// and the face-down absence (drop the `face_down` guard and it appears).
+    #[test]
+    fn room_half_identities_report_the_copied_halves_and_skip_face_down() {
+        use crate::types::ability::{RoomCopiableHalves, RoomHalfIdentity};
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new(FormatConfig::standard(), 2, 7);
+
+        let halves = RoomCopiableHalves {
+            left: RoomHalfIdentity {
+                name: "Greenhouse".to_string(),
+                mana_cost: ManaCost::default(),
+            },
+            right: Some(RoomHalfIdentity {
+                name: "Rickety Gazebo".to_string(),
+                mana_cost: ManaCost::default(),
+            }),
+        };
+
+        // A Copy Enchantment that entered as a copy of a two-halved Room: its
+        // OWN printed shape is a single-faced enchantment.
+        let copy = create_object(
+            &mut state,
+            CardId(9100),
+            PlayerId(0),
+            "Copy Enchantment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&copy).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.back_face = None;
+            obj.copied_room_halves = Some(halves.clone());
+        }
+
+        // Same shape, but face down (CR 708.2a).
+        let hidden = create_object(
+            &mut state,
+            CardId(9101),
+            PlayerId(0),
+            "Copy Enchantment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&hidden).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.back_face = None;
+            obj.copied_room_halves = Some(halves);
+            obj.face_down = true;
+        }
+
+        // An ordinary permanent that is not a Room at all.
+        let bear = create_object(
+            &mut state,
+            CardId(9102),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+
+        let views = derive_views(&state, Some(PlayerId(0)));
+
+        let published = views
+            .room_half_identities
+            .get(&copy)
+            .expect("a battlefield Room publishes its halves");
+        assert_eq!(published.left.name, "Greenhouse");
+        assert_eq!(
+            published.right.as_ref().map(|half| half.name.as_str()),
+            Some("Rickety Gazebo"),
+            "the right door exists through the COPIED halves, not through the \
+             recipient's own (absent) back face"
+        );
+
+        assert!(
+            !views.room_half_identities.contains_key(&hidden),
+            "CR 708.2a: a face-down permanent has no name or mana cost to publish"
+        );
+        assert!(
+            !views.room_half_identities.contains_key(&bear),
+            "a non-Room permanent has no halves"
         );
     }
 
@@ -5731,9 +6105,12 @@ mod tests {
         // `Tokens` is Conditional, because its boundary mint can park on a replacement choice.
         state.register_pending_materialization(
             PlayerId(0),
-            crate::types::game_state::PersistentAxisMaterialization::Tokens(
-                family_test_token_profile(),
-            ),
+            crate::types::game_state::PersistentAxisMaterialization::Tokens(Box::new(
+                crate::types::game_state::TokenGrowth {
+                    profile: family_test_token_profile(),
+                    per_cycle_delta: 1,
+                },
+            )),
         );
         let scheduled_views = derive_views(&state, None);
         assert!(
@@ -5895,8 +6272,12 @@ mod tests {
                 ResourceAxis::Mana(ManaType::White),
             ],
         );
-        // A DriveSequence naming the whole unbounded set — the one stash kind that would schedule
-        // a mana axis if the exclusion were dropped.
+        // A DELIBERATELY HOSTILE graft. Post-`ResourceAxis::unbounded_mark_kind`, production
+        // filters `Mana(_)` out of a `DriveSequence`'s `collapsed_axes`, so NO accept can build
+        // this stash. It is constructed by hand precisely so the `scheduled_display_axes`
+        // exclusion is still exercised: the row asks "if a mana axis DID reach the announcement,
+        // would the badge fold and stay `Unscheduled`?", which is a question about the PROJECTION,
+        // not about the filter. Do not "simplify" it to match production — that vacates the row.
         state.register_pending_materialization(
             p0,
             PersistentAxisMaterialization::DriveSequence {
@@ -7075,7 +7456,7 @@ mod tests {
         derive_views(state, Some(PlayerId(0))).current_target_kind
     }
 
-    /// Row 1 — the originating #7692 defect. CR 115.1's targets are "object(s)
+    /// CR 115.1's targets are "object(s)
     /// and/or player(s)"; an offer holding both must name both halves rather
     /// than collapsing to whichever half the client happens to inspect.
     #[test]
@@ -7101,8 +7482,9 @@ mod tests {
             "a mixed offer must name BOTH halves; naming only the object half is #7692 itself"
         );
 
-        // THE WIRE CONTRACT for a payload-carrying variant. Unlike row 2's
-        // payload-free pin, this one IS sensitive to the tagging mode: dropping
+        // THE WIRE CONTRACT for a payload-carrying variant. Unlike the
+        // payload-free pin on the player-only offer, this one IS sensitive to
+        // the tagging mode: dropping
         // `content = "data"` flattens the category alongside the tag and reds
         // here. The client mirror is hand-written with no generated binding to
         // force agreement, so this assertion is the only thing holding the two
@@ -7118,7 +7500,7 @@ mod tests {
         );
     }
 
-    /// Row 2 — the mixed arm must not swallow the pure-player case.
+    /// The mixed arm must not swallow the pure-player case.
     #[test]
     fn an_all_player_offer_names_players() {
         let mut state = two_player_state();
@@ -7136,15 +7518,15 @@ mod tests {
 
         // The WIRE form of the payload-free variant — a different claim from
         // the classification above: that one pins the classifier, this one pins
-        // what a player-only offer (#7692's own reported case) actually reaches
-        // the client as.
+        // what a player-only offer actually reaches the client as.
         //
         // WHAT THIS DOES NOT PIN, stated so nobody reads a guarantee into it:
         // `Players` carries no payload, so `content = "data"` has nothing to
         // wrap and its encoding is IDENTICAL under adjacent and internal
         // tagging. This assertion therefore cannot detect a change of tagging
-        // mode. The variants that can are the payload-carrying ones, and rows 1
-        // and 3 pin those.
+        // mode. The variants that can are the payload-carrying ones, pinned by
+        // `a_mixed_offer_names_both_objects_and_players` and
+        // `a_creature_offer_is_narrowed_past_nonland_permanent`.
         assert_eq!(
             serde_json::to_value(&views).expect("the derived views serialize")
                 ["current_target_kind"],
@@ -7153,7 +7535,7 @@ mod tests {
         );
     }
 
-    /// Row 3 — CR 109.1 + CR 110.4: the narrowest true category wins, so a
+    /// CR 109.1 + CR 110.4: the narrowest true category wins, so a
     /// creature-only offer is a creature and not merely a nonland permanent.
     #[test]
     fn a_creature_offer_is_narrowed_past_nonland_permanent() {
@@ -7197,7 +7579,7 @@ mod tests {
         );
     }
 
-    /// Row 4 — the same narrowing for CR 110.4's planeswalker permanent type.
+    /// The same narrowing for CR 110.4's planeswalker permanent type.
     #[test]
     fn a_planeswalker_offer_is_narrowed_past_nonland_permanent() {
         let mut state = two_player_state();
@@ -7218,7 +7600,7 @@ mod tests {
         );
     }
 
-    /// Row 5 — narrowing did not eat the NonlandPermanent arm: a permanent
+    /// Narrowing did not eat the NonlandPermanent arm: a permanent
     /// that is neither creature nor planeswalker still reaches it.
     #[test]
     fn a_nonland_noncreature_permanent_offer_stays_nonland_permanent() {
@@ -7240,7 +7622,7 @@ mod tests {
         );
     }
 
-    /// Row 6 — CR 110.4: a land in the offer widens the answer to the bare
+    /// CR 110.4: a land in the offer widens the answer to the bare
     /// permanent category, because "nonland permanent" is then false of it.
     #[test]
     fn a_land_and_creature_offer_widens_to_permanent() {
@@ -7269,7 +7651,7 @@ mod tests {
         );
     }
 
-    /// Row 7 — the mandated hostile fixture: a Land Planeswalker (the Wrenn
+    /// The hostile fixture: a Land Planeswalker (the Wrenn
     /// and One shape, `core_types = [Land, Planeswalker]`) beside an ordinary
     /// creature must widen to Permanent rather than break the lattice.
     #[test]
@@ -7299,9 +7681,9 @@ mod tests {
         );
     }
 
-    /// Row 8 — the same card offered ALONE narrows back to Planeswalker. Paired
-    /// with row 7: together they prove the lattice moves in both directions
-    /// rather than defaulting one way.
+    /// The same card offered ALONE narrows back to Planeswalker. Paired with
+    /// `a_land_planeswalker_beside_a_creature_widens_to_permanent`: together they
+    /// prove the lattice moves in both directions rather than defaulting one way.
     #[test]
     fn a_land_planeswalker_alone_is_named_a_planeswalker() {
         let mut state = two_player_state();
@@ -7323,7 +7705,7 @@ mod tests {
         );
     }
 
-    /// Row 9 — CR 110.1 + CR 115.2: a permanent is a card on the battlefield,
+    /// CR 110.1 + CR 115.2: a permanent is a card on the battlefield,
     /// and an off-battlefield object can still be a legal target. A creature
     /// card in a graveyard must not be called a permanent.
     #[test]
@@ -7347,8 +7729,9 @@ mod tests {
         );
     }
 
-    /// Row 10 — CR 112.1: a spell is a card on the stack. The paired positive
-    /// for row 11, so that row's negative cannot pass on a dead predicate.
+    /// CR 112.1: a spell is a card on the stack. The paired positive for
+    /// `an_ability_on_the_stack_is_not_called_a_spell`, so that row's negative
+    /// cannot pass on a dead predicate.
     #[test]
     fn a_spell_offer_names_a_spell() {
         let mut state = two_player_state();
@@ -7380,7 +7763,7 @@ mod tests {
         );
     }
 
-    /// Row 11 — CR 113.7a: an activated ability exists on the stack
+    /// CR 113.7a: an activated ability exists on the stack
     /// independently of its source and is NOT a spell (CR 112.1). Stack
     /// residency alone must not answer this.
     #[test]
@@ -7420,7 +7803,7 @@ mod tests {
         );
     }
 
-    /// Row 12 — CR 400.2: an offered object the projection cannot resolve
+    /// CR 400.2: an offered object the projection cannot resolve
     /// degrades the WHOLE answer, rather than being dropped so the remainder
     /// can be classified confidently. The fixture deliberately mixes a
     /// resolvable creature with an unresolvable id: a `filter_map` drop would
@@ -7452,7 +7835,7 @@ mod tests {
         );
     }
 
-    /// Row 13 — an empty offer on a LIVE prompt yields no kind. The absence of
+    /// An empty offer on a LIVE prompt yields no kind. The absence of
     /// an offer is not a kind of choice. This state is reached, not merely
     /// total: an all-optional announcement can auto-skip to completion and
     /// install a progress whose `current_legal_targets` is empty.
@@ -7490,11 +7873,11 @@ mod tests {
         );
     }
 
-    /// Row 14 — no prompt means no wire key, AND the key is genuinely present
-    /// when a prompt is live. Both halves live in one test on purpose: without
-    /// the positive half, the negative passes even if the field is never
-    /// populated at all. This is also the scope matrix's negative test — every
-    /// `WaitingFor` variant outside the two gated ones reaches the same arm.
+    /// No prompt means no wire key, AND the key is genuinely present when a
+    /// prompt is live. Both halves live in one test on purpose: without the
+    /// positive half, the negative passes even if the field is never populated
+    /// at all. It is also the negative for the whole gate — every `WaitingFor`
+    /// variant outside the two gated ones reaches the same arm.
     #[test]
     fn no_targeting_prompt_emits_no_kind() {
         let mut state = two_player_state();
@@ -7535,7 +7918,7 @@ mod tests {
         );
     }
 
-    /// Row 15 — the filtered projection agrees on a public offer. It must do so
+    /// The filtered projection agrees on a public offer. It must do so
     /// by delegating to `derive_views(filtered_state, ..)`, not by re-sourcing
     /// from authoritative state: re-sourcing would characterize an object the
     /// viewer is not entitled to characterize (CR 400.2).
@@ -7573,7 +7956,7 @@ mod tests {
         );
     }
 
-    /// Row 16 — provenance axis 1: the kind binds to the LIVE slot, not slot 0.
+    /// Provenance axis 1: the kind binds to the LIVE slot, not slot 0.
     /// The two slots classify differently on purpose, so reading
     /// `target_slots[0]` answers Permanent and reds.
     #[test]
@@ -7613,7 +7996,7 @@ mod tests {
         );
     }
 
-    /// Row 18 — BOTH gated variants are classified. Every other unit test here
+    /// BOTH gated variants are classified. Every other unit test here
     /// drives `TriggerTargetSelection`; dropping `TargetSelection` from the
     /// combined arm would leave every ordinary spell cast, activated ability
     /// and loyalty activation publishing nothing, with all of them still green.
@@ -7659,11 +8042,11 @@ mod tests {
         );
     }
 
-    /// Row 19 — CR 205.1b: an effect can make a permanent a creature while it
+    /// CR 205.1b: an effect can make a permanent a creature while it
     /// is "still a planeswalker", so both guards are true of this object. It is
     /// the ONLY input on which the guard ORDER is observable, and therefore the
     /// only fixture here that reds a swapped Creature/Planeswalker order — the
-    /// Land Planeswalker of rows 7 and 8 never makes both guards true.
+    /// Land Planeswalker fixtures never make both guards true.
     #[test]
     fn an_animated_planeswalker_is_named_a_creature_not_a_planeswalker() {
         let mut state = two_player_state();
@@ -7685,9 +8068,10 @@ mod tests {
         );
     }
 
-    /// Row 20 — provenance axis 2: the kind reads the NARROWED offer, not the
-    /// slot's declared set. Only one slot exists, so `current_slot` is 0 and
-    /// row 16 cannot catch this revert; reading
+    /// Provenance axis 2: the kind reads the NARROWED offer, not the slot's
+    /// declared set. Only one slot exists, so `current_slot` is 0 and
+    /// `the_kind_binds_to_the_live_slot_not_the_first_slot` cannot catch this
+    /// revert; reading
     /// `target_slots[current_slot].legal_targets` answers Permanent.
     #[test]
     fn the_kind_reads_the_narrowed_offer_not_the_slots_declared_set() {

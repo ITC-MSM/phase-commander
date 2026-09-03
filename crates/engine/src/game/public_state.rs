@@ -484,6 +484,10 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             // `_ => {}`) so a new event variant must be classified to compile.
             GameEvent::GameStarted
             | GameEvent::HiddenSearchViewed { .. }
+            // CR 701.17a: the milled object's display is already marked dirty by
+            // the paired `ZoneChanged` in the same batch, and no player-level
+            // display field depends on the mill itself.
+            | GameEvent::Milled { .. }
             | GameEvent::PhaseChanged { .. }
             | GameEvent::PriorityPassed { .. }
             | GameEvent::SpellCast { .. }
@@ -835,6 +839,7 @@ mod tests {
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             duration: None,
         };

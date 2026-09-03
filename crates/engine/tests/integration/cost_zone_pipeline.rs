@@ -7839,7 +7839,7 @@ fn duration_bearing_delayed_whenever_event_stays_installed_and_fires_again() {
     let life_before = resolve_delayed_installer(&mut runner, installer);
     assert!(
         !runner.state().delayed_triggers[0].one_shot,
-        "CR 603.7c: a duration-bearing WheneverEvent is not a one-shot"
+        "CR 603.7b: a duration-bearing WheneverEvent is not a one-shot"
     );
 
     let acted = runner
@@ -13107,6 +13107,7 @@ fn effect_zone_put_at_library_position_mixed_sources_preserves_legacy_library_or
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: Some(position),
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
