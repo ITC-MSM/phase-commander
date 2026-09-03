@@ -1133,6 +1133,7 @@ mod throne_of_eldraine_mana_riders;
 mod throw_instead_tail_class;
 mod timely_ward_regression;
 mod tinybones_joins_up_multi_target;
+mod tinybones_pocket_nuisance;
 mod tobita_master_of_winds_flying_grant;
 mod tom_bombadil_lore_counter_gate;
 mod tombstone_stairwell_per_player_tokens;
