@@ -8188,6 +8188,8 @@ fn try_parse_choose_and_pay_per_object(
         filter,
         min,
         max,
+        cardinality: None,
+        eligibility: None,
     });
     clause.sub_ability = Some(Box::new(pay_ability));
     // CR 603.4: The "that player may" modal makes the whole clause optional —
@@ -14986,6 +14988,8 @@ fn parse_choose_survivors_destroy_rest_ir(
                 filter,
                 min: 0,
                 max: Some(max),
+                cardinality: None,
+                eligibility: None,
             }),
             Some(match connector {
                 DestroyRestConnector::Then => ClauseBoundary::Then,
@@ -31048,6 +31052,8 @@ fn maybe_convert_choose_head_into_tracked_set(def: &mut AbilityDefinition) {
         filter,
         min,
         max,
+        cardinality: None,
+        eligibility: None,
     };
     def.multi_target = None;
 }
@@ -31660,6 +31666,8 @@ fn parse_exile_pile_shuffle_cloak_ir(
                 filter,
                 min: 0,
                 max: None,
+                cardinality: None,
+                eligibility: None,
             }),
             Some(ClauseBoundary::Comma),
             ClauseDisposition::Emit {
