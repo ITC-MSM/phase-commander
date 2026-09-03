@@ -352,6 +352,60 @@ fn ozai_document_ir_lowers_keyword_transform_and_unspent_mana_gate() {
         }));
 }
 
+/// CR 702.8a + CR 601.3d + CR 611.3b: full-pipeline regression for Graveyard
+/// Shift's "This spell has flash as long as there are five or more mana
+/// values among cards in your graveyard." line. The generic static-line
+/// classifier's "has " arm (`STATIC_CONTAINS_PATTERNS`) would otherwise claim
+/// this line and lower it to an inert `StaticDefinition { affected: SelfRef,
+/// modifications: [AddKeyword(Flash)] }` — inert because
+/// `for_each_static_effect_source` only gathers continuous-effect sources
+/// from the battlefield and command zone, so a Hand-zone spell's own static
+/// never fires (a "supported but does nothing" misparse). Revert-
+/// discriminating: removing `oracle_classifier::is_self_conditional_flash_grant`
+/// (or its wiring into `should_defer_spell_to_effect`) makes `statics`
+/// non-empty and `casting_options` empty below.
+#[test]
+fn graveyard_shift_flash_permission_reaches_casting_options_not_statics() {
+    let types = ["Sorcery".to_string()];
+    let parsed = parse_oracle_text(
+        "This spell has flash as long as there are five or more mana values among cards in your graveyard.\nReturn target creature card from your graveyard to the battlefield.",
+        "Graveyard Shift",
+        &[],
+        &types,
+        &[],
+    );
+    assert!(
+        parsed.statics.is_empty(),
+        "the flash line must NOT lower to a continuous static (it would be inert in hand): {:?}",
+        parsed.statics
+    );
+    assert_eq!(
+        parsed.casting_options.len(),
+        1,
+        "the flash line must produce exactly one SpellCastingOption, got {:?}",
+        parsed.casting_options
+    );
+    let option = &parsed.casting_options[0];
+    assert!(matches!(
+        option.kind,
+        crate::types::ability::SpellCastingOptionKind::AsThoughHadFlash
+    ));
+    assert!(
+        option.condition.is_some(),
+        "the flash permission must carry the graveyard mana-value condition, not be unconditional"
+    );
+    // The reanimation effect itself must still parse (not swallowed).
+    assert_eq!(parsed.abilities.len(), 1);
+    assert!(
+        !matches!(
+            parsed.abilities[0].effect.as_ref(),
+            Effect::Unimplemented { .. }
+        ),
+        "the reanimation effect must parse, got {:?}",
+        parsed.abilities[0].effect
+    );
+}
+
 #[test]
 fn nominal_dispatch_preserves_precomputed_x_floor_for_spells_and_residuals() {
     let types = ["Creature".to_string()];
