@@ -22,7 +22,7 @@
 //! `Effect::Surveil` never populates, so the qualifying card would silently
 //! stay in the graveyard instead of moving to hand.
 //!
-//! Three mutation-tested cases, all driven through the real activation +
+//! Four mutation-tested cases, all driven through the real activation +
 //! resolution pipeline (`GameRunner::activate` + `GameAction::SelectCards`
 //! answering the resulting `WaitingFor::SurveilChoice`):
 //!   1. `chandra_moves_a_qualifying_card_from_graveyard_to_hand` — surveil put
@@ -36,6 +36,13 @@
 //!      library instead of putting it into the graveyard -> no move happens
 //!      at all (negative control: the "this way" gate requires the graveyard
 //!      branch specifically, not "surveil happened").
+//!   4. `chandra_redirected_graveyard_card_stays_out_of_hand` — the surveil
+//!      choice sends the (qualifying) card toward the graveyard, but a Rest in
+//!      Peace-class graveyard replacement effect redirects it to EXILE instead
+//!      -> no hand-move happens and the card is not in the graveyard either
+//!      (regression: `BatchCompletion::SurveilKeepOnTop`'s `graveyard_bound`
+//!      publish is the surveil choice's CANDIDATE list, not proof of arrival —
+//!      the gate must still check the card's actual post-replacement zone).
 //!
 //! CR ANCHORS:
 //!   * CR 701.25a — to surveil N: look at the top N, put any number into the
@@ -48,15 +55,22 @@
 //!     filter with `destination: Some(Zone::Graveyard)` for exactly this
 //!     reason (a redirect away from the graveyard would defeat it, mirroring
 //!     the put-onto-battlefield sibling).
+//!   * CR 614.1a + CR 614.6 — a replacement effect using "instead" (Rest in
+//!     Peace: "exile it instead") means the originally named event (arriving
+//!     in the graveyard) never happens at all; case 4 exercises exactly this
+//!     against the "this way" gate's destination check.
 
 use engine::game::scenario::{GameRunner, GameScenario, P0};
-use engine::types::ability::Effect;
+use engine::types::ability::{
+    AbilityDefinition, AbilityKind, Effect, ReplacementDefinition, TargetFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
-use engine::types::zones::Zone;
+use engine::types::replacements::ReplacementEvent;
+use engine::types::zones::{EtbTapState, Zone};
 
 const CHANDRA_ORACLE: &str = concat!(
     "+1: Surveil 1. If you put a noncreature, nonland card into your ",
@@ -213,5 +227,105 @@ fn chandra_keeping_the_card_on_top_never_moves_it_to_hand() {
         library.first(),
         Some(&card),
         "the kept card must remain on top of the library"
+    );
+}
+
+/// CR 614.6: "If a card would be put into a graveyard from anywhere, exile it
+/// instead." (Rest in Peace / Leyline of the Void class.) Mirrors the fixture
+/// in `surveil_rest_pile_redirect_continuation.rs` — each reflexive-gate test
+/// file is self-contained, so this small builder is duplicated rather than
+/// shared across independent `tests/integration/*` binaries-worth of modules.
+fn graveyard_exile_replacement(description: &str) -> ReplacementDefinition {
+    ReplacementDefinition::new(ReplacementEvent::Moved)
+        .destination_zone(Zone::Graveyard)
+        .execute(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                destination: Zone::Exile,
+                origin: None,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        ))
+        .description(description.to_string())
+}
+
+/// Case 4 (regression — actual arrival zone, not the surveil choice's intended
+/// destination): the surveilled card qualifies (Instant) and the controller
+/// submits an empty keep-on-top set, so the surveil choice's OWN intent is "put
+/// it into the graveyard" — but a Rest in Peace-class graveyard replacement
+/// effect is on the battlefield, so the card actually lands in EXILE instead.
+///
+/// `AbilityCondition::ZoneChangedThisWay { destination: Some(Zone::Graveyard),
+/// .. }` must read the card's post-replacement CURRENT zone (CR 608.2c + CR
+/// 614.1a + CR 614.6), not merely "was this id one of the surveil choice's
+/// graveyard-bound candidates". `BatchCompletion::SurveilKeepOnTop`'s
+/// `graveyard_bound` field publishes exactly that candidate-id list to
+/// `state.last_zone_changed_ids` — republishing it unconditionally (skipping
+/// the destination check entirely, e.g. by evaluating the condition against
+/// `top_cards`/`graveyard_bound` membership alone instead of delegating to the
+/// shared `ZoneChangedThisWay` evaluator's live zone lookup) would wrongly fire
+/// the "put that card into your hand" rider on a card that never actually
+/// reached the graveyard. This test distinguishes the two: it fails on the
+/// first shape (redirected card ends up in HAND) and passes only when the
+/// gate genuinely requires graveyard arrival.
+#[test]
+fn chandra_redirected_graveyard_card_stays_out_of_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let chandra = scenario
+        .add_planeswalker_from_oracle(
+            P0,
+            "Chandra, Chill of Compliance",
+            "Chandra",
+            3,
+            CHANDRA_ORACLE,
+        )
+        .id();
+    let card = scenario.add_card_to_library_top(P0, "Surveilled Card");
+    scenario
+        .add_creature(P0, "Rest in Peace", 0, 0)
+        .as_enchantment()
+        .with_replacement_definition(graveyard_exile_replacement(
+            "If a card would be put into a graveyard from anywhere, exile it instead.",
+        ));
+
+    let mut runner = scenario.build();
+    {
+        let obj = runner
+            .state_mut()
+            .objects
+            .get_mut(&card)
+            .expect("library card exists");
+        obj.card_types.core_types = vec![CoreType::Instant];
+    }
+
+    activate_plus_one_and_surveil(&mut runner, chandra, &[]);
+
+    assert_eq!(
+        runner.state().objects[&card].zone,
+        Zone::Exile,
+        "the graveyard-replacement effect must redirect the surveilled card to exile, \
+         not the graveyard the surveil choice named"
+    );
+    assert!(
+        !runner.state().players[P0.0 as usize].hand.contains(&card),
+        "a card the surveil choice sent toward the graveyard but that was actually \
+         redirected to exile must NOT trigger the \"put that card into your hand\" rider"
+    );
+    assert!(
+        !runner.state().players[P0.0 as usize]
+            .graveyard
+            .contains(&card),
+        "the redirect means the card never actually reached the graveyard"
     );
 }
