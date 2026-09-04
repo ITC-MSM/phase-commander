@@ -505,6 +505,100 @@ mod tests {
         );
     }
 
+    /// End-to-end wiring test (not just parser shape / manual-target install):
+    /// drives the REAL `Effect::Conjure` resolver first, then `ApplyPerpetual`
+    /// with `TargetFilter::LastCreated`, and confirms the grant lands on the
+    /// object `Conjure` actually just created — not on the ability's source —
+    /// proving `state.last_created_token_ids` is genuinely consulted at
+    /// grant-installation time (Agent of Raffine's "Conjure a duplicate ...
+    /// into your hand. It perpetually gains ..." shape). The parser-level test
+    /// (`perpetual_grant_after_conjure_binds_last_created_not_parent_target` in
+    /// `parser::oracle_effect::tests`) proves the AST comes out right; this
+    /// proves the runtime target resolution does too.
+    #[test]
+    fn perpetual_grant_after_conjure_installs_on_conjured_object_not_source() {
+        use crate::types::ability::{ConjureCard, ConjureSource, ContinuousModification};
+        use crate::types::statics::StaticMode;
+
+        let mut state = GameState::new_two_player(7);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Agent of Raffine".to_string(),
+            Zone::Battlefield,
+        );
+
+        let conjure_ability = ResolvedAbility::new(
+            Effect::Conjure {
+                cards: vec![ConjureCard {
+                    source: ConjureSource::Named {
+                        name: "Conjured Duplicate".to_string(),
+                    },
+                    count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                }],
+                destination: Zone::Hand,
+                tapped: false,
+                library_position: None,
+                library_players: None,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        crate::game::effects::conjure::resolve(&mut state, &conjure_ability, &mut events).unwrap();
+
+        let conjured_id = *state
+            .last_created_token_ids
+            .first()
+            .expect("Conjure must publish the conjured object as the chain-created referent");
+        assert_ne!(
+            conjured_id, source_id,
+            "the conjured object must be a distinct object from the ability source"
+        );
+
+        let modification = PerpetualModification::GrantAbility {
+            modifications: vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBlock,
+            }],
+        };
+        // `targets` is deliberately EMPTY here (not `vec![TargetRef::Object(conjured_id)]`):
+        // `perpetual_target_object_ids` short-circuits on a non-empty `ability.targets`
+        // and returns it directly WITHOUT ever calling `resolved_targets` — the
+        // actual `TargetFilter::LastCreated => state.last_created_token_ids` lookup
+        // this test exists to exercise. A real "It perpetually gains ..." clause
+        // reaches this resolver with empty targets (Conjure declares none), so an
+        // empty vec here is the production-faithful fixture, not a shortcut.
+        let grant_ability = ResolvedAbility::new(
+            Effect::ApplyPerpetual {
+                target: TargetFilter::LastCreated,
+                modification: modification.clone(),
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        super::resolve(&mut state, &grant_ability, &mut events).unwrap();
+
+        let conjured_obj = state.objects.get(&conjured_id).unwrap();
+        assert!(
+            conjured_obj
+                .static_definitions
+                .iter_all()
+                .any(|sd| sd.mode == StaticMode::CantBlock),
+            "the CONJURED object must receive the CantBlock grant"
+        );
+        let source_obj = state.objects.get(&source_id).unwrap();
+        assert!(
+            !source_obj
+                .static_definitions
+                .iter_all()
+                .any(|sd| sd.mode == StaticMode::CantBlock),
+            "the ability SOURCE must not receive the grant meant for the conjured duplicate"
+        );
+    }
+
     #[test]
     fn perpetual_grant_keywords_parent_target_uses_stationed_event() {
         use crate::types::ability::TargetFilter;

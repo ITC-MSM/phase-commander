@@ -11157,8 +11157,19 @@ fn try_parse_perpetual_modify_cost(tp: TextPair, ctx: &ParseContext) -> Option<E
         .parse(tp.lower)
         .is_ok()
     {
-        parse_bound_it_perpetual_gain_cost_subject(tp.lower, ctx)
-            .map(|rest| (rest, TargetFilter::ParentTarget))?
+        let bound_rest = parse_bound_it_perpetual_gain_cost_subject(tp.lower, ctx)?;
+        // CR 608.2c: same sibling fix as `parse_perpetual_self_subject`'s bare
+        // "it" branch — when the immediately preceding clause in this chain
+        // CREATED an object (Conjure/Token/CopyTokenOf/Manifest/Cloak), "it"
+        // binds to that just-created object, not the legacy chosen/tracked
+        // antecedent `parse_bound_it_perpetual_gain_cost_subject`'s own gate
+        // (`ctx.parent_target_available || ctx.pending_tracked_set_origin`)
+        // was written for. Checked first so a genuine chain-created referent
+        // always wins; falls through to the existing ParentTarget binding
+        // otherwise, leaving every currently-passing case unchanged.
+        let target = counter::counter_anaphor_created_token_binding("it", ctx)
+            .unwrap_or(TargetFilter::ParentTarget);
+        (bound_rest, target)
     } else {
         parse_perpetual_self_subject(tp.lower, ctx)?
     };
