@@ -2089,7 +2089,14 @@ pub(super) fn parse_targeted_action_ast(
                 );
                 if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
-                        target,
+                        // CR 205.3a + CR 608.2c: same clause, same seam as the
+                        // hand-destination arm — a trailing "except for <type
+                        // list>" narrows the POPULATION, so it applies whatever
+                        // zone the resolver later scans.
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
                         origin,
                         destination: Zone::Battlefield,
                         enters_under,
@@ -2120,10 +2127,50 @@ pub(super) fn parse_targeted_action_ast(
                 // remain `ChangeZone { origin: Graveyard, destination: Hand }`,
                 // not `BounceAll` (whose resolver only scans the battlefield).
                 if is_mass && origin.is_none() {
-                    Some(TargetedImperativeAst::ReturnAll { target, count })
+                    // CR 205.3a + CR 608.2c: a mass bounce may carry its
+                    // exclusion AFTER the destination phrase — Whelming Wave's "return
+                    // all creatures to their owners' hands except for Krakens,
+                    // Leviathans, Octopuses, and Serpents". Slinn Voda prints the same
+                    // shape with Merfolk leading the list, and Cyclone Summoner returns
+                    // all PERMANENTS "except for Giants, Wizards, and lands" — so this
+                    // arm sees mixed core-type/subtype exclusions, not only creatures.
+                    // `strip_return_destination_ext_with_remainder` leaves that clause
+                    // in `dest_remainder`, where nothing but the battlefield
+                    // attach-host probe used to look, so the whole exclusion was
+                    // silently dropped and the spell bounced the exempted creatures
+                    // too (issue #7451). Fold it onto the population with the SAME
+                    // grammar the adjacent form uses (Scourglass, The Argent
+                    // Etchings), so both surface orders reach one authority.
+                    //
+                    // A graveyard-origin mass return ("return all creature cards from
+                    // your graveyard to your hand except for Zombies") falls to the
+                    // `ReturnAllToZone` arm below, which applies the SAME exclusion
+                    // through the same helper — an "except for" clause is a population
+                    // filter, so it narrows the same set whichever zone the resolver
+                    // scans. That arm previously dropped the clause silently and
+                    // returned the exempted cards anyway (PR review of issue #7451).
+                    Some(TargetedImperativeAst::ReturnAll {
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
+                        count,
+                    })
                 } else if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
-                        target,
+                        // CR 205.3a + CR 608.2c: an explicit-origin mass return
+                        // carries its exclusion the same way the implicit-origin
+                        // sibling above does ("return all creature cards from your
+                        // graveyard to your hand except for Zombies"). The clause is
+                        // a POPULATION filter, so it narrows the same set regardless
+                        // of which zone the resolver scans — applying it here rather
+                        // than dropping it is what keeps the two surface orders on one
+                        // grammar authority. Previously this arm silently discarded
+                        // the clause and returned the exempted cards anyway.
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
                         origin,
                         destination: Zone::Hand,
                         // CR 110.2 (docs/MagicCompRules.txt:616): controller
@@ -2151,7 +2198,20 @@ pub(super) fn parse_targeted_action_ast(
             Some(d) => {
                 if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
-                        target,
+                        // CR 205.3a + CR 608.2c: as above — the exclusion is a
+                        // population filter, not a destination property.
+                        //
+                        // SCOPE: all four mass-return arms in THIS dispatcher apply
+                        // it. `oracle_effect/mod.rs::try_parse_verb_and_target` has
+                        // three sibling `ReturnAllToZone` constructions that do not;
+                        // no printed card routes a mass return with an "except for"
+                        // through the sequence parser today (imperative.rs wins for
+                        // that shape), and unlike here the remainder is returned as
+                        // `rem` rather than dropped. Left for a measured change.
+                        target: crate::parser::oracle_target::apply_except_for_type_list_exclusion(
+                            target,
+                            dest_remainder,
+                        )?,
                         origin,
                         destination: d.zone,
                         // CR 110.2 (docs/MagicCompRules.txt:616): controller
