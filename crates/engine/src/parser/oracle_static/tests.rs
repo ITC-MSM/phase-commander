@@ -31388,12 +31388,16 @@ fn heroic_defiance_pt_grant_gated_on_most_common_color() {
 
 /// CR 105.2 + CR 611.3a (Invasion Djinn cycle — Sulam Djinn): "This creature
 /// gets -2/-2 as long as [color] is the most common color among all permanents
-/// or is tied for most common" must parse to a `QuantityComparison` between
-/// the named color's battlefield-wide permanent count
-/// (`QuantityRef::ObjectCount`) and the largest per-color count across all
+/// or is tied for most common" must parse to a `StaticCondition::And` of two
+/// `QuantityComparison`s: (1) the largest per-color count across all
 /// permanents (`QuantityRef::ObjectCountBySharedQuality` grouped by
-/// `SharedQuality::Color`, `AggregateFunction::Max`). `Comparator::GE` already
-/// admits ties, matching the printed "or is tied for most common" tail.
+/// `SharedQuality::Color`, `AggregateFunction::Max`) is at least 1 — a
+/// most-common-color bucket must actually exist — and (2) the named color's
+/// battlefield-wide permanent count (`QuantityRef::ObjectCount`) is at least
+/// that max. `Comparator::GE` already admits ties, matching the printed "or
+/// is tied for most common" tail. The first conjunct is required so an
+/// all-colorless battlefield (no bucket reaches size 1) can never vacuously
+/// satisfy `0 >= 0`.
 #[test]
 fn sulam_djinn_pt_penalty_gated_on_green_being_most_common_color() {
     let defs = parse_static_line_multi(
@@ -31431,24 +31435,35 @@ fn sulam_djinn_pt_penalty_gated_on_green_being_most_common_color() {
             color: ManaColor::Green,
         }],
     });
+    let max_color_bucket = || QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCountBySharedQuality {
+            filter: all_permanents.clone(),
+            quality: SharedQuality::Color,
+            aggregate: AggregateFunction::Max,
+        },
+    };
     assert_eq!(
         penalty.condition,
-        Some(StaticCondition::QuantityComparison {
-            lhs: QuantityExpr::Ref {
-                qty: QuantityRef::ObjectCount {
-                    filter: green_permanents,
+        Some(StaticCondition::And {
+            conditions: vec![
+                StaticCondition::QuantityComparison {
+                    lhs: max_color_bucket(),
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 1 },
                 },
-            },
-            comparator: Comparator::GE,
-            rhs: QuantityExpr::Ref {
-                qty: QuantityRef::ObjectCountBySharedQuality {
-                    filter: all_permanents,
-                    quality: SharedQuality::Color,
-                    aggregate: AggregateFunction::Max,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: green_permanents,
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: max_color_bucket(),
                 },
-            },
+            ],
         }),
-        "the -2/-2 must be gated on green's count >= the max per-color count"
+        "the -2/-2 must be gated on (max per-color count >= 1) AND (green's count >= the max \
+         per-color count), so an all-colorless battlefield can never vacuously satisfy it"
     );
 }
 

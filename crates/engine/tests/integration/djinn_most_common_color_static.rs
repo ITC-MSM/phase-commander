@@ -49,6 +49,13 @@ fn blue_cost() -> ManaCost {
     }
 }
 
+fn colorless_cost() -> ManaCost {
+    ManaCost::Cost {
+        generic: 1,
+        shards: vec![],
+    }
+}
+
 /// CR 105.2 + CR 611.3a: green strictly leads the battlefield-wide color
 /// census (Sulam Djinn itself plus two more green permanents outnumber a
 /// single blue permanent) — the -2/-2 applies.
@@ -145,5 +152,45 @@ fn sulam_djinn_shrinks_when_green_is_tied_for_most_common() {
         (4, 4),
         "green is tied for most common (2 green, 2 blue): -2/-2 must still apply per \
          \"or is tied for most common\" (6/6 base -> 4/4)"
+    );
+}
+
+/// CR 105.2 + CR 611.3a: EVERY battlefield permanent — Sulam Djinn included —
+/// is colorless. No color bucket exists at all, so there IS no "most common
+/// color"; green cannot be it. The -2/-2 must NOT apply.
+///
+/// Regression for a bug where `QuantityRef::ObjectCountBySharedQuality`'s
+/// `Max` aggregate returns `0` over an empty (all-colorless) bucket set,
+/// which used to coincide with the named color's own `0` count and make a
+/// bare `named_count >= max_bucket` comparison (`0 >= 0`) vacuously true —
+/// wrongly shrinking Sulam Djinn even though no color exists on the
+/// battlefield. Mirrors `eval_shares_color_with_most_common_color`
+/// (`game::conditions`), the analogous Heroic Defiance authority, which
+/// explicitly returns `false` when there is no colored permanent.
+#[test]
+fn sulam_djinn_stays_base_when_battlefield_is_entirely_colorless() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let sulam = scenario
+        .add_creature_from_oracle(P0, "Sulam Djinn", 6, 6, SULAM_DJINN)
+        .with_mana_cost(colorless_cost())
+        .id();
+    // Every other battlefield permanent is also colorless — no color bucket
+    // reaches size 1, so no color (including green) can be "most common".
+    scenario
+        .add_creature(P0, "Colorless Filler A", 1, 1)
+        .with_mana_cost(colorless_cost());
+    scenario
+        .add_creature(P1, "Colorless Filler B", 1, 1)
+        .with_mana_cost(colorless_cost());
+
+    let mut runner = scenario.build();
+
+    assert_eq!(
+        effective_pt(&mut runner, sulam),
+        (6, 6),
+        "entire battlefield is colorless (0 green, 0 of any color): there is no most \
+         common color, so the -2/-2 must NOT apply — Sulam Djinn stays base 6/6"
     );
 }

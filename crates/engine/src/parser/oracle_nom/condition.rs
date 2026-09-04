@@ -290,14 +290,30 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
 /// gets -2/-2 as long as [color] is the most common color among all
 /// permanents or is tied for most common."
 ///
-/// Maps to a `QuantityComparison` between the battlefield-wide count of
-/// permanents with the named color (`QuantityRef::ObjectCount`) and the
-/// largest such count across every color (`QuantityRef::ObjectCountBySharedQuality`
-/// grouped by `SharedQuality::Color`, CR 109.3's grouped-aggregate shape).
-/// `Comparator::GE` already admits ties, so the optional "or is tied for most
-/// common" tail is redundant text discarded here — both phrasings collapse to
-/// the same comparison, mirroring how `parse_shares_most_common_color_condition`
-/// treats Heroic Defiance's analogous "or a color tied for most common" tail.
+/// Maps to a `StaticCondition::And` of two `QuantityComparison`s over the
+/// battlefield-wide count of permanents with the named color
+/// (`QuantityRef::ObjectCount`) and the largest per-color count across every
+/// color (`QuantityRef::ObjectCountBySharedQuality` grouped by
+/// `SharedQuality::Color`). `Comparator::GE` already admits ties, so the
+/// optional "or is tied for most common" tail is redundant text discarded
+/// here — both phrasings collapse to the same comparison, mirroring how
+/// `parse_shares_most_common_color_condition` treats Heroic Defiance's
+/// analogous "or a color tied for most common" tail.
+///
+/// The second conjunct (`max_bucket >= 1`) is required for correctness, not
+/// stylistic symmetry: when every battlefield permanent is colorless, no
+/// color bucket exists and `ObjectCountBySharedQuality`'s `Max` aggregate
+/// (CR 109.3 defines color as a characteristic, but does not itself define
+/// this grouped aggregate or its empty-population behavior) returns `0` for
+/// an empty bucket set — coinciding with the named color's own `0` count and
+/// making a bare `named_count >= max_bucket` comparison vacuously true. That
+/// would wrongly treat "no color exists" as "this color is most common".
+/// Requiring `max_bucket >= 1` alongside `named_count >= max_bucket` forces
+/// `named_count >= 1` too, so the pair is only satisfiable when a real
+/// colored population exists and the named color is (tied for) its largest
+/// bucket — matching how `eval_shares_color_with_most_common_color`
+/// (`game::conditions`) explicitly returns `false` when there is no colored
+/// permanent for the analogous Heroic Defiance condition.
 /// Deliberately composed from existing generic `QuantityRef` building blocks
 /// rather than a new `StaticCondition` variant — the named-color population
 /// and the "most common among all colors" aggregate are both already-typed
@@ -319,23 +335,37 @@ fn parse_color_is_most_common_among_permanents_condition(
         controller: None,
         properties: vec![FilterProp::HasColor { color }],
     });
+    let max_color_bucket = || QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCountBySharedQuality {
+            filter: all_permanents.clone(),
+            quality: SharedQuality::Color,
+            aggregate: AggregateFunction::Max,
+        },
+    };
 
     Ok((
         rest,
-        StaticCondition::QuantityComparison {
-            lhs: QuantityExpr::Ref {
-                qty: QuantityRef::ObjectCount {
-                    filter: colored_permanents,
+        StaticCondition::And {
+            conditions: vec![
+                // A most-common-color bucket must actually exist — false when
+                // every permanent is colorless (no bucket reaches size 1).
+                StaticCondition::QuantityComparison {
+                    lhs: max_color_bucket(),
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 1 },
                 },
-            },
-            comparator: Comparator::GE,
-            rhs: QuantityExpr::Ref {
-                qty: QuantityRef::ObjectCountBySharedQuality {
-                    filter: all_permanents,
-                    quality: SharedQuality::Color,
-                    aggregate: AggregateFunction::Max,
+                // The named color's count must be at least as large as the
+                // largest bucket — i.e. it leads or ties for most common.
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: colored_permanents,
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: max_color_bucket(),
                 },
-            },
+            ],
         },
     ))
 }
