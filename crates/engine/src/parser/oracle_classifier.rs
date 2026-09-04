@@ -252,25 +252,7 @@ pub(crate) fn should_defer_spell_to_effect(lower: &str) -> bool {
 /// for sibling self-referential casting predicates
 /// (`parse_cant_spend_mana_restriction`, `parse_negative_self_casting_restriction`).
 fn is_self_conditional_flash_grant(lower: &str) -> bool {
-    // Word-boundary guard on "flash" (mirrors `parse_object_recipient_pronoun`'s
-    // idiom): without it, "flash" would also match as a PREFIX of "flashback"
-    // ("~ has flashback {2}{U}"), wrongly deferring a real keyword-grant
-    // static line away from the static classifier.
-    preceded(
-        alt((tag::<_, _, OracleError<'_>>("~"), tag("this spell"))),
-        terminated(
-            tag(" has flash"),
-            peek(alt((
-                value((), nom::combinator::eof),
-                value(
-                    (),
-                    nom::character::complete::satisfy(|c: char| !c.is_alphanumeric()),
-                ),
-            ))),
-        ),
-    )
-    .parse(lower)
-    .is_ok()
+    nom_primitives::parse_self_spell_has_flash_prefix(lower).is_ok()
 }
 
 fn is_spell_resolution_next_untap_restriction(lower: &str) -> bool {

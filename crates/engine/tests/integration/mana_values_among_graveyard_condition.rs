@@ -3,9 +3,8 @@
 //! graveyard" (Aven Heartstabber, Snooping Newsie, Syndicate Infiltrator,
 //! Graveyard Shift, and their Alchemy variants).
 //!
-//! CR 202.3 (mana value) + CR 201.2 (distinct-value counting, shared with
-//! Field of the Dead's "different names") + CR 611.3a (continuous "as long
-//! as" static gate) + CR 601.3d (conditional flash grant on a spell).
+//! CR 202.3 (mana value) + CR 611.3a (continuous "as long as" static gate) +
+//! CR 601.3d (conditional flash grant on a spell).
 //!
 //! Two DIFFERENT runtime paths are exercised — they share the same condition
 //! (`StaticCondition`/`ParsedCondition::QuantityComparison` over
@@ -163,6 +162,15 @@ fn aven_heartstabber_no_bonus_with_four_distinct_values_despite_more_cards() {
             .with_mana_cost(generic_cost(*mv));
     }
 
+    // P1 has five distinct values, but "your graveyard" is relative to Aven's
+    // controller (P0). A dropped controller filter would wrongly turn the bonus
+    // on before P0 receives a fifth distinct value below.
+    for mv in 0..5u32 {
+        scenario
+            .add_creature_to_graveyard(P1, &format!("Opponent Filler MV{mv}"), 1, 1)
+            .with_mana_cost(generic_cost(mv));
+    }
+
     let mut runner = scenario.build();
     runner.state_mut().layers_dirty.mark_full();
     evaluate_layers(runner.state_mut());
@@ -171,12 +179,12 @@ fn aven_heartstabber_no_bonus_with_four_distinct_values_despite_more_cards() {
     assert_eq!(
         obj.power,
         Some(1),
-        "printed power only — 4 distinct mana values (despite 6 total cards) must not trigger the bonus"
+        "printed power only — P0's 4 distinct mana values (despite P1 having 5) must not trigger the bonus"
     );
     assert_eq!(
         obj.toughness,
         Some(1),
-        "printed toughness only — 4 distinct mana values must not trigger the bonus"
+        "printed toughness only — P0's 4 distinct mana values must not trigger the bonus"
     );
     assert!(
         !obj.keywords.contains(&Keyword::Deathtouch),

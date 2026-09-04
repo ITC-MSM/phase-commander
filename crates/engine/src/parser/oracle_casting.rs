@@ -7,6 +7,7 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::oracle_cost::{parse_gerund_cost, parse_oracle_cost};
+use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_util::{parse_mana_symbols, parse_ordinal, TextPair};
 use crate::parser::oracle_condition::parse_restriction_condition;
 use crate::types::ability::{
@@ -326,19 +327,7 @@ fn parse_self_has_flash_option(body_lower: &str) -> Option<SpellCastingOption> {
     // wrongly claiming "~ has flashback {2}{U}" as a bare unconditional grant
     // with garbage leftover text.
     let (rest, _) = preceded(
-        (
-            alt((tag::<_, _, OracleError<'_>>("~"), tag("this spell"))),
-            terminated(
-                tag(" has flash"),
-                nom::combinator::peek(nom::branch::alt((
-                    value((), nom::combinator::eof),
-                    value(
-                        (),
-                        nom::character::complete::satisfy(|c: char| !c.is_alphanumeric()),
-                    ),
-                ))),
-            ),
-        ),
+        nom_primitives::parse_self_spell_has_flash_prefix,
         opt(tag(" as long as ")),
     )
     .parse(body_lower)
@@ -2321,7 +2310,7 @@ Trample";
             Some(ParsedCondition::QuantityComparison {
                 lhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::ObjectCountDistinct { qualities, .. },
+                        qty: QuantityRef::ObjectCountDistinct { filter, qualities },
                     },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 5 },
@@ -2329,6 +2318,13 @@ Trample";
                 assert_eq!(
                     qualities,
                     vec![crate::types::ability::SharedQuality::ManaValue]
+                );
+                let crate::types::ability::TargetFilter::Typed(filter) = filter else {
+                    panic!("expected Typed graveyard filter");
+                };
+                assert_eq!(
+                    filter.controller,
+                    Some(crate::types::ability::ControllerRef::You)
                 );
             }
             other => {

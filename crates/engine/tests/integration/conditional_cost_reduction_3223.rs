@@ -190,8 +190,8 @@ fn a_sewer_crocodile_cost_reduction_carries_graveyard_mana_value_condition() {
     // Syndicate Infiltrator, Graveyard Shift, and their Alchemy variants) is
     // now modeled as `StaticCondition`/`ParsedCondition::QuantityComparison`
     // over `QuantityRef::ObjectCountDistinct[ManaValue]` in the controller's
-    // graveyard, GE 5 (CR 202.3 mana value + CR 201.2 distinct-value
-    // counting). This card's cost-reduction condition reuses the identical
+    // graveyard, GE 5 (CR 202.3 mana value). This card's cost-reduction
+    // condition reuses the identical
     // shared-grammar leaf, so the previously-loud gap is now captured.
     let card = "A-Sewer Crocodile";
     let oracle = "{3}{U}: Sewer Crocodile can't be blocked this turn. \

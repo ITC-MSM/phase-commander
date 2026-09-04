@@ -1065,7 +1065,7 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // colors among ..." path; registering it here makes it reachable in the
         // bare-suffix context too.
         parse_distinct_colors_among_tail,
-        // CR 202.3 + CR 201.2: bare "mana value[s] among <filter>" — reached
+        // CR 202.3: bare "mana value[s] among <filter>" — reached
         // after a parent has consumed "there are N [or more] " (Aven
         // Heartstabber and the SNC graveyard-mana-value-diversity class:
         // "there are five or more mana values among cards in your
@@ -2053,7 +2053,7 @@ fn parse_distinct_colors_among_tail(input: &str) -> OracleResult<'_, QuantityRef
     Ok(("", QuantityRef::DistinctColorsAmong { source }))
 }
 
-/// CR 202.3 + CR 201.2 + CR 603.4: Parse bare "mana value\[s\] among
+/// CR 202.3 + CR 603.4: Parse bare "mana value\[s\] among
 /// \<population\>" → `QuantityRef::ObjectCountDistinct { filter, qualities:
 /// [ManaValue] }`.
 ///
@@ -10893,6 +10893,10 @@ mod tests {
                     Some(crate::types::zones::Zone::Graveyard),
                     "graveyard zone must survive into the filter: {filter:?}"
                 );
+                let TargetFilter::Typed(filter) = filter else {
+                    panic!("expected Typed graveyard filter");
+                };
+                assert_eq!(filter.controller, Some(ControllerRef::You));
             }
             other => panic!("expected ObjectCountDistinct, got {other:?}"),
         }
