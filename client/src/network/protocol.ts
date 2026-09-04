@@ -101,6 +101,16 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  44 — DerivedViews.back_face_spell_costs publishes, for each card the viewer
+ *       may cast whose player chooses a spell face at cast time (a split card
+ *       such as a Room, a spell//spell MDFC — CR 709.3 + CR 712.11b), the live
+ *       cost of the OTHER face; spellCosts reports the live face only. The
+ *       cost badge renders both faces from this map. Additive behind a serde
+ *       default, but this client renders the map directly; a v43 host would
+ *       silently show a Room's single-face badge again, on top of the second
+ *       half's printed cost. Since game_setup and reconnect_ack carry
+ *       GameState, first contact rejects the version skew. Bumped in lockstep
+ *       with PROTOCOL_VERSION 60.
  *  43 — LegalActionsWire.viewerInteraction's shortcut preview changed from a
  *       single optional InteractionShortcutPreview to an
  *       Array<InteractionShortcutPreview>, one element per offerable count,
@@ -305,7 +315,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 43 as const;
+export const WIRE_PROTOCOL_VERSION = 44 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
