@@ -1759,7 +1759,7 @@ impl GameObject {
         modification: &crate::types::ability::PerpetualModification,
         all_creature_types: &[String],
     ) {
-        use crate::types::ability::PerpetualModification;
+        use crate::types::ability::{ContinuousModification, PerpetualModification};
         use crate::types::card_type::CoreType;
         match modification {
             PerpetualModification::SetBasePowerToughness { power, toughness } => {
@@ -1870,6 +1870,72 @@ impl GameObject {
                     .active_zones(crate::types::zones::self_spell_cost_mod_active_zones());
                 self.static_definitions.push(synthetic.clone());
                 Arc::make_mut(&mut self.base_static_definitions).push(synthetic);
+            }
+            PerpetualModification::GrantAbility { modifications } => {
+                // Digital-only Alchemy (no CR entry for "perpetually"): install
+                // each classified quoted-ability grant onto the persistent
+                // baseline so it survives every layer/zone reset, mirroring the
+                // `GrantKeywords` (base_keywords) and `ModifyCost`
+                // (base_static_definitions) arms above. The parser
+                // (`perpetual_grant_modification_is_supported`,
+                // oracle_effect/mod.rs) accepts only the modification kinds
+                // handled here — `classify_quoted_inner`'s other outputs
+                // (GrantTrigger, GrantReplacement) fail the parse closed rather
+                // than reaching this match, so no wildcard arm is needed.
+                use crate::types::ability::TargetFilter;
+                self.sync_missing_base_characteristics();
+                for granted in modifications {
+                    match granted {
+                        ContinuousModification::AddKeyword { keyword } => {
+                            if !self.keywords.contains(keyword) {
+                                self.keywords.push(keyword.clone());
+                            }
+                            if !self.base_keywords.contains(keyword) {
+                                self.base_keywords.push(keyword.clone());
+                            }
+                        }
+                        ContinuousModification::AddStaticMode { mode } => {
+                            let synthetic =
+                                crate::types::ability::StaticDefinition::new(mode.clone())
+                                    .affected(TargetFilter::SelfRef);
+                            self.static_definitions.push(synthetic.clone());
+                            Arc::make_mut(&mut self.base_static_definitions).push(synthetic);
+                        }
+                        // CR 113 / CR 117: the quoted body classified to a full
+                        // spell/activated ability (Agent of Raffine's "You may
+                        // spend mana as though it were mana of any color to
+                        // cast this spell.") rather than a bare keyword or
+                        // restriction static. Mirrors the NON-perpetual layer-6
+                        // `GrantAbility` apply (`game/layers.rs`): push onto
+                        // BOTH the live `abilities` (so a from-hand cast sees
+                        // it immediately — this grant typically lands on a
+                        // card sitting in hand, not on the battlefield, so
+                        // there is no layer pass to populate it from base) and
+                        // `base_abilities` (so it survives the battlefield
+                        // layer reset's `abilities = base_abilities.clone()`).
+                        // No `concretize_granting_object` step: unlike an
+                        // aura/equipment donor, a perpetual self-grant has no
+                        // separate granting object to rebind `GrantingObject`
+                        // self-references to. Dedup by structural equality,
+                        // matching every other perpetual-grant arm's
+                        // idempotency (this function runs once per
+                        // `ApplyPerpetual` resolution).
+                        ContinuousModification::GrantAbility { definition } => {
+                            if !self.abilities.iter().any(|a| a == definition.as_ref()) {
+                                Arc::make_mut(&mut self.abilities).push(*definition.clone());
+                            }
+                            if !self.base_abilities.iter().any(|a| a == definition.as_ref()) {
+                                Arc::make_mut(&mut self.base_abilities).push(*definition.clone());
+                            }
+                        }
+                        // CR 601.2f / CR 611.2c: unreachable in practice — the
+                        // parser's `perpetual_grant_modification_is_supported`
+                        // gate rejects any other classified kind before this
+                        // ever runs. A future kind added to that gate must add
+                        // its installation here too.
+                        _ => {}
+                    }
+                }
             }
         }
         self.perpetual_mods.push(modification.clone());

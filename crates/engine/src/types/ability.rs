@@ -13486,6 +13486,36 @@ pub enum PerpetualModification {
         mode: crate::types::statics::CostModifyMode,
         amount: ManaCost,
     },
+    /// Digital-only Alchemy (no CR entry for "perpetually"): "[object] perpetually
+    /// gains \"<ability text>\"[ and \"<ability text>\"]*" — a permanent grant of
+    /// one or more FULL abilities (not just evergreen keywords or a self-cost
+    /// modifier), e.g. Agent of Raffine's conjured duplicate perpetually gaining
+    /// "You may spend mana as though it were mana of any color to cast this
+    /// spell." (CR 601.2f-adjacent alternate mana payment) or Karlach, Tiefling
+    /// Berserker's returned creature perpetually gaining "~ can't block." (CR
+    /// 509.1a blocking restriction).
+    ///
+    /// Each quoted ability text is classified through the SAME single authority
+    /// used by every other quoted-ability grant
+    /// (`oracle_static::keyword_grant::classify_quoted_inner`), so the granted
+    /// text's OWN self-reference (`~`) is resolved the ordinary way once the
+    /// modification is installed on the recipient — no separate pronoun-binding
+    /// step is needed for the INNER text. What this variant exists to carry is
+    /// the OUTER grant's applied-to target, resolved by the parser
+    /// (`parse_perpetual_self_subject`) to the correct antecedent: the
+    /// ability's own parent target for a bare self-referential grant (Karlach),
+    /// or `TargetFilter::LastCreated` when the immediately preceding clause in
+    /// the same chain created the object being granted to (a conjured
+    /// duplicate — Agent of Raffine and siblings).
+    ///
+    /// Only modification KINDS the perpetual runtime can install onto a
+    /// persistent baseline are accepted by the parser
+    /// (`perpetual_grant_modification_is_supported`); a granted ability text
+    /// that classifies to an unsupported kind (e.g. a full triggered ability)
+    /// fails the parse closed rather than silently dropping part of the grant.
+    GrantAbility {
+        modifications: Vec<ContinuousModification>,
+    },
 }
 
 /// CR 400.5 + CR 608.2c: The required placement order for a Dig's unkept

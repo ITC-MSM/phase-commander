@@ -377,6 +377,134 @@ mod tests {
         assert!(obj.base_keywords.contains(&Keyword::Deathtouch));
     }
 
+    /// Karlach, Tiefling Berserker cycle shape: a quoted grant that classifies
+    /// to `AddStaticMode` (CR 509.1a "can't block") must install onto BOTH the
+    /// live `static_definitions` and the persistent `base_static_definitions`,
+    /// mirroring `perpetual_grant_keywords_adds_to_object`.
+    #[test]
+    fn perpetual_grant_ability_installs_static_mode() {
+        use crate::types::ability::ContinuousModification;
+        use crate::types::statics::StaticMode;
+
+        let mut state = GameState::new_two_player(7);
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Karlach, Tiefling Berserker".to_string(),
+            Zone::Battlefield,
+        );
+
+        let modification = PerpetualModification::GrantAbility {
+            modifications: vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBlock,
+            }],
+        };
+        let ability = ResolvedAbility::new(
+            Effect::ApplyPerpetual {
+                target: TargetFilter::Any,
+                modification: modification.clone(),
+            },
+            vec![TargetRef::Object(id)],
+            id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        super::resolve(&mut state, &ability, &mut events).unwrap();
+        crate::game::layers::flush_layers(&mut state);
+
+        let obj = state.objects.get(&id).unwrap();
+        assert!(
+            obj.static_definitions
+                .iter_all()
+                .any(|sd| sd.mode == StaticMode::CantBlock),
+            "CantBlock static must be live on the object"
+        );
+        assert!(
+            obj.base_static_definitions
+                .iter()
+                .any(|sd| sd.mode == StaticMode::CantBlock),
+            "CantBlock static must survive the layer flush via base_static_definitions"
+        );
+        assert!(obj.perpetual_mods.contains(&modification));
+    }
+
+    /// Agent of Raffine shape: a quoted grant that classifies to a NESTED
+    /// `ContinuousModification::GrantAbility` (a full spell/activated ability,
+    /// not a bare keyword or restriction static — "You may spend mana as
+    /// though it were mana of any color to cast this spell.") must install
+    /// the whole `AbilityDefinition` onto both `abilities` (so a from-hand
+    /// cast sees it immediately) and `base_abilities` (so it survives the
+    /// battlefield layer reset), and must not double-install on a second
+    /// application of the identical modification (structural-equality dedup,
+    /// mirroring the non-perpetual layer-6 `GrantAbility` apply).
+    #[test]
+    fn perpetual_grant_ability_installs_nested_ability_and_survives_layer_flush() {
+        use crate::types::ability::{AbilityDefinition, AbilityKind, ContinuousModification};
+
+        let mut state = GameState::new_two_player(7);
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Agent of Raffine".to_string(),
+            Zone::Hand,
+        );
+
+        let granted = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GainLife {
+                amount: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+        );
+        let modification = PerpetualModification::GrantAbility {
+            modifications: vec![ContinuousModification::GrantAbility {
+                definition: Box::new(granted.clone()),
+            }],
+        };
+        let ability = ResolvedAbility::new(
+            Effect::ApplyPerpetual {
+                target: TargetFilter::Any,
+                modification: modification.clone(),
+            },
+            vec![TargetRef::Object(id)],
+            id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        super::resolve(&mut state, &ability, &mut events).unwrap();
+
+        {
+            let obj = state.objects.get(&id).unwrap();
+            assert!(
+                obj.abilities.iter().any(|a| a == &granted),
+                "granted ability must be live on the object immediately (from-hand visibility)"
+            );
+            assert!(
+                obj.base_abilities.iter().any(|a| a == &granted),
+                "granted ability must be recorded on base_abilities"
+            );
+        }
+
+        // Re-applying the identical modification (e.g. a second layer pass
+        // re-deriving the same perpetual mod) must not duplicate the grant.
+        if let Some(obj) = state.objects.get_mut(&id) {
+            obj.apply_perpetual_modification(&modification, &[]);
+        }
+        let obj = state.objects.get(&id).unwrap();
+        assert_eq!(
+            obj.abilities.iter().filter(|a| *a == &granted).count(),
+            1,
+            "re-applying the same grant must be idempotent"
+        );
+        assert_eq!(
+            obj.base_abilities.iter().filter(|a| *a == &granted).count(),
+            1,
+            "re-applying the same grant must be idempotent on base_abilities too"
+        );
+    }
+
     #[test]
     fn perpetual_grant_keywords_parent_target_uses_stationed_event() {
         use crate::types::ability::TargetFilter;

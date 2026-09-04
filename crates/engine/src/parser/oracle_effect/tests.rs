@@ -40765,6 +40765,136 @@ fn perpetual_parser_maps_modify_cost() {
     );
 }
 
+/// Karlach, Tiefling Berserker cycle: "~ perpetually gains \"This creature
+/// can't block.\"" — `classify_quoted_inner` classifies the quoted body as
+/// `ContinuousModification::AddStaticMode { mode: CantBlock }` (CR 509.1a
+/// blocking restriction), which the perpetual runtime installs directly
+/// (`GameObject::apply_perpetual_modification`'s `AddStaticMode` arm).
+#[test]
+fn perpetual_parser_maps_grant_ability_single_static_mode() {
+    use crate::types::ability::PerpetualModification;
+    use crate::types::statics::StaticMode;
+
+    // "~" here, not "This creature": card-level parsing normalizes "this
+    // creature"/"this card" self-references to "~" (`normalize_card_name_refs`)
+    // BEFORE any clause reaches `classify_quoted_inner`, so `~` is the form
+    // this fragment-level helper must be fed to match production input
+    // (mirrors every neighboring `perpetual_parser_maps_*` test's convention).
+    let e = parse_effect("~ perpetually gains \"~ can't block.\"");
+    match &e {
+        Effect::ApplyPerpetual {
+            target: TargetFilter::Any,
+            modification: PerpetualModification::GrantAbility { modifications },
+        } => {
+            assert_eq!(
+                modifications,
+                &vec![ContinuousModification::AddStaticMode {
+                    mode: StaticMode::CantBlock
+                }],
+                "expected a single CantBlock AddStaticMode grant"
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
+/// Multiple quoted bodies joined by " and " must each classify independently
+/// and all install (nom-combinator loop in `try_parse_perpetual_grant_ability`,
+/// not a single-quote special case) — builds for the class of multi-ability
+/// perpetual grants, not just the one-quote Karlach/Raffine cards.
+#[test]
+fn perpetual_parser_maps_grant_ability_multiple_quoted_bodies() {
+    use crate::types::ability::PerpetualModification;
+    use crate::types::keywords::Keyword;
+
+    let e = parse_effect("~ perpetually gains \"flying\" and \"vigilance\".");
+    match &e {
+        Effect::ApplyPerpetual {
+            target: TargetFilter::Any,
+            modification: PerpetualModification::GrantAbility { modifications },
+        } => {
+            assert_eq!(
+                modifications,
+                &vec![
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Flying
+                    },
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Vigilance
+                    },
+                ],
+                "expected both quoted keyword grants to classify and install"
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
+/// Honest-red: a granted quoted body that classifies to a modification kind
+/// the perpetual runtime cannot install onto a persistent baseline
+/// (`GrantTrigger` — a full triggered ability body has no persistent-baseline
+/// installer) must fail the WHOLE clause closed rather than silently
+/// dropping it or installing a partial/incorrect grant.
+#[test]
+fn perpetual_grant_ability_rejects_unsupported_triggered_body() {
+    let e = parse_effect("~ perpetually gains \"When ~ dies, draw a card.\"");
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "an unsupported (triggered-ability) quoted grant must fail closed, got {e:?}"
+    );
+}
+
+/// CR 608.2c pronoun rebinding (the Agent of Raffine / Karlach cycle shape):
+/// a bare "it" following a same-chain object-CREATING clause must bind to
+/// that just-created object (`TargetFilter::LastCreated`), not to the
+/// ability's chosen target. Uses a target-prefixed conjure-duplicate
+/// reference (`try_parse_conjure_duplicate`'s currently-modeled reference
+/// form) rather than Agent of Raffine's own "the top card of their library"
+/// / the Karlach cycle's self-reanimation phrasing, neither of which
+/// `try_parse_conjure_duplicate` / the self-reanimation clause parse yet
+/// (separate, pre-existing gaps unrelated to this pronoun fix). This test
+/// exercises the LastCreated-binding building block in isolation from those
+/// gaps: once either reference form is modeled, the real card wiring falls
+/// out for free through this same `ctx.token_created_in_chain` /
+/// `publishes_chain_created_referent` path (`Effect::Conjure` was added
+/// there specifically for this).
+#[test]
+fn perpetual_grant_after_conjure_binds_last_created_not_parent_target() {
+    let def = parse_effect_chain(
+        "Conjure a duplicate of target creature card in your graveyard into your hand. It perpetually gains \"This creature can't block.\"",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(&*def.effect, Effect::Conjure { .. }),
+        "expected Conjure, got {:?}",
+        def.effect
+    );
+    let grant = def
+        .sub_ability
+        .as_ref()
+        .expect("the perpetual grant must remain chained to the conjure");
+    match &*grant.effect {
+        Effect::ApplyPerpetual {
+            target,
+            modification: PerpetualModification::GrantAbility { modifications },
+            ..
+        } => {
+            assert_eq!(
+                target,
+                &TargetFilter::LastCreated,
+                "\"it\" must bind to the just-conjured duplicate, not ParentTarget"
+            );
+            assert_eq!(
+                modifications,
+                &vec![ContinuousModification::AddStaticMode {
+                    mode: crate::types::statics::StaticMode::CantBlock
+                }]
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
 /// Definite "that card perpetually gains ..." back-references the parent
 /// target ([`TargetFilter::ParentTarget`]). Bare "It ..." needs the surrounding
 /// chain context and is covered by `perpetual_anaphor_after_chosen_card_targets_parent_target`
