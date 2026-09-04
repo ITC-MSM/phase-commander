@@ -2053,7 +2053,7 @@ fn parse_distinct_colors_among_tail(input: &str) -> OracleResult<'_, QuantityRef
     Ok(("", QuantityRef::DistinctColorsAmong { source }))
 }
 
-/// CR 202.3 + CR 603.4: Parse bare "mana value\[s\] among
+/// CR 202.3: Parse bare "mana value\[s\] among
 /// \<population\>" → `QuantityRef::ObjectCountDistinct { filter, qualities:
 /// [ManaValue] }`.
 ///

@@ -37,9 +37,11 @@
 use engine::game::engine::EngineError;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameScenario, P0, P1};
+use engine::game::zones::create_object;
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
-use engine::types::identifiers::ObjectId;
+use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -212,6 +214,95 @@ fn aven_heartstabber_no_bonus_with_four_distinct_values_despite_more_cards() {
     assert!(obj.keywords.contains(&Keyword::Deathtouch));
 }
 
+/// Owner-scoped graveyard regression (PR #8347 review, HIGH). CR 400.3 + CR
+/// 109.5 + CR 108.4a: a graveyard's membership is keyed by OWNER, not
+/// controller — "your graveyard" is an ownership claim even though the
+/// parser represents "your" as `ControllerRef::You` (see
+/// `game::filter::is_owner_scoped_zone`). A creature P0 OWNS but that was
+/// under P1's control when it died (e.g. via a control-stealing effect like
+/// Mind Control) leaves a stale `obj.controller = P1` behind
+/// (`reset_for_battlefield_exit` does not reset `controller` back to the
+/// owner on a non-battlefield exit) — yet the card still lands in ITS
+/// OWNER's graveyard per CR 400.3 and must count toward P0's distinct-mana-
+/// value query. Resolving `QuantityRef::ObjectCountDistinct` through the
+/// plain controller-scoped `matches_target_filter` (instead of the zone-aware
+/// `matches_target_filter_for_zone`) would wrongly exclude it, since its live
+/// `controller` field reads P1, not P0.
+#[test]
+fn aven_heartstabber_counts_owned_creature_that_died_under_opponent_control() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let aven = scenario
+        .add_creature(P0, "Aven Heartstabber", 1, 1)
+        .from_oracle_text(AVEN_HEARTSTABBER)
+        .id();
+
+    // Four distinct mana values, cleanly owned AND controlled by P0.
+    for mv in 0..4u32 {
+        scenario
+            .add_creature_to_graveyard(P0, &format!("Filler MV{mv}"), 1, 1)
+            .with_mana_cost(generic_cost(mv));
+    }
+
+    let mut runner = scenario.build();
+    runner.state_mut().layers_dirty.mark_full();
+    evaluate_layers(runner.state_mut());
+    assert_eq!(
+        runner.state().objects[&aven].power,
+        Some(1),
+        "only 4 distinct mana values before the owner-scoped 5th arrives"
+    );
+
+    // The 5th distinct mana value: a creature P0 OWNS, staged directly into
+    // P0's graveyard, but whose live `controller` field is P1 — reproducing
+    // the state a control-stealing effect (Mind Control) followed by that
+    // creature's death would leave behind.
+    let stolen = scenario_add_creature_to_graveyard_post_build(
+        &mut runner,
+        P0,
+        "Stolen Filler",
+        generic_cost(4),
+    );
+    assert_eq!(
+        runner.state().objects[&stolen].owner,
+        P0,
+        "fixture: the card must be OWNED by P0 for this case to discriminate"
+    );
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&stolen)
+        .unwrap()
+        .controller = P1;
+    assert_eq!(
+        runner.state().objects[&stolen].controller,
+        P1,
+        "fixture: the stale controller must read P1 — an owner-keyed \
+         implementation and a controller-keyed one must give DIFFERENT \
+         answers here, or this fixture cannot discriminate"
+    );
+
+    runner.state_mut().layers_dirty.mark_full();
+    evaluate_layers(runner.state_mut());
+
+    let obj = &runner.state().objects[&aven];
+    assert_eq!(
+        obj.power,
+        Some(3),
+        "a creature P0 OWNS must count toward P0's 'your graveyard' distinct-mana-value \
+         query even though its stale `controller` field reads P1 — ownership, not stale \
+         controller, is authoritative for graveyard membership (CR 400.3)"
+    );
+    assert_eq!(obj.toughness, Some(3));
+    assert!(
+        obj.keywords.contains(&Keyword::Deathtouch),
+        "deathtouch must be granted once the owner-scoped 5th distinct value is present, \
+         got {:?}",
+        obj.keywords
+    );
+}
+
 #[test]
 fn aven_heartstabber_bonus_tracks_live_as_graveyard_changes() {
     // CR 611.3a: the static re-evaluates continuously. Start below the
@@ -264,10 +355,6 @@ fn scenario_add_creature_to_graveyard_post_build(
     name: &str,
     mana_cost: ManaCost,
 ) -> ObjectId {
-    use engine::game::zones::create_object;
-    use engine::types::card_type::CoreType;
-    use engine::types::identifiers::CardId;
-
     let state = runner.state_mut();
     let card_id = CardId(state.next_object_id);
     let id = create_object(state, card_id, player, name.to_string(), Zone::Graveyard);

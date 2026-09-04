@@ -3602,7 +3602,21 @@ fn resolve_ref(
             let mut signatures: std::collections::HashSet<Vec<Vec<String>>> =
                 std::collections::HashSet::new();
             for id in crate::game::targeting::zone_object_ids(state, zone) {
-                if !matches_target_filter(state, id, filter, &filter_ctx) {
+                // CR 400.3 + CR 109.5 + CR 108.4a: graveyard/hand/library
+                // membership is owner-scoped, not controller-scoped, so a
+                // stale `obj.controller` left by a control-change effect
+                // (e.g. a stolen creature that dies into its owner's
+                // graveyard) must not exclude the object from its owner's
+                // "your graveyard" query. Route through the zone-aware
+                // authority rather than the plain controller-scoped
+                // `matches_target_filter`.
+                if !crate::game::filter::matches_target_filter_for_zone(
+                    state,
+                    id,
+                    zone,
+                    filter,
+                    &filter_ctx,
+                ) {
                     continue;
                 }
                 let Some(obj) = state.objects.get(&id) else {
