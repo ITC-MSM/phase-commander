@@ -40,11 +40,11 @@ use crate::parser::oracle_static::{
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, BounceSelection,
     CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser, ContinuousModification,
-    ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, DigSource, DoorLockOp,
-    Duration, Effect, EffectScope, FaceDownProfile, FilterProp, ForceBlockAttackerRef,
-    GrantedAbilityScope, LibraryPosition, MultiTargetSpec, ObjectSelectionCardinality,
-    ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope, PlayerScope,
-    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
+    ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, CounterKindChooser,
+    CounterKindDomain, DigSource, DoorLockOp, Duration, Effect, EffectScope, FaceDownProfile,
+    FilterProp, ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition, MultiTargetSpec,
+    ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope,
+    PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
     ReassembleControlMode, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
     TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
     ZoneOwner,
@@ -4298,6 +4298,77 @@ fn try_parse_choose_damage_source(rest: &str) -> Option<ChooseImperativeAst> {
     Some(ChooseImperativeAst::DamageSource { source_filter })
 }
 
+/// CR 608.2d + CR 122.1b: "a kind of counter[ at random][ that <self> doesn't
+/// have on it] from among <list>" — the counter-kind choice whose population is
+/// PRINTED on the card rather than read off the object (Crystalline Giant).
+///
+/// Three independent riders, each optional and each read from the text rather
+/// than assumed:
+///   * " at random" — the GAME picks (`CounterKindChooser::Random`), so no
+///     prompt is ever shown.
+///   * " that <self> doesn't have on it" — narrows the printed set BEFORE the
+///     pick. CR 608.2d: an excluded option can't be chosen; narrowing after
+///     the draw would let a random pick land on a present kind and place
+///     nothing.
+///   * the list itself, read by `classify_and_parse_from_among_counter_list` —
+///     the same item authority Grimdancer's pair pick uses, so a new counter
+///     spelling is learned in exactly one place.
+///
+/// The domain the exclusion is measured against is the ability's own source:
+/// the sentence says "this creature", which the normalizer writes as `~`.
+fn try_parse_choose_counter_kind_from_among(rest_lower: &str) -> Option<ChooseImperativeAst> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("a kind of counter")
+        .parse(rest_lower.trim())
+        .ok()?;
+    let (rest, random) = opt(tag::<_, _, OracleError<'_>>(" at random"))
+        .parse(rest)
+        .ok()?;
+
+    // Optional exclusion clause. `opt` on the whole sequence, so a card that
+    // prints the list without an exclusion still parses.
+    let exclusion = (
+        tag::<_, _, OracleError<'_>>(" that "),
+        alt((
+            tag("~"),
+            tag("this creature"),
+            tag("this permanent"),
+            tag("it"),
+        )),
+        alt((tag(" doesn't have"), tag(" does not have"))),
+        tag(" on it"),
+    );
+    let (rest, excluded) = match opt(exclusion).parse(rest) {
+        Ok((rest, found)) => (rest, found.is_some()),
+        Err(_) => return None,
+    };
+
+    let (list, _) = tag::<_, _, OracleError<'_>>(" from among ")
+        .parse(rest)
+        .ok()?;
+    let entries = crate::parser::oracle_effect::classify_and_parse_from_among_counter_list(
+        list.trim().trim_end_matches('.'),
+    )?;
+
+    Some(ChooseImperativeAst::CounterKind {
+        // CR 608.2d: the printed set is self-contained; the object the
+        // exclusion reads is the ability's source.
+        target: TargetFilter::SelfRef,
+        domain: CounterKindDomain::Printed {
+            // The list parser also yields a per-entry count. "A kind of
+            // counter" places one of the chosen kind, so the count is not the
+            // choice's business; a printed list that ever spelled a quantity
+            // ("two charge counters") would need it read here.
+            kinds: entries.into_iter().map(|(kind, _count)| kind).collect(),
+            excluding_kinds_on_target: excluded,
+        },
+        chooser: if random.is_some() {
+            CounterKindChooser::Random
+        } else {
+            CounterKindChooser::Controller
+        },
+    })
+}
+
 /// CR 608.2d + CR 122.1: "a [kind of] counter on <domain>" — the counter-kind
 /// choice head. An anaphor (`it` / `that permanent` / `that creature`) binds
 /// to `ParentTarget` (The Caves of Androzani); a typed untargeted domain uses
@@ -4308,6 +4379,13 @@ fn try_parse_choose_damage_source(rest: &str) -> Option<ChooseImperativeAst> {
 /// remains owned by the existing target-designation path rather than being
 /// misclassified as a resolution-time source population.
 fn try_parse_choose_counter_kind(rest_lower: &str) -> Option<ChooseImperativeAst> {
+    // CR 608.2d + CR 122.1b: the printed-population sibling shares this head
+    // ("a kind of counter") and is told apart only by its tail, so it must be
+    // tried first — otherwise "on " never matches and the whole clause falls
+    // through to Unimplemented (Crystalline Giant).
+    if let Some(ast) = try_parse_choose_counter_kind_from_among(rest_lower) {
+        return Some(ast);
+    }
     let (domain, _) = alt((
         tag::<_, _, OracleError<'_>>("a kind of counter on "),
         tag("a counter on "),
@@ -4331,6 +4409,8 @@ fn try_parse_choose_counter_kind(rest_lower: &str) -> Option<ChooseImperativeAst
     {
         return Some(ChooseImperativeAst::CounterKind {
             target: TargetFilter::ParentTarget,
+            domain: CounterKindDomain::default(),
+            chooser: CounterKindChooser::default(),
         });
     }
 
@@ -4342,7 +4422,11 @@ fn try_parse_choose_counter_kind(rest_lower: &str) -> Option<ChooseImperativeAst
     {
         return None;
     }
-    Some(ChooseImperativeAst::CounterKind { target })
+    Some(ChooseImperativeAst::CounterKind {
+        target,
+        domain: CounterKindDomain::default(),
+        chooser: CounterKindChooser::default(),
+    })
 }
 
 /// CR 108.3 + CR 701.38d: Detect "a <type> owned by the voter" and emit
@@ -5645,7 +5729,15 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
         ChooseImperativeAst::TwoTargets { target_a, .. } => Effect::TargetOnly { target: target_a },
         // CR 608.2d + CR 122.1: "choose a counter on it" → interactive
         // counter-kind selection on the anaphoric object.
-        ChooseImperativeAst::CounterKind { target } => Effect::ChooseCounterKind { target },
+        ChooseImperativeAst::CounterKind {
+            target,
+            domain,
+            chooser,
+        } => Effect::ChooseCounterKind {
+            target,
+            domain,
+            chooser,
+        },
     }
 }
 
@@ -6957,8 +7049,14 @@ fn try_parse_gain_keyword(text: &str) -> Option<Effect> {
         return None;
     }
 
-    // Default duration: UntilEndOfTurn for keyword granting sub-abilities
-    let duration = duration.or(Some(Duration::UntilEndOfTurn));
+    // CR 611.2a (`docs/MagicCompRules.txt:2908`): do NOT inject a default window
+    // here. `None` must stay a true unset sentinel so a window this clause's own
+    // recognizer already hoisted onto the carrier can distribute into the embedded
+    // field (`oracle_ir::ast::duration_is_unset_sentinel`). An injected
+    // `UntilEndOfTurn` is byte-identical to a PRINTED one, so the distribution rule
+    // cannot tell them apart and declines, stranding the printed window. The single
+    // authority for the fallback is the resolver (`game/effects/effect.rs`), which
+    // already applies `.unwrap_or(Duration::UntilEndOfTurn)`.
 
     Some(Effect::GenericEffect {
         static_abilities: vec![StaticDefinition::continuous()
@@ -7019,7 +7117,15 @@ fn try_parse_gain_all_activated_abilities_of_target(text: &str) -> Option<Effect
         recipient: TargetFilter::SelfRef,
         // CR 602.1: "all ACTIVATED abilities of" — the default scope.
         scope: GrantedAbilityScope::ActivatedOnly,
-        duration: duration.or(Some(Duration::UntilEndOfTurn)),
+        // CR 611.2a: emit the PARSED duration verbatim, so `None` is a true unset
+        // sentinel. Injecting a `Some(Duration::UntilEndOfTurn)` default here would
+        // be byte-identical to a PRINTED "until end of turn" and therefore invisible
+        // to `apply_duration_to_effect`'s unset-sentinel guard, which would then
+        // decline to distribute a governing outer duration onto this node. The
+        // default is supplied downstream instead: `gain_activated_abilities.rs`
+        // resolves `duration.or(ability.duration).unwrap_or(UntilEndOfTurn)`, so a
+        // card that prints no window still lands on `UntilEndOfTurn`.
+        duration,
     })
 }
 
@@ -14941,6 +15047,7 @@ mod tests {
                 .expect("typed untargeted counter domain must parse");
             let ChooseImperativeAst::CounterKind {
                 target: TargetFilter::Typed(filter),
+                ..
             } = ast
             else {
                 panic!("expected typed CounterKind domain, got {ast:?}");
@@ -14998,6 +15105,7 @@ mod tests {
                 try_parse_choose_counter_kind(input),
                 Some(ChooseImperativeAst::CounterKind {
                     target: TargetFilter::ParentTarget,
+                    ..
                 })
             ));
         }
