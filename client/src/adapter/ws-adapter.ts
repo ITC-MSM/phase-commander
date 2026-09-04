@@ -203,6 +203,9 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 58 — `DraftPlayerView::commanders_required` publishes the procedure-owned
+ *      commander designation count. The client renders designation controls
+ *      from this required field rather than inferring them from `DraftKind`.
  * 57 — `GameAction::BeginResolveAll` gained `scope: ResolveAllScope` (`Own`
  *      binds only the requester and resolves immediately; `Shared` opens the
  *      table-wide consent protocol), and `PriorityPassingMode` gained
@@ -396,7 +399,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 57;
+export const PROTOCOL_VERSION = 58;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -952,7 +955,27 @@ export class WebSocketAdapter implements EngineAdapter {
     this.startPing();
 
     socket.ws.onmessage = (event) => {
-      this.handleMessage(JSON.parse(event.data as string));
+      let message: unknown;
+      try {
+        message = JSON.parse(event.data as string);
+      } catch {
+        this.rejectAuthoritativeStateExport(
+          new AdapterError("WS_ERROR", "Server sent an invalid WebSocket frame.", false),
+        );
+        return;
+      }
+      if (
+        typeof message !== "object"
+        || message === null
+        || !("type" in message)
+        || typeof message.type !== "string"
+      ) {
+        this.rejectAuthoritativeStateExport(
+          new AdapterError("WS_ERROR", "Server sent an invalid WebSocket frame.", false),
+        );
+        return;
+      }
+      this.handleMessage(message as { type: string; data?: unknown });
     };
 
     socket.ws.onerror = () => {
@@ -1105,6 +1128,9 @@ export class WebSocketAdapter implements EngineAdapter {
         "Authoritative-state export requires a secure connection",
         false,
       );
+    }
+    if (this.sessionIdentityRejected) {
+      throw new AdapterError("WS_ERROR", "Session identity rejected", false);
     }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
@@ -1865,11 +1891,16 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "AuthoritativeStateExport": {
-        const data = msg.data as { state?: unknown };
+        const data = msg.data;
         const pending = this.pendingAuthoritativeStateExport;
         this.pendingAuthoritativeStateExport = null;
         if (pending) {
-          if (typeof data.state === "string") {
+          if (
+            typeof data === "object"
+            && data !== null
+            && "state" in data
+            && typeof data.state === "string"
+          ) {
             pending.resolve(data.state);
           } else {
             pending.reject(new AdapterError(
@@ -1883,16 +1914,27 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "AuthoritativeStateExportFailed": {
-        const data = msg.data as { message?: unknown };
+        const data = msg.data;
         const pending = this.pendingAuthoritativeStateExport;
         this.pendingAuthoritativeStateExport = null;
         pending?.reject(new AdapterError(
           "WS_ERROR",
-          typeof data.message === "string" ? data.message : "Authoritative-state export failed.",
+          typeof data === "object"
+            && data !== null
+            && "message" in data
+            && typeof data.message === "string"
+            ? data.message
+            : "Authoritative-state export failed.",
           false,
         ));
         break;
       }
+
+      default:
+        this.rejectAuthoritativeStateExport(
+          new AdapterError("WS_ERROR", "Server sent an unrecognized WebSocket frame.", false),
+        );
+        break;
 
       case "RequestRejected": {
         const data = msg.data as { reason?: unknown };
@@ -2164,6 +2206,8 @@ export class WebSocketAdapter implements EngineAdapter {
       this.pingInterval = null;
     }
     this.rejectInitialization(error);
+    this.rejectAuthoritativeStateExport(error);
+    this.rejectPregameMutation(error);
     this.emit({ type: "error", message: error.message });
     this.ws?.close();
     return false;
