@@ -207,6 +207,14 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 60 — DerivedViews.back_face_spell_costs publishes, for each card the viewer
+ *      may cast whose player chooses a spell face at cast time (a split card
+ *      such as a Room, a spell//spell MDFC — CR 709.3 + CR 712.11b), the live
+ *      cost of the OTHER face; spell_costs reports the live face only. The
+ *      cost badge renders both faces from this map. Serde-additive, but the
+ *      client renders the map directly, so an older server would silently
+ *      show a Room's single-face badge again. The full handshake refuses
+ *      stale peers. Lobby messages are unchanged.
  * 59 — InteractionResponseSpec.shortcut.preview changed from a single optional
  *      InteractionShortcutPreview to an Array<InteractionShortcutPreview>, one
  *      element per offerable count, and each element gained an allocation list
@@ -420,7 +428,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 59;
+export const PROTOCOL_VERSION = 60;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

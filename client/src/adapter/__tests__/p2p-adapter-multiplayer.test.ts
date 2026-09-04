@@ -4171,14 +4171,14 @@ describe("P2P wire-protocol version gate", () => {
   // Both halves stamp LITERALS. A frame built from WIRE_PROTOCOL_VERSION
   // cannot tell a bumped client from an unbumped one, which is why every
   // other handshake fixture in the suite is useless as an instrument for a
-  // bump. Revert 43 → 42 and BOTH halves red: the v42 frame stops being
-  // refused, and the v43 frame stops being admitted. The admitting half is
-  // the reach-guard — without it "refuses v42" is also satisfied by a client
+  // bump. Revert 44 → 43 and BOTH halves red: the v43 frame stops being
+  // refused, and the v44 frame stops being admitted. The admitting half is
+  // the reach-guard — without it "refuses v43" is also satisfied by a client
   // that refuses everything.
-  it("refuses the previous wire protocol (v42) and admits its own (v43)", async () => {
+  it("refuses the previous wire protocol (v43) and admits its own (v44)", async () => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData(setupFrameAt(42));
+    await refusing.conn.simulateData(setupFrameAt(43));
 
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED",
@@ -4190,7 +4190,7 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest();
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData(setupFrameAt(43));
+    await admitting.conn.simulateData(setupFrameAt(44));
 
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
     expect(admitting.emitted).not.toHaveBeenCalledWith(
