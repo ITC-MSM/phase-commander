@@ -184,6 +184,11 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
             // CR 603.2 + CR 609.3: CantCauseSacrificeOrExile carries `cause`.
             | StaticMode::CantCauseSacrificeOrExile { .. }
+            // CR 701.9a + CR 701.21a: CantCauseForcedAction carries `cause` +
+            // `actions`. Runtime enforcement is in
+            // game/static_abilities.rs::forced_action_muzzled, consulted from
+            // effects/sacrifice.rs and effects/discard.rs.
+            | StaticMode::CantCauseForcedAction { .. }
             // CR 603.2g: SuppressTriggers carries `source_filter` + `events`.
             | StaticMode::SuppressTriggers { .. }
             // CR 603.2d: DoubleTriggers carries the `TriggerCause` predicate.
