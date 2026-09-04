@@ -9740,7 +9740,7 @@ fn dina_untargeted_drain_4p_offers_at_three_live_opponents() {
         stated.sort_unstable();
         assert_eq!(
             stated, expected,
-            "CR 704.5a: with no announced slot to charge, every life seat keeps the seat \
+            "CR 119.3: with no announced slot to charge, every life seat keeps the seat \
              `payload_seat` gave it at the raw product of its own count {}",
             element.count
         );
@@ -9777,7 +9777,7 @@ fn dina_untargeted_drain_4p_offers_at_three_live_opponents() {
     for (seat, _, loss) in losses.iter().filter(|(id, _, _)| *id != proposer) {
         assert!(
             published.contains(&(Some(seat.0), (-loss * suggested) as i32)),
-            "CR 704.5a: victim seat {seat:?} loses {loss} per cycle, so its previewed life \
+            "CR 119.3: victim seat {seat:?} loses {loss} per cycle, so its previewed life \
              entry must be the NEGATIVE finished magnitude on that seat's own key — a \
              proposer-keyed subject map publishes it on the wrong HUD; got {published:?}"
         );
