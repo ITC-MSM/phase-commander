@@ -1645,6 +1645,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         up_to,
         ref constraint,
         source_id,
+        reciprocal_role,
     } = state.waiting_for
     {
         if !can_view_private_for_player(player) {
@@ -1655,6 +1656,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                 up_to,
                 constraint: constraint.clone(),
                 source_id,
+                reciprocal_role,
             };
         }
     }
@@ -5283,6 +5285,7 @@ mod tests {
             up_to: false,
             constraint: None,
             source_id: ObjectId(99),
+            reciprocal_role: None,
         };
 
         let filtered = filter_state_for_viewer(&state, PlayerId(2));
@@ -5335,6 +5338,7 @@ mod tests {
             up_to: false,
             constraint: None,
             source_id: ObjectId(99),
+            reciprocal_role: None,
         };
 
         // The prompt player must see the real card identity.

@@ -4956,7 +4956,9 @@ pub(super) fn parse_for_each_player_exile_controlled(
         additional_zones: Vec::new(),
         zone_owner: iter_scope,
         filter: Some(filter),
-        chooser: Chooser::Controller,
+        chooser: Chooser::Controller.into(),
+        candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+        reciprocal_role: None,
         up_to,
         selection: CardSelectionMode::Chosen,
         constraint: None,
@@ -5586,7 +5588,9 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             additional_zones: Vec::new(),
             zone_owner: ZoneOwner::Controller,
             filter: None,
-            chooser,
+            chooser: chooser.into(),
+            candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+            reciprocal_role: None,
             up_to: false,
             selection,
             constraint: None,
@@ -5608,7 +5612,9 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 additional_zones: zones.collect(),
                 zone_owner,
                 filter: Some(filter),
-                chooser,
+                chooser: chooser.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to,
                 selection,
                 constraint: None,
@@ -13179,7 +13185,9 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
                 constraint: None,
@@ -13216,7 +13224,9 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 additional_zones: Vec::new(),
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Controller,
+                chooser: Chooser::Controller.into(),
+                candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
                 constraint: None,
@@ -14714,7 +14724,7 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::ParitySource;
+    use crate::types::ability::{ParitySource, ZoneChoiceChooser};
 
     /// Matrix row 18 — the mana ROLE must survive the cost-resource AST
     /// round-trip byte-for-byte.
@@ -20310,7 +20320,7 @@ mod tests {
                 assert!(additional_zones.is_empty());
                 assert_eq!(zone_owner, ZoneOwner::Controller);
                 assert!(filter.is_none());
-                assert_eq!(chooser, Chooser::Opponent);
+                assert_eq!(chooser, ZoneChoiceChooser::Opponent);
                 assert!(!up_to);
                 assert!(constraint.is_none());
             }

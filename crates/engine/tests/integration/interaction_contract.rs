@@ -15,7 +15,7 @@ use engine::game::DeckEntry;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, CardSelectionMode, Chooser, ChosenAttribute,
     CounterCostSelection, Effect, ManaContribution, ManaProduction, QuantityExpr, ResolvedAbility,
-    SacrificeCost, TargetFilter, TargetRef, TypedFilter, ZoneOwner,
+    SacrificeCost, TargetFilter, TargetRef, TypedFilter, ZoneChoiceCandidateSource, ZoneOwner,
 };
 use engine::types::actions::{GameAction, MulliganChoice, ResolutionOptionalPaymentChoice};
 use engine::types::card::CardFace;
@@ -25,6 +25,7 @@ use engine::types::game_state::{
     AlternativeCastKeyword, AutoPassMode, CastPaymentMode, GameState, MulliganBottomEntry,
     MulliganDecisionEntry, MulliganDecisionPhase, OpeningHandBottomReason, PendingTriggerSummary,
     PlayerDeckPool, ResolutionOptionalPaymentOption, TurnBoundary, WaitingFor,
+    ZoneOpponentChooserPurpose,
 };
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::interaction::{
@@ -1517,7 +1518,9 @@ fn zone_opponent_chooser_exact_choices_surface_distinct_opponents_and_action_cod
                 additional_zones: vec![],
                 zone_owner: ZoneOwner::Controller,
                 filter: None,
-                chooser: Chooser::Opponent,
+                chooser: Chooser::Opponent.into(),
+                candidate_source: ZoneChoiceCandidateSource::Legacy,
+                reciprocal_role: None,
                 up_to: false,
                 selection: CardSelectionMode::Chosen,
                 constraint: None,
@@ -1526,6 +1529,7 @@ fn zone_opponent_chooser_exact_choices_surface_distinct_opponents_and_action_cod
             source,
             P0,
         )),
+        purpose: ZoneOpponentChooserPurpose::Ordinary,
     };
     bind(runner.state_mut(), "zone-opponent-chooser");
 

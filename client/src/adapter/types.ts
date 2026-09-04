@@ -2182,7 +2182,7 @@ export type WaitingFor =
   | { type: "DistributeAmong"; data: { player: PlayerId; total: number; targets: TargetRef[]; unit: DistributionUnit } }
   | { type: "MoveCountersDistribution"; data: { player: PlayerId; source_id: ObjectId; counter_type?: CounterType | null; available: [CounterType, number][]; destinations: ObjectId[]; pending_effect: unknown } }
   | { type: "RemoveCountersChoice"; data: { player: PlayerId; source_id: ObjectId; counter_type?: CounterType | null; available: [CounterType, number][]; pending_effect: unknown } }
-  | { type: "ChooseFromZoneChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; up_to?: boolean; constraint?: ChooseFromZoneConstraint | null; source_id: ObjectId } }
+  | { type: "ChooseFromZoneChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; up_to?: boolean; constraint?: ChooseFromZoneConstraint | null; source_id: ObjectId; reciprocal_role?: "Produce" | "Consume" | null } }
   | { type: "BeholdChoice"; data: { player: PlayerId; choices: ObjectId[] } }
   | { type: "EffectZoneChoice"; data: {
       player: PlayerId;
@@ -2218,7 +2218,7 @@ export type WaitingFor =
   | { type: "ClashChooseOpponent"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown } }
   // CR 608.2d: "an opponent chooses" from a zone (multiplayer) — the controller
   // picks WHICH opponent makes the choice before the zone choice is presented.
-  | { type: "ChooseFromZoneOpponentChooser"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown } }
+  | { type: "ChooseFromZoneOpponentChooser"; data: { player: PlayerId; candidates: PlayerId[]; ability: unknown; purpose?: "Ordinary" | "BindReciprocalConsume" } }
   | { type: "ChooseAnnouncingOpponent"; data: { player: PlayerId; candidates: PlayerId[]; choice_index: number; choice_count: number; target_type?: CoreType; pending_cast: unknown } }
   | { type: "ChooseGiftRecipient"; data: { player: PlayerId; candidates: PlayerId[]; gift_kind?: { type: string }; pending_cast: unknown } }
   | { type: "ClashCardPlacement"; data: { player: PlayerId; card: ObjectId; remaining: [PlayerId, ObjectId][] } }
