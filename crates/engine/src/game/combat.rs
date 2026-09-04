@@ -7789,6 +7789,28 @@ mod tests {
                 return false;
             }
         }
+        // CR 508.1c + CR 508.5: defender-PERMANENT-scoped caps (The Eternal
+        // Wanderer's `MaxAttackersEachCombat { defender: Some(ThisPermanent) }`)
+        // are the same coupled DP resource as `per_defender_caps` above (see
+        // `per_permanent_defender_caps`'s doc comment) — the brute-force oracle
+        // must reject any assignment the strict validator
+        // (`validate_per_defender_attacker_caps`) would reject, or it is not a
+        // valid ground truth for the DP solver's own permanent-cap enforcement.
+        for (permanent, cap) in &c.per_permanent_defender_caps {
+            let cnt = attacks
+                .iter()
+                .filter(|(_, t)| {
+                    matches!(
+                        t,
+                        AttackTarget::Planeswalker(id) | AttackTarget::Battle(id)
+                            if id == permanent
+                    )
+                })
+                .count() as u32;
+            if cnt > *cap {
+                return false;
+            }
+        }
         for (cid, t) in attacks {
             if c.must_be_sole.contains(cid) && n != 1 {
                 return false;
@@ -8038,6 +8060,41 @@ mod tests {
                 ),
                 "tied matching + fixed forces the fixed member",
             ),
+            // CR 508.1c + CR 508.5 (PR #8321 review round 3, [MED]): a
+            // permanent-scoped cap (`per_permanent_defender_caps`, The Eternal
+            // Wanderer's "no more than one creature can attack ~ each combat")
+            // combined with a `MustAttackDefender` coupling axis — two creatures
+            // whose ONLY legal target is the same capped planeswalker, each
+            // individually required to attack it. Without the cap wired into
+            // `assignment_valid`, the brute-force oracle would accept the
+            // both-attack assignment (satisfying both requirements, score 2)
+            // since nothing there enforces the cap — silently diverging from the
+            // DP solver, which already treats this cap as a coupled resource
+            // (`max_no_payment`'s `coupled` gate) and caps its own bar at 1.
+            // Max 1: only one of the two `MustAttackDefender` requirements is
+            // jointly obeyable.
+            {
+                let pw = AttackTarget::Planeswalker(ObjectId(50));
+                let mut c = mk_constraints(
+                    vec![(20, vec![pw]), (21, vec![pw])],
+                    vec![
+                        MustAttackDefender {
+                            creature: ObjectId(20),
+                            defender: pw,
+                        },
+                        MustAttackDefender {
+                            creature: ObjectId(21),
+                            defender: pw,
+                        },
+                    ],
+                    None,
+                    vec![],
+                    vec![],
+                    vec![],
+                );
+                c.per_permanent_defender_caps = vec![(ObjectId(50), 1)];
+                (c, "permanent-scoped cap couples two forced attackers")
+            },
         ];
 
         for (c, label) in &cases {
