@@ -406,6 +406,31 @@ fn graveyard_shift_flash_permission_reaches_casting_options_not_statics() {
     );
 }
 
+/// CR 702.34a: the self-flash prefix guard must leave "~ has flashback" on
+/// the static-keyword path. This is the positive receiving-path guard paired
+/// with `spell_self_has_flash_word_boundary_excludes_flashback`.
+#[test]
+fn self_flashback_reaches_typed_static_keyword() {
+    let types = ["Sorcery".to_string()];
+    let parsed = parse_oracle_text("~ has flashback {2}{u}.", "Some Spell", &[], &types, &[]);
+
+    assert!(parsed.casting_options.is_empty());
+    assert!(parsed.statics.iter().any(|static_def| {
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Flashback(FlashbackCost::Mana(ManaCost::Cost {
+                    generic: 2,
+                    shards: vec![ManaCostShard::Blue],
+                })),
+            })
+    }));
+    assert!(parsed
+        .abilities
+        .iter()
+        .all(|ability| { !matches!(ability.effect.as_ref(), Effect::Unimplemented { .. }) }));
+}
+
 #[test]
 fn nominal_dispatch_preserves_precomputed_x_floor_for_spells_and_residuals() {
     let types = ["Creature".to_string()];
