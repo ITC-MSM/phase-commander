@@ -9728,7 +9728,7 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return parsed_clause(Effect::RingTemptsYou);
     }
 
-    // CR 101.4 + CR 608.2c + CR 701.17a: "For each player, [you ]choose from
+    // CR 101.4 + CR 608.2c + CR 701.21a: "For each player, [you ]choose from
     // among the permanents that player controls an artifact, a creature, ..."
     // — Tragic Arrogance pattern where the spell's controller chooses for all
     // players. The "you" is grammatically optional: CR 608.2c's imperative
