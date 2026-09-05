@@ -8799,7 +8799,7 @@ pub enum AlternativeCastKeyword {
     /// Custom Warp keyword — exile-at-end-step rider; no CR section.
     Warp,
     /// CR 702.74a: ETB + sacrifice trigger fires when the resolving permanent
-    /// was cast for its evoke cost (CR 702.74b).
+    /// was cast for its evoke cost.
     Evoke,
     /// CR 702.119a-c: Emerge alternative cost requires sacrificing the specified
     /// permanent quality while casting and reduces the emerge cost by that
@@ -13164,7 +13164,7 @@ pub enum WaitingFor {
     ///   may be recast from exile later (no CR section; rider lives on the
     ///   keyword).
     /// - `Evoke` (CR 702.74a) — creature ETBs and sacrifices itself when cast
-    ///   for the evoke cost (CR 702.74b).
+    ///   for the evoke cost.
     /// - `Overload` (CR 702.96a) — substitutes the overload cost and rewrites
     ///   every "target" in the spell's text to "each" (CR 702.96b-c).
     /// - `Bestow` (CR 702.103a) — substitutes the bestow cost and turns the
@@ -13984,7 +13984,7 @@ pub enum WaitingFor {
         /// The zone the commander is currently in (Graveyard, Exile, Hand, or Library).
         current_zone: Zone,
     },
-    /// CR 310.11 + CR 310.12a + CR 704.5w + CR 704.5x: A battle that isn't being attacked has no
+    /// CR 310.11 + CR 310.12a + CR 704.5x: A battle that isn't being attacked has no
     /// protector, an illegal protector, or (for Sieges) a protector equal to its
     /// controller. The battle's controller (`player`) chooses a legal protector from
     /// `candidates`. Emitted only when `candidates.len() > 1`; the SBA auto-applies
@@ -15176,7 +15176,7 @@ impl WaitingFor {
     ///   fixpoint before priority is granted.
     /// * [`WaitingFor::BattleProtectorChoice`] — CR 310.11 ("its controller chooses an
     ///   appropriate player to be its protector ... This is a state-based action")
-    ///   + CR 704.5w / CR 704.5x, likewise answered inside the CR 704.3 fixpoint.
+    ///   + CR 704.5x, likewise answered inside the CR 704.3 fixpoint.
     ///
     /// Those SBA members (the commander-zone, legend and battle-protector choices) are
     /// the COMPLETE set of player-choice pauses `game::sba` opens inside the SBA
@@ -26425,7 +26425,7 @@ mod forced_cascade_window_tests {
                 },
             ),
             (
-                "BattleProtectorChoice (CR 310.11 + CR 704.5w / CR 704.5x — likewise an SBA)",
+                "BattleProtectorChoice (CR 310.11 + CR 704.5x — likewise an SBA)",
                 WaitingFor::BattleProtectorChoice {
                     player: PlayerId(0),
                     battle_id: ObjectId(5),
