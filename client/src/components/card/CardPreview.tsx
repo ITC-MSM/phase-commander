@@ -7,7 +7,8 @@ import {
 } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
-import type { AbilityBlockKind, ChosenAttribute, GameObject, Keyword, ManaCost, Zone } from "../../adapter/types.ts";
+import type { ChosenAttribute, GameObject, Keyword, ManaCost, Zone } from "../../adapter/types.ts";
+import { ABILITY_BLOCK_REASON_KEY } from "../../viewmodel/abilityBlockReason.ts";
 import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
 import { abilityLabel, loyaltyBadge, spellCostDisplay, stripLoyaltyCostPrefix } from "../../viewmodel/costLabel.ts";
 import { useCardImage } from "../../hooks/useCardImage.ts";
@@ -21,6 +22,7 @@ import { faceDownMarkerRef } from "./faceDownMarker.ts";
 import { shouldRenderCardBack } from "../../viewmodel/cardProps.ts";
 import type { CardRuling } from "../../services/engineRuntime.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
+import { useBackFaceSpellCost } from "../../hooks/useBackFaceSpellCost.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
 import { useUiStore, type MobileHandGesture } from "../../stores/uiStore.ts";
 import { renderDescription } from "../../utils/description.ts";
@@ -58,17 +60,6 @@ type CardPreviewArt =
       rungs?: ImageRungs;
       advanceFailedSource?(failedSrc: string): void;
     };
-
-/**
- * CR 602.5: Maps an engine `AbilityBlockKind` to its i18n reason key. Pure
- * display formatting — no game logic. Kept exhaustive so a new kind is a
- * compile error until a key is added.
- */
-const ABILITY_BLOCK_REASON_KEY: Record<AbilityBlockKind, string> = {
-  CantBeActivated: "abilityBlock.cantBeActivated",
-  CantActivateDuring: "abilityBlock.cantActivateDuring",
-  Prohibited: "abilityBlock.prohibited",
-};
 
 let lastPointerPosition: { x: number; y: number } | null = null;
 
@@ -1109,6 +1100,10 @@ function CardImagePreview({
   // mana cost (e.g. The Prismatic Bridge's {W}{U}{B}{R}{G} instead of Esika's
   // {1}{G}{G}). See cardImageLookup / back_face wiring.
   const effectiveCost = useGameStore((s) => obj ? s.spellCosts[String(obj.id)] : undefined);
+  // CR 709.3 + CR 712.11b: the other castable spell face's live cost, when
+  // the engine published one; only the cast-cost badge shows it, never the
+  // Ctrl "other face" view, which already IS that face.
+  const backFaceCost = useBackFaceSpellCost(obj?.id, obj?.back_face?.mana_cost);
   const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
   const activateLabels = useMemo<ActivateLabel[]>(() => {
     if (!obj || obj.zone !== "Battlefield") return [];
@@ -1145,6 +1140,7 @@ function CardImagePreview({
     showCastManaCost && obj ? spellCostDisplay(effectiveCost, obj.mana_cost) : null;
   const displayCost = showOtherFace ? otherFaceCost : (castCostDisplay?.displayCost ?? null);
   const displayCostReduced = castCostDisplay?.isReduced ?? false;
+  const displayBackFace = showOtherFace || castCostDisplay == null ? undefined : backFaceCost;
 
   return (
     <div className={`${containerClass} border border-gray-600 overflow-hidden shadow-2xl ${renderInfoPanel ? "rounded-t-[4%] rounded-b-lg bg-gray-900" : "rounded-[4%]"}`}>
@@ -1184,7 +1180,7 @@ function CardImagePreview({
           // preview's own width, which varies from a 300px hand hover to a
           // 472px docked preview — a fixed px size can only be right at one end.
           <div className="pointer-events-none absolute inset-0 z-10 @container">
-            <ManaCostPips cost={displayCost} isReduced={displayCostReduced} size="fluid" />
+            <ManaCostPips cost={displayCost} isReduced={displayCostReduced} backFace={displayBackFace} size="fluid" />
           </div>
         )}
         {classLevel != null && (
