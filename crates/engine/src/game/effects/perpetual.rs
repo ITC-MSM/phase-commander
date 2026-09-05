@@ -114,7 +114,27 @@ fn perpetual_target_object_ids(
         }
     }
 
-    if ids.is_empty() && matches!(target, TargetFilter::ParentTarget) {
+    // CR 609.3 ("If an effect attempts to do something impossible, it does only
+    // as much as possible"): an anaphoric filter that resolved to NOTHING has no
+    // referent, so the perpetual edit applies to nothing — it must NOT fall back
+    // to the ability source, which is a different object entirely.
+    //
+    // `ParentTarget` ("it", the parent instruction's target) and `LastCreated`
+    // ("it", the object the previous clause just made — `state.last_created_token_ids`,
+    // see `publishes_chain_created_referent` in `oracle_effect/lower.rs`) are both
+    // anaphors: they NAME an antecedent rather than describing a set. When the
+    // antecedent does not exist — a `Conjure` that conjured zero cards, a token
+    // producer that made none — the clause has no subject and does nothing.
+    //
+    // The source fallback below is for `TargetFilter::Any` and friends, where a
+    // perpetual rider with no declared target genuinely means "this object"
+    // (Mutable Pupa's self-grant).
+    if ids.is_empty()
+        && matches!(
+            target,
+            TargetFilter::ParentTarget | TargetFilter::LastCreated
+        )
+    {
         return ids;
     }
 
@@ -383,7 +403,7 @@ mod tests {
     /// mirroring `perpetual_grant_keywords_adds_to_object`.
     #[test]
     fn perpetual_grant_ability_installs_static_mode() {
-        use crate::types::ability::ContinuousModification;
+        use crate::types::ability::PerpetualGrantModification;
         use crate::types::statics::StaticMode;
 
         let mut state = GameState::new_two_player(7);
@@ -396,7 +416,7 @@ mod tests {
         );
 
         let modification = PerpetualModification::GrantAbility {
-            modifications: vec![ContinuousModification::AddStaticMode {
+            modifications: vec![PerpetualGrantModification::AddStaticMode {
                 mode: StaticMode::CantBlock,
             }],
         };
@@ -440,7 +460,7 @@ mod tests {
     /// mirroring the non-perpetual layer-6 `GrantAbility` apply).
     #[test]
     fn perpetual_grant_ability_installs_nested_ability_and_survives_layer_flush() {
-        use crate::types::ability::{AbilityDefinition, AbilityKind, ContinuousModification};
+        use crate::types::ability::{AbilityDefinition, AbilityKind, PerpetualGrantModification};
 
         let mut state = GameState::new_two_player(7);
         let id = create_object(
@@ -459,7 +479,7 @@ mod tests {
             },
         );
         let modification = PerpetualModification::GrantAbility {
-            modifications: vec![ContinuousModification::GrantAbility {
+            modifications: vec![PerpetualGrantModification::GrantAbility {
                 definition: Box::new(granted.clone()),
             }],
         };
@@ -517,7 +537,7 @@ mod tests {
     /// proves the runtime target resolution does too.
     #[test]
     fn perpetual_grant_after_conjure_installs_on_conjured_object_not_source() {
-        use crate::types::ability::{ConjureCard, ConjureSource, ContinuousModification};
+        use crate::types::ability::{ConjureCard, ConjureSource, PerpetualGrantModification};
         use crate::types::statics::StaticMode;
 
         let mut state = GameState::new_two_player(7);
@@ -559,7 +579,7 @@ mod tests {
         );
 
         let modification = PerpetualModification::GrantAbility {
-            modifications: vec![ContinuousModification::AddStaticMode {
+            modifications: vec![PerpetualGrantModification::AddStaticMode {
                 mode: StaticMode::CantBlock,
             }],
         };

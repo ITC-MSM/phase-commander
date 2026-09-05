@@ -11019,31 +11019,6 @@ fn try_parse_perpetual_grant_keywords(tp: TextPair, ctx: &ParseContext) -> Optio
     })
 }
 
-/// CR 601.2f / CR 611.2c (Digital-only Alchemy "perpetually" grant): which
-/// `ContinuousModification` kinds `GameObject::apply_perpetual_modification`
-/// can install onto a persistent baseline. A granted quoted-ability body that
-/// classifies (via `classify_quoted_inner`) to any OTHER kind — `GrantTrigger`
-/// (a triggered ability body) or `GrantReplacement` (an object-hosted
-/// replacement rider) — has no persistent-baseline installer yet, so the
-/// whole grant must fail the parse closed (`try_parse_perpetual_grant_ability`
-/// returns `None`, falling through to `Unimplemented`) rather than silently
-/// dropping part of a multi-ability grant. An empty list (a degenerate quote
-/// with no recognized body) is also rejected.
-fn perpetual_grant_modification_is_supported(
-    modifications: &[crate::types::ability::ContinuousModification],
-) -> bool {
-    use crate::types::ability::ContinuousModification;
-    !modifications.is_empty()
-        && modifications.iter().all(|modification| {
-            matches!(
-                modification,
-                ContinuousModification::AddKeyword { .. }
-                    | ContinuousModification::AddStaticMode { .. }
-                    | ContinuousModification::GrantAbility { .. }
-            )
-        })
-}
-
 /// A single `"<ability text>"` segment: consumes the opening and closing
 /// quotes and returns the inner text unquoted.
 fn parse_perpetual_quoted_ability_body(input: &str) -> Option<(&str, &str)> {
@@ -11067,8 +11042,8 @@ fn parse_perpetual_quoted_ability_body(input: &str) -> Option<(&str, &str)> {
 /// anything inside the quotes.
 ///
 /// Honest-red: a granted body that classifies to a modification kind the
-/// runtime cannot install onto a persistent baseline
-/// (`perpetual_grant_modification_is_supported`) fails the WHOLE clause
+/// runtime cannot install onto a persistent baseline (one that
+/// `PerpetualGrantModification::try_from` rejects) fails the WHOLE clause
 /// closed rather than silently dropping part of a multi-ability grant, and
 /// any unconsumed tail after the last quote (a rider this leaf cannot model)
 /// does the same.
@@ -11099,14 +11074,27 @@ fn try_parse_perpetual_grant_ability(tp: TextPair, ctx: &ParseContext) -> Option
         return None;
     }
 
-    let modifications: Vec<crate::types::ability::ContinuousModification> = bodies
+    let classified: Vec<crate::types::ability::ContinuousModification> = bodies
         .into_iter()
         .flat_map(super::oracle_static::classify_quoted_inner)
         .collect();
 
-    if !perpetual_grant_modification_is_supported(&modifications) {
+    // CR 601.2f / CR 611.2c: honest-red gate. An empty list (a degenerate quote
+    // with no recognized body) would record a grant that installs nothing, and a
+    // body classifying to a kind with no persistent-baseline installer
+    // (`GrantTrigger`, `GrantReplacement`, …) must fail the WHOLE clause rather
+    // than silently drop part of a multi-ability grant — so the `Result` collect
+    // short-circuits on the first rejection. `PerpetualGrantModification` is the
+    // single authority for what "installable" means (see its `TryFrom`); there is
+    // no second predicate here to drift out of sync with the installer.
+    if classified.is_empty() {
         return None;
     }
+    let modifications: Vec<crate::types::ability::PerpetualGrantModification> = classified
+        .into_iter()
+        .map(crate::types::ability::PerpetualGrantModification::try_from)
+        .collect::<Result<_, _>>()
+        .ok()?;
 
     Some(Effect::ApplyPerpetual {
         target,

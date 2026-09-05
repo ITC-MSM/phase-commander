@@ -13431,6 +13431,64 @@ impl FaceDownProfile {
     }
 }
 
+/// CR 601.2f / CR 611.2c (digital-only Alchemy "perpetually" grant): the CLOSED
+/// set of quoted-ability grant kinds that `GameObject::apply_perpetual_modification`
+/// can install onto a persistent baseline.
+///
+/// `ContinuousModification` is the engine-wide 57-variant layer vocabulary; only
+/// three of its kinds have a persistent-baseline installer. Carrying that subset
+/// as its OWN type (rather than a `Vec<ContinuousModification>` guarded by a
+/// separate predicate) makes the acceptance gate and the installer the same
+/// authority: [`PerpetualModification::GrantAbility`] cannot be constructed
+/// holding a kind the installer does not handle, and adding a variant here is a
+/// compile error in `apply_perpetual_modification` until it is installed. The
+/// previous shape — a `matches!` gate in the parser plus a wildcard arm in the
+/// installer — could drift silently: widening the gate recorded the modification
+/// in `perpetual_mods` while installing nothing.
+///
+/// Wire-compatible with the `ContinuousModification` subset it mirrors: same
+/// `#[serde(tag = "type")]`, same variant names, same field names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PerpetualGrantModification {
+    /// A bare evergreen/parameterized keyword ("~ has flying") — installed onto
+    /// `keywords` + `base_keywords`.
+    AddKeyword { keyword: Keyword },
+    /// A restriction/permission static ("~ can't block", CR 509.1a) — installed
+    /// as a synthetic self-affecting `StaticDefinition` onto `static_definitions`
+    /// + `base_static_definitions`.
+    AddStaticMode {
+        #[serde(deserialize_with = "crate::types::statics::deserialize_static_mode_fwd")]
+        mode: StaticMode,
+    },
+    /// A full spell/activated ability body (Agent of Raffine's "You may spend
+    /// mana as though it were mana of any color to cast this spell.") — installed
+    /// onto `abilities` + `base_abilities`.
+    GrantAbility { definition: Box<AbilityDefinition> },
+}
+
+impl TryFrom<ContinuousModification> for PerpetualGrantModification {
+    /// The rejected modification, returned intact so a caller can report which
+    /// kind failed the gate.
+    type Error = ContinuousModification;
+
+    /// Fail-closed: any kind without a persistent-baseline installer is rejected,
+    /// so a newly added `ContinuousModification` variant defaults to "not
+    /// perpetually installable" — the safe answer — rather than to a silent no-op
+    /// at install time. The parser turns a rejection into a whole-clause parse
+    /// failure (`Effect::Unimplemented`), never a partially applied grant.
+    fn try_from(modification: ContinuousModification) -> Result<Self, Self::Error> {
+        match modification {
+            ContinuousModification::AddKeyword { keyword } => Ok(Self::AddKeyword { keyword }),
+            ContinuousModification::AddStaticMode { mode } => Ok(Self::AddStaticMode { mode }),
+            ContinuousModification::GrantAbility { definition } => {
+                Ok(Self::GrantAbility { definition })
+            }
+            other => Err(other),
+        }
+    }
+}
+
 /// The typed effect enum. Each variant corresponds to an effect handler.
 /// Zero HashMap<String, String> fields.
 // clippy::large_enum_variant: `Effect` is the engine's central 100+ variant
@@ -13508,13 +13566,14 @@ pub enum PerpetualModification {
     /// the same chain created the object being granted to (a conjured
     /// duplicate — Agent of Raffine and siblings).
     ///
-    /// Only modification KINDS the perpetual runtime can install onto a
-    /// persistent baseline are accepted by the parser
-    /// (`perpetual_grant_modification_is_supported`); a granted ability text
-    /// that classifies to an unsupported kind (e.g. a full triggered ability)
-    /// fails the parse closed rather than silently dropping part of the grant.
+    /// Typed as [`PerpetualGrantModification`] — the closed set of kinds the
+    /// perpetual runtime can install onto a persistent baseline — rather than
+    /// the full `ContinuousModification` vocabulary, so an uninstallable kind
+    /// cannot be represented here at all. A granted ability text that
+    /// classifies to one (e.g. a full triggered ability) fails the parse closed
+    /// rather than silently dropping part of the grant.
     GrantAbility {
-        modifications: Vec<ContinuousModification>,
+        modifications: Vec<PerpetualGrantModification>,
     },
 }
 

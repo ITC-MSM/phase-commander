@@ -40772,7 +40772,7 @@ fn perpetual_parser_maps_modify_cost() {
 /// (`GameObject::apply_perpetual_modification`'s `AddStaticMode` arm).
 #[test]
 fn perpetual_parser_maps_grant_ability_single_static_mode() {
-    use crate::types::ability::PerpetualModification;
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
     use crate::types::statics::StaticMode;
 
     // "~" here, not "This creature": card-level parsing normalizes "this
@@ -40788,7 +40788,7 @@ fn perpetual_parser_maps_grant_ability_single_static_mode() {
         } => {
             assert_eq!(
                 modifications,
-                &vec![ContinuousModification::AddStaticMode {
+                &vec![PerpetualGrantModification::AddStaticMode {
                     mode: StaticMode::CantBlock
                 }],
                 "expected a single CantBlock AddStaticMode grant"
@@ -40804,7 +40804,7 @@ fn perpetual_parser_maps_grant_ability_single_static_mode() {
 /// perpetual grants, not just the one-quote Karlach/Raffine cards.
 #[test]
 fn perpetual_parser_maps_grant_ability_multiple_quoted_bodies() {
-    use crate::types::ability::PerpetualModification;
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
     use crate::types::keywords::Keyword;
 
     let e = parse_effect("~ perpetually gains \"flying\" and \"vigilance\".");
@@ -40816,10 +40816,10 @@ fn perpetual_parser_maps_grant_ability_multiple_quoted_bodies() {
             assert_eq!(
                 modifications,
                 &vec![
-                    ContinuousModification::AddKeyword {
+                    PerpetualGrantModification::AddKeyword {
                         keyword: Keyword::Flying
                     },
-                    ContinuousModification::AddKeyword {
+                    PerpetualGrantModification::AddKeyword {
                         keyword: Keyword::Vigilance
                     },
                 ],
@@ -40886,9 +40886,11 @@ fn perpetual_grant_after_conjure_binds_last_created_not_parent_target() {
             );
             assert_eq!(
                 modifications,
-                &vec![ContinuousModification::AddStaticMode {
-                    mode: crate::types::statics::StaticMode::CantBlock
-                }]
+                &vec![
+                    crate::types::ability::PerpetualGrantModification::AddStaticMode {
+                        mode: crate::types::statics::StaticMode::CantBlock
+                    }
+                ]
             );
         }
         other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),

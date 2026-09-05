@@ -1759,7 +1759,7 @@ impl GameObject {
         modification: &crate::types::ability::PerpetualModification,
         all_creature_types: &[String],
     ) {
-        use crate::types::ability::{ContinuousModification, PerpetualModification};
+        use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
         use crate::types::card_type::CoreType;
         match modification {
             PerpetualModification::SetBasePowerToughness { power, toughness } => {
@@ -1876,17 +1876,24 @@ impl GameObject {
                 // each classified quoted-ability grant onto the persistent
                 // baseline so it survives every layer/zone reset, mirroring the
                 // `GrantKeywords` (base_keywords) and `ModifyCost`
-                // (base_static_definitions) arms above. The parser
-                // (`perpetual_grant_modification_is_supported`,
-                // oracle_effect/mod.rs) accepts only the modification kinds
-                // handled here — `classify_quoted_inner`'s other outputs
-                // (GrantTrigger, GrantReplacement) fail the parse closed rather
-                // than reaching this match, so no wildcard arm is needed.
+                // (base_static_definitions) arms above.
+                //
+                // CR 601.2f / CR 611.2c: the match below is EXHAUSTIVE over
+                // `PerpetualGrantModification` — the closed, typed set of kinds
+                // this installer handles (`types/ability.rs`). It carries no
+                // wildcard arm on purpose: the parser cannot construct a
+                // `GrantAbility` holding an uninstallable kind
+                // (`PerpetualGrantModification::try_from` is the single gate, and
+                // rejects `classify_quoted_inner`'s other outputs —
+                // `GrantTrigger`, `GrantReplacement` — closing the whole parse),
+                // and widening that gate is a compile error here until the new
+                // kind is installed. A wildcard would let a widened gate record
+                // the modification in `perpetual_mods` while installing nothing.
                 use crate::types::ability::TargetFilter;
                 self.sync_missing_base_characteristics();
                 for granted in modifications {
                     match granted {
-                        ContinuousModification::AddKeyword { keyword } => {
+                        PerpetualGrantModification::AddKeyword { keyword } => {
                             if !self.keywords.contains(keyword) {
                                 self.keywords.push(keyword.clone());
                             }
@@ -1894,7 +1901,7 @@ impl GameObject {
                                 self.base_keywords.push(keyword.clone());
                             }
                         }
-                        ContinuousModification::AddStaticMode { mode } => {
+                        PerpetualGrantModification::AddStaticMode { mode } => {
                             let synthetic =
                                 crate::types::ability::StaticDefinition::new(mode.clone())
                                     .affected(TargetFilter::SelfRef);
@@ -1920,7 +1927,7 @@ impl GameObject {
                         // matching every other perpetual-grant arm's
                         // idempotency (this function runs once per
                         // `ApplyPerpetual` resolution).
-                        ContinuousModification::GrantAbility { definition } => {
+                        PerpetualGrantModification::GrantAbility { definition } => {
                             if !self.abilities.iter().any(|a| a == definition.as_ref()) {
                                 Arc::make_mut(&mut self.abilities).push(*definition.clone());
                             }
@@ -1928,12 +1935,6 @@ impl GameObject {
                                 Arc::make_mut(&mut self.base_abilities).push(*definition.clone());
                             }
                         }
-                        // CR 601.2f / CR 611.2c: unreachable in practice — the
-                        // parser's `perpetual_grant_modification_is_supported`
-                        // gate rejects any other classified kind before this
-                        // ever runs. A future kind added to that gate must add
-                        // its installation here too.
-                        _ => {}
                     }
                 }
             }
