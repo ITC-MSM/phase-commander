@@ -43,7 +43,8 @@ use lower::{
     consolidate_die_and_coin_defs, extract_deal_damage_multi_target,
     extract_double_counter_multi_target, extract_put_counter_multi_target,
     extract_remove_counter_multi_target, extract_switch_pt_multi_target,
-    instruction_spine_is_continuation, is_token_creating_effect, parse_damage_player_scope,
+    instruction_spine_is_continuation, is_token_creating_effect,
+    parse_contextual_bare_card_aggregate, parse_damage_player_scope,
     parse_for_each_opponent_target_fanout_clause, publishes_chain_created_referent,
     rebind_clause_recipients_with, rebind_decline_body_recipient,
     rebind_subject_only_body_recipient, scan_until_next_same_source_exile_invalidation,
@@ -4843,7 +4844,7 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
         unless_pay: None,
     };
 
-    // CR 611.2a (:2908) + CR 514.2 (:2442): this recognizer owns the leading duration
+    // CR 611.2a + CR 514.2: this recognizer owns the leading duration
     // (`strip_temporary_restriction_duration_prefix`) AND builds its own sub_ability
     // chain from the tail conjuncts, so it must stamp through the single
     // chain-distributing authority. Writing `duration` into the literal reached the head
@@ -6446,8 +6447,8 @@ fn original_counter_choice_list_items(
 /// Requires at least 2 items and that every item names a real counter type;
 /// a non-counter list returns `None`. Nom-only — no string dispatch.
 ///
-/// CR 122.1b: keyword counters (docs/MagicCompRules.txt:1180).
-/// CR 122.1: named counters (docs/MagicCompRules.txt:1176).
+/// CR 122.1b: keyword counters.
+/// CR 122.1: named counters.
 pub(crate) fn classify_and_parse_counter_choice_list(
     choices_text: &str,
 ) -> Option<Vec<(CounterType, QuantityExpr)>> {
@@ -9692,11 +9693,29 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return parsed_clause(Effect::RingTemptsYou);
     }
 
-    // CR 101.4 + CR 701.17a: "For each player, you choose from among the permanents that
-    // player controls an artifact, a creature, ..." — Tragic Arrogance pattern where
-    // the spell's controller chooses for all players.
-    if let Ok((after_prefix, _)) =
-        tag::<_, _, OracleError<'_>>("for each player, you choose ").parse(tp.lower)
+    // CR 101.4 + CR 608.2c + CR 701.21a: "For each player, [you ]choose from
+    // among the permanents that player controls an artifact, a creature, ..."
+    // — Tragic Arrogance pattern where the spell's controller chooses for all
+    // players. The "you" is grammatically optional: CR 608.2c's imperative
+    // voice already addresses the ability's controller by default, so a bare
+    // "for each player, choose ..." (no "you") is the SAME controller-chooses
+    // idiom, not a per-player self-choice — confirmed by Breach the
+    // Multiverse / Ghouls' Night Out ("For each player, choose a creature
+    // card in that player's graveyard. Put those cards onto the battlefield
+    // under YOUR control"), where the cards end up under the ability's
+    // controller despite no "you" appearing before "choose". The Eternal
+    // Wanderer's −4 ("For each player, choose a creature that player
+    // controls. Each player sacrifices all creatures they control not chosen
+    // this way.") is the same idiom applied to a battlefield-control choose
+    // instead of a zone choose; the second sentence is fully implied by
+    // `ChooseAndSacrificeRest`'s semantics (mirrors how Tragic Arrogance's own
+    // "Then each player sacrifices..." sweep sentence is absorbed rather than
+    // re-parsed) and is superfluous here.
+    if let Ok((after_prefix, _)) = alt((
+        tag::<_, _, OracleError<'_>>("for each player, you choose "),
+        tag("for each player, choose "),
+    ))
+    .parse(tp.lower)
     {
         if let Some(ast) = imperative::parse_category_and_sacrifice_rest_pub(after_prefix) {
             return parsed_clause(imperative::lower_choose_ast(ast));
@@ -15011,6 +15030,135 @@ fn parse_choose_survivors_destroy_rest_ir(
     })
 }
 
+/// CR 400.11 + CR 400.11b + CR 701.20: Whole-line recognizer for the
+/// open-a-booster-pack class (Booster Tutor; A Container of Booster Packs and
+/// Summon the Pack share the head and differ only in the take clause).
+///
+/// The sentence is ONE effect, not a chain: the reveal and the take are not
+/// independently valid steps — there is nothing to reveal or to take until the
+/// pack has been opened, and the cards never enter a zone the way a chained
+/// `Reveal` → `ChangeZone` pair would require. Splitting on the commas is what
+/// left the printed card parsing as an `Unimplemented("open")` head followed by
+/// a `Reveal`/`ChangeZone` pair pointed at a nonexistent parent target.
+///
+/// Grammar, one `alt` per axis:
+/// ```text
+/// "open a " ["sealed "] ["magic "] "booster pack"
+///   [", reveal " ("the"|"those") " cards"]
+///   (", and put "|", then put "|" and put "|", put ") ["up to "] NUMBER
+///   " of " ("them"|"those cards"|"the cards"|"the revealed cards")
+///   DESTINATION ["."]
+/// ```
+fn parse_open_booster_pack_ir(
+    text: &str,
+    kind: AbilityKind,
+    ctx: &ParseContext,
+) -> Option<EffectChainIr> {
+    let lower = text.to_lowercase();
+
+    let parsed = nom_on_lower(text, &lower, |input| {
+        // Head: the pack itself. "sealed" and "Magic" are printed flavor on the
+        // same noun, so each is its own optional modifier rather than a
+        // separate spelled-out alternative.
+        let (input, _) = tag("open a ").parse(input)?;
+        let (input, _) = opt(tag("sealed ")).parse(input)?;
+        let (input, _) = opt(tag("magic ")).parse(input)?;
+        let (input, _) = tag("booster pack").parse(input)?;
+
+        // CR 701.20: the reveal half. Absent on cards that open a pack without
+        // showing it to every player.
+        let (input, reveal) = map(
+            opt((
+                tag(", reveal "),
+                alt((tag("the"), tag("those"))),
+                tag(" cards"),
+            )),
+            |matched| matched.is_some(),
+        )
+        .parse(input)?;
+
+        // The take clause: how many of the opened cards are brought into the
+        // game, and where they go.
+        let (input, _) = alt((
+            tag(", and put "),
+            tag(", then put "),
+            tag(" and put "),
+            tag(", put "),
+        ))
+        .parse(input)?;
+        let (input, up_to) = map(opt(tag("up to ")), |matched| matched.is_some()).parse(input)?;
+        let (input, count) = nom_primitives::parse_number(input)?;
+        let (input, _) = tag(" of ").parse(input)?;
+        let (input, _) = alt((
+            tag("them"),
+            tag("those cards"),
+            tag("the revealed cards"),
+            tag("the cards"),
+        ))
+        .parse(input)?;
+        let (input, destination) = parse_booster_take_destination(input)?;
+        let (input, _) = opt(tag(".")).parse(input)?;
+        let (input, _) = eof.parse(input)?;
+        Ok((input, (reveal, up_to, count, destination)))
+    });
+    let ((reveal, up_to, count, destination), _) = parsed?;
+
+    let count = QuantityExpr::Fixed {
+        value: count as i32,
+    };
+    let count = if up_to {
+        QuantityExpr::up_to(count)
+    } else {
+        count
+    };
+
+    let mut builder = ClauseIrBuilder::new(text);
+    builder
+        .clause(
+            text,
+            parsed_clause(Effect::OpenBoosterPack {
+                // CR 400.11: Booster Tutor takes "one of them" — any card in
+                // the pack. A filtered take clause ("all creature cards
+                // revealed this way", Summon the Pack) narrows this.
+                filter: TargetFilter::Any,
+                count,
+                destination,
+                reveal,
+            }),
+            None,
+            ClauseDisposition::Emit {
+                followup: None,
+                intrinsic: None,
+            },
+        )
+        .push();
+
+    Some(EffectChainIr {
+        clauses: builder.finish(),
+        kind,
+        continuation_kind: Some(kind),
+        player_scope_rewrite: PlayerScopeRewrite::Apply,
+        chain_rounding: None,
+        actor: ctx.actor.clone(),
+        in_trigger: ctx.in_trigger,
+        repeat_until: None,
+    })
+}
+
+/// CR 400.11b: the zone a card taken out of an opened pack enters. Nested by
+/// preposition so each preposition names its zone family once.
+fn parse_booster_take_destination(input: &str) -> OracleResult<'_, Zone> {
+    // The bare zone-word combinator, not `oracle_nom::filter::parse_zone_word`:
+    // the possessive ("your") is consumed by the preposition arm here, so the
+    // remaining token is the bare zone noun.
+    use super::oracle_target::parse_zone_word;
+    alt((
+        preceded(tag(" into your "), parse_zone_word),
+        value(Zone::Battlefield, tag(" onto the battlefield")),
+    ))
+    .parse(input)
+}
+
 /// CR 107.1 + CR 608.2e: Whole-chain recognizer for the Balance equalization
 /// class (Balance, Restore Balance, Balancing Act).
 ///
@@ -17714,7 +17862,7 @@ fn try_parse_verb_and_target<'a>(
         };
         return match dest {
             Some(d) if d.zone == Zone::Battlefield => {
-                // CR 110.2a (docs/MagicCompRules.txt:618) + CR 608.2c (:2793):
+                // CR 110.2a + CR 608.2c:
                 // bind the raw control clause BEFORE either struct literal —
                 // the `target,` field shorthand MOVES `target`, so a `&target`
                 // borrow inside the literal would not compile. `d.control` is
@@ -17784,7 +17932,7 @@ fn try_parse_verb_and_target<'a>(
                             target,
                             origin,
                             destination: Zone::Hand,
-                            // CR 110.2 (docs/MagicCompRules.txt:616): controller
+                            // CR 110.2: controller
                             // semantics apply only while an object is a permanent.
                             enters_under: EntersUnderSpec::Default,
                             enter_tapped: false,
@@ -17821,7 +17969,7 @@ fn try_parse_verb_and_target<'a>(
                             target,
                             origin,
                             destination: d.zone,
-                            // CR 110.2 (docs/MagicCompRules.txt:616): controller
+                            // CR 110.2: controller
                             // semantics apply only while an object is a permanent.
                             enters_under: EntersUnderSpec::Default,
                             enter_tapped: false,
@@ -18445,6 +18593,157 @@ fn try_parse_tap_goad_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     })
 }
 
+/// Which relation an anaphoric possessive on a compound damage subject's object
+/// conjunct binds — i.e. what the referent player set is to those objects.
+///
+/// A typed enum rather than a `bool`/`Option<()>`: the two relations are read by
+/// different runtime machinery (a controller field vs. a protector property), and
+/// naming them is what lets "each battle they protect" stop being a verbatim
+/// Oracle-text comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PossessiveRelation {
+    /// "they control" / "those players control" — CR 109.4 controller.
+    Controls,
+    /// "they protect" — CR 310.9e battle protector.
+    Protects,
+}
+
+/// Strip a trailing ANAPHORIC possessive from a compound damage subject's object
+/// conjunct, returning the bare object phrase and the relation it binds.
+///
+/// Suffix-anchored rather than scanned (the `strip_trailing_duration` idiom): the
+/// possessive closes the phrase, so `take_until` locating it is a position
+/// computation, not a substring dispatch. One `alt` per axis — the relation — and
+/// the whole suffix must close the phrase, which is what makes this a gate rather
+/// than a probe.
+///
+/// Returns `None` when no anaphoric possessive is present; the caller then uses
+/// the phrase unchanged, which is the correct reading for an object conjunct that
+/// names no controller at all.
+fn parse_anaphoric_possessive_suffix(phrase: &str) -> Option<(&str, PossessiveRelation)> {
+    let mut suffix = alt((
+        pair(
+            take_until::<_, _, OracleError<'_>>(" they control"),
+            value(PossessiveRelation::Controls, tag(" they control")),
+        ),
+        pair(
+            take_until(" those players control"),
+            value(PossessiveRelation::Controls, tag(" those players control")),
+        ),
+        pair(
+            take_until(" they protect"),
+            value(PossessiveRelation::Protects, tag(" they protect")),
+        ),
+    ));
+    let (rest, (bare_object_phrase, relation)) = suffix.parse(phrase).ok()?;
+    // The possessive must CLOSE the phrase; a match followed by more text is a
+    // different construction and this gate declines it rather than guessing.
+    if !rest.is_empty() {
+        return None;
+    }
+    Some((bare_object_phrase, relation))
+}
+
+/// Apply a resolved anaphoric possessive to every `Typed` leaf of an object
+/// filter, recursing through `Or`.
+///
+/// The `Or` recursion is load-bearing, not defensive: "each creature and
+/// planeswalker they control" parses to `Or{Typed{Creature}, Typed{Planeswalker}}`
+/// (Goblin Chainwhirler, End the Festivities, Sarkhan's Unsealing), so a
+/// non-recursive binding would silently drop the relation on every such card.
+fn apply_anaphoric_possessive(
+    filter: &mut TargetFilter,
+    relation: PossessiveRelation,
+    controller: Option<&ControllerRef>,
+) {
+    match filter {
+        TargetFilter::Typed(tf) => match relation {
+            // CR 109.4: the player who controls those objects.
+            PossessiveRelation::Controls => tf.controller = controller.cloned(),
+            // CR 310.9e: "the player who protects a battle" means that battle's
+            // protector — a distinct relation from control, carried as a filter
+            // property rather than as the controller field.
+            PossessiveRelation::Protects => {
+                if let Some(controller) = controller {
+                    tf.properties.push(FilterProp::ProtectorMatches {
+                        controller: controller.clone(),
+                    });
+                }
+            }
+        },
+        TargetFilter::Or { filters } => {
+            for f in filters.iter_mut() {
+                apply_anaphoric_possessive(f, relation, controller);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The damage amount of a compound damage-subject clause, in either Oracle
+/// spelling, returning the amount and the slice where the RECIPIENT list begins.
+///
+/// CR 120.1: an object that deals damage is the source of that damage; the
+/// amount is a property of the damage event, not of the recipient list, so both
+/// spellings below denote the same thing and must lower to the same
+/// `QuantityExpr`.
+///
+/// The two Oracle spellings — the amount BEFORE the noun ("3 damage to …",
+/// "X damage to …") and AFTER it ("damage equal to <expr> to …") — are a surface
+/// variation with **no governing CR**; that is a parser observation, stated as
+/// one rather than dressed in a citation. Because they differ only in word
+/// order, this is ONE axis of the damage-subject grammar rather than two
+/// grammars, and it is parameterized here instead of being duplicated into a
+/// third sibling parser.
+///
+/// The suffix arm is CONNECTOR-ANCHORED, mirroring the object-first parser's
+/// `take_until(" and each player")`: the recipient clause is bounded at the
+/// conjunction BEFORE the amount is split off, so a trailing property phrase on
+/// the object half ("each creature without flying") cannot make the split run
+/// past the conjunction. That greedy-consumption failure is exactly what drops
+/// the player half on Rupture and Magmasaur when the clause instead falls
+/// through to `lower.rs`'s remainder-based lift.
+fn parse_damage_amount_and_recipients<'a>(
+    after_verb: &'a str,
+    ctx: &mut ParseContext,
+) -> Option<(QuantityExpr, &'a str)> {
+    // Prefix arm: "<count> damage to <recipients>".
+    if let Some(parsed) =
+        super::oracle_util::parse_count_expr(after_verb).and_then(|(qty, rest)| {
+            let (rest, _) = tag::<_, _, OracleError<'_>>("damage").parse(rest).ok()?;
+            let rest = rest.trim_start();
+            let (rest, _) = tag::<_, _, OracleError<'_>>("to ").parse(rest).ok()?;
+            Some((qty, rest))
+        })
+    {
+        return Some(parsed);
+    }
+
+    // Suffix arm: "damage equal to <expr> to <recipients>".
+    let (after_equal_to, _) = tag::<_, _, OracleError<'_>>("damage equal to ")
+        .parse(after_verb)
+        .ok()?;
+    // Bound the clause at the conjunction first, so the amount split below can
+    // never reach past it into the object half's property suffix.
+    let (_, before_connector) = take_until::<_, _, OracleError<'_>>(" and each ")
+        .parse(after_equal_to)
+        .ok()?;
+    // Within the amount half, " to " separates <expr> from the recipient list —
+    // the same boundary `lower.rs`'s own "damage equal to " branch uses.
+    let (_, qty_text) = take_until::<_, _, OracleError<'_>>(" to ")
+        .parse(before_connector)
+        .ok()?;
+    let recipients = &after_equal_to[qty_text.len() + " to ".len()..];
+    let qty_text = qty_text.trim();
+    // Reuse `lower.rs`'s quantity parsers by CALLING them, in its own order, so
+    // the two routes cannot drift: event-context refs, then the general CDA
+    // quantity parser, then the contextual bare-card aggregate.
+    let qty = crate::parser::oracle_quantity::parse_event_context_quantity(qty_text)
+        .or_else(|| crate::parser::oracle_quantity::parse_cda_quantity_with_context(qty_text, ctx))
+        .or_else(|| parse_contextual_bare_card_aggregate(qty_text, ctx))?;
+    Some((qty, recipients))
+}
+
 /// CR 608.2c: Split compound damage actions like "~ deals 3 damage to any target
 /// and you gain 3 life" into a primary DealDamage effect with a sub_ability chain
 /// for the remainder clause. Instructions within a single spell or ability are
@@ -18455,10 +18754,12 @@ fn try_parse_tap_goad_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
 /// because `parse_target` consumes them as part of the target filter.
 /// Detect "deals N damage to each [opponent/player] and each [type] they control".
 ///
-/// CR 120.3 + CR 609.7: This compound target pattern deals damage to BOTH players
-/// and objects from a single source as one simultaneous damage event. Producing
-/// two chained effects (DamageEachPlayer + DamageAll sub_ability) would split
-/// the event in two, breaking replacement/prevention shields like Awe Strike
+/// CR 608.2f + CR 609.7: This compound target pattern deals damage to BOTH players
+/// and objects from a single source as one simultaneous damage event — 608.2f
+/// makes an action over multiple players and/or objects one action processed
+/// simultaneously, and 609.7 is what makes "from a single source" load-bearing.
+/// Producing two chained effects (DamageEachPlayer + DamageAll sub_ability) would
+/// split the event in two, breaking replacement/prevention shields like Awe Strike
 /// ("the next time a source would deal damage ... prevent that damage"), which
 /// must observe the full batch as one event from one source.
 ///
@@ -18467,7 +18768,10 @@ fn try_parse_tap_goad_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
 /// recipient set under one `DamageContext`.
 ///
 /// Cards: Goblin Chainwhirler, Kumano Faces Kakkazan, etc.
-fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectClause> {
+fn try_parse_compound_player_object_damage(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
     // Extract the damage verb + amount using the same entry logic as try_parse_damage_with_remainder.
     // structural: not dispatch — positional search for verb in variable-length subject prefix
     let pos = lower.find("deals ").or_else(|| lower.find("deal "))?;
@@ -18481,20 +18785,35 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
     };
     let after_lower = &lower[pos + verb_len..];
 
-    // Parse amount: "N damage to "
-    let (qty, after_amount) =
-        super::oracle_util::parse_count_expr(after_lower).and_then(|(qty, rest)| {
-            let (rest, _) = tag::<_, _, OracleError<'_>>("damage").parse(rest).ok()?;
-            let rest = rest.trim_start();
-            let (rest, _) = tag::<_, _, OracleError<'_>>("to ").parse(rest).ok()?;
-            Some((qty, rest))
-        })?;
+    // Parse the amount in either Oracle spelling, prefix or suffix.
+    let (qty, after_amount) = parse_damage_amount_and_recipients(after_lower, ctx)?;
 
-    // Match: "each [opponent/player] and each [type phrase] {they control | you don't control | your opponents control}"
-    let (after_each, _) = tag::<_, _, OracleError<'_>>("each ")
-        .parse(after_amount)
-        .ok()?;
-    let (after_player, player_filter) = parse_damage_player_scope(after_each).ok()?;
+    // The player conjunct, in either opener the grammar admits.
+    //
+    // CR 102.2 + CR 102.3: "each opponent" is the other player in a two-player
+    //   game (102.2) and every player not on your team in a team multiplayer
+    //   game (102.3). A free-for-all Commander pod is NEITHER case; the engine
+    //   generalises to "every player who is not the controller"
+    //   (`collect_matching_players`), and that generalisation has no governing CR.
+    // CR 109.5: "you" on an object refers to the object's controller, which is
+    //   what `PlayerFilter::Controller` resolves to.
+    //
+    // The trailing connector is what disambiguates the bare "you" opener: "you"
+    // can only be a damage RECIPIENT here if " and each " follows it, which rules
+    // out the continuation clause "you gain 2 life" and the "you" inside
+    // "your opponents control". `peek` leaves the connector for the tag below.
+    let (after_player, player_filter) = alt((
+        preceded(
+            tag::<_, _, OracleError<'_>>("each "),
+            parse_damage_player_scope,
+        ),
+        value(
+            PlayerFilter::Controller,
+            terminated(tag("you"), peek(tag(" and each "))),
+        ),
+    ))
+    .parse(after_amount)
+    .ok()?;
 
     // " and each " connector
     let (after_and_each, _) = tag::<_, _, OracleError<'_>>(" and each ")
@@ -18521,57 +18840,99 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
         return None;
     }
 
-    // CR 109.4 + CR 109.5: Probe for controller-suffix variants on the object
-    // half, or the battle-specific "they protect" suffix (CR 310.9e).
-    fn set_opponent_controller(filter: &mut TargetFilter) {
-        match filter {
-            TargetFilter::Typed(tf) => {
-                tf.controller = Some(ControllerRef::Opponent);
-            }
-            TargetFilter::Or { filters } => {
-                for f in filters.iter_mut() {
-                    set_opponent_controller(f);
-                }
-            }
-            _ => {}
-        }
+    // An inner " and each " is an N-way conjunction this two-conjunct grammar
+    // does not model. Fail closed, mirroring the object-first sibling's identical
+    // guard; the residual is reported by the swallowed-conjunct detector rather
+    // than silently discarded.
+    if scan_contains_phrase(after_and_each, "and each") {
+        return None;
     }
 
-    let object_filter = if after_and_each == "battle they protect" {
-        TargetFilter::Typed(TypedFilter::new(TypeFilter::Battle).properties(vec![
-            FilterProp::ProtectorMatches {
-                controller: ControllerRef::Opponent,
-            },
-        ]))
-    } else {
-        let mut probe = alt((
-            preceded(
-                take_until::<_, _, OracleError<'_>>(" they control"),
-                tag(" they control"),
-            ),
-            preceded(
-                take_until::<_, _, OracleError<'_>>(" you don't control"),
-                tag(" you don't control"),
-            ),
-            preceded(
-                take_until::<_, _, OracleError<'_>>(" your opponents control"),
-                tag(" your opponents control"),
-            ),
-        ));
-        let (gate_rest, _) = probe.parse(after_and_each).ok()?;
-        if !gate_rest.is_empty() {
-            return None;
-        }
-
-        let target_text = format!("each {after_and_each}");
-        let (mut object_filter, _rem) = parse_target(&target_text);
-        set_opponent_controller(&mut object_filter);
-        object_filter
+    // Strip an optional trailing ANAPHORIC possessive — a possessive whose
+    // referent is the player conjunct parsed a few bytes earlier in this same
+    // string, rather than a player named independently. Explicit possessives
+    // ("you control", "you don't control", "your opponents control") are NOT
+    // here: `parse_target` already owns those, because they name their player
+    // outright and need no antecedent.
+    //
+    // Anaphor resolution is a parse-time LEXICAL decision with no governing CR;
+    // it is stated as an observation rather than dressed in a citation. What the
+    // resolved binding then MEANS does have rules: CR 109.4 for a controller,
+    // CR 310.9e for a battle's protector.
+    let (bare_object_phrase, possessive) = match parse_anaphoric_possessive_suffix(after_and_each) {
+        Some((bare, relation)) => (bare, Some(relation)),
+        None => (after_and_each, None),
     };
+    if bare_object_phrase.is_empty() {
+        return None;
+    }
 
-    // CR 120.3: Single effect, one damage source, simultaneous batch across both
-    // the player set and the object set. Replacement effects observe this as one
-    // coherent damage event — see `resolve_all` in game/effects/deal_damage.rs.
+    // Classify the object conjunct with the existing building block — the parser
+    // IS the detector. Bind the formatted string first: `parse_target(&format!(…))`
+    // would borrow a temporary that drops at the end of the statement (E0716),
+    // and `rem` is a sub-slice of it.
+    let target_text = format!("each {bare_object_phrase}");
+    let (mut object_filter, rem) = parse_target(&target_text);
+    // The object conjunct must be FULLY consumed. This is what rejects a player
+    // predicate continuation ("each player draws a card"), whose verb phrase
+    // `parse_target` leaves unconsumed.
+    if !rem
+        .chars()
+        .all(|c| c.is_ascii_whitespace() || c.is_ascii_punctuation())
+    {
+        return None;
+    }
+    // The parsed filter must NAME AT LEAST ONE OBJECT TYPE, in every `Or` leaf.
+    // An enum-shape check is NOT enough: `TargetFilter::Typed(_)` also matches a
+    // `TypedFilter` with an EMPTY `type_filters` vec — which is exactly what
+    // `parse_target` returns for a player-shaped phrase — and `filter.rs`'s
+    // `for tf in type_filters` loop is a no-op on an empty vec, so such a filter
+    // matches EVERY permanent on the battlefield rather than none.
+    fn names_a_type(filter: &TargetFilter) -> bool {
+        match filter {
+            TargetFilter::Typed(tf) => !tf.type_filters.is_empty(),
+            TargetFilter::Or { filters } => filters.iter().all(names_a_type),
+            _ => false,
+        }
+    }
+    if !names_a_type(&object_filter) {
+        return None;
+    }
+
+    // Bind the anaphor to the player conjunct already parsed in this clause —
+    // never to a game-state lookup and never to the ability's controller.
+    //
+    // The mapping is deliberately NOT a blanket "inherit the player conjunct's
+    // controller": absence of a possessive leaves the filter exactly as
+    // `parse_target` returned it, which is what makes "each opponent and each
+    // other creature" damage EVERY other creature rather than only opponents'.
+    // Its object-first twin proves that is the right answer.
+    if let Some(relation) = possessive {
+        // CR 102.2 + CR 102.3: an "each opponent" conjunct binds the anaphor to
+        //   the opponents. `PlayerFilter::All` restricts nothing, because every
+        //   player controls their own permanents, so the union is unrestricted.
+        let controller = match player_filter {
+            PlayerFilter::Opponent => Some(&ControllerRef::Opponent),
+            PlayerFilter::All => None,
+            // The bare "you" opener: an object half of the controller's own
+            // permanents spells its possessive out ("you control"), which
+            // `parse_target` consumes itself, so no anaphoric arm fires here.
+            PlayerFilter::Controller => None,
+            // Unreachable by construction — the opener `alt` above produces only
+            // the three variants matched here. Decline rather than guess a
+            // binding if that ever stops being true.
+            _ => return None,
+        };
+        apply_anaphoric_possessive(&mut object_filter, relation, controller);
+    }
+
+    // CR 608.2f: "Some spells and abilities include actions taken on multiple
+    // players and/or objects. In most cases, each such action is processed
+    // simultaneously." The conjoined recipients are ONE such action, which is why
+    // both audiences belong to one effect rather than two chained ones.
+    // CR 120.4b: damage is dealt as modified by replacement and prevention
+    // effects (rules 614 and 615), so that single event is what those shields
+    // observe — see `resolve_all` in game/effects/deal_damage.rs.
     Some(ParsedEffectClause {
         effect: Effect::DamageAll {
             amount: qty,
@@ -18589,7 +18950,7 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
     })
 }
 
-/// CR 120.1 + CR 120.3: Compound object+player damage — type-first variant.
+/// CR 120.1 + CR 608.2f: Compound object+player damage — type-first variant.
 /// Detects "deals N damage to each [type-phrase] and each player" and emits a
 /// single `Effect::DamageAll` carrying both the object filter and a
 /// `player_filter: Some(PlayerFilter::All)` so the resolver damages every
@@ -18606,7 +18967,10 @@ fn try_parse_compound_player_object_damage(lower: &str) -> Option<ParsedEffectCl
 /// Cards: Pyrohemia, Pestilence, Earthquake, Hurricane, Inferno, Famine,
 /// Fire Tempest, Cave-In, Crypt Rats, Cloudthresher, Flamebreak, Devastate,
 /// Dakmor Plague, Dry Spell, Festering Evil, etc. (~30 cards).
-fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectClause> {
+fn try_parse_compound_object_player_damage(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
     // Reuse the same verb+amount entry logic as the player-first variant.
     let pos = lower.find("deals ").or_else(|| lower.find("deal "))?; // allow-noncombinator: positional verb search inside a variable-length subject prefix; tag("deals ") below is the actual dispatch.
     let verb_len = if tag::<_, _, OracleError<'_>>("deals ")
@@ -18619,14 +18983,8 @@ fn try_parse_compound_object_player_damage(lower: &str) -> Option<ParsedEffectCl
     };
     let after_lower = &lower[pos + verb_len..];
 
-    // Parse amount: "N damage to "
-    let (qty, after_amount) =
-        super::oracle_util::parse_count_expr(after_lower).and_then(|(qty, rest)| {
-            let (rest, _) = tag::<_, _, OracleError<'_>>("damage").parse(rest).ok()?;
-            let rest = rest.trim_start();
-            let (rest, _) = tag::<_, _, OracleError<'_>>("to ").parse(rest).ok()?;
-            Some((qty, rest))
-        })?;
+    // Parse the amount in either Oracle spelling, prefix or suffix.
+    let (qty, after_amount) = parse_damage_amount_and_recipients(after_lower, ctx)?;
 
     // Must start with "each " (the object half of the conjunction).
     let (after_each, _) = tag::<_, _, OracleError<'_>>("each ")
@@ -19584,17 +19942,18 @@ fn try_split_damage_compound(text: &str, ctx: &mut ParseContext) -> Option<Parse
         return None;
     }
 
-    // CR 120.2a: Compound player+object damage — "each opponent and each [type] they control"
+    // CR 608.2f: Compound player+object damage — "each opponent and each [type] they control"
     // must be detected before the general compound splitter, because the "and" here connects
-    // two damage targets (not two independent effects).
-    if let Some(clause) = try_parse_compound_player_object_damage(&lower) {
+    // two damage RECIPIENTS of one simultaneously-processed action (not two independent
+    // effects).
+    if let Some(clause) = try_parse_compound_player_object_damage(&lower, ctx) {
         return Some(clause);
     }
 
-    // CR 120.1 + CR 120.3: Same shape, type-first ordering — "each creature
+    // CR 120.1 + CR 608.2f: Same shape, type-first ordering — "each creature
     // [with X | without X] and each player" (Pyrohemia / Earthquake / Hurricane
     // class). Must run before the general split so the player half isn't dropped.
-    if let Some(clause) = try_parse_compound_object_player_damage(&lower) {
+    if let Some(clause) = try_parse_compound_object_player_damage(&lower, ctx) {
         return Some(clause);
     }
 
@@ -30276,14 +30635,102 @@ fn rewrite_rounding_mode(def: &mut AbilityDefinition, mode: RoundingMode) {
     }
 }
 
-fn lift_each_player_exile_top_scope(effect: &mut Effect, player_scope: &mut Option<PlayerFilter>) {
-    if player_scope.is_some() {
+/// CR 401.1 + CR 608.2c: a distributive top-of-library exile names one library per player
+/// in scope, but `Effect::ExileTop` resolves exactly ONE library (`exile_top.rs` →
+/// `resolve_player_for_context_ref`). The distribution therefore rides on the ability's
+/// `player_scope` fan-out, which rebinds the acting controller to each player in turn
+/// (`effects/mod.rs` `resolve_ability_chain`).
+///
+/// CR 102.2 + CR 102.3: `Opponent` narrows that iteration to the controller's opponents
+/// (team-aware, eliminated-player-safe) — the ONLY difference from `All`.
+///
+/// Erasure of the owner sentinel is UNCONDITIONAL: never clobbering an enclosing
+/// `player_scope` and always erasing the sentinel are independent obligations, and an
+/// early return on `player_scope.is_some()` would satisfy the first by abandoning the
+/// second. `TargetFilter::Opponent` left in this slot resolves at runtime to
+/// `opponents(..).first()` (`game/targeting.rs`), i.e. silently ONE opponent.
+fn lift_distributive_exile_top_scope(effect: &mut Effect, player_scope: &mut Option<PlayerFilter>) {
+    let Effect::ExileTop { player, .. } = effect else {
         return;
-    }
-    if let Effect::ExileTop { player, .. } = effect {
-        if matches!(player, TargetFilter::ScopedPlayer) {
+    };
+    let own_scope = match player {
+        TargetFilter::ScopedPlayer => PlayerFilter::All,
+        TargetFilter::Opponent => PlayerFilter::Opponent,
+        // Every other owner is a real single-library reference (Controller, Player,
+        // Typed{Opponent} for "target opponent's", ParentTarget, …): pass through untouched.
+        _ => return,
+    };
+    match player_scope {
+        // No enclosing iteration: this clause's own distributive owner defines one.
+        None => {
+            *player_scope = Some(own_scope);
             *player = TargetFilter::Controller;
-            *player_scope = Some(PlayerFilter::All);
+        }
+        // An enclosing `player_scope` is already iterating (a leading "Each opponent …"
+        // subject). NEVER clobber it — that is what the previous early return protected.
+        // But the sentinel must still be erased: `ScopedPlayer` reads the enclosing
+        // iteration's rebound player (`resolve_player_for_context_ref` →
+        // `ability.scoped_player`), which is the reading the cards already in this state
+        // rely on today.
+        Some(_) => *player = TargetFilter::ScopedPlayer,
+    }
+}
+
+/// CR 401.1: `TargetFilter::Opponent` in an `Effect::ExileTop.player` slot is a PARSE-ONLY
+/// scope sentinel that `lift_distributive_exile_top_scope` erases unconditionally.
+/// If one ever survives, `exile_top.rs` resolves it through `resolve_player_for_context_ref`,
+/// whose `Opponent` arm falls back to `opponents(..).first()` (`game/targeting.rs`) — silently
+/// exiling ONE opponent's top card instead of each opponent's. That failure is fail-OPEN
+/// (a wrong but usable answer), so assert on it.
+///
+/// Deliberately does NOT assert on `TargetFilter::ScopedPlayer`: that sentinel legitimately
+/// survives on printed cards whose clause already carries a `player_scope`, where it resolves
+/// to `ability.scoped_player` — the rebound iterating player. Benign, and load-bearing.
+///
+/// This is a CI regression net, NOT production safety: `debug_assertions` is compiled out of
+/// the shipped WASM release profile. The production guarantee is the unconditional erasure in
+/// `lift_distributive_exile_top_scope`; this catches a future edit that reintroduces a
+/// conditional path.
+///
+/// Roots are enumerated deliberately. Five of the seven cards in this class are TRIGGERS
+/// (Brainstealer Dragon, Nassari, Stolen Strategy, Mindleecher, Lobelia; Processing Plant's
+/// sits in a trigger's `else_ability`) and only Fire Lord Ozai's is an activated ability, so a
+/// guard wired to `abilities` alone would be vacuous exactly where the class lives.
+/// `visit_ability_def` supplies the recursion through `sub_ability` / `else_ability` /
+/// `mode_abilities`. `StaticDefinition` holds no `AbilityDefinition` and so has no root here.
+#[cfg(debug_assertions)]
+pub(super) fn debug_assert_exile_top_opponent_sentinel_lifted(
+    parsed: &crate::parser::oracle::ParsedAbilities,
+    card_name: &str,
+) {
+    let assert_lifted = |def: &AbilityDefinition, root: &str| {
+        let _ = crate::types::ability_visit::visit_ability_def(def, &mut |effect: &Effect| {
+            assert!(
+                !matches!(
+                    effect,
+                    Effect::ExileTop {
+                        player: TargetFilter::Opponent,
+                        ..
+                    }
+                ),
+                "unlifted ExileTop opponent-scope sentinel on {card_name} ({root}): \
+                 `TargetFilter::Opponent` must be erased by lift_distributive_exile_top_scope, \
+                 otherwise exile_top resolves it to a single opponent instead of each opponent"
+            );
+            std::ops::ControlFlow::Continue(())
+        });
+    };
+    for def in &parsed.abilities {
+        assert_lifted(def, "activated/spell ability");
+    }
+    for trigger in &parsed.triggers {
+        if let Some(execute) = &trigger.execute {
+            assert_lifted(execute, "trigger execute");
+        }
+    }
+    for replacement in &parsed.replacements {
+        if let Some(execute) = &replacement.execute {
+            assert_lifted(execute, "replacement execute");
         }
     }
 }
@@ -31479,6 +31926,21 @@ pub(crate) fn parse_ability_ir(
         ChainLoweringMode::WithContext => parse_conditional_protection_grant_ir(text, kind, ctx),
     };
     if let Some(body) = conditional_protection {
+        return AbilityIr {
+            source_text: text.to_string(),
+            body,
+            shell: AbilityShellIr::default(),
+            die_results: vec![],
+            root_transforms: vec![],
+            modal: None,
+        };
+    }
+    // CR 400.11 + CR 400.11b: "Open a sealed Magic booster pack, reveal the
+    // cards, and put one of them into your hand." One effect, not a chain — the
+    // commas would otherwise split it into a head the parser cannot model and
+    // two orphaned steps. Recognized in BOTH lowering modes: the sentence is a
+    // whole printed spell ability, so it must win wherever a card body enters.
+    if let Some(body) = parse_open_booster_pack_ir(text, kind, ctx) {
         return AbilityIr {
             source_text: text.to_string(),
             body,
@@ -35317,11 +35779,12 @@ pub(crate) fn parse_effect_chain_ir(
             bind_search_library_for_each_antecedent(&mut clause.effect, target, &text_no_qty_lower);
         }
         // CR 608.2: `parse_exile_ast` uses `ScopedPlayer` as the structural
-        // marker for "each player's library". Lower it into the same
-        // player_scope-driven shape used by Evelyn/Jeleva-class effects:
-        // the resolver iterates all players and `Controller` reads the
-        // rebound per-player controller.
-        lift_each_player_exile_top_scope(&mut clause.effect, &mut player_scope);
+        // marker for "each player's library" and `Opponent` for "each
+        // opponent's library". Lower either into the same player_scope-driven
+        // shape used by Evelyn/Jeleva-class effects: the resolver iterates the
+        // players in scope and `Controller` reads the rebound per-player
+        // controller.
+        lift_distributive_exile_top_scope(&mut clause.effect, &mut player_scope);
         // CR 608.2c + CR 109.4: Fold a pending player-scope lifted from a
         // fieldless subject-predicate (`Effect::Investigate` — "That player
         // investigates", Declaration in Stone) into this chunk's `player_scope`.
@@ -36535,7 +36998,7 @@ fn try_parse_put_zone_change(lower: &str, text: &str) -> Option<Effect> {
         .map(|(effect, _, _)| effect)
 }
 
-/// The third tuple element is the CR 110.2a (docs/MagicCompRules.txt:618)
+/// The third tuple element is the CR 110.2a
 /// battlefield-entry control spec. It is returned ALONGSIDE the `Effect` rather
 /// than folded into `Effect::ChangeZone.enters_under` because the `Effect` field
 /// is a collapsed `Option<ControllerRef>` with no room for the fail-closed
@@ -36750,14 +37213,14 @@ fn try_parse_put_zone_change_parts(
                 let origin_text = format!("{}{}", before.lower, after.lower);
                 infer_origin_zone(&origin_text)
             };
-            // CR 110.2a (docs/MagicCompRules.txt:618): the SAME span as the
+            // CR 110.2a: the SAME span as the
             // single-literal `scan_contains_phrase(after_put_tp.lower, "under
             // your control")` boolean this replaces — no reach change. The
             // fold's `You`-wins priority makes it byte-for-byte non-regressive
             // (both walk word boundaries over the identical span and both
             // return `You` when that clause is present anywhere in it); the only
-            // delta is that a third-person anaphor is now bound (CR 608.2c @
-            // :2793) or failed closed instead of silently dropped.
+            // delta is that a third-person anaphor is now bound (CR 608.2c)
+            // or failed closed instead of silently dropped.
             let enters_under_spec = bind_control_clause(
                 fold_control_clauses(after_put_tp.lower),
                 name_entry_control_antecedent(Some(&target), ctx),

@@ -2354,6 +2354,7 @@ impl ReflexiveGateParent {
             | Effect::FlipPermanent { .. }
             | Effect::SearchLibrary { .. }
             | Effect::SearchOutsideGame { .. }
+            | Effect::OpenBoosterPack { .. }
             | Effect::RevealHand { .. }
             | Effect::RevealFromHand { .. }
             | Effect::Reveal { .. }
@@ -6093,11 +6094,11 @@ fn chosen_number_extremum_of(amount: &QuantityExpr) -> Option<AggregateFunction>
     }
 }
 
-/// CR 120.2b + CR 120.3 + CR 102.2: leading "each opponent/player/foe/other
-/// opponent/other player" damage scope, returning the matched filter AND the
-/// unconsumed remainder. Unlike `parse_damage_each_player_scope` it is NOT
-/// all-consuming — used only by the multi-target damage CHAIN primary, which
-/// hands the trailing " and M damage to ..." segment back to the loop.
+/// CR 102.2 + CR 102.3: leading "each opponent/player/foe/other opponent/other
+/// player" damage scope, returning the matched filter AND the unconsumed
+/// remainder. Unlike `parse_damage_each_player_scope` it is NOT all-consuming —
+/// used only by the multi-target damage CHAIN primary, which hands the trailing
+/// " and M damage to ..." segment back to the loop.
 fn parse_damage_each_player_scope_with_remainder(text: &str) -> Option<(PlayerFilter, &str)> {
     let (rest, filter) = preceded(
         tag("each "),
@@ -6110,7 +6111,26 @@ fn parse_damage_each_player_scope_with_remainder(text: &str) -> Option<(PlayerFi
                 )),
             ),
             value(PlayerFilter::Opponent, tag("other player")),
-            parse_damage_player_scope,
+            // CR 109.5: "your" on an object refers to the object's controller, so
+            // "each of your opponents" is the PARTITIVE spelling of the same
+            // player scope as "each opponent" — a surface variant, not a new
+            // scope.
+            //
+            // Only the FIRST-PERSON partitive is accepted. "of their opponents"
+            // would bind an anaphor to some antecedent player rather than to the
+            // controller, so mapping it onto the static `PlayerFilter::Opponent`
+            // would install a wrong-referent rule; no live card carries it, so
+            // the arm is omitted rather than guessed.
+            //
+            // `parse_damage_player_scope` matches the SINGULAR stem ("opponent"
+            // is a prefix of "opponents") and the enclosing
+            // `parse_damage_each_player_scope` is all-consuming over
+            // whitespace/punctuation, so the trailing plural "s" must be consumed
+            // here or the scope would decline on its own remainder.
+            terminated(
+                preceded(opt(tag("of your ")), parse_damage_player_scope),
+                opt(tag("s")),
+            ),
         )),
     )
     .parse(text)
@@ -6469,6 +6489,7 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
                 phase: Phase::PreCombatMain,
                 player: crate::types::player::PlayerId(0),
                 gate: crate::types::ability::TurnGate::None,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
         ),
         // CR 505.1 + CR 603.7a: Symmetric to the prefix form at
@@ -6482,6 +6503,26 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
                 phase: Phase::End,
                 player: crate::types::player::PlayerId(0),
                 gate: crate::types::ability::TurnGate::None,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
+            },
+        ),
+        // CR 608.2c: anaphoric "that player's next end step" — "that player"
+        // refers to a chained effect's target's OWNER, not the ability's
+        // controller (The Eternal Wanderer's +1: "Return that card to the
+        // battlefield under its owner's control at the beginning of that
+        // player's next end step"; Faramir, Prince of Ithilien uses the same
+        // surface phrase for a DIFFERENT referent — a chosen player — and
+        // remains its own unimplemented gap, not covered by this arm). Must
+        // precede the bare "your next end step" arm textually distinct
+        // (neither is a suffix of the other), so ordering here is not
+        // load-bearing, but is kept adjacent for readability.
+        (
+            " at the beginning of that player's next end step",
+            DelayedTriggerCondition::AtNextPhaseForPlayer {
+                phase: Phase::End,
+                player: crate::types::player::PlayerId(0),
+                gate: crate::types::ability::TurnGate::None,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::ParentTargetOwner,
             },
         ),
         // CR 513.2 + CR 603.7a: reordered "…, sacrifice that token at the
@@ -6496,6 +6537,7 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
                 phase: Phase::End,
                 player: crate::types::player::PlayerId(0),
                 gate: crate::types::ability::TurnGate::AfterCreationTurn,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
         ),
         // CR 603.7a + CR 104.3e: anaphoric "that turn's end step" — the extra
@@ -6509,6 +6551,7 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
                 phase: Phase::End,
                 player: crate::types::player::PlayerId(0),
                 gate: crate::types::ability::TurnGate::None,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
         ),
         (
@@ -6517,6 +6560,7 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
                 phase: Phase::Upkeep,
                 player: crate::types::player::PlayerId(0),
                 gate: crate::types::ability::TurnGate::None,
+                binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
             },
         ),
         // CR 514.3a + CR 603.7a: "at the beginning of the next cleanup step"
@@ -6561,6 +6605,7 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                     phase: Phase::Upkeep,
                     player: crate::types::player::PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 tag("at the beginning of your next upkeep, "),
             ),
@@ -6569,6 +6614,7 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                     phase: Phase::End,
                     player: crate::types::player::PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 tag("at the beginning of your next end step, "),
             ),
@@ -6585,6 +6631,7 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                     phase: Phase::End,
                     player: crate::types::player::PlayerId(0),
                     gate: crate::types::ability::TurnGate::AfterCreationTurn,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 tag("at the beginning of the end step on your next turn, "),
             ),
@@ -6602,6 +6649,7 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                     phase: Phase::End,
                     player: crate::types::player::PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 tag("at the beginning of that turn's end step, "),
             ),
@@ -6613,6 +6661,7 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                     phase: Phase::PreCombatMain,
                     player: crate::types::player::PlayerId(0),
                     gate: crate::types::ability::TurnGate::None,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
                 tag("at the beginning of your next main phase, "),
             ),
@@ -7346,7 +7395,7 @@ pub(super) fn strip_any_number_quantifier(text: &str) -> (String, Option<MultiTa
 pub(super) struct ReturnDestination {
     pub(super) zone: Zone,
     pub(super) transformed: bool,
-    // CR 110.2a (docs/MagicCompRules.txt:618): the battlefield-entry control
+    // CR 110.2a: the battlefield-entry control
     // clause AS WRITTEN — raw syntax, deliberately unbound. A destination
     // stripper sees only the destination phrase, never the moved object's
     // filter or the enclosing `ParseContext`, so it cannot resolve a
@@ -7469,12 +7518,12 @@ pub(super) fn strip_return_destination_ext_with_remainder(
     // Ordered longest-first to avoid partial matches.
     // "transformed" variants must come before their non-transformed counterparts.
     // Tuples: (phrase, zone, transformed, control, enter_tapped, enters_attacking)
-    // CR 110.2a (docs/MagicCompRules.txt:618): the `control` column is the
+    // CR 110.2a: the `control` column is the
     // parser-table carrier for whatever control clause the row's phrase already
     // spells out — `Some(You)` for "under your control", `Some(Owner)` for every
-    // "under <its|their|his|her> owner('s|s') control" spelling (CR 110.2 @ :616,
+    // "under <its|their|his|her> owner('s|s') control" spelling (CR 110.2,
     // which restates the default rather than overriding it), `None` otherwise.
-    // Non-battlefield rows are always `None`: CR 110.1 (:614) gives a controller
+    // Non-battlefield rows are always `None`: CR 110.1 gives a controller
     // only to permanents. Rows whose phrase carries no clause fall through to the
     // `parse_leading_control_clause` pass below, which picks up the third-person
     // forms the table never enumerated.
@@ -7778,15 +7827,15 @@ pub(super) fn strip_return_destination_ext_with_remainder(
             // exactly as the pre-existing `pos + phrase_len` indexing already
             // assumes.
             let mut entry_offset = pos + phrase_len;
-            // CR 110.2a (docs/MagicCompRules.txt:618): one control-clause
+            // CR 110.2a: one control-clause
             // authority, two possible positions — inside the matched table
             // phrase, or trailing it. Declared OUTSIDE the battlefield block
             // because it is read at the `ReturnDestination` construction below,
             // which EVERY row reaches (including the hand/graveyard/command
-            // rows, whose `control` is always `None` per CR 110.1 @ :614).
+            // rows, whose `control` is always `None` per CR 110.1).
             // `*row_control` is a `Copy` read out of the `&'static` table row.
             let mut control: Option<ControlClausePossessor> = *row_control;
-            // CR 122.6 (:1208): putting counters on an object includes giving
+            // CR 122.6: putting counters on an object includes giving
             // counters to it as it enters the battlefield. Battlefield-entry
             // riders, the control
             // clause and the "with … counter(s)" clause are INDEPENDENT entry
@@ -7914,7 +7963,7 @@ fn parse_leading_battlefield_return_destination(
         value((false, false, false), tag("")),
     ))
     .parse(input)?;
-    // CR 110.2a (docs/MagicCompRules.txt:618): parse the control clause (or its
+    // CR 110.2a: parse the control clause (or its
     // absence) as raw syntax. The four hand-picked literal arms this replaces
     // recognized only "under your control", "under their owners' control" and
     // "under its owner's control"; the singular "under their/his/her owner's
@@ -8391,7 +8440,10 @@ pub(super) fn try_parse_damage(lower: &str, text: &str, ctx: &mut ParseContext) 
 }
 
 /// CR 608.2c: Bind a bare "those cards" aggregate only to its typed chain antecedent.
-fn parse_contextual_bare_card_aggregate(text: &str, ctx: &ParseContext) -> Option<QuantityExpr> {
+pub(super) fn parse_contextual_bare_card_aggregate(
+    text: &str,
+    ctx: &ParseContext,
+) -> Option<QuantityExpr> {
     let source = ctx.bare_card_aggregate_source?;
     let (rest, qty) = nom_quantity::parse_contextual_bare_card_aggregate_ref(text, source).ok()?;
     rest.trim().is_empty().then_some(QuantityExpr::Ref { qty })
@@ -10312,6 +10364,7 @@ pub(super) fn apply_where_x_effect_expression(
         | Effect::RollDie { count: amount, .. }
         | Effect::Sacrifice { count: amount, .. }
         | Effect::SearchOutsideGame { count: amount, .. }
+        | Effect::OpenBoosterPack { count: amount, .. }
         | Effect::SetLifeTotal { amount, .. }
         | Effect::SkipNextStep { count: amount, .. }
         | Effect::SkipNextTurn { count: amount, .. }
@@ -12642,7 +12695,7 @@ mod tests {
         ));
     }
 
-    /// CR 122.6 (:1208) + CR 110.2a (:618) + issue #1498: a counter clause with
+    /// CR 122.6 + CR 110.2a + issue #1498: a counter clause with
     /// no `" on it"` filler must lift its counters onto `enter_with_counters`,
     /// and — the discriminating half — whatever is printed AFTER it must survive
     /// and reach the normal entry-clause path rather than being truncated away.
@@ -12688,7 +12741,7 @@ mod tests {
         );
     }
 
-    /// CR 725.1 (:6240) + CR 608.2c (:2795) + CR 122.1 (:1178): Heart-Shaped
+    /// CR 725.1 + CR 608.2c + CR 122.1: Heart-Shaped
     /// Herb. An instruction printed after the counter clause is NOT part of the
     /// destination and must be handed back as the remainder for normal clause
     /// processing. This is the unit-level discriminator for the bug the PR
@@ -12720,7 +12773,7 @@ mod tests {
         );
     }
 
-    /// CR 122.1 (:1178): conjoined counter clauses inside ONE "with …" rider.
+    /// CR 122.1: conjoined counter clauses inside ONE "with …" rider.
     /// Verbatim Oracle text of Perennation; Gilraen, Dúnedain Protector prints
     /// the same shape after a control clause. Parsing only the first conjunct
     /// (the previous behavior) silently dropped the second counter.
@@ -13083,6 +13136,7 @@ mod tests {
             phase: Phase::End,
             player: crate::types::player::PlayerId(0),
             gate: crate::types::ability::TurnGate::None,
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         };
 
         let (rest, cond) =

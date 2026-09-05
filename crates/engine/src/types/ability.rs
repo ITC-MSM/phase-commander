@@ -4867,6 +4867,40 @@ impl WheneverEventExpiry {
     }
 }
 
+/// CR 603.7a + CR 608.2c: which player `AtNextPhaseForPlayer.player` names,
+/// symbolic until the delayed trigger is CREATED — mirrors `TurnGate`'s own
+/// "symbolic at parse time, concrete once created" split
+/// (`AfterCreationTurn` -> `After(turn)`). `player` itself stays a
+/// placeholder `PlayerId` at parse time regardless of `binding` (unread until
+/// `effects::delayed_trigger::resolve` overwrites it), so this field is the
+/// one source of truth for HOW that overwrite resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DelayedTriggerPlayerBinding {
+    /// "your next [phase]" — the ability's controller. DEFAULT; every
+    /// pre-existing card using this variant (Greasefang, Bag of Holding, the
+    /// main-phase/upkeep family) is this binding.
+    #[default]
+    Controller,
+    /// CR 608.2c: "that player's next [phase]" where "that player"
+    /// anaphorically refers to a chained effect's target's OWNER — not the
+    /// ability's controller. The Eternal Wanderer's +1: "Exile up to one
+    /// target artifact or creature. Return that card to the battlefield
+    /// under its owner's control at the beginning of that player's next end
+    /// step" — the exiled permanent may belong to any player, so "that
+    /// player" (its owner, CR 400.3) is resolved from the parent target at
+    /// delayed-trigger creation, not assumed to be the controller.
+    ParentTargetOwner,
+}
+
+impl DelayedTriggerPlayerBinding {
+    /// Serde skip-helper: `Controller` is the default and is omitted from
+    /// JSON, so every pre-existing serialized `AtNextPhaseForPlayer` (and
+    /// every existing snapshot/golden fixture) stays byte-identical.
+    pub fn is_controller(&self) -> bool {
+        matches!(self, DelayedTriggerPlayerBinding::Controller)
+    }
+}
+
 /// When a delayed triggered ability fires (CR 603.7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -4874,8 +4908,10 @@ pub enum DelayedTriggerCondition {
     /// "at the beginning of the next [phase]"
     /// CR 603.7: fires on next PhaseChanged for that phase.
     AtNextPhase { phase: Phase },
-    /// "at the beginning of your next [phase]"
-    /// Fires only when the specified player is active.
+    /// "at the beginning of your next [phase]" / "at the beginning of that
+    /// player's next [phase]" — fires only when the resolved player is
+    /// active. `player` is a compile-time placeholder rewritten to a concrete
+    /// `PlayerId` at delayed-trigger creation per `binding`.
     AtNextPhaseForPlayer {
         phase: Phase,
         player: PlayerId,
@@ -4883,6 +4919,15 @@ pub enum DelayedTriggerCondition {
         /// semantics. `None` (default) = fire at the nearest matching phase.
         #[serde(default, skip_serializing_if = "TurnGate::is_none")]
         gate: TurnGate,
+        /// CR 608.2c: which player `player` resolves to at creation. Skipped
+        /// from JSON when `Controller` (the default), mirroring `gate`, so
+        /// every pre-existing serialized `AtNextPhaseForPlayer` round-trips
+        /// byte-identical.
+        #[serde(
+            default,
+            skip_serializing_if = "DelayedTriggerPlayerBinding::is_controller"
+        )]
+        binding: DelayedTriggerPlayerBinding,
     },
     /// "when [object] leaves the battlefield"
     WhenLeavesPlay {
@@ -6538,6 +6583,13 @@ pub enum TargetFilter {
     /// *player-reference* role only — it is never used as an object-population
     /// filter (an opponent-controlled object is expressed as
     /// `Typed(.., controller: Some(ControllerRef::Opponent))`).
+    ///
+    /// SECOND ROLE (parse-only, CR 401.1): in the top-of-library exile owner tables
+    /// (`parse_library_player_suffix` / `parse_dig_library_owner`) this variant is the
+    /// scope sentinel for the possessive "each opponent's library", exactly mirroring
+    /// `ScopedPlayer`'s sentinel role for "each player's library". It never survives into
+    /// a finished `AbilityDefinition`: `lift_distributive_exile_top_scope` rewrites it to
+    /// `Controller` and stamps `AbilityDefinition.player_scope = Some(PlayerFilter::Opponent)`.
     Opponent,
     SelfRef,
     /// CR 201.5a: The specific object that GRANTED the ability this filter lives
@@ -15480,6 +15532,44 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "is_default_outside_game_source_pool")]
         source_pool: OutsideGameSourcePool,
     },
+    /// CR 400.11 + CR 400.11b + CR 701.20: Open a sealed Magic booster pack —
+    /// a set of cards from OUTSIDE the game — reveal them, and bring `count` of
+    /// the revealed cards matching `filter` into the game at `destination`
+    /// (CR 400.11b: "Some effects bring cards into a game from outside the
+    /// game"). Cards that are not taken were never in any zone (CR 400.11:
+    /// "Outside the game is not a zone"), so they are not exiled or put into a
+    /// graveyard — they simply remain outside the game.
+    ///
+    /// Booster packs have no Comprehensive Rules entry: opening one is a
+    /// physical action the printed cards (Booster Tutor, Summon the Pack,
+    /// A Container of Booster Packs, The Chaos Keeper) instruct the player to
+    /// perform, and the reminder text ("Remove that card from your deck before
+    /// beginning a new game") governs the between-games bookkeeping the engine
+    /// does not model. The digital engine substitutes a pack generated from
+    /// `GameState::booster_shelf` (see `game::boosters`).
+    ///
+    /// Parameterized rather than card-shaped: `filter` + `count` + `destination`
+    /// separate "which of the opened cards may be taken", "how many", and "where
+    /// they go", which is the axis the printed cards actually differ on —
+    /// Booster Tutor takes one card of any kind into its controller's hand,
+    /// Summon the Pack takes every creature card onto the battlefield.
+    OpenBoosterPack {
+        /// CR 400.11: which of the opened cards may be taken.
+        #[serde(default = "default_target_filter_any")]
+        filter: TargetFilter,
+        /// How many of the opened cards are taken. `QuantityExpr::UpTo` peels
+        /// into the choice's "up to" flag exactly as it does for
+        /// `SearchOutsideGame`.
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+        /// CR 400.11b: the zone the taken cards enter.
+        #[serde(default = "default_zone_hand")]
+        destination: Zone,
+        /// CR 701.20: "reveal the cards" — the whole pack is public, not just
+        /// the card that is taken.
+        #[serde(default)]
+        reveal: bool,
+    },
     RevealHand {
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
@@ -19190,6 +19280,9 @@ impl Effect {
             | Effect::Vote { .. }
             | Effect::Cleanup { .. }
             | Effect::SearchOutsideGame { .. }
+            // CR 400.11 + CR 608.2d: the pack's cards are chosen as the effect
+            // resolves, not declared as stack targets.
+            | Effect::OpenBoosterPack { .. }
             | Effect::Choose { .. }
             | Effect::OpponentGuess { .. }
             | Effect::ChooseDamageSource { .. }
@@ -19705,6 +19798,11 @@ impl Effect {
             // `Zone::Library` destination WOULD be a move *to* a library; every
             // one of the 11 shipping nodes is `Hand` today.
             Effect::SearchOutsideGame { destination, .. } => *destination == Zone::Library,
+            // CR 400.11: a booster pack's cards are OUTSIDE the game, which is
+            // not a zone — so the origin half never touches a library. The
+            // destination is still read, because a `Zone::Library` destination
+            // would be a move *to* a library.
+            Effect::OpenBoosterPack { destination, .. } => *destination == Zone::Library,
 
             // CR 901.4: "All plane and phenomenon cards remain in the COMMAND ZONE
             // throughout the game, both while they're part of a planar deck and
@@ -20279,6 +20377,9 @@ impl Effect {
             Effect::SearchOutsideGame { count, .. } => {
                 f(count);
             }
+            Effect::OpenBoosterPack { count, .. } => {
+                f(count);
+            }
             Effect::RevealHand { count, .. } => {
                 if let Some(q) = count {
                     f(q);
@@ -20702,6 +20803,7 @@ impl Effect {
             | Effect::Discard { count, .. }
             | Effect::SearchLibrary { count, .. }
             | Effect::SearchOutsideGame { count, .. }
+            | Effect::OpenBoosterPack { count, .. }
             | Effect::ExileTop { count, .. }
             | Effect::ExileFaceDownPile { count, .. }
             | Effect::AddPendingETBCounters { count, .. }
@@ -20965,6 +21067,7 @@ impl Effect {
             | Effect::Discard { count, .. }
             | Effect::SearchLibrary { count, .. }
             | Effect::SearchOutsideGame { count, .. }
+            | Effect::OpenBoosterPack { count, .. }
             | Effect::ExileTop { count, .. }
             | Effect::ExileFaceDownPile { count, .. }
             | Effect::AddPendingETBCounters { count, .. }
@@ -21310,6 +21413,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::FlipPermanent { .. } => "FlipPermanent",
         Effect::SearchLibrary { .. } => "SearchLibrary",
         Effect::SearchOutsideGame { .. } => "SearchOutsideGame",
+        Effect::OpenBoosterPack { .. } => "OpenBoosterPack",
         Effect::RevealHand { .. } => "RevealHand",
         Effect::RevealFromHand { .. } => "RevealFromHand",
         Effect::Reveal { .. } => "Reveal",
@@ -21563,6 +21667,7 @@ pub enum EffectKind {
     Shuffle,
     SearchLibrary,
     SearchOutsideGame,
+    OpenBoosterPack,
     ExileTop,
     TargetOnly,
     Choose,
@@ -21825,6 +21930,7 @@ impl From<&Effect> for EffectKind {
             Effect::FlipPermanent { .. } => EffectKind::FlipPermanent,
             Effect::SearchLibrary { .. } => EffectKind::SearchLibrary,
             Effect::SearchOutsideGame { .. } => EffectKind::SearchOutsideGame,
+            Effect::OpenBoosterPack { .. } => EffectKind::OpenBoosterPack,
             Effect::RevealHand { .. } => EffectKind::Reveal,
             Effect::RevealFromHand { .. } => EffectKind::Reveal,
             Effect::Reveal { .. } => EffectKind::Reveal,

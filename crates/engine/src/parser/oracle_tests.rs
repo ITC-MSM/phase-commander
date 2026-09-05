@@ -6882,6 +6882,7 @@ fn devourer_of_destiny_opening_hand_reveal_creates_first_upkeep_dig() {
             phase: Phase::Upkeep,
             player: PlayerId(0),
             gate: crate::types::ability::TurnGate::None,
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         }
     );
 
@@ -27668,7 +27669,7 @@ fn census_variant_names(body: &str) -> Vec<String> {
 /// it.
 #[test]
 fn render_net_effect_carrier_census() {
-    const EFFECT_VARIANT_PIN: usize = 232;
+    const EFFECT_VARIANT_PIN: usize = 233;
     /// `(enum header, pinned variant count, the ONE variant the net destructures)`.
     const PAYLOAD_ENUM_PINS: &[(&str, usize, &str)] = &[
         ("pub enum CastingPermission {", 8, "ExileWithAltCost"),

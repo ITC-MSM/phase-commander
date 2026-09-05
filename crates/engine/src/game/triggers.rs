@@ -12907,6 +12907,11 @@ fn delayed_trigger_event_with_index(
             phase,
             player,
             gate,
+            // `binding` is only consulted at delayed-trigger CREATION
+            // (`effects::delayed_trigger::resolve`), which has already
+            // stamped `player` to a concrete id by the time this matcher
+            // runs each phase change — nothing left here to read it for.
+            binding: _,
         } => {
             if state.active_player != *player {
                 return None;
@@ -13852,7 +13857,7 @@ fn evaluate_trigger_condition_with_source(
         // `Not { Box::new(WasCast) }`. The `Not` arm inverts the result, so an
         // unanswerable subject resolves Not(WasCast) to `true`. This is NOT because
         // CR 603.4 removes the ability when the source leaves its zone — CR 603.4
-        // (`docs/MagicCompRules.txt:2596`) says nothing about the source's zone, and
+        // says nothing about the source's zone, and
         // CR 113.7a explicitly says the opposite for abilities ("Destruction or
         // removal of the source after that time won't affect the ability"). Rather,
         // a subject the engine cannot answer for yields `false` for the plain
