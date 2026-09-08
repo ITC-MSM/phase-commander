@@ -31956,7 +31956,8 @@ fn extra_turn_controller() {
     assert!(matches!(
         e,
         Effect::ExtraTurn {
-            target: TargetFilter::Controller
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 1 },
         }
     ));
 }
@@ -31971,9 +31972,112 @@ fn extra_turn_imperative() {
     assert!(matches!(
         clause.effect,
         Effect::ExtraTurn {
-            target: TargetFilter::Controller
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 1 },
         }
     ));
+}
+
+#[test]
+fn extra_turn_fixed_cardinal_and_subject_are_preserved() {
+    let one = parse_effect("Target player takes an extra turn after this one.");
+    assert!(matches!(
+        one,
+        Effect::ExtraTurn {
+            target: TargetFilter::Player,
+            count: QuantityExpr::Fixed { value: 1 },
+        }
+    ));
+
+    let two = parse_effect("Target player takes two extra turns after this one.");
+    assert!(matches!(
+        two,
+        Effect::ExtraTurn {
+            target: TargetFilter::Player,
+            count: QuantityExpr::Fixed { value: 2 },
+        }
+    ));
+}
+
+#[test]
+fn extra_turn_grammar_is_all_consuming_and_does_not_shadow_initiative() {
+    assert!(matches!(
+        parse_imperative_effect(
+            "take two extra turns after this one",
+            &mut ParseContext::default(),
+        )
+        .effect,
+        Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 2 },
+        }
+    ));
+    assert!(matches!(
+        parse_effect("Take the initiative."),
+        Effect::TakeTheInitiative
+    ));
+    assert!(matches!(
+        parse_imperative_effect(
+            "take two extra turns after this one and draw a card",
+            &mut ParseContext::default(),
+        )
+        .effect,
+        Effect::Unimplemented { .. }
+    ));
+}
+
+#[test]
+fn extra_turn_count_rejects_values_above_i32_max() {
+    assert!(matches!(
+        parse_effect("Target player takes 2147483647 extra turns after this one."),
+        Effect::ExtraTurn {
+            count: QuantityExpr::Fixed { value: i32::MAX },
+            ..
+        }
+    ));
+    assert!(matches!(
+        parse_imperative_effect(
+            "take 2147483648 extra turns after this one",
+            &mut ParseContext::default(),
+        )
+        .effect,
+        Effect::Unimplemented { .. }
+    ));
+}
+
+#[test]
+fn ral_zarek_coin_result_shell_preserves_singular_extra_turn_count() {
+    let def = parse_effect_chain(
+        "Flip five coins. Take an extra turn after this one for each coin that comes up heads.",
+        AbilityKind::Activated,
+    );
+    let Effect::FlipCoins {
+        count,
+        win_effect: Some(win_effect),
+        lose_effect: None,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected FlipCoins, got {:?}", def.effect);
+    };
+    assert_eq!(count, &QuantityExpr::Fixed { value: 5 });
+    assert!(matches!(
+        win_effect.effect.as_ref(),
+        Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 1 },
+        }
+    ));
+}
+
+#[test]
+fn coin_heads_quantifier_uses_the_final_for_each_clause() {
+    assert_eq!(
+        strip_trailing_coin_heads_quantifier(
+            "For each player, draw a card for each coin that comes up heads."
+        ),
+        Some("For each player, draw a card")
+    );
 }
 
 #[test]
