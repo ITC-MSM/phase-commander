@@ -12,7 +12,7 @@ use super::super::oracle_nom::enters_under::{
 };
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::primitives::parse_keyword_name;
-use super::super::oracle_target::{parse_target, parse_target_with_ctx, parse_type_phrase};
+use super::super::oracle_target::{parse_target, parse_target_with_ctx, parse_type_phrase_folding};
 use super::super::oracle_util::{contains_possessive, parse_count_expr, parse_ordinal, TextPair};
 use super::{apply_where_x_to_filter, strip_trailing_where_x};
 use crate::parser::oracle_ir::ast::*;
@@ -2860,9 +2860,11 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
     // CR 301.5b + CR 608.2c: these attach forms are imperative game actions,
     // not noun-phrase continuations. Keep the matcher narrow so name-based
     // chains like "put counters on it and attach Fractal Harness to it" stay
-    // available to the token-counter attach rewriter.
+    // available to the token-counter attach rewriter. "That Equipment" is the
+    // selected-object anaphor used by Grip of Phyresis.
     .or(alt((
         value((), tag("attach this equipment ")),
+        value((), tag("attach that equipment ")),
         value((), tag("attach an equipment that was attached ")),
     )))
     .or(alt((
@@ -7230,11 +7232,11 @@ fn parse_change_zone_enters_tapped_attacking(
     if !recognized {
         return None;
     }
-    // N-D: materialize TargetFilter::Typed via parse_type_phrase on the type
+    // N-D: materialize TargetFilter::Typed via parse_type_phrase_folding on the type
     // tail — RevealedHasCardType carries no TargetFilter, so reuse the canonical
     // materializer rather than reconstructing from the recognized condition.
     let type_tail = strip_moved_object_subject(condition_clause)?;
-    let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase(type_tail);
+    let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase_folding(type_tail);
     if matches!(filter, TargetFilter::Any | TargetFilter::None) || !leftover.trim().is_empty() {
         return None;
     }
@@ -7249,7 +7251,7 @@ fn parse_change_zone_enters_tapped_attacking(
 /// (Summoner's Grimoire). Shared with the `Condition_If` swallow detector so the
 /// represented clause can be located and stripped text-scoped, reusing the same
 /// leading-condition combinators (`strip_moved_object_subject` +
-/// `parse_type_phrase`) that `parse_change_zone_enters_tapped_attacking` uses —
+/// `parse_type_phrase_folding`) that `parse_change_zone_enters_tapped_attacking` uses —
 /// not a verbatim Oracle-string match.
 pub(crate) fn is_moved_object_enters_modifier_clause(sentence: &str) -> bool {
     let lower = sentence.to_lowercase();
@@ -7265,7 +7267,7 @@ pub(crate) fn is_moved_object_enters_modifier_clause(sentence: &str) -> bool {
     let Some(type_tail) = strip_moved_object_subject(after_if) else {
         return false;
     };
-    let (filter, _leftover) = crate::parser::oracle_target::parse_type_phrase(type_tail);
+    let (filter, _leftover) = crate::parser::oracle_target::parse_type_phrase_folding(type_tail);
     !matches!(filter, TargetFilter::Any | TargetFilter::None)
 }
 
@@ -8837,7 +8839,7 @@ pub(super) fn try_parse_repeat_process_for_keywords(text: &str) -> Option<Vec<Ke
 /// class ("do the same for <type>"), not Estrid alone.
 ///
 /// Combinators only: `opt`/`tag`/`alt` for the prefix, then the shared
-/// `parse_type_phrase` for the filter. Requires the phrase to be fully consumed
+/// `parse_type_phrase_folding` for the filter. Requires the phrase to be fully consumed
 /// (modulo a trailing period) by a non-empty typed filter, so unrelated
 /// "do/repeat …" tails fall through to normal dispatch rather than being
 /// swallowed.
@@ -8848,7 +8850,7 @@ pub(super) fn try_parse_do_the_same_for_type(text: &str) -> Option<Vec<TypeFilte
         let (i, _) = tag::<_, _, OracleError<'_>>("do the same for ").parse(i)?;
         Ok((i, ()))
     })?;
-    let (filter, remainder) = parse_type_phrase(rest.trim().trim_end_matches('.').trim());
+    let (filter, remainder) = parse_type_phrase_folding(rest.trim().trim_end_matches('.').trim());
     if !remainder.trim().trim_end_matches('.').trim().is_empty() {
         return None;
     }
@@ -8876,7 +8878,7 @@ fn starts_do_the_same_for_type_before_then(text: &str) -> bool {
     .parse(lower.as_str()) else {
         return false;
     };
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     remainder.trim().is_empty() && pure_type_substitution(filter).is_some()
 }
 
@@ -9926,6 +9928,26 @@ mod tests {
         assert!(starts_bare_and_clause(
             "attach an Equipment that was attached to ~ to that creature"
         ));
+    }
+
+    #[test]
+    fn bare_and_starts_equipment_attachment_anaphors_but_not_other_attachment_forms() {
+        for clause in ["attach this Equipment to it", "attach that Equipment to it"] {
+            assert!(starts_bare_and_clause(clause), "must split: {clause}");
+        }
+        for clause in [
+            "attach ~ to it",
+            "attach this Aura to it",
+            "attach that Aura to it",
+            "attach this Fortification to it",
+            "attach that Fortification to it",
+            "attach Fractal Harness to it",
+        ] {
+            assert!(
+                !starts_bare_and_clause(clause),
+                "must preserve specialized/non-Equipment route: {clause}"
+            );
+        }
     }
 
     #[test]
@@ -11914,7 +11936,7 @@ mod tests {
     /// milled artifact (e.g. an Equipment, an artifact land) be moved to hand.
     ///
     /// End-to-end guard: the building-block fix lives in
-    /// `parse_type_phrase_with_ctx` (`oracle_target.rs`); this test pins the
+    /// `parse_type_phrase_folding_with_ctx` (`oracle_target.rs`); this test pins the
     /// full Oracle-text → typed-AST contract for the milled-card retrieval
     /// path so future refactors to the dig-from-among lowering can't silently
     /// regress the AND-of-types semantics.

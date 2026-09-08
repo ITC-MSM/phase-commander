@@ -1075,6 +1075,17 @@ pub(crate) fn resume_resolution_frames(state: &mut GameState, events: &mut Vec<G
         ResolutionFrame::PerCategoryZoneChoice(_) => {
             let _ = choose_from_zone::drain_active_per_category_zone_choice(state, &[], events);
         }
+        // CR 706.3a + CR 608.2c: a die-roll frame is re-parked (with its loop
+        // cursor advanced) when a results-table branch suspends for its own
+        // interactive choice. Once that choice settles, the remaining dice still
+        // owe their branches, so the frame drains here and the loop continues.
+        //
+        // The CR 706.6 "ignore the lowest roll" prompt is a DIFFERENT resume: it
+        // is consumed by `GameAction::SelectDieRolls`, which takes the frame
+        // before any drain can see it. Only a mid-loop re-park reaches this arm.
+        ResolutionFrame::DieRoll(_) => {
+            roll_die::drain_active_die_roll(state, events);
+        }
         ResolutionFrame::OptionalEffect(_)
         | ResolutionFrame::CoinFlip(_)
         | ResolutionFrame::Proliferate(_)
@@ -2851,6 +2862,95 @@ pub(crate) fn first_object_target(targets: &[TargetRef]) -> Option<ObjectId> {
     })
 }
 
+/// CR 113.7a + CR 611.2a + CR 615.3: install a damage replacement created by the
+/// RESOLUTION of a spell or ability whose scope is its SOURCE rather than a
+/// recipient object.
+///
+/// The single authority for the SOURCE-SCOPED DAMAGE-SHIELD installs it owns —
+/// `prevent_damage`'s untargeted branch and player-scoped arm, and
+/// `create_damage_replacement`'s non-battlefield arm — so those cannot drift.
+///
+/// Scope of that claim, stated precisely: it is NOT the only writer to
+/// `state.pending_damage_replacements`. `add_target_replacement::resolve` still
+/// pushes raw at its `TargetFilter::None` global arm and its `TargetRef::Player`
+/// arm, and neither latches `source_controller`, so a controller-relative gate on
+/// those definitions falls back to `state.active_player` in the pending scan
+/// rather than to the installer (CR 113.8 / CR 109.5 would prefer the installer).
+/// That is PRE-EXISTING behavior, deliberately left alone by issue #8485 rather
+/// than changed late in that work, and this comment is its only record. Routing
+/// those two arms through this authority is the clean end state.
+///
+/// CR 113.7a: "Once activated or triggered, an ability exists on the stack
+/// independently of its source. Destruction or removal of the source after that
+/// time won't affect the ability." Hosting such a shield on the SOURCE permanent
+/// (which the pre-#8485 code did whenever the source happened to be a
+/// battlefield object) makes its lifetime an accident of the SOURCE'S ZONE
+/// rather than of the effect's stated duration (CR 611.2a), and subjects it to
+/// the CR 702.26b phased-out gate in `functioning_abilities::active_replacements`
+/// even though the effect is not the source's ability any more.
+///
+/// The floating registry is the engine's home for exactly this: it is not
+/// touched by the CR 613.1 layer reset, is not zone-gated, is mutated in place
+/// by the prevention appliers (all three of which dispatch on the `ObjectId(0)`
+/// sentinel), and is pruned on schedule by all three windows (`turns.rs`:
+/// cleanup, end-of-combat teardown, untap step) -- CR 615.3, "until they're used
+/// up or their duration has expired".
+///
+/// `anchor_zones` is the CALLER'S OWN pre-existing object-hosting zone set --
+/// the zones in which that caller stored the shield on its source before this
+/// authority existed. It is a caller parameter and not a constant because the
+/// two pre-existing forks disagree: `prevent_damage::resolve`'s untargeted
+/// branch tested `Zone::Battlefield` alone while `push_player_scoped_shield`
+/// tested `Zone::Battlefield | Zone::Command`. Handing each caller its own set
+/// is what makes the ANCHORED population exactly the population that caller
+/// newly moves, and leaves every shield that was ALREADY in the registry
+/// carrying `source_object: None` and today's sentinel semantics -- including an
+/// untargeted shield sourced from a Command-zone emblem. A single hardcoded
+/// `Battlefield | Command` test would newly anchor that emblem case and flip
+/// `SourceExclusion::Exclude`, `DamageTargetPlayerScope::SourceChosenPlayer`
+/// and every host-reading `ReplacementCondition` from inert to evaluated.
+/// The SHAPE mirrors the object scan's own `zones_to_scan`
+/// (`replacement.rs`) -- a zone set, checked with `contains`. That is a
+/// shape precedent only: `zones_to_scan` is a hardcoded local with no callers,
+/// so it is not itself an instance of per-caller parameterization. An EMPTY
+/// slice means "anchor nothing", which is correct for a caller that is only
+/// being refactored onto the authority and moves no shield at all.
+pub(crate) fn install_floating_damage_replacement(
+    state: &mut GameState,
+    mut shield: crate::types::ability::ReplacementDefinition,
+    controller: PlayerId,
+    source_id: ObjectId,
+    anchor_zones: &[Zone],
+) {
+    // CR 113.8 + CR 109.5: "The controller of an activated ability on the stack is
+    // the player who activated it"; CR 109.5's "you"/"your" clause says the same
+    // for an activated ability. Latch the installing controller so a
+    // controller-relative filter or condition resolves under the sentinel host,
+    // which per CR 109.4 has no controller of its own.
+    if shield.source_controller.is_none() {
+        shield.source_controller = Some(controller);
+    }
+    // CR 113.7a: anchor the host ONLY for a source that was actually
+    // hosting the shield before this authority existed -- i.e. an object in THIS
+    // CALLER'S `anchor_zones`. The two callers do not agree on that set (see the
+    // doc comment), so it must not be hardcoded here. A shield created by a
+    // resolving instant/sorcery never had a host, and neither did any shield this
+    // caller was ALREADY routing to the registry -- for `prevent_damage::resolve`'s
+    // untargeted branch that includes a Command-zone (emblem) source, which its
+    // `Battlefield`-only fork already sent here. Leaving all of those `None`
+    // reproduces today's sentinel semantics byte-for-byte for the entire
+    // pre-existing registry population.
+    if shield.source_object.is_none()
+        && state
+            .objects
+            .get(&source_id)
+            .is_some_and(|obj| anchor_zones.contains(&obj.zone))
+    {
+        shield.source_object = Some(source_id);
+    }
+    state.pending_damage_replacements.push(shield);
+}
+
 enum OneSidedFightSubject {
     /// The parent chose this object; prepend it to restore the contract.
     Prepend(ObjectId),
@@ -3199,6 +3299,26 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::ArrangePlanarDeckTopChoice { .. }
             | WaitingFor::RedistributeLifeTotals { .. }
             | WaitingFor::CoinFlipKeepChoice { .. }
+            // CR 706.6 + CR 608.2c: the "ignore the lowest roll" choice pauses
+            // resolution before the surviving results exist. A chained
+            // sub_ability ("Roll a d20. <effect> equal to the result") must run
+            // only AFTER the ignore is submitted — resolving it inline would
+            // read a die result that has not been decided.
+            //
+            // This arm ALSO carries both events-slice die-result consumers,
+            // neither of which the compiler can see:
+            //   1. `recent_roll_difference` (`game/contraptions.rs`)
+            //      reverse-scans the shared events vec with no resolution
+            //      boundary, so Hard Hat Area's reflexive
+            //      `AssembleContraptionsFromRollDifference` must not run until
+            //      `resume_after_ignore` has pushed the survivors' `DieRolled`.
+            //   2. `snapshot_resolution_context_quantity`
+            //      (`game/effects/effect.rs`) reverse-scans the SAME vec via
+            //      `extract_amount_from_event` to freeze CR 611.2d "where X is
+            //      the result" into a continuous effect, so Hammer Helper's
+            //      `GenericEffect` static registration must not run before those
+            //      events exist — it would snapshot a permanent +0/+0.
+            | WaitingFor::DieKeepChoice { .. }
             | WaitingFor::DigChoice { .. }
             | WaitingFor::SurveilChoice { .. }
             | WaitingFor::RevealChoice { .. }
@@ -10100,6 +10220,40 @@ fn perform_player_scope_sacrifices(
             }
         }
     }
+    // CR 118.12 + CR 608.2c + CR 609.3: "Sacrifice a creature. If you do, [rider]." — seed
+    // the performed-flag for a sacrifice that completed through the INTERACTIVE
+    // `EffectZoneChoice` path (Victimize, #7898).
+    //
+    // The mandatory-rider seed in `resolve_ability_with_events` decides the flag
+    // by scanning the LOCAL event slice for `PermanentSacrificed`. That works for
+    // the auto path (`sacrifice.rs`: `!up_to && eligible.len() <= count`), which
+    // sacrifices inline. But when the controller has more eligible creatures than
+    // the sacrifice needs, the resolver instead parks on
+    // `WaitingFor::EffectZoneChoice` and returns BEFORE anything is sacrificed —
+    // so that slice holds no `PermanentSacrificed` when the seed evaluates, the
+    // flag stays false, and the rider is silently skipped. In a real game that is
+    // the ordinary case (any caster controlling 2+ creatures), which made
+    // Victimize return nothing at all.
+    //
+    // The sacrifice is only actually known to have happened HERE, at the
+    // completion seam the resumed choice runs through, so the flag must be
+    // stamped onto the stashed continuation frame the same way
+    // `resolve_optional_effect_decision` (accepted "you may") and
+    // `finalize_discard_choice_completion` (an answered discard choice) do.
+    //
+    // Guarded on the completion LEDGER, not on the fact that the seam ran: a
+    // declined / empty selection sacrifices nothing, and CR 118.12 makes the
+    // dependent clause do nothing unless the preceding action occurred. This is
+    // deliberately independent of `cost_payment_failed_flag`, which the rider's
+    // own gate still checks separately.
+    if completion.propagate_parent_context && !completion.sacrificed.is_empty() {
+        if let Some(frame) = state.active_ability_continuation_frame_mut() {
+            frame
+                .pending
+                .chain
+                .set_optional_effect_performed_recursive(true);
+        }
+    }
     if completion.propagate_parent_context {
         if let Some(snapshot) =
             parent_referent_context_from_events(state, &events[events_before_sacrifice..]).or_else(
@@ -10173,11 +10327,15 @@ fn record_announced_sacrifice(
 /// CR 701.21a: Derive terminal sacrifice bookkeeping from the actual events,
 /// not from attempts. This includes an event delivered by the replacement
 /// response immediately before the pending queue is drained.
+// The boxed records are cloned directly from `ZoneChanged` and moved into
+// `CreatureExploited`; retaining that allocation avoids an unbox/rebox copy at
+// this handoff.
+#[allow(clippy::vec_box)]
 fn record_sacrifice_batch_events(
     completion: &mut PendingPlayerScopeSacrificeCompletion,
     events: &[GameEvent],
-) -> Vec<ObjectId> {
-    let mut completed = Vec::new();
+) -> Vec<Box<ZoneChangeRecord>> {
+    let mut completed: Vec<Box<ZoneChangeRecord>> = Vec::new();
     for event in events {
         match event {
             GameEvent::PermanentSacrificed { object_id, .. }
@@ -10185,7 +10343,6 @@ fn record_sacrifice_batch_events(
                     && !completion.sacrificed.contains(object_id) =>
             {
                 completion.sacrificed.push(*object_id);
-                completed.push(*object_id);
                 if !completion.zone_changed.contains(object_id) {
                     completion.zone_changed.push(*object_id);
                 }
@@ -10203,7 +10360,6 @@ fn record_sacrifice_batch_events(
                 // announced sacrifice's terminal result.
                 if !completion.sacrificed.contains(object_id) {
                     completion.sacrificed.push(*object_id);
-                    completed.push(*object_id);
                 }
                 if !completion.zone_changed.contains(object_id) {
                     completion.zone_changed.push(*object_id);
@@ -10216,6 +10372,17 @@ fn record_sacrifice_batch_events(
                         .departed_zone_change_indices
                         .push(record.turn_zone_change_index);
                 }
+                // CR 603.2g + CR 702.110b: only the actual announced
+                // battlefield departure proves the creature was sacrificed as
+                // exploit resolved. `PermanentSacrificed` bookkeeping alone
+                // cannot fabricate the victim snapshot.
+                if !completion.followed_up_sacrifices.contains(object_id)
+                    && !completed
+                        .iter()
+                        .any(|completed_record| completed_record.object_id == *object_id)
+                {
+                    completed.push(record.clone());
+                }
             }
             _ => {}
         }
@@ -10227,16 +10394,18 @@ fn record_sacrifice_batch_events(
 /// follow-up only after the sacrifice event has completed. The completion ledger
 /// survives a replacement choice, so a resumed event is neither skipped nor
 /// emitted twice.
+#[allow(clippy::vec_box)]
 fn emit_sacrifice_batch_follow_ups(
     completion: &mut PendingPlayerScopeSacrificeCompletion,
-    completed: Vec<ObjectId>,
+    completed: Vec<Box<ZoneChangeRecord>>,
     events: &mut Vec<GameEvent>,
 ) {
     let Some(follow_up) = completion.follow_up.clone() else {
         return;
     };
 
-    for sacrificed in completed {
+    for record in completed {
+        let sacrificed = record.object_id;
         if completion.followed_up_sacrifices.contains(&sacrificed) {
             continue;
         }
@@ -10245,6 +10414,7 @@ fn emit_sacrifice_batch_follow_ups(
                 events.push(GameEvent::CreatureExploited {
                     exploiter,
                     sacrificed,
+                    record,
                 });
             }
         }
@@ -10515,6 +10685,7 @@ pub(crate) fn drain_pending_discard_batch(
                 remaining_count,
                 paused_card,
                 chooser,
+                ..
             } = discard::discard_at_random(
                 state,
                 discard::RandomDiscardRequest {
@@ -16317,6 +16488,128 @@ mod tests {
     use super::*;
     use crate::database::synthesis::synthesize_extort;
 
+    fn real_sacrifice_events() -> (ObjectId, ObjectId, Vec<GameEvent>, Box<ZoneChangeRecord>) {
+        let mut state = GameState::new_two_player(42);
+        let exploiter = create_object(
+            &mut state,
+            CardId(91),
+            PlayerId(0),
+            "Exploit source".to_string(),
+            Zone::Battlefield,
+        );
+        let victim = create_object(
+            &mut state,
+            CardId(92),
+            PlayerId(0),
+            "Exploit victim".to_string(),
+            Zone::Battlefield,
+        );
+        let victim_object = state.objects.get_mut(&victim).expect("victim exists");
+        victim_object.card_types.core_types.push(CoreType::Creature);
+        victim_object.base_card_types = victim_object.card_types.clone();
+        victim_object.is_token = true;
+        victim_object.controller = PlayerId(0);
+        victim_object.owner = PlayerId(1);
+
+        let mut events = Vec::new();
+        let outcome = crate::game::sacrifice::sacrifice_permanent(
+            &mut state,
+            victim,
+            PlayerId(0),
+            &mut events,
+        )
+        .expect("fixture sacrifice succeeds");
+        assert!(matches!(
+            outcome,
+            crate::game::sacrifice::SacrificeOutcome::Complete
+        ));
+        let record = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } if *object_id == victim => Some(record.clone()),
+                _ => None,
+            })
+            .expect("successful sacrifice emits its departure record");
+        (exploiter, victim, events, record)
+    }
+
+    fn exploit_completion(
+        exploiter: ObjectId,
+        victim: ObjectId,
+    ) -> PendingPlayerScopeSacrificeCompletion {
+        PendingPlayerScopeSacrificeCompletion {
+            announced: vec![victim],
+            follow_up: Some(PendingPlayerScopeSacrificeFollowUp::Exploit { exploiter }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn exploit_follow_up_uses_the_actual_departure_record_once_in_any_event_order() {
+        let (exploiter, victim, sacrifice_events, expected_record) = real_sacrifice_events();
+
+        for events in [sacrifice_events.clone(), {
+            let mut reversed = sacrifice_events.clone();
+            reversed.reverse();
+            reversed
+        }] {
+            let mut completion = exploit_completion(exploiter, victim);
+            let completed = record_sacrifice_batch_events(&mut completion, &events);
+            let mut emitted = Vec::new();
+            emit_sacrifice_batch_follow_ups(&mut completion, completed, &mut emitted);
+            assert_eq!(completion.sacrificed, vec![victim]);
+            assert_eq!(emitted.len(), 1);
+            assert!(matches!(
+                &emitted[0],
+                GameEvent::CreatureExploited {
+                    exploiter: event_exploiter,
+                    sacrificed,
+                    record,
+                } if *event_exploiter == exploiter
+                    && *sacrificed == victim
+                    && record == &expected_record
+            ));
+
+            let completed = record_sacrifice_batch_events(&mut completion, &events);
+            emit_sacrifice_batch_follow_ups(&mut completion, completed, &mut emitted);
+            assert_eq!(
+                emitted.len(),
+                1,
+                "repeated scans must not duplicate an exploit follow-up"
+            );
+        }
+    }
+
+    #[test]
+    fn exploit_follow_up_requires_an_announced_battlefield_departure_record() {
+        let (exploiter, victim, sacrifice_events, _) = real_sacrifice_events();
+        let permanent_sacrificed = sacrifice_events
+            .iter()
+            .find(|event| matches!(event, GameEvent::PermanentSacrificed { .. }))
+            .cloned()
+            .expect("successful sacrifice emits bookkeeping");
+
+        let mut completion = exploit_completion(exploiter, victim);
+        let completed = record_sacrifice_batch_events(
+            &mut completion,
+            std::slice::from_ref(&permanent_sacrificed),
+        );
+        let mut emitted = Vec::new();
+        emit_sacrifice_batch_follow_ups(&mut completion, completed, &mut emitted);
+        assert_eq!(completion.sacrificed, vec![victim]);
+        assert!(
+            emitted.is_empty(),
+            "bookkeeping without an actual departure cannot prove exploit"
+        );
+
+        let mut unannounced = exploit_completion(exploiter, ObjectId(victim.0 + 1));
+        let completed = record_sacrifice_batch_events(&mut unannounced, &sacrifice_events);
+        emit_sacrifice_batch_follow_ups(&mut unannounced, completed, &mut emitted);
+        assert!(emitted.is_empty());
+    }
+
     #[test]
     fn resolution_window_batch_reaches_a_chained_consumer() {
         let window = || {
@@ -16480,7 +16773,9 @@ mod tests {
     use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
     use crate::types::phase::Phase;
     use crate::types::player::{PlayerCounterKind, PlayerId};
-    use crate::types::resolution::{OptionalEffectFrame, ResolutionStateWire};
+    use crate::types::resolution::{
+        OptionalEffectFrame, ResolutionStateWire, RESOLUTION_STATE_WIRE_VERSION,
+    };
     use crate::types::statics::CastFrequency;
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
@@ -18247,14 +18542,19 @@ mod tests {
         ));
         state.current_trigger_event = None;
 
-        let v2 = serde_json::to_value(ResolutionStateWire::from_game_state(state.clone()))
-            .expect("real optional-effect prompt serializes as v2");
-        assert_eq!(v2["resolution_state_version"], 2);
-        assert!(v2.get("pending_optional_effect").is_none());
-        assert!(v2.get("pending_optional_trigger_event").is_none());
-        assert!(v2.get("pending_optional_trigger_match_count").is_none());
-        state = serde_json::from_value::<ResolutionStateWire>(v2)
-            .expect("real optional-effect prompt round-trips through the v2 wire")
+        let current = serde_json::to_value(ResolutionStateWire::from_game_state(state.clone()))
+            .expect("real optional-effect prompt serializes through the current wire");
+        assert_eq!(
+            current["resolution_state_version"],
+            RESOLUTION_STATE_WIRE_VERSION
+        );
+        assert!(current.get("pending_optional_effect").is_none());
+        assert!(current.get("pending_optional_trigger_event").is_none());
+        assert!(current
+            .get("pending_optional_trigger_match_count")
+            .is_none());
+        state = serde_json::from_value::<ResolutionStateWire>(current)
+            .expect("real optional-effect prompt round-trips through the current wire")
             .into_game_state();
 
         crate::game::engine::apply(
@@ -22647,7 +22947,7 @@ mod tests {
         // A non-cost, non-optional parent: a `BecomeCopy` reflexive parent.
         let become_copy_parent = ResolvedAbility::new(
             Effect::BecomeCopy {
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 target: TargetFilter::SelfRef,
                 duration: None,
                 mana_value_limit: None,
@@ -22817,7 +23117,7 @@ mod tests {
         // unconditional.
         let become_copy = ResolvedAbility::new(
             Effect::BecomeCopy {
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 target: TargetFilter::SelfRef,
                 duration: None,
                 mana_value_limit: None,

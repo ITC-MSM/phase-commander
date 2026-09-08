@@ -1837,9 +1837,10 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
         }
-        Effect::ExtraTurn { target } => {
+        Effect::ExtraTurn { target, count } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
+            acc = acc.or(scan_quantity_expr(count, mode));
             acc
         }
         Effect::GrantExtraLoyaltyActivations { amount, target } => {
@@ -4776,7 +4777,13 @@ fn scan_replacement_condition(x: &ReplacementCondition, mode: ScanMode) -> Axes 
         ReplacementCondition::OnlyExtraTurn => Axes::NONE,
         ReplacementCondition::TokenSubtypeMatches { subtypes: _ } => Axes::NONE,
         ReplacementCondition::TokenCoreTypeMatches { core_types: _ } => Axes::NONE,
-        ReplacementCondition::FirstTokenCreationEachTurn { player: _ } => Axes::NONE,
+        ReplacementCondition::FirstTokenCreationEachTurn { active_player_req } => {
+            let mut acc = Axes::NONE;
+            if let Some(x) = active_player_req {
+                acc = acc.or(scan_controller_ref(x));
+            }
+            acc
+        }
         ReplacementCondition::ExceptFirstDrawInDrawStep => Axes::NONE,
         ReplacementCondition::IfControlsMatching { filter, minimum: _ } => {
             let mut acc = Axes::NONE;
@@ -6975,6 +6982,20 @@ mod tests {
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
 
+    #[test]
+    fn extra_turn_scan_reaches_dynamic_count() {
+        let axes = scan_effect(
+            &Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+            },
+            ScanMode::LoopFirewall,
+        );
+        assert!(axes.event);
+    }
+
     fn zone_choice_for_scan(
         zone: Zone,
         candidate_source: ZoneChoiceCandidateSource,
@@ -8613,7 +8634,7 @@ mod tests {
             },
             Effect::BecomeCopy {
                 target: f(),
-                recipient: f(),
+                recipient: crate::types::ability::CopyRecipient::Untargeted(f()),
                 duration: None,
                 mana_value_limit: None,
                 additional_modifications: vec![],
