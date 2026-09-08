@@ -29,6 +29,7 @@ combo-verify = ["test-support"]
 
 [dependencies]
 serde = { workspace = true }
+serde_ignored = "0.1"
 tracing = { workspace = true }
 thiserror = "2"
 rand = "0.9"
@@ -48,6 +49,9 @@ im = { version = "15", features = ["serde"] }
 rustc-hash = "2"
 smallvec = { version = "1", features = ["serde", "union"] }
 ts-rs = { version = "=12.0.1", optional = true, features = ["serde-compat"] }
+
+[target.'cfg(windows)'.dependencies]
+same-file = "1"
 
 [[bin]]
 name = "coverage-report"
