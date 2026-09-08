@@ -5,8 +5,8 @@ use crate::game::game_object::AttachTarget;
 use crate::game::zones;
 use crate::types::ability::{
     ControllerRef, Duration, Effect, EffectError, EffectKind, EffectResolutionResult, FilterProp,
-    LibraryPosition, QuantityExpr, ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef,
-    TargetSelectionMode, TypeFilter, TypedFilter,
+    LibraryPosition, OpponentMayScope, QuantityExpr, ResolvedAbility, TargetChoiceTiming,
+    TargetFilter, TargetRef, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -424,6 +424,111 @@ fn resolution_choice_cardinality(
     }
 }
 
+fn resolution_zone_candidates(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    target_filter: &TargetFilter,
+    filter_controller: PlayerId,
+    scan_zones: &[Zone],
+    destination: Zone,
+) -> Vec<ObjectId> {
+    let ctx = crate::game::filter::FilterContext::from_ability_with_controller(
+        ability,
+        filter_controller,
+    );
+    state
+        .objects
+        .iter()
+        .filter(|(id, object)| {
+            scan_zones.contains(&object.zone)
+                && !object.is_emblem
+                && crate::game::filter::matches_target_filter(state, **id, target_filter, &ctx)
+        })
+        .filter(|(id, object)| {
+            destination != Zone::Exile
+                || !crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
+                    state,
+                    ability,
+                    **id,
+                    object.controller,
+                )
+        })
+        .map(|(id, _)| *id)
+        .collect()
+}
+
+/// CR 608.2d + CR 701.13a: report whether this exact optional-for-any-player
+/// graveyard-exile instruction lacks enough legal cards for its exact
+/// resolution-time selection. Adjacent ChangeZone shapes return `None` so the
+/// ordinary optional-effect path retains authority over them.
+pub(crate) fn exact_scoped_graveyard_exile_is_infeasible(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<bool> {
+    let Effect::ChangeZone {
+        origin: Some(Zone::Graveyard),
+        destination: Zone::Exile,
+        target:
+            TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            }),
+        up_to: false,
+        ..
+    } = &ability.effect
+    else {
+        return None;
+    };
+    let spec = ability.multi_target.as_ref()?;
+    let max = spec.max.as_ref()?;
+    let canonical_properties = [
+        FilterProp::Owned {
+            controller: ControllerRef::ScopedPlayer,
+        },
+        FilterProp::InZone {
+            zone: Zone::Graveyard,
+        },
+    ];
+    if !ability.optional
+        || ability.optional_for != Some(OpponentMayScope::AnyPlayer)
+        || ability
+            .targets
+            .iter()
+            .any(|target| matches!(target, TargetRef::Object(_)))
+        || ability.target_choice_timing != TargetChoiceTiming::Resolution
+        || !type_filters.contains(&TypeFilter::Card)
+        || properties.as_slice() != canonical_properties
+        || max != &spec.min
+    {
+        return None;
+    }
+
+    let target_filter = match &ability.effect {
+        Effect::ChangeZone { target, .. } => target,
+        _ => unreachable!("shape matched above"),
+    };
+    let filter_controller =
+        crate::game::effects::controller_for_relative_filter(state, ability, target_filter);
+    let candidates = resolution_zone_candidates(
+        state,
+        ability,
+        target_filter,
+        filter_controller,
+        &[Zone::Graveyard],
+        Zone::Exile,
+    );
+    Some(
+        crate::game::ability_utils::resolve_multi_target_bounds(
+            state,
+            ability,
+            spec,
+            candidates.len(),
+        )
+        .is_err(),
+    )
+}
+
 // PLAN §7 Phase A: the zone-change pipeline (result enums, delivery tail,
 // `execute_zone_move`, `deliver_replaced_zone_change`) now lives in
 // `crate::game::zone_pipeline`. These shims keep every existing
@@ -823,40 +928,14 @@ pub fn resolve(
         // "creature you control" needs "you" to resolve to the *target* player
         // (not the caster), we pass `filter_controller` explicitly. Include the
         // resolving ability so `Owned { ScopedPlayer }` reads `scoped_player`.
-        let ctx = crate::game::filter::FilterContext::from_ability_with_controller(
+        let eligible = resolution_zone_candidates(
+            state,
             ability,
+            target_filter,
             filter_controller,
+            &scan_zones,
+            dest_zone,
         );
-        let eligible: Vec<ObjectId> = state
-            .objects
-            .iter()
-            .filter(|(id, obj)| {
-                scan_zones.contains(&obj.zone)
-                    && !obj.is_emblem
-                    && crate::game::filter::matches_target_filter(state, **id, target_filter, &ctx)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        let eligible: Vec<ObjectId> = if dest_zone == Zone::Exile {
-            eligible
-                .into_iter()
-                .filter(|id| {
-                    let acting_player = state
-                        .objects
-                        .get(id)
-                        .map(|obj| obj.controller)
-                        .unwrap_or(ability.controller);
-                    !crate::game::static_abilities::triggered_cause_sacrifice_or_exile_muzzled(
-                        state,
-                        ability,
-                        *id,
-                        acting_player,
-                    )
-                })
-                .collect()
-        } else {
-            eligible
-        };
 
         let (choice_count, min_count, choice_up_to) =
             resolution_choice_cardinality(state, ability, eligible.len(), up_to);
@@ -1903,12 +1982,15 @@ pub fn resolve_all(
         // keyed by *owner*, not controller — only a card on the battlefield is a
         // permanent (CR 110.1) and thus has a controller; ownership (CR 108.3)
         // is the player who started the game with the card. A creature stolen
-        // via Mind Control retains
-        // `obj.controller = thief` even after dying into its owner's graveyard
-        // (`reset_for_battlefield_exit` does not reset controller; only the
-        // layer pass over `battlefield_phased_in_ids` does, and it skips zones
-        // off the battlefield). Filtering by owner is therefore both rules-
-        // correct and robust to that state divergence. For battlefield-origin
+        // via Mind Control has its controller reset to the owner fallback by
+        // `zones::apply_zone_exit_cleanup` on the way into the graveyard
+        // (`reset_for_battlefield_exit` does not reset controller itself; the
+        // CR 109.4 reset alongside it in `apply_zone_exit_cleanup` does — the
+        // stack/off-battlefield-exit counterpart to the layers pass's own
+        // `battlefield_phased_in_ids`-scoped reset for permanents still ON the
+        // battlefield). Filtering by owner is therefore both rules-correct and
+        // robust to any state divergence in a hand-built or serialized state.
+        // For battlefield-origin
         // mass moves ("exile all permanents you control"), `obj.controller`
         // is authoritative, so we keep that filter for the battlefield case.
         state
@@ -2357,6 +2439,186 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    fn exact_scoped_graveyard_exile_ability() -> ResolvedAbility {
+        let mut ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer,
+                    },
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                ])),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.optional = true;
+        ability.optional_for = Some(OpponentMayScope::AnyPlayer);
+        ability.multi_target = Some(MultiTargetSpec::exact(QuantityExpr::Fixed { value: 3 }));
+        ability.target_choice_timing = TargetChoiceTiming::Resolution;
+        ability.set_scoped_player_recursive(PlayerId(1));
+        ability
+    }
+
+    #[test]
+    fn exact_scoped_graveyard_exile_feasibility_uses_legal_candidate_count() {
+        let mut state = GameState::new_two_player(42);
+        let ability = exact_scoped_graveyard_exile_ability();
+        for index in 0..2 {
+            create_object(
+                &mut state,
+                CardId(index + 1),
+                PlayerId(1),
+                format!("Eligible {index}"),
+                Zone::Graveyard,
+            );
+        }
+        create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Controller decoy".to_string(),
+            Zone::Graveyard,
+        );
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &ability),
+            Some(true)
+        );
+
+        create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Eligible 2".to_string(),
+            Zone::Graveyard,
+        );
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &ability),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn exact_scoped_graveyard_exile_feasibility_declines_adjacent_shapes() {
+        let state = GameState::new_two_player(42);
+        let baseline = exact_scoped_graveyard_exile_ability();
+
+        let mut ordinary_you_may = baseline.clone();
+        ordinary_you_may.optional_for = None;
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &ordinary_you_may),
+            None
+        );
+
+        let mut up_to = baseline.clone();
+        up_to.multi_target = Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 3 }));
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &up_to),
+            None
+        );
+
+        let mut unlimited = baseline.clone();
+        unlimited.multi_target = Some(MultiTargetSpec::unlimited(0));
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &unlimited),
+            None
+        );
+
+        let mut stack_choice = baseline.clone();
+        stack_choice.target_choice_timing = TargetChoiceTiming::Stack;
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &stack_choice),
+            None
+        );
+
+        let mut restricted_card_type = baseline.clone();
+        if let Effect::ChangeZone {
+            target: TargetFilter::Typed(target),
+            ..
+        } = &mut restricted_card_type.effect
+        {
+            target.type_filters = vec![TypeFilter::Creature, TypeFilter::Card];
+        }
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &restricted_card_type),
+            Some(true)
+        );
+
+        let mut object_type_without_card = baseline.clone();
+        if let Effect::ChangeZone {
+            target: TargetFilter::Typed(target),
+            ..
+        } = &mut object_type_without_card.effect
+        {
+            target.type_filters = vec![TypeFilter::Creature];
+        }
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &object_type_without_card),
+            None
+        );
+
+        let mut controller_relative = baseline.clone();
+        if let Effect::ChangeZone { target, .. } = &mut controller_relative.effect {
+            *target = TargetFilter::Typed(
+                TypedFilter::card()
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }]),
+            );
+        }
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &controller_relative),
+            None
+        );
+
+        let mut extra_property = baseline.clone();
+        if let Effect::ChangeZone {
+            target: TargetFilter::Typed(target),
+            ..
+        } = &mut extra_property.effect
+        {
+            target.properties.push(FilterProp::Another);
+        }
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &extra_property),
+            None
+        );
+
+        let mut wrong_origin = baseline.clone();
+        if let Effect::ChangeZone { origin, .. } = &mut wrong_origin.effect {
+            *origin = Some(Zone::Hand);
+        }
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &wrong_origin),
+            None
+        );
+
+        let mut wrong_destination = baseline;
+        if let Effect::ChangeZone { destination, .. } = &mut wrong_destination.effect {
+            *destination = Zone::Hand;
+        }
+        assert_eq!(
+            exact_scoped_graveyard_exile_is_infeasible(&state, &wrong_destination),
+            None
+        );
     }
 
     /// V15 — CR 701.17c + CR 400.7 + CR 603.7c: `resolve` fills an absent
@@ -4861,12 +5123,14 @@ mod tests {
     #[test]
     fn change_zone_all_exile_target_player_graveyard_includes_stolen_then_died() {
         // CR 404.2 + CR 110.2: A creature stolen via Mind Control / Bribery
-        // dies into its *owner's* graveyard, but `obj.controller` retains the
-        // thief's PlayerId because `reset_for_battlefield_exit` does not reset
-        // controller and the layer pass only re-applies controller modifications
-        // to permanents that are still on the battlefield. "Exile target
-        // player's graveyard" must filter by `obj.owner`, not `obj.controller`,
-        // so the stolen-then-died corpse is not silently left behind.
+        // dies into its *owner's* graveyard, and `zones::apply_zone_exit_cleanup`
+        // resets `obj.controller` back to the owner fallback on that exit (via
+        // `revert_layered_characteristics_to_base`). "Exile target player's
+        // graveyard" must still filter by `obj.owner`, not `obj.controller`, as
+        // defence-in-depth for a hand-built or serialized state where the two
+        // have diverged (e.g. loaded from an older save, or constructed directly
+        // as this test does) — the filter must not depend on `obj.controller`
+        // having been correctly reset.
         //
         // Regression for the bug shipped in 08ab17b97: `create_object` sets
         // `controller = owner`, so the original test could not exercise this

@@ -148,9 +148,18 @@ export function export_replay_log(): string;
 
 /**
  * The single authoritative `CustomFormatRules -> FormatConfig` resolver,
- * exposed for the lobby's "select a saved custom format" action. Total and
- * infallible: a `CustomFormatRules` carries every structural field the config
- * needs, so there is no unresolvable input.
+ * exposed for the lobby's "select a saved custom format" action.
+ * `FormatConfig::for_custom_rules` itself is total and infallible: a
+ * `CustomFormatRules` carries every structural field the config needs, so
+ * there is no unresolvable input. This wrapper is fallible anyway — beyond
+ * deserializing the JS payload, it also bounds the resolved config's
+ * `starting_life` (CR 704.5a / CR 810.8c playability floor, and the engine's
+ * `MAX_STARTING_LIFE` overflow-safety ceiling) via
+ * `validate_starting_life_bounds`. `custom_rules` is user-editable
+ * localStorage data, so this bound fails early with a readable lobby-level
+ * message rather than a raw `FormatConfig::deserialize` error at game
+ * start. It is defense in depth, not the sole check: `FormatConfig`'s own
+ * `Deserialize` (see below) remains the closing gate regardless.
  *
  * The frontend must call this rather than assembling a `FormatConfig` from the
  * saved rules itself. `FormatConfig`'s own `Deserialize` re-derives the config
@@ -270,8 +279,10 @@ export function get_game_state(): any;
 export function get_legal_actions_for_viewer_js(player_id: number): any;
 
 /**
- * Get the legal actions, auto-pass recommendation, and spell costs for the current game state.
- * Returns `{ actions: GameAction[], autoPassRecommended: boolean, spellCosts: Record<string, ManaCost> }`.
+ * Get the legal actions, auto-pass recommendation, spell costs, and the CR 118.3
+ * "can't pay this cost right now" read-out for the current game state.
+ * Returns `{ actions: GameAction[], autoPassRecommended: boolean, spellCosts: Record<string, ManaCost>,
+ * activationBlockReasons: Record<string, AbilityBlockEntry[]> }`.
  */
 export function get_legal_actions_js(): any;
 

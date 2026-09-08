@@ -2530,7 +2530,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::PowerExceedsBase
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
-        | FilterProp::DealtDamageThisTurn
+        | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
@@ -2812,7 +2812,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::PowerExceedsBase
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
-        | FilterProp::DealtDamageThisTurn
+        | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
@@ -3183,7 +3183,7 @@ fn legacy_effect(x: &Effect) -> bool {
                     } => source_filters.iter().any(|filter| legacy_target_filter(filter)),
                 }
         }
-        Effect::ChooseCounterKind { target } => legacy_target_filter(target),
+        Effect::ChooseCounterKind { target, .. } => legacy_target_filter(target),
         Effect::PutChosenCounter {
             target,
             count,
@@ -3281,7 +3281,9 @@ fn legacy_effect(x: &Effect) -> bool {
                 || legacy_quantity_expr(count)
                 || legacy_target_filter(filter)
         }
-        Effect::Seek { filter, count, .. } | Effect::SearchOutsideGame { filter, count, .. } => {
+        Effect::Seek { filter, count, .. }
+        | Effect::SearchOutsideGame { filter, count, .. }
+        | Effect::OpenBoosterPack { filter, count, .. } => {
             legacy_target_filter(filter) || legacy_quantity_expr(count)
         }
         Effect::SearchLibrary {
@@ -4553,7 +4555,7 @@ fn rw_effect(
         // resolution-local, per-iteration binding consumed by a later
         // PutChosenCounter. No board WRITE: placement is the separate
         // PutChosenCounter.
-        Effect::ChooseCounterKind { target } => {
+        Effect::ChooseCounterKind { target, .. } => {
             let mut p = if target.is_context_ref() {
                 reads_board_of(StateKind::ObjectCounters)
             } else {
@@ -5444,24 +5446,21 @@ fn rw_effect(
         } => {
             // CR 707.2 + CR 611.2c: the RECIPIENT (copier) is mutated (ObjectPt +
             // SetMembership); the donor `target` is only read for its copiable
-            // values. The single-subject case (`recipient == SelfRef`, every
-            // existing copy card) keeps its EXACT prior profile — the write scoped
+            // values. The single-subject case (`crate::types::ability::CopyRecipient::Source`, every
+            // self-copy card) keeps its EXACT prior profile — the write scoped
             // by the announced `target` slot — so the ordering-parity classification
-            // of the existing copy corpus is byte-identical (no scope re-derivation
-            // is smuggled into this Niko-only change). Only the NEW mass-recipient
-            // path (Niko: "Shards you control") writes the recipient set and reads
-            // the donor, since there the copier and the copied donor are distinct.
-            let write_scope_filter = match recipient {
-                TargetFilter::SelfRef => target,
-                _ => recipient,
-            };
+            // of the existing copy corpus is byte-identical. Only a distinct
+            // recipient (Shuri's announced target, Niko's "Shards you control")
+            // writes the recipient set and reads the donor, since there the copier
+            // and the copied donor are different objects.
+            let write_scope_filter = recipient.filter().unwrap_or(target);
             let (mut p, sc) = obj(StateKind::ObjectPt, write_scope_filter);
             place_object_write(
                 &mut p,
                 StateKind::SetMembership,
                 scope_of(write_scope_filter, chain_root),
             );
-            if !matches!(recipient, TargetFilter::SelfRef) {
+            if recipient.filter().is_some() {
                 p.merge(board_value_aggregate_read(target, StateKind::ObjectPt));
             }
             (p, sc)
@@ -6035,6 +6034,7 @@ fn rw_effect(
         | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::CounterAll { .. }
         | Effect::SearchOutsideGame { .. }
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealFromHand { .. }
         | Effect::ChooseDamageSource { .. }
         | Effect::PhaseIn { .. }

@@ -258,21 +258,20 @@ function objectCandidate(id: string, name: string | null, reference: string): In
   };
 }
 
+/** One published option, its `value` surface stated by the caller — the axis the modal's
+ *  wording whitelist reads. */
+function mayAnswer(id: string, value: string): InteractionChoice {
+  return {
+    id: cid(id),
+    surfaces: [{ type: "value", data: { role: "accept", index: null, value } }],
+    status: { type: "available" },
+  };
+}
+
 /** A may point's two published options. The control reads the `value` surface these carry —
  *  never the index. */
 function mayCandidates(takeId: string, declineId: string): InteractionChoice[] {
-  return [
-    {
-      id: cid(takeId),
-      surfaces: [{ type: "value", data: { role: "accept", index: null, value: "take" } }],
-      status: { type: "available" },
-    },
-    {
-      id: cid(declineId),
-      surfaces: [{ type: "value", data: { role: "accept", index: null, value: "decline" } }],
-      status: { type: "available" },
-    },
-  ];
+  return [mayAnswer(takeId, "take"), mayAnswer(declineId, "decline")];
 }
 
 function element(
@@ -987,6 +986,39 @@ describe("LoopShortcutModal", () => {
     expect(screen.getByText("Sue Storm — taken each iteration")).toBeInTheDocument();
     expect(screen.getByText("Reed Richards — taken each iteration")).toBeInTheDocument();
     expect(screen.queryByText(/declined each iteration/)).not.toBeInTheDocument();
+  });
+
+  // Hostile: the ONLY declaration content is a may point whose answer this modal has no wording
+  // for, so every row it could render is dropped and the box would be a title over nothing.
+  it("omits the declaration panel when no may row survives", () => {
+    seed(
+      buildRespondToShortcutWaitingFor(),
+      {},
+      respondInteraction({ points: [statementMayPoint(0, "s0", "a0")] }, [
+        objectCandidate("s0", "Sue Storm", "402"),
+        mayAnswer("a0", "abstain"),
+      ]),
+    );
+    render(<RespondToShortcutModal />);
+
+    expect(screen.queryByText("Proposed declaration:")).not.toBeInTheDocument();
+  });
+
+  // The paired positive, one literal apart: the same fixture with a whitelisted answer keeps the
+  // title AND its row, so a renderer that dropped the panel unconditionally fails here.
+  it("keeps the declaration panel when its one may row survives", () => {
+    seed(
+      buildRespondToShortcutWaitingFor(),
+      {},
+      respondInteraction({ points: [statementMayPoint(0, "s0", "a0")] }, [
+        objectCandidate("s0", "Sue Storm", "402"),
+        mayAnswer("a0", "take"),
+      ]),
+    );
+    render(<RespondToShortcutModal />);
+
+    expect(screen.getByText("Proposed declaration:")).toBeInTheDocument();
+    expect(screen.getByText("Sue Storm — taken each iteration")).toBeInTheDocument();
   });
 
   // T6 (non-vacuity): both modals self-gate — a non-matching waitingFor.type
@@ -1710,10 +1742,12 @@ describe("LoopShortcutModal", () => {
     expect(dispatchMock).not.toHaveBeenCalled();
   });
 
-  // P5-17: a count the offer published no element for renders zeros and refuses Confirm — no
-  // seeded split and no nearest match. Authoring a partition there is what makes it a rendered
-  // state, not a dead end.
-  it("seeds nothing at a count the engine published no element for (P5-17)", () => {
+  // P5-17: the FAIL-CLOSED end of the unsampled count. This transport cannot preview, so there is
+  // no engine answer to seed the rows from and the modal renders zeros and refuses Confirm —
+  // never a nearest match and never a client-computed split. Authoring a partition there is what
+  // makes it a rendered state rather than a dead end. The preview-capable end is the row below
+  // that installs a `previewInteraction` adapter.
+  it("seeds nothing at an unsampled count with no preview capability (P5-17)", () => {
     seed(
       buildLoopShortcutWaitingFor({ schema: { iteration_count: { Fixed: 8 } } }),
       {},
@@ -1728,6 +1762,9 @@ describe("LoopShortcutModal", () => {
         [seatCandidate("k4", 1), seatCandidate("k5", 2)],
       ),
     );
+    // The precondition this row's zeros are about, stated rather than inherited: an adapter with
+    // no `previewInteraction` is what makes the seam resolve `null`.
+    useGameStore.setState({ adapter: bareAdapter() });
     render(<DeclareShortcutModal />);
 
     // leg A — at the published count the rows read the published split and Confirm is enabled, so
@@ -1736,7 +1773,7 @@ describe("LoopShortcutModal", () => {
     expect(allocationRow("P3")).toHaveAttribute("aria-valuenow", "4");
     expect(confirmButton()).toBeEnabled();
 
-    // leg B — the gap. Nothing is seeded from anywhere.
+    // leg B — the gap, with nothing to seed from: the transport cannot answer.
     fireEvent.change(countBox(), { target: { value: "5" } });
     expect(allocationRow("P2")).toHaveAttribute("aria-valuenow", "0");
     expect(allocationRow("P3")).toHaveAttribute("aria-valuenow", "0");
@@ -2148,6 +2185,20 @@ function answerWith(request: InteractionPreviewRequest, amount: number): Interac
   } as unknown as InteractionPreview;
 }
 
+/** An engine answer carrying the split the COMPLETION mints at `count` — the shape the seam
+ *  returns for a count the offer published no element for. */
+function answerAllocating(
+  request: InteractionPreviewRequest,
+  count: number,
+  allocation: AmountAssignment[],
+  amount: number,
+): InteractionPreview {
+  return {
+    ...answerWith(request, amount),
+    shortcutPreview: element(count, allocation, [{ family: "life", player: 2, amount }]),
+  } as InteractionPreview;
+}
+
 /** The pin-route offer rows 9 and 10 author a split on: two announced seats, an even published
  *  split of the count, and one published life line. */
 function seedPreviewOffer(store: StoreOverrides = {}) {
@@ -2497,5 +2548,56 @@ describe("DeclareShortcutModal — authored-split preview", () => {
     expect(useAppNotificationStore.getState().notification?.description).toBe(
       "This game connection does not support interaction responses",
     );
+  });
+
+  // Row 12: at a count the offer's bounded sample published no element for, the modal asks the
+  // engine for the canonical split with a pin naming NOTHING, then reads the answer into its rows
+  // and its dispatch. The two iterations issue the IDENTICAL request and differ only in what the
+  // engine answered, so a client-side recomputation renders and dispatches the same split twice.
+  it("completes an unsampled count from the engine's own answer", async () => {
+    for (const [amount, allocation] of [
+      [-8, [amt("k4", 2), amt("k5", 2)]],
+      [-6, [amt("k4", 3), amt("k5", 1)]],
+    ] as const) {
+      cleanup();
+      vi.mocked(dispatchInteraction).mockClear();
+      const previewInteraction = vi.fn((request: InteractionPreviewRequest) =>
+        Promise.resolve(answerAllocating(request, 4, [...allocation], amount)),
+      );
+      seedPreviewOffer({ adapter: { ...bareAdapter(), previewInteraction } as EngineAdapter });
+      render(<DeclareShortcutModal />);
+
+      // NEGATIVE SIBLING: at the offer's OWN published count, with nothing authored, the widened
+      // gate asks nothing and the rows read the published split.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(previewInteraction).not.toHaveBeenCalled();
+      expect(allocationRow("P2")).toHaveAttribute("aria-valuenow", "3");
+      expect(allocationRow("P3")).toHaveAttribute("aria-valuenow", "2");
+
+      fireEvent.change(countBox(), { target: { value: "4" } });
+      expect(await screen.findByText(`${amount} life — P3`)).toBeInTheDocument();
+
+      // ONE request per settled state, naming nothing over the announced point.
+      expect(previewInteraction).toHaveBeenCalledOnce();
+      expect(previewInteraction.mock.calls[0][0].response).toEqual({
+        type: "shortcut",
+        data: {
+          decision: { type: "fixed", data: { iterations: 4 } },
+          pins: [{ group: 2, choiceIds: [], amounts: [] }],
+        },
+      });
+
+      expect(allocationRow("P2")).toHaveAttribute("aria-valuenow", String(allocation[0].amount));
+      expect(allocationRow("P3")).toHaveAttribute("aria-valuenow", String(allocation[1].amount));
+      expect(confirmButton()).toBeEnabled();
+      fireEvent.click(confirmButton());
+      expect(vi.mocked(dispatchInteraction).mock.calls[0][0].response).toEqual({
+        type: "shortcut",
+        data: {
+          decision: { type: "fixed", data: { iterations: 4 } },
+          pins: [{ group: 2, choiceIds: ["k4", "k5"], amounts: [...allocation] }],
+        },
+      });
+    }
   });
 });

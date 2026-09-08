@@ -204,10 +204,22 @@ pub(crate) fn apply_zone_exit_cleanup(
         .activated_abilities_this_game
         .retain(|(id, _), _| *id != object_id);
 
-    // CR 400.7: Snapshot LKI before zone change from battlefield or exile.
-    // Power/toughness reflect layer modifications on battlefield (Layer 7);
-    // from exile they will be None (no layer computation), which is correct.
-    if from == Zone::Battlefield || from == Zone::Exile {
+    // CR 400.7: Snapshot LKI before a zone change out of any zone whose
+    // characteristics are not recomputed on demand. Power/toughness reflect
+    // layer modifications on battlefield (Layer 7); from exile they will be
+    // None (no layer computation), which is correct.
+    //
+    // CR 608.2h + CR 109.4: `Zone::Stack` is included because the CR 109.4
+    // reset below erases `obj.controller` on the way out, and a look-back
+    // effect that needs the at-exit controller of a stack object has nowhere
+    // else to read it. Render Silent ("Counter target spell. Its controller
+    // can't cast spells this turn") is the measured consumer:
+    // `ability_utils::parent_target_controller` already prefers this snapshot
+    // for any off-battlefield object and only falls through to `obj.controller`
+    // when there is none, so widening the capture is the whole fix — no
+    // consumer changes. The stack seed (`layers.rs`) owns a stack object's
+    // controller on the way IN; this owns the record of it on the way OUT.
+    if from == Zone::Battlefield || from == Zone::Exile || from == Zone::Stack {
         let lki_copiable_values =
             crate::game::layers::compute_current_copiable_values(state, object_id);
         if let Some(obj) = state.objects.get(&object_id) {
@@ -425,8 +437,74 @@ pub(crate) fn apply_zone_exit_cleanup(
             });
         }
 
+        // CR 400.7 + CR 611.2a: the REMAINING exits of the same in-place grant the
+        // block above closes. This IS a hand-kept list, like the Stack block
+        // above it — there is no shared predicate, so a FOURTH in-place zone
+        // added to `grant_lingering_permissions` (`effects/cast_from_zone.rs`:
+        // `Zone::Exile | Zone::Graveyard | Zone::Hand`) would not reach here on
+        // its own. That sibling is named so the next reader can check the two
+        // against each other. Exile already has its own clear far above, so the
+        // two left over are HAND and GRAVEYARD, and both were open:
+        // a discarded card and a milled card each carried their grant onward,
+        // where the readers pick it up again by CURRENT zone and never by origin
+        // (`casting::has_graveyard_timed_alt_cost_permission`,
+        // `casting::has_exile_cast_permission`). Emry, Lurker of the Loch is the
+        // named specimen of the graveyard half in the block above; exiling that
+        // graveyard afterwards left the card castable. A hand-origin permission authorizes casting the
+        // card FROM THE HAND ("Until end of turn, you may cast spells from your
+        // hand …", Chandra, Flame's Catalyst); a card that leaves the hand
+        // without being cast "becomes a new object with no memory of … its
+        // previous existence", so the grant must not travel with it. Without
+        // this, a discarded card lands in the graveyard still carrying the
+        // permission, where `casting::has_graveyard_timed_alt_cost_permission`
+        // and `graveyard_spell_objects_available_to_cast` re-offer it as a free
+        // graveyard cast — the same re-offer the Stack exit above exists to
+        // prevent, reached by the other door.
+        //
+        // `to != Zone::Stack` is load-bearing, not defensive, and that is MEASURED:
+        // dropping it turns `rishkars_expertise_free_cast_completes_during_resolution`
+        // red on "the consumed free-cast permission must remain only as a neutral
+        // stable slot" and
+        // `hand_cast_selection_casts_during_resolution_without_lingering_permission`
+        // red on its hand-cast wording of the same assertion. Casting the card IS a
+        // move to the stack, and it is the one exit these grants authorize
+        // (Sunforger searching a card to hand and casting it from there,
+        // Electrodominance's resolution-time pick, Emry's graveyard cast). The
+        // spent grant is then dropped by the Stack exit above when the spell
+        // leaves the stack.
+        //
+        // Scoped to the three in-place cast/play variants, mirroring that block.
+        // The exile-scoped designations a card can gain as it leaves the hand
+        // (`Plotted` from CR 702.170a, `Foretold` from CR 702.143a) are
+        // deliberately absent: those are granted at the exile side of the same
+        // move and must survive it.
+        clear_hand_or_graveyard_casting_permissions_on_exit(obj_mut, from, to);
+
         if from == Zone::Battlefield {
             obj_mut.reset_for_battlefield_exit();
+        }
+
+        // CR 109.4: "Only objects on the stack or on the battlefield have a
+        // controller. Objects that are neither on the stack nor on the
+        // battlefield aren't controlled by any player." CR 108.4a: "If anything
+        // asks for the controller of a card that doesn't have one … use its
+        // owner instead." So an object arriving in any OTHER zone must carry the
+        // owner fallback, not whatever CR 613.1b layer-2 control change was last
+        // applied to it.
+        //
+        // Keyed on the DESTINATION, which is the CR 109.4 partition itself —
+        // not on `from == Zone::Stack`. The battlefield leg already reached this
+        // answer via `revert_layered_characteristics_to_base` (called below for
+        // `from == Zone::Battlefield`), which writes the same
+        // `base_controller.unwrap_or(owner)` expression, so this write is
+        // idempotent there and the two sites agree by construction. The STACK
+        // exit had no such reset: MEASURED, a stolen spell that Dissipate
+        // counters-and-exiles reached `Zone::Exile` carrying the THIEF, and
+        // `filter::is_owner_scoped_zone` (Hand | Library | Graveyard) does not
+        // shield Exile. The at-exit controller is not lost — the LKI capture
+        // above snapshots it for CR 608.2h consumers.
+        if !matches!(to, Zone::Battlefield | Zone::Stack) {
+            obj_mut.controller = obj_mut.base_controller.unwrap_or(obj_mut.owner);
         }
 
         // CR 702.103b: A bestowed Aura's type-changing effect lasts until the
@@ -901,6 +979,26 @@ pub(crate) fn clear_cast_origin_off_provenance_zones(
     }
 }
 
+/// CR 400.7 + CR 118.9: an in-place hand/graveyard cast or play permission
+/// cannot survive a zone change other than the permitted cast to the stack.
+/// Both the live cleanup and resolved-command replay call this authority.
+fn clear_hand_or_graveyard_casting_permissions_on_exit(
+    obj: &mut crate::game::game_object::GameObject,
+    from: Zone,
+    to: Zone,
+) {
+    if matches!(from, Zone::Hand | Zone::Graveyard) && to != Zone::Stack {
+        obj.casting_permissions.retain(|permission| {
+            !matches!(
+                permission,
+                crate::types::ability::CastingPermission::ExileWithAltCost { .. }
+                    | crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. }
+                    | crate::types::ability::CastingPermission::PlayFromExile { .. }
+            )
+        });
+    }
+}
+
 pub fn apply_resolved_zone_change(
     state: &mut GameState,
     command: &ResolvedZoneChangeCommand,
@@ -995,6 +1093,7 @@ pub fn apply_resolved_zone_change(
         .get_mut(&command.object.object_id)
         .expect("validated zone command object remains live");
     object.zone = command.to;
+    clear_hand_or_graveyard_casting_permissions_on_exit(object, command.from, command.to);
     // CR 400.7 + CR 601.2i: replay bypasses `apply_zone_exit_cleanup`, so it
     // must reproduce the live Stack-exit carrier clear from the recorded move.
     if command.from == Zone::Stack && command.to != Zone::Stack {
@@ -1453,9 +1552,34 @@ pub(crate) fn move_to_zone_with_entry_flags(
         || from == Zone::Battlefield
         || to == Zone::Hand
         || from == Zone::Hand
+        || to == Zone::Stack
         || static_dependency_before
         || static_dependency_after
     {
+        //   - CR 601.2a + CR 611.2f: "a player first moves that card ... to the
+        //     stack. ... Any continuous effects that modify the characteristics of
+        //     the spell as you start casting it BEGIN AS IT IS PUT ON THE STACK."
+        //     The stack pass in `evaluate_layers` is what performs that beginning —
+        //     it resets each stack object to its base and re-applies every
+        //     applicable continuous effect (CR 613.1), including the CR 112.2
+        //     controller seed and the pre-existing CR 613.1 keyword grants the loop
+        //     already serves (Taigam's rebound, Waystone's mobilize, StackSpell-
+        //     filtered statics). Before this term, only a HAND origin marked, via
+        //     `from == Zone::Hand`; Exile -> Stack, Graveyard -> Stack and
+        //     Command -> Stack satisfied no disjunct and ran NO pass at all
+        //     (Exile and Graveyard MEASURED; Command follows the same `else if`
+        //     arm by inspection), so a spell cast from a zone its caster does not own kept
+        //     the OWNER as its controller, contradicting CR 112.2, and a live
+        //     keyword grant naming that spell was never applied.
+        //     COST: `ZoneMoveRequest::casting_to_stack` is the one constructor that
+        //     hardcodes `Zone::Stack`; its production callers are
+        //     `casting_costs::finalize_cast_with_phyrexian_choices_inner` (the real
+        //     cast) and `casting::project_evoke_entry_state` (a read-only projection
+        //     over a cloned state, on the AI search path, whose object is hand-origin
+        //     in practice). So the added work is ONE FULL PASS PER CAST WHOSE ORIGIN
+        //     IS Graveyard / Exile / Command / Library — zero passes today, not a
+        //     cheap pass being upgraded. Hand and Battlefield origins already mark
+        //     via `from == Zone::Hand` / `from == Zone::Battlefield`.
         crate::game::layers::mark_layers_full(state);
     }
 
@@ -1686,21 +1810,76 @@ pub fn mark_simultaneous_departure_records(
     }
 }
 
+/// CR 603.10a + CR 704.5d/e: where an object stands relative to the battlefield,
+/// for producers and observers that must decide whether it *left*.
+///
+/// Object-side counterpart of `BattlefieldDepartureSourceContext` (the record-side
+/// authority). Callers pass ids verified on the battlefield immediately before the
+/// move being classified, so `DepartedCeased` is only ever reached via a real
+/// departure.
+///
+/// NOT for forward-looking eligibility gates ("is this permanent on the battlefield
+/// right now, so I may tap / equip / sacrifice it"). Those have no departure event
+/// and no last-known-information fallback: for them an absent id means "no such
+/// object" and must be REJECTED, whereas `has_departed()` would answer `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BattlefieldResidency {
+    /// Still on the battlefield: the reachable cause is any destruction
+    /// replacement that leaves the permanent on the battlefield — CR 701.19a/b
+    /// regeneration, CR 702.89a umbra armor, CR 122.1c shield counters — so an
+    /// id its producer had already verified on the battlefield survives the
+    /// move being classified.
+    ///
+    /// CR 704.5n's "becomes unattached ... remains on the battlefield" is named
+    /// here only for contrast; it is NOT a producer this function observes.
+    /// `sba::check_unattached_equipment` clears `attached_to` and emits
+    /// `GameEvent::Unattached` with no zone move, so an unattached Equipment
+    /// gets no battlefield-origin `ZoneChanged`, never enters a producer's
+    /// departure id list, and is therefore never passed to this function.
+    Remained,
+    /// Left the battlefield and still exists in another zone.
+    DepartedPresent,
+    /// Left the battlefield and then ceased to exist — CR 704.5d (token) or
+    /// CR 704.5e (copy of a card). CR 111.7's parenthetical is why this still
+    /// counts as a departure: applicable triggered abilities trigger *before* a
+    /// token ceases to exist, and CR 608.2h keeps the departure record as the
+    /// authority for what it was.
+    DepartedCeased,
+}
+
+impl BattlefieldResidency {
+    /// CR 603.10a: did this object leave the battlefield in the event being classified?
+    pub(crate) fn has_departed(self) -> bool {
+        matches!(self, Self::DepartedPresent | Self::DepartedCeased)
+    }
+}
+
+/// CR 603.10a + CR 704.5d/e: the single authority for "has this object left the
+/// battlefield". `state.objects` no longer holds an object that ceased, so absence
+/// must read as a departure, not as a survival.
+pub(crate) fn battlefield_residency(state: &GameState, id: ObjectId) -> BattlefieldResidency {
+    match state.objects.get(&id) {
+        Some(obj) if obj.zone == Zone::Battlefield => BattlefieldResidency::Remained,
+        Some(_) => BattlefieldResidency::DepartedPresent,
+        None => BattlefieldResidency::DepartedCeased,
+    }
+}
+
 /// CR 603.10a: Filter `ids` to those whose object has actually left the
 /// battlefield (now resides in some other zone). Producers that accumulate a
 /// candidate ID list — bounce, change-zone, sacrifice, destroy — pass that list
 /// through this filter before `mark_simultaneous_departures` so that a member
 /// which never actually departed (regenerated, sacrifice-prevented, bounce
 /// guarded out) is excluded from every survivor's `co_departed` group.
+///
+/// CR 704.5d/e: an id absent from `state.objects` **ceased to exist** after
+/// departing, which is a departure, not a survival — CR 111.7's parenthetical says
+/// applicable triggered abilities trigger before a token ceases. Callers pass ids
+/// verified on the battlefield immediately before the move being classified.
 pub fn departed_subset(state: &GameState, ids: &[ObjectId]) -> Vec<ObjectId> {
     ids.iter()
         .copied()
-        .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .is_some_and(|o| o.zone != Zone::Battlefield)
-        })
+        .filter(|&id| battlefield_residency(state, id).has_departed())
         .collect()
 }
 
@@ -1708,6 +1887,15 @@ pub fn departed_subset(state: &GameState, ids: &[ObjectId]) -> Vec<ObjectId> {
 /// sweep that does not expose an explicit ID list (e.g. `sacrifice_unchosen`
 /// internal loops). Collects every battlefield-origin `ZoneChanged` in `slice`
 /// whose object is now off-battlefield, then groups them as co-departed.
+///
+/// CR 704.3 + CR 704.5d: this runs at the END of an SBA iteration, after the
+/// CR 704.5d sweep has removed ceased tokens, so residency — not raw presence — is
+/// the only correct question. Two consequences, both measured: a 2-member group
+/// containing a ceased token collapses below `mark_simultaneous_departures`'
+/// `len() < 2` floor and is never stamped **at all**; and because that function
+/// *assigns* `co_departed` rather than merging, under-counting here *overwrites*
+/// correct groups stamped by earlier sub-sweeps, breaking the mutual-record
+/// relation the CR 603.10a observer arm requires.
 pub fn stamp_simultaneous_from_slice(state: &GameState, slice: &mut [GameEvent]) {
     let departed: Vec<ObjectId> = slice
         .iter()
@@ -1716,13 +1904,7 @@ pub fn stamp_simultaneous_from_slice(state: &GameState, slice: &mut [GameEvent])
                 object_id,
                 from: Some(Zone::Battlefield),
                 ..
-            } if state
-                .objects
-                .get(object_id)
-                .is_some_and(|o| o.zone != Zone::Battlefield) =>
-            {
-                Some(*object_id)
-            }
+            } if battlefield_residency(state, *object_id).has_departed() => Some(*object_id),
             _ => None,
         })
         .collect();

@@ -397,13 +397,35 @@ function DeclareShortcutOffer({
   // answer for every iteration. No client-side default — an unanswered point disables Confirm.
   const [mayPicks, setMayPicks] = useState<Record<number, InteractionChoiceId>>({});
 
+  const [answer, setAnswer] = useState<InteractionPreview | null>(null);
+  const latest = useRef<PreviewRequestId | null>(null);
+  const minted = useRef(0);
+
+  // CR 732.2a: magnitudes are read off a CONFIRMABLE answer only. `?? null` collapses the
+  // binding's optional-and-nullable spellings into the one absent state.
+  const authoredPreview =
+    answer?.status.type === "confirmable" ? (answer.shortcutPreview ?? null) : null;
+
   const published: AmountAssignment[] = previewed?.allocation ?? [];
-  const publishedRaw = (id: InteractionChoiceId) =>
-    String(published.find((a) => a.choiceId === id)?.amount ?? 0);
+  // CR 732.2a + CR 601.2c: what the rows read. The offer publishes elements for a bounded SAMPLE
+  // of its own count window, so at an unsampled count there is no published split to seed them
+  // from and the engine's answer to the request below carries one. The answer is read only for
+  // the count it itself states, so an answer still in flight when the picker moves cannot seed
+  // rows for a different count. `published` stays the OFFER's own list: the authored-split
+  // comparison below is stated against what the offer published, which is what routes the
+  // returned magnitudes to the rendered lines at a count it published nothing for.
+  const rowSource: AmountAssignment[] =
+    previewed !== undefined
+      ? published
+      : authoredPreview?.count === chosen
+        ? (authoredPreview.allocation ?? [])
+        : [];
+  const sourcedRaw = (id: InteractionChoiceId) =>
+    String(rowSource.find((a) => a.choiceId === id)?.amount ?? 0);
   // The count tag travels with the edit: moving the picker moves `previewed`, this test goes
   // false, and an edit made at another count is DISCARDED rather than re-scaled.
   const rowRaw = (id: InteractionChoiceId) =>
-    authored?.count === chosen ? (authored.raw[id] ?? publishedRaw(id)) : publishedRaw(id);
+    authored?.count === chosen ? (authored.raw[id] ?? sourcedRaw(id)) : sourcedRaw(id);
 
   // The declaration, re-parsed from what the rows actually READ, in published order. `parseAmount`
   // is the single sanitization authority here exactly as it is for the count, so an out-of-window
@@ -468,14 +490,19 @@ function DeclareShortcutOffer({
     // to leak onto. `amounts` is always written explicitly. CR 732.2c: `null` on an unselected
     // subject is the same type-level refusal arm the count uses above, so the dispatched id is
     // the SELECTED value rather than an assertion, a default, a clamp or a fallback.
-    const pinFor = (p: InteractionShortcutPoint): InteractionShortcutPin | null =>
-      p.kind === "mayChoice"
-        ? { group: p.group, choiceIds: [mayPicks[p.group]], amounts: [] }
-        : targetsControl?.kind === "allocation"
-          ? { group: p.group, choiceIds: effective.map((a) => a.choiceId), amounts: effective }
-          : subject === null
-            ? null
-            : { group: p.group, choiceIds: [subject], amounts: [] };
+    const pinFor = (p: InteractionShortcutPoint): InteractionShortcutPin | null => {
+      if (p.kind === "mayChoice") {
+        // An unanswered group takes that same refusal arm, so an unset pick is unrepresentable
+        // in a pin rather than shipped as `[undefined]`.
+        const pick = mayPicks[p.group];
+        return pick === undefined ? null : { group: p.group, choiceIds: [pick], amounts: [] };
+      }
+      return targetsControl?.kind === "allocation"
+        ? { group: p.group, choiceIds: effective.map((a) => a.choiceId), amounts: effective }
+        : subject === null
+          ? null
+          : { group: p.group, choiceIds: [subject], amounts: [] };
+    };
 
     const pins = points.filter((p) => !p.readOnly).map(pinFor);
     if (pins.includes(null)) return null;
@@ -522,21 +549,40 @@ function DeclareShortcutOffer({
     void dispatchInteraction(submission).catch(() => undefined);
   };
 
+  // CR 732.2a: the count the picker offers may be one the offer's bounded sample published no
+  // element for, and then the engine is the only source of the canonical split. `declaredResponse`
+  // already builds the pin that asks for it — naming nothing, because nothing is authored here.
+  // Shares `custom`'s leading conjuncts, so an UntilLethal offer never asks: its control takes the
+  // `subject` arm. A second announced-target point drops `pinRoute` (`renderable` requires the
+  // point's own group), which is the shape the engine refuses to complete.
+  const unsampled =
+    pinRoute &&
+    targetsControl?.kind === "allocation" &&
+    chosen !== null &&
+    previewed === undefined &&
+    authored?.count !== chosen;
+
+  // The player's OWN entries at the chosen count. NOT the effective split: the rows now derive
+  // that from the answer, so a key reading it would move the moment an answer landed and issue a
+  // second request for the same settled state.
+  const authoredEntries =
+    authored?.count === chosen
+      ? (targetsControl?.point.candidateIds ?? [])
+          .map((id) => `${id}:${authored.raw[id] ?? ""}`)
+          .join(",")
+      : "";
+
   // CR 732.2a: the settled declaration stated as primitives, so one request is issued per SETTLED
   // edit rather than one per keystroke. `null` while there is nothing to preview.
   const declarationKey =
-    custom && declarationComplete && offerId !== null
+    offerId !== null && ((custom && declarationComplete) || unsampled)
       ? [
           offerId,
           String(chosen),
-          effective.map((a) => `${a.choiceId}:${a.amount}`).join(","),
+          authoredEntries,
           mayPoints.map((p) => `${p.group}:${mayPicks[p.group]}`).join(","),
         ].join("|")
       : null;
-
-  const [answer, setAnswer] = useState<InteractionPreview | null>(null);
-  const latest = useRef<PreviewRequestId | null>(null);
-  const minted = useRef(0);
 
   useEffect(() => {
     // Load-bearing rather than cosmetic: the resolve guard below compares against the ANSWER's
@@ -561,11 +607,6 @@ function DeclareShortcutOffer({
     // from, and any wider identity would re-issue per keystroke.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [declarationKey]);
-
-  // CR 732.2a: magnitudes are read off a CONFIRMABLE answer only. `?? null` collapses the
-  // binding's optional-and-nullable spellings into the one absent state.
-  const authoredPreview =
-    answer?.status.type === "confirmable" ? (answer.shortcutPreview ?? null) : null;
 
   const handleDecline = useCallback(() => {
     // CR 732.2a: decline the auto-offer; the engine restores ordinary priority.
@@ -789,11 +830,32 @@ export function RespondToShortcutModal() {
   const allocationGroup = spec?.allocationGroup ?? null;
   const orderPoints = points.filter((p) => p.kind === "targets" && p.group !== allocationGroup);
   const allocation = declared?.allocation ?? [];
-  const mayPoints = points.filter((p) => p.kind === "mayChoice");
+  // One authority for whether a may row exists, so the panel's predicate and its render cannot
+  // drift: a point this modal has no wording for contributes neither a row nor a title.
+  const mayRows = points
+    .filter((p) => p.kind === "mayChoice")
+    .flatMap((point) => {
+      // The engine publishes EXACTLY TWO candidate ids on a `mayChoice` statement point,
+      // read in order as SUBJECT then ANSWER; a decision whose subject cannot be minted
+      // publishes no point at all, so this positional read is total over what arrives.
+      const [subjectId, answerId] = point.candidateIds;
+      if (subjectId === undefined || answerId === undefined) return [];
+      const answer = mayCandidate(candidates, answerId);
+      // A whitelist, deliberately: an answer this modal has no wording for renders
+      // nothing rather than a raw lookup key.
+      if (answer !== "take" && answer !== "decline") return [];
+      return [
+        <p key={point.group} className="text-sm text-slate-200">
+          {t(`comboShortcut.respondDecision.${answer}`, {
+            subject: candidateLabel(t, candidates, subjectId),
+          })}
+        </p>,
+      ];
+    });
   const showsDeclaration =
     allocation.length > 0 ||
     orderPoints.some((p) => p.candidateIds.length > 0) ||
-    mayPoints.length > 0;
+    mayRows.length > 0;
 
   const footer = (
     <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
@@ -853,24 +915,7 @@ export function RespondToShortcutModal() {
                 </p>
               )),
             )}
-            {mayPoints.map((point) => {
-              // The engine publishes EXACTLY TWO candidate ids on a `mayChoice` statement point,
-              // read in order as SUBJECT then ANSWER; a decision whose subject cannot be minted
-              // publishes no point at all, so this positional read is total over what arrives.
-              const [subjectId, answerId] = point.candidateIds;
-              if (subjectId === undefined || answerId === undefined) return null;
-              const answer = mayCandidate(candidates, answerId);
-              // A whitelist, deliberately: an answer this modal has no wording for renders
-              // nothing rather than a raw lookup key.
-              if (answer !== "take" && answer !== "decline") return null;
-              return (
-                <p key={point.group} className="text-sm text-slate-200">
-                  {t(`comboShortcut.respondDecision.${answer}`, {
-                    subject: candidateLabel(t, candidates, subjectId),
-                  })}
-                </p>
-              );
-            })}
+            {mayRows}
           </div>
         )}
       </div>

@@ -22,7 +22,7 @@ use super::primitives::{
 use super::quantity as nom_quantity;
 use super::target as nom_target;
 use crate::parser::oracle_target::{
-    cast_capable_zones_except, parse_shared_quality, parse_type_phrase, parse_zone_suffix,
+    cast_capable_zones_except, parse_shared_quality, parse_type_phrase_folding, parse_zone_suffix,
     parse_zone_word, peek_zone_boundary, superlative_property_filter_prop,
 };
 use crate::parser::oracle_util::parse_subtype;
@@ -276,9 +276,98 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_quantity_quantity_comparison,
         parse_zone_conditions,
         parse_there_are_counters_on_source,
+        // CR 105.2 + CR 611.3a: "<color> is the most common color among all
+        // permanents [or is tied for most common]" (Invasion Djinn cycle).
+        parse_color_is_most_common_among_permanents_condition,
         parse_remaining_state_presence_conditions_tail,
     ))
     .parse(input)
+}
+
+/// CR 105.2 + CR 611.3a: "<color> is the most common color among all
+/// permanents[ or is tied for most common]" — the Invasion Djinn cycle (Sulam
+/// Djinn, Goham Djinn, Ruham Djinn, Zanam Djinn, Halam Djinn): "This creature
+/// gets -2/-2 as long as [color] is the most common color among all
+/// permanents or is tied for most common."
+///
+/// Maps to a `StaticCondition::And` of two `QuantityComparison`s over the
+/// battlefield-wide count of permanents with the named color
+/// (`QuantityRef::ObjectCount`) and the largest per-color count across every
+/// color (`QuantityRef::ObjectCountBySharedQuality` grouped by
+/// `SharedQuality::Color`). `Comparator::GE` already admits ties, so the
+/// optional "or is tied for most common" tail is redundant text discarded
+/// here — both phrasings collapse to the same comparison, mirroring how
+/// `parse_shares_most_common_color_condition` treats Heroic Defiance's
+/// analogous "or a color tied for most common" tail.
+///
+/// The second conjunct (`max_bucket >= 1`) is required for correctness, not
+/// stylistic symmetry: when every battlefield permanent is colorless, no
+/// color bucket exists and `ObjectCountBySharedQuality`'s `Max` aggregate
+/// (CR 109.3 defines color as a characteristic, but does not itself define
+/// this grouped aggregate or its empty-population behavior) returns `0` for
+/// an empty bucket set — coinciding with the named color's own `0` count and
+/// making a bare `named_count >= max_bucket` comparison vacuously true. That
+/// would wrongly treat "no color exists" as "this color is most common".
+/// Requiring `max_bucket >= 1` alongside `named_count >= max_bucket` forces
+/// `named_count >= 1` too, so the pair is only satisfiable when a real
+/// colored population exists and the named color is (tied for) its largest
+/// bucket — matching how `eval_shares_color_with_most_common_color`
+/// (`game::conditions`) explicitly returns `false` when there is no colored
+/// permanent for the analogous Heroic Defiance condition.
+/// Deliberately composed from existing generic `QuantityRef` building blocks
+/// rather than a new `StaticCondition` variant — the named-color population
+/// and the "most common among all colors" aggregate are both already-typed
+/// axes, so no new leaf is needed.
+fn parse_color_is_most_common_among_permanents_condition(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, color) = parse_color(input)?;
+    let (rest, _) = tag(" is the most common color among all permanents").parse(rest)?;
+    let (rest, _) = opt(tag(" or is tied for most common")).parse(rest)?;
+
+    let all_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: Vec::new(),
+    });
+    let colored_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: vec![FilterProp::HasColor { color }],
+    });
+    let max_color_bucket = || QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCountBySharedQuality {
+            filter: all_permanents.clone(),
+            quality: SharedQuality::Color,
+            aggregate: AggregateFunction::Max,
+        },
+    };
+
+    Ok((
+        rest,
+        StaticCondition::And {
+            conditions: vec![
+                // A most-common-color bucket must actually exist — false when
+                // every permanent is colorless (no bucket reaches size 1).
+                StaticCondition::QuantityComparison {
+                    lhs: max_color_bucket(),
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 1 },
+                },
+                // The named color's count must be at least as large as the
+                // largest bucket — i.e. it leads or ties for most common.
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: colored_permanents,
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: max_color_bucket(),
+                },
+            ],
+        },
+    ))
 }
 
 /// Keeps the remaining state-presence grammar below nom's tuple-arity limit
@@ -404,10 +493,10 @@ fn parse_damage_dealt_this_turn_conditions(input: &str) -> OracleResult<'_, Stat
     .parse(input)
 }
 
-/// Wrapper around `parse_type_phrase` that fails (nom error) when the result is
+/// Wrapper around `parse_type_phrase_folding` that fails (nom error) when the result is
 /// `TargetFilter::Any`, used as a nom-compatible parser combinator.
 fn parse_type_phrase_nonempty(input: &str) -> OracleResult<'_, TargetFilter> {
-    let (filter, rest) = parse_type_phrase(input);
+    let (filter, rest) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -430,7 +519,7 @@ fn parse_type_phrase_nonempty(input: &str) -> OracleResult<'_, TargetFilter> {
 ///     to the one creature/permanent this trigger's damage went to.
 ///   - "a creature", "a permanent", etc. — bare indefinite references that stay
 ///     a generic type-phrase filter (the demonstrative binding does not apply).
-///   - Any `parse_type_phrase` result (e.g. "a creature or planeswalker an
+///   - Any `parse_type_phrase_folding` result (e.g. "a creature or planeswalker an
 ///     opponent controlled" from Rith, Liberated Primeval).
 ///
 /// All forms map to `DamageDealtThisTurn { source: Any, target: <filter>,
@@ -454,7 +543,7 @@ fn parse_subject_was_dealt_excess_damage_this_turn(
         ),
         value(TargetFilter::EventTarget, tag("that permanent")),
         // Bare article form: "a creature or planeswalker an opponent controlled"
-        // (Rith), "a creature", "a permanent", etc. Delegate to parse_type_phrase
+        // (Rith), "a creature", "a permanent", etc. Delegate to parse_type_phrase_folding
         // which handles "a/an <type>", "a/an <type> <controller-suffix>",
         // and compound "a <type> or <type>" forms.
         parse_type_phrase_nonempty,
@@ -530,7 +619,7 @@ fn parse_player_was_dealt_damage_threshold_this_turn(
 /// satisfied when at least one recipient matching the subject was dealt combat
 /// damage this turn by a source matching the `by` filter.
 ///
-/// Builds for the class — the source is parsed by `parse_type_phrase`, so any
+/// Builds for the class — the source is parsed by `parse_type_phrase_folding`, so any
 /// "by a <creature type / creature / permanent>" qualifier is covered, and the
 /// subject covers both "a player" and "an opponent" recipients. The resulting
 /// `QuantityRef::DamageDealtThisTurn` carries `damage_kind: CombatOnly`
@@ -552,7 +641,7 @@ fn parse_player_dealt_combat_damage_by_source_this_turn(
     .parse(input)?;
     let (rest, _) = tag(" was dealt combat damage by ").parse(rest)?;
     // CR 608.2i: the `by` source qualifier — "a Zombie", "a creature", etc.
-    let (source, after_source) = parse_type_phrase(rest);
+    let (source, after_source) = parse_type_phrase_folding(rest);
     if matches!(source, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -807,7 +896,7 @@ fn parse_control_named_pair(input: &str) -> OracleResult<'_, StaticCondition> {
     let (after_named, type_text) = take_until(" named ").parse(rest)?;
     let (after_named, _) = tag(" named ").parse(after_named)?;
     let filter_base = parse_control_named_type_filter(type_text, input)?;
-    // Strip any FilterProp::Named that parse_type_phrase may have attached so the
+    // Strip any FilterProp::Named that parse_type_phrase_folding may have attached so the
     // synthesized per-name conjuncts carry exactly one Named property each.
     let filter_base = strip_filter_named_property(filter_base);
     let (rest_after_pair, (filters, connector)) =
@@ -837,7 +926,7 @@ fn parse_control_named_type_filter<'a>(
     type_text: &'a str,
     error_input: &'a str,
 ) -> Result<TargetFilter, nom::Err<OracleError<'a>>> {
-    let (filter, type_remainder) = parse_type_phrase(type_text);
+    let (filter, type_remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) || !type_remainder.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             error_input,
@@ -1195,7 +1284,7 @@ fn strip_filter_named_property(filter: TargetFilter) -> TargetFilter {
 fn parse_control_presence_tail(input: &str) -> OracleResult<'_, StaticCondition> {
     let _ = alt((parse_article, value((), tag("another ")))).parse(input)?;
 
-    let (filter, remainder) = parse_type_phrase(input);
+    let (filter, remainder) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1544,7 +1633,7 @@ fn merge_attached_predicate_filter(
 /// the result into the subject filter) and the anaphoric "it" recipient path
 /// (`parse_recipient_is_filter_condition`, which uses the bare filter directly as
 /// the recipient match). Uses the same color / legendary-basic supertype /
-/// `parse_type_phrase` recognition the attached path historically used, so the
+/// `parse_type_phrase_folding` recognition the attached path historically used, so the
 /// downstream merged output is preserved byte-for-byte.
 fn parse_bare_predicate_tail(input: &str) -> OracleResult<'_, TargetFilter> {
     let (rest, _) = opt(parse_article).parse(input)?;
@@ -1581,7 +1670,7 @@ fn parse_bare_predicate_tail(input: &str) -> OracleResult<'_, TargetFilter> {
         }
     }
 
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if remainder.len() == rest.len() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1681,7 +1770,7 @@ fn parse_top_of_library_condition(input: &str) -> OracleResult<'_, StaticConditi
     }
     // Fold any disjunction into a single gate over an `Or` *filter* (the runtime
     // `matches_target_filter` handles `TargetFilter::Or`). The common "X or Y
-    // card" form is already one `Or` filter (parse_type_phrase folds it); an
+    // card" form is already one `Or` filter (parse_type_phrase_folding folds it); an
     // article-delimited "a X or a Y" would yield multiple filters, which we wrap
     // here so the result is always one `TopOfLibraryMatches`.
     let filter = if filters.len() > 1 {
@@ -2459,7 +2548,7 @@ fn parse_source_is_type(input: &str) -> OracleResult<'_, StaticCondition> {
     ))
     .parse(rest)?;
     let (rest, _) = parse_article(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     let condition = StaticCondition::SourceMatchesFilter { filter };
     let condition = if negated {
         StaticCondition::Not {
@@ -2953,10 +3042,10 @@ fn parse_subject_property_inequality_form(input: &str) -> OracleResult<'_, Stati
     let (rest, (comparator, aggregate)) = parse_superlative_comparator_phrase(rest)?;
     // Aggregate scope: "each other <type>'s <prop>" / "every other <type>'s <prop>".
     let (rest, _) = alt((tag("each other "), tag("every other "))).parse(rest)?;
-    // <type> phrase. parse_type_phrase consumes "creature", "creature you
+    // <type> phrase. parse_type_phrase_folding consumes "creature", "creature you
     // control", etc. — without the "other" prefix (already stripped above so
     // we control the exclusion semantics through OtherThanTriggerObject).
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -2999,7 +3088,7 @@ fn parse_subject_has_superlative_form(input: &str) -> OracleResult<'_, StaticCon
     let (rest, comparator) = parse_optional_tied_for_tail(rest, aggregate, property)?;
     // " among <filter>".
     let (rest, _) = tag(" among ").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -3124,7 +3213,7 @@ fn parse_you_control_superlative_object_condition(
     // reinterpret a partially consumed superlative as a weaker condition.
     let (rest, (object_filter, population_filter)) = cut(|rest| {
         // CR 109.2 + CR 109.4: `you control` describes a battlefield permanent,
-        // not an off-battlefield "card" or a stack "spell". `parse_type_phrase`
+        // not an off-battlefield "card" or a stack "spell". `parse_type_phrase_folding`
         // intentionally consumes those terminal nouns in other contexts, so
         // reject them before delegating the candidate noun phrase.
         if scan_at_word_boundaries(candidate_text, |word| {
@@ -3138,7 +3227,7 @@ fn parse_you_control_superlative_object_condition(
             return Err(oracle_err(candidate_text));
         }
 
-        let (object_filter, candidate_remainder) = parse_type_phrase(candidate_text);
+        let (object_filter, candidate_remainder) = parse_type_phrase_folding(candidate_text);
         if matches!(object_filter, TargetFilter::Any) || !candidate_remainder.is_empty() {
             return Err(oracle_err(candidate_remainder));
         }
@@ -3153,7 +3242,7 @@ fn parse_you_control_superlative_object_condition(
         let (rest, _) = parse_optional_tied_for_tail(rest, aggregate, property)?;
         let (rest, population_filter) =
             if let Ok((among_rest, _)) = tag::<_, _, OracleError<'_>>(" among ").parse(rest) {
-                let (filter, remainder) = parse_type_phrase(among_rest);
+                let (filter, remainder) = parse_type_phrase_folding(among_rest);
                 if matches!(filter, TargetFilter::Any) {
                     return Err(oracle_err(remainder));
                 }
@@ -3250,7 +3339,7 @@ pub(crate) fn parse_spell_target_has_superlative(
     // property with the leading clause is enforced by the shared combinator.
     let (rest, _) = parse_optional_tied_for_tail(rest, aggregate, property)?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" among ").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(oracle_err(remainder));
     }
@@ -3584,7 +3673,7 @@ fn parse_they_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition>
     let (rest, _) = tag("they control ").parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -3991,7 +4080,7 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
     let (rest, _) = tag("you control ").parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4025,7 +4114,7 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
 }
 
 /// Lift a GROUP shared-quality marker out of a filter produced by
-/// `parse_type_phrase`, returning its quality and removing the property.
+/// `parse_type_phrase_folding`, returning its quality and removing the property.
 ///
 /// `FilterProp::SharesQuality { reference: None }` is a GROUP-SELECTION
 /// constraint on a chosen candidate set: CR 601.2c is where the player
@@ -4124,7 +4213,7 @@ fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality>
 /// Eternal Glory, Mechanized Production, Chrome Replicator). The two reach this
 /// function differently and so are two branches, not two parsers:
 ///
-///   * **Branch A (relative clause)** — `parse_type_phrase` has ALREADY consumed
+///   * **Branch A (relative clause)** — `parse_type_phrase_folding` has ALREADY consumed
 ///     the clause through `oracle_target::parse_that_clause_suffix`, leaving a
 ///     `FilterProp::SharesQuality` group marker on the filter and an empty
 ///     remainder. `take_group_shared_quality` lifts the marker onto this
@@ -4132,7 +4221,7 @@ fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality>
 ///     `oracle_target::parse_shared_quality_clause` stays the single authority
 ///     for that vocabulary.
 ///   * **Branch B (postmodifier)** — not a `that …` clause, so
-///     `parse_type_phrase` leaves it in the remainder and the quality noun is
+///     `parse_type_phrase_folding` leaves it in the remainder and the quality noun is
 ///     delegated to the same shared authority, `parse_shared_quality`.
 ///
 /// The controller scope is parameterized on `parse_control_scope_prefix`, so
@@ -4155,7 +4244,7 @@ fn parse_control_count_ge_shared_quality(input: &str) -> OracleResult<'_, Static
     let (rest, ctrl) = parse_control_scope_prefix(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (mut filter, remainder) = parse_type_phrase(type_text);
+    let (mut filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4212,7 +4301,7 @@ fn parse_control_count_ge_toughness_gt_power(input: &str) -> OracleResult<'_, St
     let (rest, _) = tag("you control ").parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4338,7 +4427,7 @@ pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> 
     let (rest, ctrl) = parse_control_scope_prefix(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4346,7 +4435,7 @@ pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> 
         )));
     }
     let filter = inject_controller(filter, ctrl);
-    // Map remainder back to original input slice — parse_type_phrase consumed
+    // Map remainder back to original input slice — parse_type_phrase_folding consumed
     // from a potentially trimmed copy, so use pointer arithmetic to get the
     // correct byte offset (remainder.len() would be wrong if trailing chars
     // were stripped by trim_end_matches).
@@ -4369,7 +4458,7 @@ pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> 
 /// cost reductions (bare "a creature is attacking you"), and the filtered Trap
 /// cycle's alternative costs — Nemesis Trap ("a white creature is attacking"),
 /// Slingbow Trap ("a black creature with flying is attacking"). The qualifier
-/// is delegated to `parse_type_phrase` (mirrors `parse_creature_has_keyword`)
+/// is delegated to `parse_type_phrase_folding` (mirrors `parse_creature_has_keyword`)
 /// so the whole class of attacker filters is covered by one combinator rather
 /// than the former bare-only literal. Lowers to `IsPresent` over the filter
 /// with `FilterProp::Attacking { defender }` appended — the same property
@@ -4380,7 +4469,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
     // "enchanted creature", "enchanted artifact", "enchanted land", "equipped
     // creature" (see `parse_attached_condition_subject_core`) — is
     // self-referential: the host of THIS Aura/Equipment, not a generic
-    // board-wide filter. `parse_type_phrase` would otherwise happily match
+    // board-wide filter. `parse_type_phrase_folding` would otherwise happily match
     // any of these as a permanent/creature/artifact/land with
     // `FilterProp::EnchantedBy`/`EquippedBy`, silently swapping "is the
     // specific permanent this Aura/Equipment is attached to attacking" for
@@ -4395,7 +4484,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
         return Err(oracle_err(input));
     }
     let (rest, _) = opt(parse_article).parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(oracle_err(input));
     }
@@ -4421,7 +4510,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
 /// state (Charging Hooligan: "If a Rat is attacking, ..."). Complements
 /// `parse_filtered_creature_is_attacking` (which owns the attacking / "attacking
 /// you" defender form): this arm uniquely adds the `is blocking` predicate over
-/// the same type axis (via `parse_type_phrase`, so any subtype/core type works).
+/// the same type axis (via `parse_type_phrase_folding`, so any subtype/core type works).
 /// The attacking case overlaps that combinator and yields the identical
 /// `IsPresent`; it is registered first, so this arm is reached for the blocking form.
 /// No controller restriction — a matching attacker/blocker controlled by any
@@ -4429,9 +4518,9 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
 /// form ("creatures are attacking"), which `parse_creatures_are_attacking_count_ge`
 /// owns.
 fn parse_a_type_is_in_combat(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Require a singular article; `parse_type_phrase` strips it itself.
+    // Require a singular article; `parse_type_phrase_folding` strips it itself.
     nom::combinator::peek(alt((tag("a "), tag("an "))).map(|_| ())).parse(input)?;
-    let (filter, remainder) = parse_type_phrase(input);
+    let (filter, remainder) = parse_type_phrase_folding(input);
     let TargetFilter::Typed(mut typed) = filter else {
         return Err(oracle_err(input));
     };
@@ -4486,7 +4575,7 @@ fn parse_creatures_are_attacking_count_ge(input: &str) -> OracleResult<'_, Stati
 /// The verb is parameterized over the controller axis: the leading verb phrase
 /// selects `Some(ControllerRef::You)`, `Some(ControllerRef::Opponent)`, or
 /// `None` (any player), and the SAME downstream parse (required article,
-/// `parse_type_phrase`, full-consume) runs for all three. CR 611.3a: this is a
+/// `parse_type_phrase_folding`, full-consume) runs for all three. CR 611.3a: this is a
 /// static "as long as" gate, so the condition is re-evaluated continuously
 /// rather than locked in. CR 109.4: the injected `InZone { Battlefield }`
 /// reflects that only the battlefield (and stack) has a controller, so the
@@ -4511,11 +4600,11 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
     // count, handled elsewhere). A required combinator (not opt) preserves the
     // hard rejection the previous starts_with guard enforced. `peek` requires
     // the article without consuming it, so the article-inclusive `rest` still
-    // flows to `parse_type_phrase` (which strips "a "/"an " itself and maps
+    // flows to `parse_type_phrase_folding` (which strips "a "/"an " itself and maps
     // "another " to `FilterProp::Another`).
     let (rest, _article) =
         nom::combinator::peek(alt((tag("a "), tag("an "), tag("another ")))).parse(rest)?;
-    let (filter, mut remainder) = parse_type_phrase(rest);
+    let (filter, mut remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4529,7 +4618,7 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
     // ("or a Plan") is NOT a standalone control condition, so the top-level
     // `parse_condition_connective` cannot split it; instead a single shared
     // verb governs both type filters. Each additional " or <article> <type>"
-    // segment is folded into a disjunction of presence filters. `parse_type_phrase`
+    // segment is folded into a disjunction of presence filters. `parse_type_phrase_folding`
     // (unchanged) parses each article-led segment; this loop only adds the
     // elided-verb continuation specific to the control-condition grammar, so the
     // recipient/attached `it's X or Y` paths (which DO repeat a parseable RHS)
@@ -4546,7 +4635,7 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
         else {
             break;
         };
-        let (next_filter, next_remainder) = parse_type_phrase(after_or);
+        let (next_filter, next_remainder) = parse_type_phrase_folding(after_or);
         if matches!(next_filter, TargetFilter::Any) {
             break;
         }
@@ -4583,17 +4672,17 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
 /// type phrase leads ("a creature you control") and is followed by a `has
 /// <keyword>` predicate, rather than the verb leading ("you control a
 /// creature"). Generalized over every evergreen keyword in the `KEYWORDS`
-/// table and every type phrase `parse_type_phrase` recognizes, so it covers
+/// table and every type phrase `parse_type_phrase_folding` recognizes, so it covers
 /// the whole class of "a/an <permanent> <controller-clause> has <keyword>"
 /// conditions, not one card.
 fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Optional leading article — `parse_type_phrase` also strips it, but the
+    // Optional leading article — `parse_type_phrase_folding` also strips it, but the
     // article may precede a non-type word, so guard it explicitly first.
     let (rest, _) = opt(parse_article).parse(input)?;
-    // `parse_type_phrase` consumes the type word AND any "you control" /
+    // `parse_type_phrase_folding` consumes the type word AND any "you control" /
     // "an opponent controls" controller suffix, setting `controller` on the
     // returned filter. The remainder begins at the `has <keyword>` predicate.
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4628,7 +4717,7 @@ fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> 
 ///     `this card`; "this card" is a parse-only self-reference not yet
 ///     normalized to `~`, so the literal `tag("this card")` arm in that
 ///     combinator is required here).
-///   - `parse_type_phrase` — folds the informational " card" qualifier and the
+///   - `parse_type_phrase_folding` — folds the informational " card" qualifier and the
 ///     attached "in your <zone>" clause into one `TargetFilter` (the same
 ///     grammar shape `parse_card_in_graveyard` relies on).
 ///   - `make_quantity_comparison` — the shared `ObjectCount == N` shape.
@@ -4647,7 +4736,7 @@ fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> 
 fn parse_source_is_only_type_in_zone(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, ()) = parse_source_self_token(input)?;
     let (rest, _) = tag(" is the only ").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4679,26 +4768,26 @@ fn parse_source_is_only_type_in_zone(input: &str) -> OracleResult<'_, StaticCond
 /// <keyword>" battlefield predicate, the subject's presence is checked in a
 /// graveyard. This is the gate half of a conditional continuous static (CR
 /// 611.3a) whose grant is a keyword ability (CR 702). Generalized over every
-/// type phrase `parse_type_phrase` recognizes and every keyword its "with
+/// type phrase `parse_type_phrase_folding` recognizes and every keyword its "with
 /// <keyword>" suffix folds in, so it covers the whole class, not one card:
 ///   - Tarmogoyf: "a land card is in a graveyard" (bare card-type gate)
 ///   - Cairn Wanderer: "a creature card with flying is in a graveyard"
 ///     (card-type + `WithKeyword { Flying }` gate)
 ///
 /// In a graveyard every object is a card, so "creature card" / "land card" is the
-/// card-type filter — `parse_type_phrase` folds the informational " card" suffix
+/// card-type filter — `parse_type_phrase_folding` folds the informational " card" suffix
 /// and the "with <keyword>" suffix, so no bespoke keyword parsing is needed here.
 /// "in a graveyard" is controller-agnostic (any graveyard); no controller is
 /// injected. The `is in a graveyard` suffix is required, so this never mis-claims
 /// a bare "a creature card ..." presence phrase handled elsewhere.
 pub(crate) fn parse_card_in_graveyard(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Optional leading article — `parse_type_phrase` also strips it, but guard it
+    // Optional leading article — `parse_type_phrase_folding` also strips it, but guard it
     // explicitly first to mirror `parse_creature_has_keyword`.
     let (rest, _) = opt(parse_article).parse(input)?;
-    // `parse_type_phrase` consumes the type word, the informational " card"
+    // `parse_type_phrase_folding` consumes the type word, the informational " card"
     // suffix, and any "with <keyword>" clause (folded into the filter as
     // `FilterProp::WithKeyword`). The remainder begins at the presence predicate.
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4788,11 +4877,11 @@ fn parse_control_count_le(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("or fewer ").parse(rest)?;
     // A named-count condition may be followed by an execute clause. Preserve
     // the comma-prefixed clause as the condition remainder before handing the
-    // typed, named phrase to `parse_type_phrase`; otherwise that parser treats
+    // typed, named phrase to `parse_type_phrase_folding`; otherwise that parser treats
     // the effect text as part of the literal card name.
     let (condition_remainder, type_text) = parse_control_named_final_name(rest)?;
     let type_text = type_text.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4818,7 +4907,7 @@ fn parse_control_count_eq(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, n) = parse_number(rest)?;
     let rest = rest.trim_start();
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4836,7 +4925,7 @@ fn parse_control_count_eq(input: &str) -> OracleResult<'_, StaticCondition> {
 /// Parse "you control no [type]" → Not(IsPresent { filter }).
 fn parse_you_control_no(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("you control no ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4866,7 +4955,7 @@ fn parse_no_opponent_controls_a(input: &str) -> OracleResult<'_, StaticCondition
     // Require an article — reject the bare-plural count form ("no opponent
     // controls creatures") exactly as the affirmative control arms do.
     let (rest, _) = parse_article(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4902,7 +4991,7 @@ fn parse_no_opponent_controls_a(input: &str) -> OracleResult<'_, StaticCondition
 /// control" semantics per iterated player (CR 109.5).
 fn parse_a_player_controls_no(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("a player controls no ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4934,7 +5023,7 @@ fn parse_a_player_controls_no(input: &str) -> OracleResult<'_, StaticCondition> 
 /// Kezzerdrix (creatures).
 fn parse_your_opponents_control_no(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("your opponents control no ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4958,7 +5047,7 @@ fn parse_your_opponents_control_no(input: &str) -> OracleResult<'_, StaticCondit
 fn parse_you_dont_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("you don't control ").parse(input)?;
     let (rest, _) = parse_article(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4989,7 +5078,7 @@ fn parse_you_dont_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
 /// the building block extends to any "<filter> have total <property> N or X"
 /// phrase.
 ///
-/// The `filter` subject reuses `parse_type_phrase`, so any subject-controller
+/// The `filter` subject reuses `parse_type_phrase_folding`, so any subject-controller
 /// combination it understands ("creatures you control", "creatures an opponent
 /// controls", etc.) flows through automatically.
 ///
@@ -5000,11 +5089,11 @@ fn parse_you_dont_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
 ///   (`oracle_effect::conditions::strip_leading_general_conditional` →
 ///   `static_condition_to_ability_condition`).
 fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondition> {
-    // 1. Filter subject. parse_type_phrase consumes the noun phrase plus its
+    // 1. Filter subject. parse_type_phrase_folding consumes the noun phrase plus its
     //    trailing controller suffix ("creatures you control") and returns the
     //    typed filter with controller already injected. Reject `Any` so a bare
     //    "have total ..." prefix cannot accidentally match without a subject.
-    let (filter, remainder) = parse_type_phrase(input);
+    let (filter, remainder) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5057,7 +5146,7 @@ fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondi
 }
 
 /// Inject a controller (CR 109.5 You / CR 102.2 Opponent) into a TargetFilter
-/// produced by `parse_type_phrase`, and ensure the filter is battlefield-scoped
+/// produced by `parse_type_phrase_folding`, and ensure the filter is battlefield-scoped
 /// (CR 109.4: only the battlefield and stack have a controller).
 /// CR 109.4: Add `InZone { Battlefield }` to a Typed filter (and each `Or`/`And`
 /// leg) if absent, WITHOUT constraining the controller. Used for "any player
@@ -5120,7 +5209,7 @@ pub(crate) fn inject_controller(filter: TargetFilter, ctrl: ControllerRef) -> Ta
     }
 }
 
-/// Inject `ControllerRef::You` into a TargetFilter produced by `parse_type_phrase`.
+/// Inject `ControllerRef::You` into a TargetFilter produced by `parse_type_phrase_folding`.
 /// Thin wrapper over `inject_controller` for the many "you control" call sites.
 pub(crate) fn inject_controller_you(filter: TargetFilter) -> TargetFilter {
     inject_controller(filter, ControllerRef::You)
@@ -5902,7 +5991,7 @@ fn parse_card_left_your_graveyard_this_turn(input: &str) -> OracleResult<'_, Sta
 /// or greater/more" — an additive two-term count threshold. Cavernous Maw:
 /// "the number of other Caves you control plus the number of Cave cards in your
 /// graveyard is three or greater". Term A is a live battlefield object count
-/// ("other Caves you control" → `parse_type_phrase` yields `Typed(Cave, You,
+/// ("other Caves you control" → `parse_type_phrase_folding` yields `Typed(Cave, You,
 /// [Another])` outright); term B is a subtype-filtered graveyard card count. The
 /// zone-/controlled-count combinators key on core card types, not land subtypes
 /// (CR 205.3i: Cave is a land type), so both terms are built explicitly. The two
@@ -5910,11 +5999,11 @@ fn parse_card_left_your_graveyard_this_turn(input: &str) -> OracleResult<'_, Sta
 fn parse_additive_two_term_count_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("the number of ").parse(input)?;
     // Term A: the controlled-object subject up to the " plus the number of "
-    // joiner. `parse_type_phrase` owns the whole subject including the "other"
+    // joiner. `parse_type_phrase_folding` owns the whole subject including the "other"
     // (→ Another) qualifier and the "you control" controller suffix.
     let (rest, term_a_text) = take_until(" plus the number of ").parse(rest)?;
     let (rest, _) = tag(" plus the number of ").parse(rest)?;
-    let (a_filter, a_leftover) = parse_type_phrase(term_a_text.trim());
+    let (a_filter, a_leftover) = parse_type_phrase_folding(term_a_text.trim());
     if !a_leftover.trim().is_empty() || matches!(a_filter, TargetFilter::Any) {
         return Err(oracle_err(input));
     }
@@ -5941,12 +6030,12 @@ fn parse_additive_two_term_count_threshold(input: &str) -> OracleResult<'_, Stat
 /// CR 205.3i + CR 404.1: "<subtype> cards in your graveyard" → a subtype-filtered
 /// controller-graveyard card count. `parse_zone_card_count` keys on core card
 /// types, so the subtype filter (e.g. Cave) is built explicitly via
-/// `parse_type_phrase`; the count stays a `ZoneCardCount` with the filter set
+/// `parse_type_phrase_folding`; the count stays a `ZoneCardCount` with the filter set
 /// and scope `Controller` (your graveyard only).
 fn parse_subtype_cards_in_your_graveyard(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, subtype_text) = take_until(" cards in your graveyard").parse(input)?;
     let (rest, _) = tag(" cards in your graveyard").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(subtype_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(subtype_text.trim());
     if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return Err(oracle_err(input));
     }
@@ -5968,7 +6057,7 @@ fn parse_permanent_put_into_your_hand_from_battlefield_this_turn(
     let (rest, type_text) =
         take_until(" was put into your hand from the battlefield this turn").parse(rest)?;
     let (rest, _) = tag(" was put into your hand from the battlefield this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6006,7 +6095,7 @@ fn parse_card_put_into_your_graveyard_from_anywhere_this_turn(
 /// count uses the shared "N or more"/"a(n)" (→ 1) threshold idiom. The bare
 /// "cards" noun carries no type, so `TargetFilter::Any` is accepted here (the
 /// owner + non-token tags still narrow it); a preceding type word
-/// ("artifact cards") narrows via `parse_type_phrase`.
+/// ("artifact cards") narrows via `parse_type_phrase_folding`.
 fn parse_opponent_cards_put_into_their_graveyard_from_anywhere_this_turn(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
@@ -6051,7 +6140,7 @@ fn parse_opponent_cards_put_into_their_graveyard_from_anywhere_this_turn(
         // still bound the set.
         TargetFilter::Any
     } else {
-        let (filter, leftover) = parse_type_phrase(type_text);
+        let (filter, leftover) = parse_type_phrase_folding(type_text);
         if !leftover.trim().is_empty() || filter == TargetFilter::Any {
             return Err(nom::Err::Error(nom::error::Error::new(
                 input,
@@ -6085,7 +6174,7 @@ fn parse_your_card_put_into_your_graveyard_from_anywhere_this_turn(
     let suffix = " card was put into your graveyard from anywhere this turn";
     let (rest, type_text) = take_until(suffix).parse(rest)?;
     let (rest, _) = tag(suffix).parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6113,7 +6202,7 @@ fn parse_object_put_into_graveyard_from_battlefield_this_turn(
     let suffix = " was put into a graveyard from the battlefield this turn";
     let (rest, type_text) = take_until(suffix).parse(rest)?;
     let (rest, _) = tag(suffix).parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6461,7 +6550,7 @@ fn parse_attacked_with_creature_count(input: &str) -> OracleResult<'_, StaticCon
 }
 
 /// CR 508.1a: "a/an <type>[ this turn]" — the typed-attacker surface. The qualifier
-/// is delegated to `parse_type_phrase` so the whole class of attacker types
+/// is delegated to `parse_type_phrase_folding` so the whole class of attacker types
 /// (Spacecraft, Vehicle, any creature type) is covered by the shared combinator
 /// rather than a per-card literal. An unrecognized qualifier yields
 /// `TargetFilter::Any`, which is REJECTED so the phrase stays an honest gap
@@ -6473,7 +6562,7 @@ fn parse_attacked_with_creature_count(input: &str) -> OracleResult<'_, StaticCon
 /// phrase must otherwise be consumed in full, so an unabsorbed qualifying clause
 /// stays an honest gap rather than being silently truncated.
 fn parse_attacked_with_typed_filter(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (filter, leftover) = parse_type_phrase(input);
+    let (filter, leftover) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6509,7 +6598,7 @@ fn parse_no_attacked_this_turn(input: &str) -> OracleResult<'_, StaticCondition>
     let (rest, _) = tag("no ").parse(input)?;
     let (rest, type_text) = take_until(" attacked this turn").parse(rest)?;
     let (rest, _) = tag(" attacked this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6737,7 +6826,7 @@ fn parse_filtered_creature_died_this_turn(input: &str) -> OracleResult<'_, Stati
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" died this turn").parse(rest)?;
     let (rest, _) = tag(" died this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text);
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7134,8 +7223,8 @@ fn parse_combat_context_conditions(input: &str) -> OracleResult<'_, StaticCondit
 fn parse_defending_player_controls(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("defending player controls ").parse(input)?;
     let (rest, _) = parse_article(rest)?;
-    // parse_type_phrase returns (filter, remaining_str) — bridge to nom remainder
-    let (filter, type_rest) = parse_type_phrase(rest);
+    // parse_type_phrase_folding returns (filter, remaining_str) — bridge to nom remainder
+    let (filter, type_rest) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7617,7 +7706,7 @@ fn parse_sacrificed_this_turn_tail(input: &str) -> OracleResult<'_, StaticCondit
     if let Ok((rest, n)) = parse_ge_threshold(input) {
         let (rest, type_text) = take_until(" this turn").parse(rest)?;
         let (rest, _) = tag(" this turn").parse(rest)?;
-        let (filter, leftover) = parse_type_phrase(type_text.trim());
+        let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
         if leftover.trim().is_empty() && filter != TargetFilter::Any {
             return Ok((
                 rest,
@@ -7635,7 +7724,7 @@ fn parse_sacrificed_this_turn_tail(input: &str) -> OracleResult<'_, StaticCondit
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" this turn").parse(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7658,7 +7747,7 @@ fn parse_died_under_your_control_this_turn(input: &str) -> OracleResult<'_, Stat
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" died under your control this turn").parse(rest)?;
     let (rest, _) = tag(" died under your control this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text);
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7836,7 +7925,7 @@ pub(crate) fn parse_spell_history_filter(type_text: &str) -> Option<TargetFilter
             return Some(filter);
         }
     }
-    let (filter, leftover) = parse_type_phrase(type_text);
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
     if leftover.trim().is_empty() && filter != TargetFilter::Any {
         return Some(filter);
     }
@@ -8147,7 +8236,7 @@ fn make_source_history_absence(prop: FilterProp) -> StaticCondition {
 /// subject-first form already lowered to, so both forms share one
 /// `QuantityComparison(ObjectCount == 0)` output and no controller restriction
 /// ("no creatures" / "no Zombies" / "no lands" counts *any* player's matching
-/// permanents). The `<type>` reuses `parse_type_phrase`, so a subtype
+/// permanents). The `<type>` reuses `parse_type_phrase_folding`, so a subtype
 /// ("Zombies"), a card type ("lands"), or a token phrase ("Reflection tokens")
 /// scopes the emptiness check exactly, and the trailing anchor is a bounded
 /// `tag` so the recognizer never runs into the effect clause.
@@ -8162,7 +8251,7 @@ fn parse_no_on_battlefield(input: &str) -> OracleResult<'_, StaticCondition> {
     .parse(input)?;
     let (rest, type_text) = take_until(anchor).parse(rest)?;
     let (rest, _) = tag(anchor).parse(rest)?;
-    let (filter, _) = parse_type_phrase(type_text);
+    let (filter, _) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -8230,7 +8319,7 @@ fn parse_entered_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     {
         let (rest, type_text) = take_until(entered_suffix).parse(rest)?;
         let (rest, _) = tag(entered_suffix).parse(rest)?;
-        let (filter, _) = parse_type_phrase(type_text.trim());
+        let (filter, _) = parse_type_phrase_folding(type_text.trim());
         return Ok((
             rest,
             make_quantity_ge(
@@ -8280,7 +8369,7 @@ fn parse_or_more_entered_count<'a>(
     let (type_and_rest, _) = tag("or more ").parse(after_n.trim_start())?;
     let (rest, type_text) = take_until(suffix).parse(type_and_rest)?;
     let (rest, _) = tag(suffix).parse(rest)?;
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     Ok((
         rest,
         make_quantity_ge(
@@ -8300,7 +8389,7 @@ fn parse_entered_this_turn_subject<'a>(
     let (rest, _) = tag(suffix).parse(rest)?;
     let type_text = type_text.trim();
     let _ = alt((parse_article, value((), tag("another ")))).parse(type_text)?;
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     Ok((
         rest,
         make_quantity_ge(
@@ -8446,6 +8535,11 @@ fn parse_there_are_conditions_with_quantity(
         (None, Some(_)) => Comparator::GE,
         (None, None) => Comparator::EQ,
     };
+    match parse_filtered_zone_card_count(rest) {
+        Ok((rest, qty)) => return Ok((rest, make_quantity_comparison(qty, comparator, n))),
+        Err(nom::Err::Error(_)) => {}
+        Err(error @ (nom::Err::Failure(_) | nom::Err::Incomplete(_))) => return Err(error),
+    }
     if let Ok((rest_after_type, type_text)) =
         take_until::<_, _, OracleError<'_>>(" cards total in ").parse(rest)
     {
@@ -8474,6 +8568,101 @@ fn parse_there_are_conditions_with_quantity(
             n,
         ),
     ))
+}
+
+/// CR 109.2a + CR 400.1: A card description with a named zone counts matching
+/// cards in that zone, so this preserves the parsed filter rather than flattening
+/// it into a lexical noun or a card-type list.
+///
+/// The type phrase and locative zone are deliberately parsed by their separate
+/// authorities. `parse_type_phrase_folding` owns the complete noun phrase, while
+/// `parse_scoped_zone_count_ref` owns the player/zone scope after `in `.
+fn parse_filtered_zone_card_count(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest_after_noun, noun) = take_until(" in ").parse(input)?;
+    let (after_cards, _) = terminated(take_until("cards"), tag("cards")).parse(noun)?;
+    if !after_cards.is_empty() {
+        return Err(oracle_err(input));
+    }
+    let (filter, remainder) = parse_type_phrase_folding(noun);
+    if !remainder.trim().is_empty() || !is_admissible_zone_card_count_filter(&filter) {
+        return Err(oracle_err(input));
+    }
+    let (rest, _) = tag(" in ").parse(rest_after_noun)?;
+    let (rest, (zone, scope)) = cut(preceded(
+        peek(alt((tag("your "), tag("all graveyards")))),
+        parse_scoped_zone_count_ref,
+    ))
+    .parse(rest)?;
+    Ok((
+        rest,
+        QuantityRef::ZoneCardCount {
+            zone,
+            card_types: Vec::new(),
+            filter: Some(filter),
+            scope,
+        },
+    ))
+}
+
+/// Limits the filtered zone-count bridge to card descriptions whose semantics
+/// remain valid in every counted zone. All other filter forms deliberately fall
+/// through to the legacy quantity grammar instead of being partially accepted.
+fn is_admissible_zone_card_count_filter(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller,
+            properties,
+        }) => {
+            controller.is_none()
+                && !type_filters.is_empty()
+                && !type_filters.iter().any(type_filter_contains_any)
+                && !properties.is_empty()
+                && properties
+                    .iter()
+                    .all(is_admissible_zone_card_count_property)
+        }
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(is_admissible_zone_card_count_filter)
+        }
+        _ => false,
+    }
+}
+
+/// `TypeFilter::Any` would make this bridge a broad unfiltered count. Descend
+/// through its recursive variants so nested `Any` filters cannot bypass that
+/// boundary.
+fn type_filter_contains_any(filter: &TypeFilter) -> bool {
+    match filter {
+        TypeFilter::Any => true,
+        TypeFilter::Non(filter) => type_filter_contains_any(filter),
+        TypeFilter::AnyOf(filters) => filters.iter().any(type_filter_contains_any),
+        TypeFilter::Creature
+        | TypeFilter::Land
+        | TypeFilter::Artifact
+        | TypeFilter::Enchantment
+        | TypeFilter::Instant
+        | TypeFilter::Sorcery
+        | TypeFilter::Planeswalker
+        | TypeFilter::Battle
+        | TypeFilter::Kindred
+        | TypeFilter::Permanent
+        | TypeFilter::Card
+        | TypeFilter::Subtype(_) => false,
+    }
+}
+
+/// Only static card-description properties can be evaluated meaningfully in a
+/// named card zone. The default is intentionally reject-by-default so a future
+/// property cannot widen this parser without an explicit admissibility decision.
+fn is_admissible_zone_card_count_property(property: &FilterProp) -> bool {
+    matches!(
+        property,
+        FilterProp::Historic
+            | FilterProp::NotHistoric
+            | FilterProp::HasSupertype { .. }
+            | FilterProp::NotSupertype { .. }
+    )
 }
 
 /// Self-referential source alternatives shared by the "exiled with [source]"
@@ -8510,7 +8699,7 @@ fn parse_no_cards_in_your_zone(input: &str) -> OracleResult<'_, StaticCondition>
     let filter = if type_text.is_empty() {
         None
     } else {
-        let (filter, remainder) = parse_type_phrase(type_text.trim());
+        let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
         if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
             return Err(oracle_err(input));
         }
@@ -8669,7 +8858,7 @@ fn parse_zone_card_type_text(type_text: &str) -> Vec<TypeFilter> {
             _ => {}
         }
     }
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let mut card_types = Vec::new();
     collect_type_filters(filter, &mut card_types);
     card_types.retain(|type_filter| *type_filter != TypeFilter::Card);
@@ -8724,7 +8913,7 @@ fn parse_subject_first_card_subject(input: &str) -> OracleResult<'_, Vec<TypeFil
         },
     ))
     .parse(input)?;
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let mut card_types = match filter {
         TargetFilter::Typed(TypedFilter { type_filters, .. }) => type_filters,
         _ => vec![],
@@ -8863,12 +9052,12 @@ fn parse_that_player_controls_more_comparison(input: &str) -> OracleResult<'_, S
     let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
     let (rest, _) = tag(" than you").parse(rest)?;
 
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let scoped_filter = match filter {
         TargetFilter::Typed(tf) => TargetFilter::Typed(tf.controller(ControllerRef::ScopedPlayer)),
         other => other,
     };
-    let you_filter = match parse_type_phrase(type_text.trim()) {
+    let you_filter = match parse_type_phrase_folding(type_text.trim()) {
         (TargetFilter::Typed(tf), _) => TargetFilter::Typed(tf.controller(ControllerRef::You)),
         (other, _) => other,
     };
@@ -8928,14 +9117,14 @@ fn parse_defending_player_comparison_conditions(input: &str) -> OracleResult<'_,
     let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
     let (rest, _) = tag(" than you").parse(rest)?;
 
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let defending_filter = match filter {
         TargetFilter::Typed(tf) => {
             TargetFilter::Typed(tf.controller(ControllerRef::DefendingPlayer))
         }
         other => other,
     };
-    let you_filter = match parse_type_phrase(type_text.trim()) {
+    let you_filter = match parse_type_phrase_folding(type_text.trim()) {
         (TargetFilter::Typed(tf), _) => TargetFilter::Typed(tf.controller(ControllerRef::You)),
         (other, _) => other,
     };
@@ -9069,7 +9258,7 @@ fn parse_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticC
                 return Err(oracle_err(rest3));
             }
             let type_text = rest3.trim_end_matches('.');
-            let (filter, remainder) = parse_type_phrase(type_text);
+            let (filter, remainder) = parse_type_phrase_folding(type_text);
             if !matches!(filter, TargetFilter::Any) {
                 let filter = match filter {
                     TargetFilter::Typed(tf) => {
@@ -9346,7 +9535,7 @@ fn parse_opponent_controls_more_than_you(input: &str) -> OracleResult<'_, Static
 }
 
 fn player_count_comparison_filters(type_text: &str) -> Option<(TargetFilter, TargetFilter)> {
-    let (type_filter, remainder) = parse_type_phrase(type_text.trim());
+    let (type_filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if !remainder.trim().is_empty() || matches!(type_filter, TargetFilter::Any | TargetFilter::None)
     {
         return None;
@@ -9512,7 +9701,7 @@ pub fn parse_zone_changed_this_way_clause_scoped(
         value((), tag::<_, _, OracleError<'_>>("at least one ")),
         value((), tag("one or more ")),
         // CR 608.2c: "another <type> … this way" (Arid Archway) — do NOT consume
-        // "another "; `parse_type_phrase` maps it to `FilterProp::Another` so the
+        // "another "; `parse_type_phrase_folding` maps it to `FilterProp::Another` so the
         // returned-this-way subject excludes the source.
         value((), nom::combinator::peek(tag("another "))),
         // CR 608.2c: "that <type> … this way" (Saw in Half, Tuktuk Scrapper) —
@@ -9527,7 +9716,7 @@ pub fn parse_zone_changed_this_way_clause_scoped(
     // type phrase — handled by the shared helper which already covers
     // top-level types (creature, artifact, enchantment, …) and subtypes
     // (Aura, Equipment, …) via the lowercase oracle subtype dictionary.
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -9543,7 +9732,7 @@ pub fn parse_zone_changed_this_way_clause_scoped(
     // `parse_you_control_a`.
     let (filter, after_filter) = fold_this_way_subject_disjunction(filter, after_filter);
 
-    // `parse_type_phrase` returns a slice of `rest`; trim any leading whitespace
+    // `parse_type_phrase_folding` returns a slice of `rest`; trim any leading whitespace
     // it left between the type phrase and the tense verb so the next `tag`
     // matches cleanly.
     let after_filter = after_filter.trim_start();
@@ -9668,7 +9857,7 @@ pub enum DamagedThisWayRecipient {
 /// This is the plain-damage sibling of [`parse_zone_changed_this_way_clause`]
 /// (zone-change verbs) and of `parse_previous_effect_excess_damage_condition`
 /// (the `excess` channel). It shares the same article × subject × tense × verb
-/// axes, so a new recipient noun is a `parse_type_phrase` concern, not a new
+/// axes, so a new recipient noun is a `parse_type_phrase_folding` concern, not a new
 /// `tag` arm here.
 ///
 /// `"dealt excess damage this way"` cannot match: the `excess` token stops the
@@ -9697,7 +9886,7 @@ pub fn parse_damaged_this_way_clause(input: &str) -> OracleResult<'_, DamagedThi
     ))
     .parse(rest)?;
 
-    // `parse_type_phrase` returns a slice of its input; trim any whitespace it
+    // `parse_type_phrase_folding` returns a slice of its input; trim any whitespace it
     // left between the noun phrase and the tense verb so the next `tag` matches
     // cleanly (same normalization the zone-change sibling performs).
     let rest = rest.trim_start();
@@ -9718,14 +9907,14 @@ pub fn parse_damaged_this_way_clause(input: &str) -> OracleResult<'_, DamagedThi
 }
 
 /// CR 120.3 + CR 205: the typed-recipient arm of [`parse_damaged_this_way_clause`].
-/// Delegates the noun phrase to [`parse_type_phrase`] — the declared authority for
+/// Delegates the noun phrase to [`parse_type_phrase_folding`] — the declared authority for
 /// type/subtype phrases — and folds a `" or a [type]"` continuation through the
 /// shared [`fold_this_way_subject_disjunction`], so a disjunctive recipient sharing
 /// one verb ("a Dragon or a Wurm is dealt damage this way") stays one condition.
 fn parse_damaged_this_way_typed_recipient(
     input: &str,
 ) -> OracleResult<'_, DamagedThisWayRecipient> {
-    let (filter, after_filter) = parse_type_phrase(input);
+    let (filter, after_filter) = parse_type_phrase_folding(input);
     // Fail closed on a vacuous or non-consuming parse, mirroring the zone-change
     // sibling: `TargetFilter::Any` means the noun was not recognized at all.
     if matches!(filter, TargetFilter::Any) || after_filter.len() == input.len() {
@@ -9917,7 +10106,7 @@ pub fn parse_you_put_onto_battlefield_this_way_clause(
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -9958,7 +10147,7 @@ pub fn parse_you_put_into_graveyard_this_way_clause(
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -9989,7 +10178,7 @@ pub fn parse_you_put_into_graveyard_this_way_clause(
 /// The bare "a card" form parses to `TypeFilter::Card` (matches any card in any
 /// zone), which is the intended existential semantics — any card discarded this
 /// way. A leading type qualifier ("a creature card") narrows the filter via the
-/// shared `parse_type_phrase` helper, covering the whole class.
+/// shared `parse_type_phrase_folding` helper, covering the whole class.
 pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (TargetFilter, bool)> {
     let (rest, _) = tag("you discard ").parse(input)?;
     let (rest, _) = alt((
@@ -9998,7 +10187,7 @@ pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (Targe
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10022,7 +10211,7 @@ pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (Targe
 /// `parse_you_discard_this_way_clause` existential check, differing only in the
 /// active verb ("sacrifice") and its fixed-graveyard destination. The optional
 /// trailing plural "s" lets "one or more artifacts" / "an artifact" / "a creature"
-/// all narrow through the shared `parse_type_phrase` helper, covering the class.
+/// all narrow through the shared `parse_type_phrase_folding` helper, covering the class.
 pub fn parse_you_sacrifice_this_way_clause(input: &str) -> OracleResult<'_, (TargetFilter, bool)> {
     let (rest, _) = tag("you sacrifice ").parse(input)?;
     let (rest, _) = alt((
@@ -10032,7 +10221,7 @@ pub fn parse_you_sacrifice_this_way_clause(input: &str) -> OracleResult<'_, (Tar
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10068,7 +10257,7 @@ pub fn parse_you_exile_this_way_clause(input: &str) -> OracleResult<'_, (TargetF
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10104,7 +10293,7 @@ fn fold_this_way_subject_disjunction(first: TargetFilter, remainder: &str) -> (T
         {
             break;
         }
-        let (next_filter, next_remainder) = parse_type_phrase(after_or);
+        let (next_filter, next_remainder) = parse_type_phrase_folding(after_or);
         if matches!(next_filter, TargetFilter::Any) {
             break;
         }
@@ -10154,7 +10343,7 @@ pub fn parse_you_put_into_hand_this_way_condition(
         ),
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10199,7 +10388,7 @@ pub fn parse_you_put_counters_on_type_this_way_condition(
             )))
         }
     };
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10237,7 +10426,7 @@ pub fn parse_returned_to_hand_this_way_clause(input: &str) -> OracleResult<'_, T
         ),
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10260,7 +10449,7 @@ pub fn parse_you_control_or_returned_this_way_condition(
 ) -> OracleResult<'_, AbilityCondition> {
     let (rest, _) = tag("you control ").parse(input)?;
     nom::combinator::peek(alt((tag("a "), tag("an "), tag("another ")))).parse(rest)?;
-    let (control_filter, after) = parse_type_phrase(rest);
+    let (control_filter, after) = parse_type_phrase_folding(rest);
     if matches!(control_filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10487,8 +10676,8 @@ pub(crate) fn match_when_you_do(i: &str) -> OracleResult<'_, ()> {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        CardTypeSetSource, CountScope, PtStat, PtValueScope, RoundingMode, TriggerCondition,
-        TypeFilter, TypedFilter, ZoneRef,
+        CardTypeSetSource, ControllerRef, CountScope, PtStat, PtValueScope, RoundingMode,
+        TargetFilter, TriggerCondition, TypeFilter, TypedFilter, ZoneRef,
     };
     use crate::types::card_type::Supertype;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -12342,7 +12531,7 @@ mod tests {
     /// indestructible" must lower its CONDITION to a typed
     /// `IsPresent { Or[ Typed{[Artifact,Creature],You,Battlefield},
     /// Typed{[Plan],You,Battlefield} ] }`, NOT `StaticCondition::Unrecognized`.
-    /// DISCRIMINATING: pre-fix `parse_type_phrase` left " or a Plan" unconsumed
+    /// DISCRIMINATING: pre-fix `parse_type_phrase_folding` left " or a Plan" unconsumed
     /// (Plan unknown + non-comma connector rejected an article-led RHS), so the
     /// condition fell to `Unrecognized` — which `evaluate_condition` treats as
     /// `true`, making the keyword grant always-on (coverage-unsupported).
@@ -14612,25 +14801,276 @@ mod tests {
             parse_inner_condition("there are fewer than six creature cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ZoneCardCount {
-                                zone: ZoneRef::Graveyard,
-                                card_types,
-                                filter: None,
-                                scope: CountScope::Controller,
-                            },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::LT,
                 rhs: QuantityExpr::Fixed { value: 6 },
-            } => {
-                assert_eq!(card_types, vec![TypeFilter::Creature]);
             }
-            other => panic!("expected ZoneCardCount Creature LT 6, got {other:?}"),
+        );
+    }
+
+    #[test]
+    fn filtered_zone_card_counts_preserve_filter_scope_and_comparator_axes() {
+        let typed = |type_filters, properties| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            })
+        };
+        let cases = [
+            (
+                "there are four or more historic cards in your graveyard",
+                Comparator::GE,
+                4,
+                typed(vec![TypeFilter::Card], vec![FilterProp::Historic]),
+                CountScope::Controller,
+            ),
+            (
+                "there are two nonhistoric cards in all graveyards",
+                Comparator::EQ,
+                2,
+                typed(vec![TypeFilter::Card], vec![FilterProp::NotHistoric]),
+                CountScope::All,
+            ),
+            (
+                "there are three legendary creature cards in your graveyard",
+                Comparator::EQ,
+                3,
+                typed(
+                    vec![TypeFilter::Creature],
+                    vec![FilterProp::HasSupertype {
+                        value: Supertype::Legendary,
+                    }],
+                ),
+                CountScope::Controller,
+            ),
+            (
+                "there are two nonbasic land cards in all graveyards",
+                Comparator::EQ,
+                2,
+                typed(
+                    vec![TypeFilter::Land],
+                    vec![FilterProp::NotSupertype {
+                        value: Supertype::Basic,
+                    }],
+                ),
+                CountScope::All,
+            ),
+            (
+                "there are three or more legendary creature or nonbasic land cards in all graveyards",
+                Comparator::GE,
+                3,
+                TargetFilter::Or {
+                    filters: vec![
+                        typed(
+                            vec![TypeFilter::Creature],
+                            vec![FilterProp::HasSupertype {
+                                value: Supertype::Legendary,
+                            }],
+                        ),
+                        typed(
+                            vec![TypeFilter::Land],
+                            vec![
+                                FilterProp::NotSupertype {
+                                    value: Supertype::Basic,
+                                },
+                                FilterProp::HasSupertype {
+                                    value: Supertype::Legendary,
+                                },
+                            ],
+                        ),
+                    ],
+                },
+                CountScope::All,
+            ),
+        ];
+
+        for (text, comparator, threshold, filter, scope) in cases {
+            let (rest, condition) = parse_inner_condition(text)
+                .unwrap_or_else(|error| panic!("must parse {text:?}: {error:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ZoneCardCount {
+                            zone: ZoneRef::Graveyard,
+                            card_types: Vec::new(),
+                            filter: Some(filter),
+                            scope,
+                        },
+                    },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value: threshold },
+                },
+                "exact AST for {text:?}",
+            );
         }
+    }
+
+    #[test]
+    fn filtered_zone_card_count_reach_guards_preserve_legacy_and_boundaries() {
+        let (rest, cards_total) =
+            parse_inner_condition("there are three creature cards total in your graveyard")
+                .expect("cards-total legacy path must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cards_total,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+
+        let (rest, instant_or_sorcery) = parse_inner_condition(
+            "there are three or more instant or sorcery cards in your graveyard",
+        )
+        .expect("property-free type disjunction must retain its legacy count path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            instant_or_sorcery,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Instant, TypeFilter::Sorcery],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+
+        let (rest, card_types_among) = parse_inner_condition(
+            "there are four or more card types among cards in your graveyard",
+        )
+        .expect("card-types-among legacy path must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            card_types_among,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctCardTypes {
+                        source: CardTypeSetSource::Zone {
+                            zone: ZoneRef::Graveyard,
+                            scope: CountScope::Controller,
+                        },
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+
+        let (rest, bare_cards) = parse_inner_condition("there are four cards in your graveyard")
+            .expect("bare cards must retain their canonical quantity path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            bare_cards,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::GraveyardSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+
+        let (rest, battlefield_count) =
+            parse_inner_condition("there are seven or more lands on the battlefield")
+                .expect("battlefield count fallback must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            battlefield_count,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Land],
+                            controller: None,
+                            properties: vec![FilterProp::InZone {
+                                zone: Zone::Battlefield,
+                            }],
+                        }),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 7 },
+            }
+        );
+
+        let (_, plural_historic) =
+            parse_filtered_zone_card_count("historic cards in your graveyard")
+                .expect("positive reach guard for rejected filtered-count forms");
+        assert!(matches!(plural_historic, QuantityRef::ZoneCardCount { .. }));
+        assert!(matches!(
+            parse_filtered_zone_card_count("historic card in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+        for text in [
+            "creature cards in your graveyard",
+            "Lesson cards in your graveyard",
+            "instant or sorcery cards in your graveyard",
+        ] {
+            assert!(
+                matches!(
+                    parse_filtered_zone_card_count(text),
+                    Err(nom::Err::Error(_))
+                ),
+                "property-free filter must fall through to the legacy count parser for {text:?}"
+            );
+        }
+        assert!(matches!(
+            parse_filtered_zone_card_count("artifact cards you control in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+        assert!(matches!(
+            parse_filtered_zone_card_count("tapped creature cards in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+
+        for text in [
+            "there are five historic cards in an opponent's graveyard",
+            "there are five historic cards in each player's graveyard",
+            "there are five historic cards in graveyard",
+        ] {
+            assert!(
+                matches!(parse_inner_condition(text), Err(nom::Err::Failure(_))),
+                "unsupported filtered-count scope must commit as Failure for {text:?}"
+            );
+        }
+
+        let (rest, _) =
+            parse_inner_condition("there are four or more historic cards in your graveyard total")
+                .expect("unconsumed tail must remain visible to the caller");
+        assert_eq!(rest, " total");
+        let (rest, _) = parse_inner_condition(
+            "there are four or more historic cards in your graveyard, draw a card",
+        )
+        .expect("comma boundary must remain visible to the caller");
+        assert_eq!(rest, ", draw a card");
     }
 
     /// CR 107.1 + CR 611.3a: "there are fewer than N cards ..." with the plain
@@ -14666,17 +15106,21 @@ mod tests {
             parse_inner_condition("there are more than two creature cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty: QuantityRef::ZoneCardCount { .. },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::GT,
                 rhs: QuantityExpr::Fixed { value: 2 },
-            } => {}
-            other => panic!("expected ZoneCardCount GT 2, got {other:?}"),
-        }
+            }
+        );
     }
 
     /// CR 107.1: suffix regression — the "or more" (GE) suffix axis still parses
@@ -14767,6 +15211,38 @@ mod tests {
         }
     }
 
+    /// CR 202.3 + CR 611.3a: the mana-value-diversity sibling of Delirium — SNC's
+    /// "there are five or more mana values among cards in your graveyard" (Aven
+    /// Heartstabber, Snooping Newsie, Syndicate Infiltrator, Graveyard Shift, and
+    /// their Alchemy variants). Unlike Delirium's `DistinctCardTypes`, this counts
+    /// distinct mana VALUES via the generic `ObjectCountDistinct` axis.
+    #[test]
+    fn test_there_are_mana_values_graveyard_diversity() {
+        let (rest, c) = parse_inner_condition(
+            "there are five or more mana values among cards in your graveyard",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCountDistinct { filter, qualities },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 5 },
+            } => {
+                assert_eq!(qualities, vec![SharedQuality::ManaValue]);
+                assert_eq!(filter.extract_in_zone(), Some(Zone::Graveyard));
+                let TargetFilter::Typed(filter) = filter else {
+                    panic!("expected Typed graveyard filter");
+                };
+                assert_eq!(filter.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ObjectCountDistinct[ManaValue] GE 5, got {other:?}"),
+        }
+    }
+
     #[test]
     fn there_are_zone_threshold_stops_before_counter_effect_clause() {
         let (rest, c) = parse_inner_condition(
@@ -14848,25 +15324,21 @@ mod tests {
             parse_inner_condition("there are three or more Lesson cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ZoneCardCount {
-                                zone: crate::types::ability::ZoneRef::Graveyard,
-                                card_types,
-                                scope: crate::types::ability::CountScope::Controller,
-                                filter: None,
-                            },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Lesson".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 3 },
-            } => {
-                assert_eq!(card_types, vec![TypeFilter::Subtype("Lesson".to_string())]);
             }
-            other => panic!("expected Lesson graveyard count GE 3, got {other:?}"),
-        }
+        );
     }
 
     #[test]
@@ -15363,7 +15835,7 @@ mod tests {
 
     #[test]
     fn test_recipient_guard_backtracks_to_attacking_alone() {
-        // GUARD: "it's attacking alone" leaves "alone" after parse_type_phrase
+        // GUARD: "it's attacking alone" leaves "alone" after parse_type_phrase_folding
         // matches "attacking " — the terminal-boundary guard rejects the pronoun
         // match so the combat combinator wins.
         let (rest, c) = parse_inner_condition("it's attacking alone").unwrap();
@@ -19859,7 +20331,7 @@ mod tests {
         assert_eq!(recipient, DamagedThisWayRecipient::Player);
     }
 
-    /// The recipient axis is a `parse_type_phrase` concern, so the whole class
+    /// The recipient axis is a `parse_type_phrase_folding` concern, so the whole class
     /// of nouns comes for free — plural verbs included.
     #[test]
     fn test_damaged_this_way_recipient_class() {
@@ -21214,9 +21686,9 @@ mod tests {
 
     /// CR 401.1: Mul Daya Channelers's "the top card of your library is a creature
     /// card" / "... a land card" parse to top-of-library core-type gates. The
-    /// informational " card" suffix is folded by `parse_type_phrase` (the same
+    /// informational " card" suffix is folded by `parse_type_phrase_folding` (the same
     /// helper the graveyard-presence gate uses), so the filter is exactly the bare
-    /// core-type filter — asserted against `parse_type_phrase`'s own output.
+    /// core-type filter — asserted against `parse_type_phrase_folding`'s own output.
     #[test]
     fn parse_inner_condition_top_of_library_is_type_card() {
         for (text, phrase) in [
@@ -21228,7 +21700,7 @@ mod tests {
         ] {
             let (rest, c) = parse_inner_condition(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
             assert!(rest.is_empty(), "{text}: leftover {rest:?}");
-            let (expected_filter, _) = parse_type_phrase(phrase);
+            let (expected_filter, _) = parse_type_phrase_folding(phrase);
             assert_eq!(
                 c,
                 StaticCondition::TopOfLibraryMatches {
@@ -21241,13 +21713,13 @@ mod tests {
 
     /// CR 401.1: Conspicuous Snoop's "the top card of your library is a Goblin
     /// card" parses to a top-of-library subtype gate (the subtype-word path of
-    /// `parse_type_phrase`). The condition parser runs on lowercased text.
+    /// `parse_type_phrase_folding`). The condition parser runs on lowercased text.
     #[test]
     fn parse_inner_condition_top_of_library_is_subtype_card() {
         let (rest, c) =
             parse_inner_condition("the top card of your library is a goblin card").unwrap();
         assert!(rest.is_empty(), "leftover: {rest:?}");
-        let (expected_filter, _) = parse_type_phrase("goblin card");
+        let (expected_filter, _) = parse_type_phrase_folding("goblin card");
         assert_eq!(
             c,
             StaticCondition::TopOfLibraryMatches {
@@ -21258,18 +21730,18 @@ mod tests {
 
     /// CR 401.1: Skill Borrower's "the top card of your library is an
     /// artifact or creature card" folds the "X or Y card" disjunction into a
-    /// single top-of-library gate over an `Or` *filter* — `parse_type_phrase`
+    /// single top-of-library gate over an `Or` *filter* — `parse_type_phrase_folding`
     /// consumes the whole compound (no per-disjunct article), so
     /// `parse_bare_predicate_disjunction` yields one filter and the runtime
     /// `matches_target_filter` disjunction handles the two card types. The `Or`
-    /// filter is asserted against `parse_type_phrase`'s own compound output.
+    /// filter is asserted against `parse_type_phrase_folding`'s own compound output.
     #[test]
     fn parse_inner_condition_top_of_library_is_disjunction() {
         let (rest, c) =
             parse_inner_condition("the top card of your library is an artifact or creature card")
                 .unwrap();
         assert!(rest.is_empty(), "leftover: {rest:?}");
-        let (expected_filter, _) = parse_type_phrase("artifact or creature card");
+        let (expected_filter, _) = parse_type_phrase_folding("artifact or creature card");
         assert!(
             matches!(&expected_filter, TargetFilter::Or { filters } if filters.len() == 2),
             "sanity: expected an Or filter, got {expected_filter:?}"
@@ -21574,7 +22046,7 @@ mod tests {
     /// CR 120.10 + CR 603.4: Rith, Liberated Primeval's "a creature or
     /// planeswalker an opponent controlled was dealt excess damage this turn"
     /// must parse as an opponent-filtered DamageDealtThisTurn with channel:Excess.
-    /// `parse_type_phrase` produces `TargetFilter::Or` for compound types, so
+    /// `parse_type_phrase_folding` produces `TargetFilter::Or` for compound types, so
     /// this test checks that the channel is Excess and the target is non-Any.
     #[test]
     fn parse_inner_condition_typed_subject_was_dealt_excess_damage_this_turn() {
@@ -21600,7 +22072,7 @@ mod tests {
             panic!("expected QuantityComparison(DamageDealtThisTurn), got: {cond:?}");
         };
         assert_eq!(channel, DamageChannel::Excess, "channel must be Excess");
-        // parse_type_phrase emits Or{Typed(Creature+Opp), Typed(Planeswalker+Opp)}
+        // parse_type_phrase_folding emits Or{Typed(Creature+Opp), Typed(Planeswalker+Opp)}
         // for compound types — verify the filter is non-trivial (not Any).
         assert!(
             !matches!(target.as_ref(), TargetFilter::Any),

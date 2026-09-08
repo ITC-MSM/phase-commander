@@ -1,4 +1,5 @@
 import type {
+  AbilityBlockEntry,
   EndContinuousEffectOffer,
   GameAction,
   GameEvent,
@@ -49,6 +50,8 @@ export interface LegalActionsWire {
   manaPaymentShortcutActions?: GameAction[];
   legalActionsByObject?: Record<string, ObjectAction[]>;
   spellCosts?: Record<string, ManaCost>;
+  /** CR 118.3: acting-player-scoped "can't pay this cost right now" read-out. */
+  activationBlockReasons?: Record<string, AbilityBlockEntry[]>;
   viewerInteraction?: ViewerInteraction;
 }
 
@@ -61,6 +64,7 @@ export function legalActionsToWire(result: LegalActionsResult): LegalActionsWire
     manaPaymentShortcutActions: result.manaPaymentShortcutActions ?? [],
     legalActionsByObject: result.legalActionsByObject,
     spellCosts: result.spellCosts,
+    activationBlockReasons: result.activationBlockReasons,
     viewerInteraction: result.viewerInteraction,
   };
 }
@@ -74,6 +78,7 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
     manaPaymentShortcutActions: wire.manaPaymentShortcutActions ?? [],
     legalActionsByObject: wire.legalActionsByObject,
     spellCosts: wire.spellCosts,
+    activationBlockReasons: wire.activationBlockReasons,
     viewerInteraction: wire.viewerInteraction,
   };
 }
@@ -101,6 +106,55 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  51 — PendingManaAbility.chosen_tappers changed from Vec<ObjectId> to
+ *       Option<Vec<ObjectId>> (#8698), separating an ANSWERED zero-tapper
+ *       CR 107.3a X-sentinel selection (X=0) from an unanswered one. A PARSE
+ *       bump like 50: the field carries no serde default, so a pre-51 payload
+ *       that omits it is a missing-field error rather than a silent None. The
+ *       reverse direction is why first contact must refuse the skew — Some([])
+ *       goes on the wire as `[]`, which a v50 build's is_empty() gate reads as
+ *       *unanswered* and re-prompts forever. Since game_setup and
+ *       reconnect_ack carry GameState, first contact rejects the skew instead.
+ *       Bumped in lockstep with PROTOCOL_VERSION 68.
+ *  50 — DerivedViews.dungeon_rooms entries gained required `card` and `rooms`
+ *       fields: the dungeon card's Scryfall identity, and every room with its
+ *       outgoing edges (CR 309.5a) and its position on the printed card face.
+ *       A PARSE bump like 49, not a silent capability loss like 39: neither
+ *       field carries a serde default, so a v49 peer cannot parse a snapshot
+ *       in which anyone is venturing. Nor is the reverse benign — this client
+ *       reads `card` unconditionally when resolving the dungeon art, so a v49
+ *       host would throw in render rather than drop the panel. Since
+ *       game_setup and reconnect_ack carry GameState, first contact rejects
+ *       the skew instead of allowing either failure.
+ *  49 — ReplacementCondition.FirstTokenCreationEachTurn moved its required
+ *       player field to an optional active_player_req, and CopyTargetPurpose
+ *       gained a CopyTokenSource variant. Both are one-way parse breaks: the
+ *       condition's player field was REQUIRED through v48, so a v48 peer hits a
+ *       missing-field error, and the purpose tag is internally tagged, so a v48
+ *       peer hits an unknown-variant error on CopyTokenSource. Bumped in
+ *       lockstep with PROTOCOL_VERSION 66.
+ *  48 — Retroactive bump for two new-tag changes that landed without one.
+ *       #8501 added Effect.OpenBoosterPack and the BoosterPack arms of
+ *       OutsideGameChoiceSource / OutsideGameSelection (adjacently-tagged, so
+ *       an old peer cannot decode them at all); #8332 added slots/slot_pools to
+ *       WaitingFor.RetargetChoice and controller to StackEntryDisplay (optional,
+ *       so an old peer decodes and then misrenders — RetargetChoiceModal
+ *       indexes slot_pools, and its ?? guards an undefined element, not an
+ *       undefined array, so an old host + new guest throws during render).
+ *       No wire shape changes here; this exists so first contact stops admitting
+ *       the skew. Bumped in lockstep with PROTOCOL_VERSION 64.
+ *  47 — WaitingFor.ReplacementChoice gained an engine-owned
+ *       ReplacementChoiceKind discriminator and a last_applied_decides flag.
+ *       Both are optional on the wire, so a skewed host/guest pair decodes
+ *       successfully and then misrenders the prompt instead of failing at
+ *       first contact.
+ *  45 — Effect.ChooseCounterKind gained domain and chooser, carried inside
+ *       GameObject.abilities and trigger definitions on every GameState frame
+ *       (CR 608.2d). Additive behind serde defaults; a v44 peer has no field to
+ *       receive the printed list or the random chooser into and silently reads
+ *       both as an on-target prompt, placing no counter. Since game_setup and
+ *       reconnect_ack carry GameState, first contact rejects the version skew.
+ *       Bumped in lockstep with PROTOCOL_VERSION 61.
  *  44 — DerivedViews.back_face_spell_costs publishes, for each card the viewer
  *       may cast whose player chooses a spell face at cast time (a split card
  *       such as a Room, a spell//spell MDFC — CR 709.3 + CR 712.11b), the live
@@ -315,7 +369,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 44 as const;
+export const WIRE_PROTOCOL_VERSION = 51 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

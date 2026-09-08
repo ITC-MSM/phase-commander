@@ -183,6 +183,18 @@ interface DeckListPayload {
   ai_decks: DeckSeatPayload[];
   /** AI difficulty strings per seat. See `DeckList.ai_difficulties` in engine. */
   ai_difficulties?: string[];
+  /**
+   * Every set whose draft boosters this game's decks were drafted from, carried
+   * verbatim from the pod. CR 903.13f(3): a draft that contained Commander
+   * Masters boosters grants the partner ability, for deckbuilding purposes, to
+   * any card that can be a commander by itself whose color identity is one or
+   * fewer colors. A LIST because that rule asks about CONTAINMENT, so a
+   * mixed-set draft must carry every set it contained. Matches its sources
+   * (`DraftMatchDeckPayload.draft_set_codes`, `DraftPlayerView.draft_set_codes`)
+   * and the engine's tolerant deserializer, which reads absent, `null` and `[]`
+   * identically as constructed play (no grant).
+   */
+  draft_set_codes?: string[] | null;
 }
 
 /** The desktop host has already ensured this exact local phase-server binary
@@ -635,6 +647,18 @@ const RECONNECT_STEADY_STATE_MS = 60_000;
  * guest has wrong; the user's recovery is a reload, not a retry. The
  * stale-state watchdog cannot help: for a guest, the adapter cache and the
  * screen go stale together, so the fingerprints match and its check returns.
+ *
+ * A SECOND residual is new here, and it belongs to the single unkeyed pending
+ * slot. Once this timer has rejected submission A, a retry B parks in that same
+ * slot, and A's late `state_update` settles B: its revision is NEWER than the
+ * guest's cached one, so the stale-revision guard above does not drop it. B's
+ * own frame then arrives, finds nothing pending, and emits `stateChanged`, so
+ * the board still converges — the cost is one early resolve carrying another
+ * action's events. Routing replies correctly needs a wire request id echoed on
+ * every settlement frame, i.e. a `WIRE_PROTOCOL_VERSION` bump, and is deferred.
+ * Do NOT instead widen the revision guard to drop such frames: dropping the
+ * frame that reports application is the deadlock the acceptance ledger exists
+ * to end.
  */
 const SUBMISSION_TIMEOUT_MS = 30_000;
 // A stale proposal leaves the prompt unchanged, so cap retries to prevent a
@@ -1997,6 +2021,15 @@ export class P2PHostAdapter implements EngineAdapter {
           commander: deck.commander ?? [],
           companion: deck.companion ?? [],
           signature_spell: deck.signature_spell ?? [],
+          // CR 903.13f(3): `commander_draft_partner_grant` computes the
+          // Commander Masters partner grant from exactly this field, so a
+          // request that omits it REJECTS a rules-legal two-commander deck and
+          // this gate kicks the guest. The host's own value travels as-is: no
+          // `?? []`, which would assert "the draft contained zero sets" where
+          // the host already knows the answer. (The engine reads absent, `null`
+          // and `[]` identically, so this is a contract-vocabulary choice, not
+          // a rules one.)
+          draft_set_codes: (this.hostDeckData as DeckListPayload).draft_set_codes,
           selected_format: this.formatConfig!.format,
         }) as { compatible: boolean; reasons: string[] };
 
@@ -2126,6 +2159,11 @@ export class P2PHostAdapter implements EngineAdapter {
         opponent: orderedOpponents[0],
         ai_decks: orderedOpponents.slice(1),
         ai_difficulties: orderedDifficulties,
+        // CR 903.13f(3): this payload is REBUILT field-by-field, so a field
+        // present on the constructor argument but not named here is silently
+        // discarded before it can reach the engine. Naming it is what carries
+        // the Commander Masters partner grant into the game.
+        draft_set_codes: hostDeck.draft_set_codes,
       };
       const playerCount = allowPartialStart
         ? orderedOpponents.length + 1
