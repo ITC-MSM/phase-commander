@@ -3012,7 +3012,6 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::ApplyPerpetual { target, .. }
         | Effect::TurnFaceUp { target }
         | Effect::TurnFaceDown { target, .. }
-        | Effect::ExtraTurn { target }
         | Effect::Double { target, .. }
         | Effect::CrankContraptions { target }
         | Effect::ReassembleContraption { target, .. }
@@ -3081,6 +3080,7 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::Connive { target, count }
         | Effect::GivePlayerCounter { count, target, .. }
         | Effect::PutAtLibraryPosition { target, count, .. }
+        | Effect::ExtraTurn { target, count }
         | Effect::SkipNextTurn { target, count }
         | Effect::SkipNextStep { target, count, .. }
         | Effect::AdditionalPhase { target, count, .. }
@@ -5833,8 +5833,9 @@ fn rw_effect(
         // profiled read observes, NOT the `Other` catch-all (which falsely
         // conflicted with a co-occurring source counter/life read on Lighthouse
         // Chronologist / Second Chance / Regenerations Restored / Time Bends).
-        Effect::ExtraTurn { target } => {
+        Effect::ExtraTurn { target, count } => {
             let mut p = ext_write(StateKind::TurnStructure);
+            p.merge(rw_quantity_expr(count));
             flag_legacy_write_target(&mut p, target);
             (p, None)
         }
@@ -8919,6 +8920,14 @@ mod tests {
             ap.writes_external.turn_structure,
             "AdditionalPhase is a TurnStructure write"
         );
+
+        let dynamic = ability_rw_profile(&ra(Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+        }));
+        assert!(dynamic.reads_event_live);
         assert!(
             !ap.writes_external.other,
             "AdditionalPhase is not the `Other` catch-all"
@@ -8929,6 +8938,7 @@ mod tests {
             cond(
                 ra(Effect::ExtraTurn {
                     target: TargetFilter::Controller,
+                    count: qfix(1),
                 }),
                 qcheck(counters_src(), 3),
             )
