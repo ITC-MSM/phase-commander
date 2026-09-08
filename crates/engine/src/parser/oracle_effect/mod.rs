@@ -11094,16 +11094,11 @@ fn parse_perpetual_self_subject<'a>(
         //  3. The TRIGGER's own non-self subject (Gitrog, Horror of Zhava's
         //     "whenever a land enters under your control"; Effluence
         //     Devourer's "whenever you sacrifice ~ or another creature") --
-        //     the SAME exclusion set `resolve_it_pronoun` and
-        //     `oracle_target::resolve_pronoun_target` already use to decide
-        //     whether a bare "it"/"them" has a trigger-subject antecedent
-        //     (`SelfRef`/`Any`/`CostPaidObject` are the ONLY subjects that
-        //     leave a bare pronoun with no antecedent), reused here rather
-        //     than re-derived. A genuinely non-self trigger subject stays
-        //     bound to the triggering object via `ParentTarget`'s own
-        //     `GameEvent::ZoneChanged`-guarded resolution (targeting.rs),
-        //     which already discriminates "the entering/dying/sacrificed
-        //     object" from "the ability's own source" per-event at runtime.
+        //     delegated to `resolve_it_pronoun`, the single authority that
+        //     chooses both whether a bare pronoun has an antecedent and which
+        //     event-relative filter names it. In particular, sacrifice events
+        //     bind through `TriggeringSource`; `ParentTarget` cannot resolve a
+        //     `GameEvent::PermanentSacrificed` referent.
         //
         // A SELF trigger (Chronicler of Worship's own ETB: the trigger's
         // `object_id == source_id`) has none of these three -- the trigger
@@ -11115,21 +11110,19 @@ fn parse_perpetual_self_subject<'a>(
         // Shrine card). That shape has no antecedent and fails the clause
         // closed, falling through to `Effect::Unimplemented` -- an honest gap
         // rather than a wrong install.
-        let has_typed_trigger_subject = ctx.subject.as_ref().is_some_and(|subject| {
-            !matches!(
-                subject,
-                TargetFilter::SelfRef | TargetFilter::Any | TargetFilter::CostPaidObject
-            )
-        });
         let target = match counter::counter_anaphor_created_token_binding("it", ctx) {
             Some(target) => target,
-            None if ctx.parent_target_available
-                || ctx.pending_tracked_set_origin.is_some()
-                || has_typed_trigger_subject =>
-            {
+            None if ctx.parent_target_available || ctx.pending_tracked_set_origin.is_some() => {
                 TargetFilter::ParentTarget
             }
-            None => return None,
+            None => {
+                let mut pronoun_ctx = ctx.clone();
+                let target = resolve_it_pronoun(&mut pronoun_ctx);
+                if matches!(target, TargetFilter::SelfRef) {
+                    return None;
+                }
+                target
+            }
         };
         return Some((rest, target));
     }

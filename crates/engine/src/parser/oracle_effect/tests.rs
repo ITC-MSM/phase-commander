@@ -41093,6 +41093,21 @@ fn perpetual_grant_ability_rejects_standalone_bare_it_with_no_antecedent() {
 
 #[test]
 fn perpetual_grant_ability_rejects_boareskyr_tollkeeper_enters_tapped() {
+    let classified = crate::parser::oracle_static::classify_quoted_inner("~ enters tapped.");
+    let [ContinuousModification::GrantAbility { definition }] = classified.as_slice() else {
+        panic!("expected the quoted fallback to produce one granted ability, got {classified:?}");
+    };
+    assert!(
+        crate::game::coverage::ability_tree_any(definition, &|d| {
+            matches!(&*d.effect, Effect::Unimplemented { .. })
+        }),
+        "the quoted fallback must retain its unimplemented inner effect"
+    );
+    assert!(
+        crate::types::ability::PerpetualGrantModification::try_from(classified[0].clone()).is_err(),
+        "the perpetual installer must reject that unsupported granted ability"
+    );
+
     let e = parse_effect("that card perpetually gains \"~ enters tapped.\"");
     assert!(
         matches!(e, Effect::Unimplemented { .. }),
