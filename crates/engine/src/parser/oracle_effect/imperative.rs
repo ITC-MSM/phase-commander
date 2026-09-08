@@ -42,9 +42,10 @@ use crate::types::ability::{
     CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser, ContinuousModification,
     ControlWindow, ControllerRef, CopyRetargetPermission, CounterAdjustment, CounterKindChooser,
     CounterKindDomain, DigSource, DoorLockOp, Duration, Effect, EffectScope, FaceDownProfile,
-    FilterProp, ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition, MultiTargetSpec,
-    ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope,
-    PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
+    FilterProp, ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition,
+    MassLibraryShuffleMode, MultiTargetSpec, ObjectSelectionCardinality,
+    ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope, PlayerScope,
+    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
     ReassembleControlMode, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
     TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
     ZoneOwner,
@@ -2770,6 +2771,7 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
                 enter_with_counters,
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             }
         }
@@ -3854,6 +3856,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: None,
+            library_shuffle: Default::default(),
             random_order: false,
         },
         // CR 107.1c + CR 701.23a + CR 701.23b: "any number" / "up to N" →
@@ -5283,6 +5286,7 @@ pub(super) fn parse_for_each_player_exile_controlled(
         enter_with_counters: vec![],
         face_down_profile: None,
         library_position: None,
+        library_shuffle: Default::default(),
         random_order: false,
     };
     let sub = AbilityDefinition::new(AbilityKind::Spell, exile_all);
@@ -7660,6 +7664,7 @@ pub(super) fn parse_put_ast(
                 target,
                 enter_tapped,
                 library_position,
+                library_shuffle: _,
                 random_order,
                 ..
             } => {
@@ -7823,6 +7828,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position,
+                library_shuffle: Default::default(),
                 random_order,
             }
         }
@@ -7896,6 +7902,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
                     enter_with_counters: vec![],
                     face_down_profile: None,
                     library_position: None,
+                    library_shuffle: Default::default(),
                     random_order: false,
                 }
             } else {
@@ -7985,6 +7992,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: Some(position),
+            library_shuffle: Default::default(),
             random_order: false,
         },
     }
@@ -8629,6 +8637,7 @@ pub(super) fn lower_shuffle_ast(ast: ShuffleImperativeAst) -> ParsedEffectClause
                     enter_with_counters: vec![],
                     face_down_profile: None,
                     library_position: None,
+                    library_shuffle: Default::default(),
                     random_order: false,
                 };
                 with_shuffle_sub_ability(effect)
@@ -8901,7 +8910,7 @@ fn lower_target_referenced_search_library(
 }
 
 /// Wrap an effect with a `Shuffle` sub_ability for compound "X into library" operations.
-pub(super) fn with_shuffle_sub_ability(effect: Effect) -> ParsedEffectClause {
+pub(super) fn with_shuffle_sub_ability(mut effect: Effect) -> ParsedEffectClause {
     // CR 400.3: When the parent `ChangeZone` routes to the target's owner's
     // library (`owner_library: true`), the implicit shuffle must randomize that
     // same library — not the spell controller's (Chaos Warp stolen-permanent case).
@@ -8912,6 +8921,14 @@ pub(super) fn with_shuffle_sub_ability(effect: Effect) -> ParsedEffectClause {
         } => TargetFilter::ParentTargetOwner,
         _ => TargetFilter::Controller,
     };
+    if let Effect::ChangeZoneAll {
+        destination: Zone::Library,
+        library_shuffle,
+        ..
+    } = &mut effect
+    {
+        *library_shuffle = MassLibraryShuffleMode::TerminalShuffle;
+    }
     let shuffle = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Shuffle {
@@ -8941,6 +8958,7 @@ fn change_zone_all_to_library_effect(origin: Zone) -> Effect {
         enter_with_counters: vec![],
         face_down_profile: None,
         library_position: None,
+        library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
         random_order: false,
     }
 }
@@ -13179,6 +13197,7 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 // position (set only when the primary destination is a library
                 // pile); randomness for the primary is routed above.
                 library_position,
+                library_shuffle: Default::default(),
                 random_order: primary_random,
             };
             let complement = Effect::ChangeZoneAll {
@@ -13192,6 +13211,7 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 face_down_profile: None,
                 // CR 401.4: the "rest" pile's bottom/top position and randomness.
                 library_position: rest_library_position,
+                library_shuffle: Default::default(),
                 random_order: complement_random,
             };
             let mut clause = parsed_clause(primary);
@@ -14483,6 +14503,7 @@ pub(super) fn lower_zone_counter_ast(ast: ZoneCounterImperativeAst) -> Effect {
                     enter_with_counters: vec![],
                     face_down_profile: None,
                     library_position: None,
+                    library_shuffle: Default::default(),
                     random_order: false,
                 }
             } else {
@@ -17691,6 +17712,7 @@ mod tests {
                 enter_with_counters: _,
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: _,
                 random_order: false,
             } => {
                 assert_eq!(origin, None);

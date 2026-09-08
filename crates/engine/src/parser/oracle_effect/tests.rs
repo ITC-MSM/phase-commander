@@ -11,8 +11,8 @@ use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
     AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction, ModalChoice,
-    PerpetualModification, SeatDirection, TurnJournalKind,
+    CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction,
+    MassLibraryShuffleMode, ModalChoice, PerpetualModification, SeatDirection, TurnJournalKind,
 };
 use crate::types::card_type::CoreType;
 use crate::types::mana::{ManaCost, ManaCostShard};
@@ -9011,6 +9011,7 @@ fn effect_exile_target_player_graveyard_is_change_zone_all() {
                     enter_with_counters: _,
                     face_down_profile: None,
                     library_position: None,
+                    library_shuffle: _,
                     random_order: false,
                 }
             ),
@@ -9211,6 +9212,7 @@ fn effect_put_exiled_with_this_artifact_into_graveyard() {
                 enter_with_counters: _,
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: _,
                 random_order: false,
             }
         ),
@@ -13596,6 +13598,7 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: None,
+            library_shuffle: Default::default(),
             random_order: false,
         }
     }
@@ -14451,6 +14454,7 @@ fn compound_shuffle_hand_and_graveyard_into_library() {
             enter_with_counters: _,
             face_down_profile: None,
             library_position: None,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
             random_order: false,
         }
     ));
@@ -14471,6 +14475,7 @@ fn compound_shuffle_hand_and_graveyard_into_library() {
             enter_with_counters: _,
             face_down_profile: None,
             library_position: None,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
             random_order: false,
         }
     ));
@@ -14532,6 +14537,339 @@ fn compound_parent_target_shuffle_hand_and_graveyard_keeps_player_scope() {
             target: TargetFilter::ParentTargetController
         }
     ));
+}
+
+fn targeted_zone_move_tree_has_unimplemented(def: &AbilityDefinition) -> bool {
+    crate::parser::oracle::has_unimplemented(def)
+}
+
+fn assert_targeted_graveyard_shuffle_shape<'a>(
+    card_name: &str,
+    root: &'a AbilityDefinition,
+    expected_player_target: &TargetFilter,
+) -> &'a AbilityDefinition {
+    let Effect::TargetOnly { target } = root.effect.as_ref() else {
+        panic!(
+            "{card_name} must declare one outer player target, got {:?}",
+            root.effect
+        );
+    };
+    assert_eq!(
+        target, expected_player_target,
+        "{card_name} must preserve its printed player/opponent target"
+    );
+
+    let move_graveyard = root
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{card_name} must move the targeted player's graveyard"));
+    assert!(
+        matches!(
+            move_graveyard.effect.as_ref(),
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Library,
+                target: TargetFilter::ParentTarget,
+                library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+                ..
+            }
+        ),
+        "{card_name} must move the chosen player's graveyard through ParentTarget, got {:?}",
+        move_graveyard.effect
+    );
+
+    let shuffle = move_graveyard
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{card_name} must shuffle after moving the graveyard"));
+    assert!(
+        matches!(
+            shuffle.effect.as_ref(),
+            Effect::Shuffle {
+                target: TargetFilter::ParentTarget
+            }
+        ),
+        "{card_name} must shuffle the same chosen player's library, got {:?}",
+        shuffle.effect
+    );
+    shuffle
+}
+
+/// CR 115.1a / CR 115.1c + CR 608.2c + CR 701.24a: the printed player target
+/// is the sole target for the graveyard-to-library instruction. Both the mass
+/// move and its intrinsic shuffle bind back to that target rather than the
+/// source's controller. These are the complete, verbatim Oracle texts of the
+/// eight cards in this grammar class.
+#[test]
+fn real_targeted_graveyard_shuffle_cards_bind_mass_move_and_shuffle_to_player_target() {
+    let cases = [
+        (
+            "Blessed Respite",
+            "Instant",
+            "Target player shuffles their graveyard into their library. Prevent all combat damage that would be dealt this turn.",
+        ),
+        (
+            "Clear the Mind",
+            "Sorcery",
+            "Target player shuffles their graveyard into their library.\nDraw a card.",
+        ),
+        (
+            "Cranial Archive",
+            "Artifact",
+            "{2}, Exile this artifact: Target player shuffles their graveyard into their library. Draw a card.",
+        ),
+        (
+            "Learn from the Past",
+            "Instant",
+            "Target player shuffles their graveyard into their library.\nDraw a card.",
+        ),
+        (
+            "Primal Command",
+            "Sorcery",
+            "Choose two —\n• Target player gains 7 life.\n• Put target noncreature permanent on top of its owner's library.\n• Target player shuffles their graveyard into their library.\n• Search your library for a creature card, reveal it, put it into your hand, then shuffle.",
+        ),
+        (
+            "Quest for Ancient Secrets",
+            "Enchantment",
+            "Whenever a card is put into your graveyard from anywhere, you may put a quest counter on Quest for Ancient Secrets.\nRemove five quest counters from Quest for Ancient Secrets and sacrifice it: Target player shuffles their graveyard into their library.",
+        ),
+        (
+            "Reminisce",
+            "Sorcery",
+            "Target player shuffles their graveyard into their library.",
+        ),
+        (
+            "Thran Foundry",
+            "Artifact",
+            "{1}, {T}, Exile this artifact: Target player shuffles their graveyard into their library.",
+        ),
+    ];
+
+    for (card_name, card_type, oracle_text) in cases {
+        let parsed = parse_oracle_text(oracle_text, card_name, &[], &[card_type.to_string()], &[]);
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .all(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                && parsed.triggers.iter().all(|trigger| {
+                    trigger
+                        .execute
+                        .as_deref()
+                        .is_none_or(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                })
+                && parsed.replacements.iter().all(|replacement| {
+                    replacement
+                        .execute
+                        .as_deref()
+                        .is_none_or(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                }),
+            "{card_name} must parse without an Unimplemented node: {parsed:#?}"
+        );
+
+        let root = if card_name == "Primal Command" {
+            &parsed.abilities[2]
+        } else {
+            &parsed.abilities[0]
+        };
+        let shuffle =
+            assert_targeted_graveyard_shuffle_shape(card_name, root, &TargetFilter::Player);
+
+        match card_name {
+            "Blessed Respite" => {
+                let prevention = shuffle
+                    .sub_ability
+                    .as_deref()
+                    .expect("Blessed Respite prevention tail");
+                assert!(matches!(
+                    prevention.effect.as_ref(),
+                    Effect::PreventDamage {
+                        amount: PreventionAmount::All,
+                        target: TargetFilter::Any,
+                        scope: PreventionScope::CombatDamage,
+                        ..
+                    }
+                ));
+                assert!(prevention.sub_ability.is_none());
+            }
+            "Clear the Mind" | "Cranial Archive" | "Learn from the Past" => {
+                let draw = shuffle
+                    .sub_ability
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{card_name} draw tail"));
+                assert!(matches!(
+                    draw.effect.as_ref(),
+                    Effect::Draw {
+                        target: TargetFilter::Controller,
+                        ..
+                    }
+                ));
+                assert!(draw.sub_ability.is_none());
+            }
+            "Primal Command" => {
+                assert!(shuffle.sub_ability.is_none());
+                let tutor = &parsed.abilities[3];
+                assert!(matches!(
+                    tutor.effect.as_ref(),
+                    Effect::SearchLibrary { .. }
+                ));
+                let put = tutor
+                    .sub_ability
+                    .as_deref()
+                    .expect("Primal Command tutor put");
+                let tutor_shuffle = put
+                    .sub_ability
+                    .as_deref()
+                    .expect("Primal Command tutor shuffle");
+                assert!(matches!(
+                    tutor_shuffle.effect.as_ref(),
+                    Effect::Shuffle {
+                        target: TargetFilter::Controller
+                    }
+                ));
+                assert!(tutor_shuffle.sub_ability.is_none());
+            }
+            _ => assert!(shuffle.sub_ability.is_none()),
+        }
+    }
+}
+
+/// CR 115.1a / CR 115.1c + CR 608.2c + CR 701.24a: Head Games and Jester's
+/// Mask keep the chosen opponent as the sole target through the hand move,
+/// search, return, and final shuffle. The search and shuffle are anaphoric
+/// consumers of the outer target; their intermediate result moves remain
+/// resolution-time chain nodes.
+#[test]
+fn real_targeted_opponent_hand_shuffle_cards_preserve_full_parent_target_chain() {
+    for (card_name, card_type, oracle_text) in [
+        (
+            "Head Games",
+            "Sorcery",
+            "Target opponent puts the cards from their hand on top of their library. Search that player's library for that many cards. The player puts those cards into their hand, then shuffles.",
+        ),
+        (
+            "Jester's Mask",
+            "Artifact",
+            "This artifact enters tapped.\n{1}, {T}, Sacrifice this artifact: Target opponent puts the cards from their hand on top of their library. Search that player's library for that many cards. That player puts those cards into their hand, then shuffles.",
+        ),
+    ] {
+        let parsed = parse_oracle_text(
+            oracle_text,
+            card_name,
+            &[],
+            &[card_type.to_string()],
+            &[],
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .all(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                && parsed.replacements.iter().all(|replacement| {
+                    replacement
+                        .execute
+                        .as_deref()
+                        .is_none_or(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                }),
+            "{card_name} must parse without an Unimplemented node: {parsed:#?}"
+        );
+
+        let root = &parsed.abilities[0];
+        let Effect::TargetOnly { target } = root.effect.as_ref() else {
+            panic!("{card_name} must declare one outer opponent target");
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(tf)
+                if tf.type_filters.is_empty()
+                    && tf.properties.is_empty()
+                    && tf.controller == Some(ControllerRef::Opponent)
+        ));
+
+        let hand_move = root.sub_ability.as_deref().expect("targeted hand move");
+        assert!(matches!(
+            hand_move.effect.as_ref(),
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Hand),
+                destination: Zone::Library,
+                target: TargetFilter::ParentTarget,
+                library_position: Some(crate::types::ability::LibraryPosition::Top),
+                ..
+            }
+        ));
+        let search = hand_move.sub_ability.as_deref().expect("opponent search");
+        let Effect::SearchLibrary { target_player, .. } = search.effect.as_ref() else {
+            panic!("{card_name} must search the chosen opponent's library, got {:?}", search.effect);
+        };
+        assert_eq!(
+            target_player.as_ref(),
+            Some(&TargetFilter::ParentTarget),
+            "{card_name} must search the outer target's library, got {target_player:?}"
+        );
+        let put_one = search.sub_ability.as_deref().expect("search result move");
+        assert!(matches!(
+            put_one.effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Hand,
+                ..
+            }
+        ));
+        let put_rest = put_one.sub_ability.as_deref().expect("tracked-set return");
+        assert!(
+            matches!(
+                put_rest.effect.as_ref(),
+                Effect::ChangeZoneAll {
+                    origin: Some(Zone::Exile),
+                    destination: Zone::Hand,
+                    target: TargetFilter::TrackedSet { .. },
+                    ..
+                }
+            ),
+            "{card_name} must return every searched card, got {:?}",
+            put_rest.effect
+        );
+        let shuffle = put_rest.sub_ability.as_deref().expect("opponent shuffle");
+        assert!(matches!(
+            shuffle.effect.as_ref(),
+            Effect::Shuffle {
+                target: TargetFilter::ParentTarget
+            }
+        ));
+        assert!(shuffle.sub_ability.is_none());
+    }
+}
+
+/// CR 701.24a: Feldon's Cane names the controller's own graveyard and library,
+/// so the targeted-player rewrite must leave both legs controller-relative.
+#[test]
+fn feldons_cane_self_graveyard_shuffle_remains_controller_relative() {
+    let parsed = parse_oracle_text(
+        "{T}, Exile this artifact: Shuffle your graveyard into your library.",
+        "Feldon's Cane",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+    let root = &parsed.abilities[0];
+    assert!(matches!(
+        root.effect.as_ref(),
+        Effect::ChangeZoneAll {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Library,
+            target: TargetFilter::Controller,
+            ..
+        }
+    ));
+    assert!(matches!(
+        root.sub_ability
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::Shuffle {
+            target: TargetFilter::Controller
+        })
+    ));
+    assert!(!targeted_zone_move_tree_has_unimplemented(root));
 }
 
 // Remaining tests truncated for space — they are identical to the original file.
@@ -20866,6 +21204,7 @@ fn reveal_partition_graveyard_primary_random_rest_to_library_bottom() {
         destination: rest_dest,
         target: rest_target,
         library_position: rest_pos,
+        library_shuffle: _,
         random_order: rest_random,
         ..
     } = &*rest.effect
@@ -20926,6 +21265,7 @@ fn reveal_partition_hand_primary_any_order_rest_to_library_bottom() {
     let Effect::ChangeZoneAll {
         destination: rest_dest,
         library_position: rest_pos,
+        library_shuffle: _,
         random_order: rest_random,
         ..
     } = &*rest.effect
@@ -25006,6 +25346,7 @@ fn exiled_cause_publishers_all_stamp_exiled_at_runtime() {
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: None,
+            library_shuffle: Default::default(),
             random_order: false,
         },
         Effect::ExileTop {
