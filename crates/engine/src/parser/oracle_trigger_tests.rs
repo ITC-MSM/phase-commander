@@ -511,7 +511,7 @@ fn becomes_target_delayed_become_copy_payload_fails_honestly() {
         AbilityKind::Spell,
         Effect::BecomeCopy {
             target: TargetFilter::EventTarget,
-            recipient: TargetFilter::SelfRef,
+            recipient: crate::types::ability::CopyRecipient::Source,
             duration: None,
             mana_value_limit: None,
             additional_modifications: Vec::new(),
@@ -5054,11 +5054,153 @@ fn trigger_pack_tactics() {
 
 #[test]
 fn trigger_exploits_a_creature() {
-    let def = parse_trigger_line(
-        "When Sidisi's Faithful exploits a creature, return target creature to its owner's hand.",
-        "Sidisi's Faithful",
+    let controlled_creature =
+        TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+    let creature = TargetFilter::Typed(TypedFilter::creature());
+    let cases = [
+        (
+            "When Sidisi's Faithful exploits a creature, return target creature to its owner's hand.",
+            TargetFilter::SelfRef,
+            Some(creature.clone()),
+        ),
+        (
+            "Whenever a creature you control exploits a creature, draw a card.",
+            controlled_creature.clone(),
+            Some(creature),
+        ),
+        (
+            "Whenever a creature you control exploits a nontoken creature, draw a card.",
+            controlled_creature.clone(),
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::NonToken]),
+            )),
+        ),
+        (
+            "Whenever a creature you control exploits a non-Human creature, draw a card.",
+            controlled_creature,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature()
+                    .with_type(TypeFilter::Non(Box::new(TypeFilter::Subtype("Human".to_string())))),
+            )),
+        ),
+        (
+            "When Sidisi's Faithful exploits, draw a card.",
+            TargetFilter::SelfRef,
+            None,
+        ),
+    ];
+
+    for (oracle, actor, victim) in cases {
+        let def = parse_trigger_line(oracle, "Sidisi's Faithful");
+        assert_eq!(def.mode, TriggerMode::Exploited, "{oracle}");
+        assert_eq!(def.valid_source, Some(actor), "{oracle}");
+        assert_eq!(def.valid_card, victim, "{oracle}");
+    }
+
+    let supported = parse_trigger_line(
+        "Whenever a creature you control exploits a creature, draw a card.",
+        "Exploit Payoff",
     );
-    assert_eq!(def.mode, TriggerMode::Exploited);
+    assert_eq!(supported.mode, TriggerMode::Exploited);
+    assert_no_unimplemented(supported.execute.as_deref().expect("trigger body"));
+
+    let unsupported = parse_trigger_line(
+        "Whenever a creature you control exploits a creature with an unsupported quality, draw a card.",
+        "Exploit Payoff",
+    );
+    assert!(matches!(unsupported.mode, TriggerMode::Unknown(_)));
+}
+
+#[test]
+fn exploit_real_cards_preserve_actor_victim_and_payoff_target_roles() {
+    const SKULL: &str = "Exploit (When this creature enters, you may sacrifice a creature.)\nWhenever a creature you control exploits a nontoken creature, create a 2/2 black Zombie creature token.";
+    const A_SKULL: &str = "Exploit (When this creature enters, you may sacrifice a creature.)\nWhenever a creature you control exploits a creature, create a 2/2 black Zombie creature token.";
+    const HENRY: &str = "Henry Wu and other Human creatures you control have exploit. (When a creature with exploit enters, you may sacrifice a creature.)\nWhenever a creature you control exploits a non-Human creature, draw a card. If the exploited creature had power 3 or greater, create a Treasure token.";
+    const FELL: &str = "Deathtouch\nExploit (When this creature enters, you may sacrifice a creature.)\nWhen this creature exploits a creature, target player draws two cards and loses 2 life.";
+
+    let parse = |oracle: &str, name: &str, keywords: &[&str], subtypes: &[&str]| {
+        parse_oracle_text(
+            oracle,
+            name,
+            &keywords
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+            &["Creature".to_string()],
+            &subtypes
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let skull = parse(SKULL, "Skull Skaab", &["Exploit"], &["Zombie"]);
+    let a_skull = parse(A_SKULL, "A-Skull Skaab", &["Exploit"], &["Zombie"]);
+    let henry = parse(
+        HENRY,
+        "Henry Wu, InGen Geneticist",
+        &[],
+        &["Human", "Scientist"],
+    );
+    let fell = parse(
+        FELL,
+        "Fell Stinger",
+        &["Deathtouch", "Exploit"],
+        &["Zombie", "Scorpion"],
+    );
+
+    fn exploit_trigger(parsed: &crate::parser::oracle::ParsedAbilities) -> &TriggerDefinition {
+        parsed
+            .triggers
+            .iter()
+            .find(|trigger| trigger.mode == TriggerMode::Exploited)
+            .expect("Exploited trigger")
+    }
+    let skull_trigger = exploit_trigger(&skull);
+    let a_skull_trigger = exploit_trigger(&a_skull);
+    assert_eq!(skull_trigger.valid_source, a_skull_trigger.valid_source);
+    assert_eq!(
+        skull_trigger.valid_source,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You)
+        ))
+    );
+    assert!(matches!(
+        skull_trigger.valid_card.as_ref(),
+        Some(TargetFilter::Typed(filter)) if filter.properties.contains(&FilterProp::NonToken)
+    ));
+    assert_eq!(
+        a_skull_trigger.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::creature()))
+    );
+    for trigger in [skull_trigger, a_skull_trigger] {
+        assert_no_unimplemented(trigger.execute.as_deref().expect("payoff"));
+    }
+
+    let henry_trigger = exploit_trigger(&henry);
+    assert!(matches!(
+        henry_trigger.valid_card.as_ref(),
+        Some(TargetFilter::Typed(filter))
+            if filter.type_filters.contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype("Human".to_string()))))
+    ));
+
+    let fell_trigger = exploit_trigger(&fell);
+    assert_eq!(fell_trigger.valid_source, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        fell_trigger.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::creature()))
+    );
+    let execute = fell_trigger
+        .execute
+        .as_deref()
+        .expect("Fell Stinger payoff");
+    assert_no_unimplemented(execute);
+    assert!(matches!(
+        execute.effect.as_ref(),
+        Effect::Draw {
+            target: TargetFilter::Player,
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -32232,4 +32374,83 @@ fn brain_maggot_reveals_the_target_opponents_hand_at_runtime() {
         !revealed.contains(&mine),
         "the controller's own hand must NOT be revealed (issue #8428), got {revealed:?}"
     );
+}
+/// Issue #7724 (CR 707.9a + CR 707.10 + CR 704.5j): Iron Man, Bleeding Edge —
+/// "Whenever you cast an artifact spell, you may copy it, except the copy isn't
+/// legendary."
+///
+/// The `[,] except <body>` tail of a copy INSTRUCTION was dropped entirely:
+/// `Effect::CopySpell` already carries an `additional_modifications` channel and
+/// the resolver already strips the supertype from the stack copy, but nothing
+/// routed the parsed exception into it. The copy therefore entered the
+/// battlefield still legendary and the legend rule killed one of the pair.
+///
+/// Asserts the whole class in one place — the exception must survive as a
+/// typed `RemoveSupertype`, not merely be absent from the description.
+#[test]
+fn iron_man_bleeding_edge_copy_is_not_legendary() {
+    let parsed = parse_oracle_text(
+        "Flying\nWhenever you cast an artifact spell, you may copy it, except the copy isn't \
+         legendary. Do this only once each turn. (The copy becomes a token.)",
+        "Iron Man, Bleeding Edge",
+        &[],
+        &["Artifact".to_string(), "Creature".to_string()],
+        &["Human".to_string(), "Hero".to_string()],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::SpellCast)
+        .expect("cast-artifact-spell trigger");
+    let execute = trigger.execute.as_ref().expect("copy effect");
+    let Effect::CopySpell {
+        additional_modifications,
+        ..
+    } = execute.effect.as_ref()
+    else {
+        panic!("expected CopySpell, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        additional_modifications,
+        &vec![ContinuousModification::RemoveSupertype {
+            supertype: Supertype::Legendary,
+        }],
+        "CR 707.9a: \"except the copy isn't legendary\" must ride the copy so CR 704.5j \
+         never sees two legends"
+    );
+    assert_no_unimplemented(execute.as_ref());
+}
+
+/// Issue #7724 companion (CR 707.9b + CR 205.1b): Tawnos, the Toymaker proves
+/// the routing fix is not legend-specific — the same `[,] except <body>` tail
+/// carries a type-addition exception into `CopySpell` too.
+#[test]
+fn tawnos_the_toymaker_copy_is_an_artifact() {
+    let parsed = parse_oracle_text(
+        "Whenever you cast a Beast or Bird creature spell, you may copy it, except the copy is \
+         an artifact in addition to its other types. (The copy becomes a token.)",
+        "Tawnos, the Toymaker",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let execute = parsed
+        .triggers
+        .iter()
+        .find_map(|t| t.execute.as_ref())
+        .expect("copy effect");
+    let Effect::CopySpell {
+        additional_modifications,
+        ..
+    } = execute.effect.as_ref()
+    else {
+        panic!("expected CopySpell, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        additional_modifications,
+        &vec![ContinuousModification::AddType {
+            core_type: crate::types::card_type::CoreType::Artifact,
+        }]
+    );
+    assert_no_unimplemented(execute.as_ref());
 }

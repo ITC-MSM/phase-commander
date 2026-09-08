@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::{one_of, space0, space1, u8 as parse_u8};
-use nom::combinator::{all_consuming, eof, map, not, opt, peek, rest, value};
+use nom::combinator::{all_consuming, eof, map, map_res, not, opt, peek, rest, value};
 use nom::error::ParseError;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
@@ -67,6 +67,32 @@ use super::super::oracle_util::{
     parse_mana_symbols, parse_ordinal, parse_rounding_suffix_only, rewrite_quantity_expr_rounding,
     split_around, starts_with_possessive, TextPair,
 };
+
+fn parse_extra_turn(input: &str) -> OracleResult<'_, QuantityExpr> {
+    all_consuming(terminated(
+        preceded(
+            (alt((tag("takes"), tag("take"))), space1),
+            terminated(
+                alt((
+                    value(QuantityExpr::Fixed { value: 1 }, tag("an extra turn")),
+                    map_res(
+                        (
+                            nom_primitives::parse_number,
+                            space1,
+                            alt((tag("extra turns"), tag("extra turn"))),
+                        ),
+                        |(value, _, _)| {
+                            i32::try_from(value).map(|value| QuantityExpr::Fixed { value })
+                        },
+                    ),
+                )),
+                (space1, tag("after this one")),
+            ),
+        ),
+        opt(tag(".")),
+    ))
+    .parse(input)
+}
 
 /// CR 611.2 + CR 601.2f + CR 118.7: Parse the transient (this-turn)
 /// activated-ability cost-reduction effect — "activated abilities of <subject>
@@ -6031,7 +6057,33 @@ pub(super) fn parse_utility_imperative_ast(
                 text: text.to_string(),
             }),
             "copy" => {
-                let rest_lower = &lower[lower.len() - rest.len()..];
+                // CR 707.9a + CR 707.10: peel a trailing "[,] except <body>"
+                // copy exception off the instruction BEFORE the copy source is
+                // parsed, so all three source sub-paths below (the
+                // "that spell or ability" anaphor, the exiled-card anaphor, and
+                // the general stack-object target) see a clean remainder and
+                // none of them has to know the except grammar. Iron Man,
+                // Bleeding Edge ("you may copy it, except the copy isn't
+                // legendary") is the canonical case; Donal, Herald of Wings,
+                // Jackal, Genius Geneticist, Storm of Saruman, Tawnos, the
+                // Toymaker, The Clone Saga, and The Sixth Doctor are the rest
+                // of the class. Body grammar is delegated to the shared
+                // `become_copy_except` authority — the same building block
+                // `BecomeCopy` and `CopyTokenOf` route through.
+                let rest_offset = text.len() - rest.len();
+                let card_name = ctx.card_name.clone().unwrap_or_default();
+                let rest_lower_full = &lower[rest_offset..];
+                let (rest, additional_modifications) =
+                    match super::become_copy_except::split_except_clause(
+                        rest,
+                        rest_lower_full,
+                        &card_name,
+                        ctx,
+                    ) {
+                        Some((head, modifications)) => (head, modifications),
+                        None => (rest, Vec::new()),
+                    };
+                let rest_lower = &rest_lower_full[..rest.len()];
                 if tag::<_, _, OracleError<'_>>("that spell or ability")
                     .parse(rest_lower)
                     .is_ok()
@@ -6048,6 +6100,7 @@ pub(super) fn parse_utility_imperative_ast(
                     return Some(UtilityImperativeAst::Copy {
                         target: TargetFilter::TriggeringSource,
                         retarget,
+                        additional_modifications,
                     });
                 }
                 // CR 608.2k: an exile-cost anaphor ("exile a card, then copy the
@@ -6088,6 +6141,7 @@ pub(super) fn parse_utility_imperative_ast(
                                 TargetFilter::ExiledBySource,
                             ),
                             retarget,
+                            additional_modifications,
                         });
                     }
                 }
@@ -6135,7 +6189,11 @@ pub(super) fn parse_utility_imperative_ast(
                     assert_no_compound_remainder(_rem, text);
                     CopyRetargetPermission::KeepOriginalTargets
                 };
-                Some(UtilityImperativeAst::Copy { target, retarget })
+                Some(UtilityImperativeAst::Copy {
+                    target,
+                    retarget,
+                    additional_modifications,
+                })
             }
             _ => unreachable!(),
         };
@@ -6403,7 +6461,7 @@ pub(super) fn parse_utility_imperative_ast(
             {
                 (TargetFilter::ParentTarget, "")
             } else {
-                parse_attach_recipient(recipient_text, ctx)
+                parse_attach_recipient(recipient_text, ctx, None)
             }
         };
         #[cfg(debug_assertions)]
@@ -6436,7 +6494,8 @@ pub(super) fn parse_utility_imperative_ast(
     {
         if rem.trim().is_empty() {
             let (attachment, _attachment_rem) = parse_attachment_anaphor(&attachment_text, ctx);
-            let (target, _target_rem) = parse_attach_recipient(&target_text, ctx);
+            let (target, _target_rem) =
+                parse_attach_recipient(&target_text, ctx, Some(&attachment));
             #[cfg(debug_assertions)]
             assert_no_compound_remainder(_attachment_rem, text);
             #[cfg(debug_assertions)]
@@ -6592,7 +6651,11 @@ fn parse_attach_target_quantifier(
     opt(alt((any_number, up_to))).parse(input)
 }
 
-fn parse_attach_recipient<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFilter, &'a str) {
+fn parse_attach_recipient<'a>(
+    text: &'a str,
+    ctx: &mut ParseContext,
+    attachment: Option<&TargetFilter>,
+) -> (TargetFilter, &'a str) {
     // CR 608.2k: thread `ctx` so "attach this Equipment to it" in trigger
     // bodies binds "it" to the triggering subject (Ancestral Katana —
     // "Whenever a Samurai or Warrior you control attacks alone … attach this
@@ -6604,6 +6667,19 @@ fn parse_attach_recipient<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetF
         let lower = trimmed.to_ascii_lowercase();
         if parse_gendered_attach_self_recipient(lower.trim()).is_ok() {
             return (TargetFilter::SelfRef, &trimmed[lower.len()..]);
+        }
+        // CR 608.2c: a selected attachment and a newly created permanent are
+        // distinct referents in "attach that Equipment to it." Bind the bare
+        // recipient only after parsing the attachment role, so source-owned
+        // Equipment and face-down card attachment semantics remain unchanged.
+        if parse_neuter_attach_self_recipient(lower.trim()).is_ok()
+            && ctx.token_created_in_chain
+            && matches!(
+                attachment,
+                Some(TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. })
+            )
+        {
+            return (TargetFilter::LastCreated, &trimmed[lower.len()..]);
         }
         if parse_neuter_attach_self_recipient(lower.trim()).is_ok()
             && attach_neuter_recipient_resolves_via_subject(ctx)
@@ -6790,11 +6866,15 @@ pub(super) fn lower_utility_imperative_ast(ast: UtilityImperativeAst) -> Effect 
             let (target, _) = parse_target(rest);
             Effect::Regenerate { target }
         }
-        UtilityImperativeAst::Copy { target, retarget } => Effect::CopySpell {
+        UtilityImperativeAst::Copy {
+            target,
+            retarget,
+            additional_modifications,
+        } => Effect::CopySpell {
             target,
             retarget,
             copier: None,
-            additional_modifications: Vec::new(),
+            additional_modifications,
             starting_loyalty_from_casualty_sacrifice: false,
         },
         UtilityImperativeAst::Transform { target, scope } => Effect::Transform { target, scope },
@@ -8993,30 +9073,38 @@ fn filter_targets_stack(filter: &TargetFilter) -> bool {
     }
 }
 
-/// CR 700.4 (#5649): match "&lt;quantity&gt; cards from your graveyard" and return the
-/// exile count. `"that many"` → the dynamic replacement amount
-/// (`QuantityRef::EventContextAmount`, Nefarious Lich); a number word → `Fixed`.
-/// Anchored on the possessive "your graveyard" so it never overlaps the
-/// top-of-library impulse idiom guarded by `parse_dynamic_count_phrase`.
-fn parse_exile_count_from_your_graveyard(lower: &str) -> Option<QuantityExpr> {
-    let trimmed = lower.trim().trim_end_matches('.').trim();
-    let (rest, qty) = alt((
-        value(
-            QuantityExpr::Ref {
-                qty: crate::types::ability::QuantityRef::EventContextAmount,
-            },
-            tag::<_, _, OracleError<'_>>("that many"),
-        ),
-        map(crate::parser::oracle_nom::primitives::parse_number, |n| {
-            QuantityExpr::Fixed { value: n as i32 }
-        }),
+/// CR 107.1 + CR 608.2c: parse the quantity prefix of
+/// "<quantity> cards from <possessive graveyard>". The complete noun,
+/// connective, possessor, and zone phrase remains for `parse_target_with_ctx`,
+/// the target grammar's single authority. `"that many"` preserves the dynamic
+/// event-context amount; a number word becomes `Fixed`.
+fn parse_exile_count_prefix<'a>(text: &'a str, lower: &str) -> Option<(QuantityExpr, &'a str)> {
+    nom_on_lower(text, lower, |input| {
+        let (input, quantity) = alt((
+            value(
+                QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                (tag("that"), space1, tag("many")),
+            ),
+            map(nom_primitives::parse_number, |number| QuantityExpr::Fixed {
+                value: number as i32,
+            }),
+        ))
+        .parse(input)?;
+        let (input, _) = space1.parse(input)?;
+        let (input, _) = peek(tag("cards")).parse(input)?;
+        Ok((input, quantity))
+    })
+}
+
+fn terminal_punctuation_only(input: &str) -> bool {
+    all_consuming(value(
+        (),
+        (space0::<_, OracleError<'_>>, opt(one_of(".;")), space0),
     ))
-    .parse(trimmed)
-    .ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(" cards from your graveyard")
-        .parse(rest)
-        .ok()?;
-    rest.trim().is_empty().then_some(qty)
+    .parse(input)
+    .is_ok()
 }
 
 /// CR 608.2c: Resolve the count expression of a dynamic-count top-of-library
@@ -9556,26 +9644,28 @@ pub(super) fn parse_exile_ast(
         }
     }
 
-    // CR 700.4 (#5649): "exile <N> cards from your graveyard" is a COUNTED
-    // graveyard exile — Nefarious Lich's damage substitution ("exile that many
-    // cards from your graveyard instead"). `Effect::ChangeZone` has no count
-    // slot, so capture the quantity here and thread it onto the clause's
-    // `MultiTargetSpec` at lowering (Forage precedent). The generic tail below
-    // would otherwise drop the count and bind a bare `ParentTarget`.
-    if let Some(count) = parse_exile_count_from_your_graveyard(&rest_text.to_ascii_lowercase()) {
-        let mut filter = crate::types::ability::TypedFilter::default()
-            .controller(ControllerRef::You)
-            .properties(vec![crate::types::ability::FilterProp::InZone {
-                zone: crate::types::zones::Zone::Graveyard,
-            }]);
-        filter.type_filters = vec![crate::types::ability::TypeFilter::Card];
-        return Some(ZoneCounterImperativeAst::Exile {
-            origin: Some(crate::types::zones::Zone::Graveyard),
-            target: TargetFilter::Typed(filter),
-            all: false,
-            enter_with_counters: vec![],
-            multi_target: Some(crate::types::ability::MultiTargetSpec::exact(count)),
-        });
+    // CR 107.1 + CR 608.2c + CR 608.2d + CR 701.13a: a counted graveyard
+    // exile preserves the exact quantity while the shared target grammar owns
+    // the possessive player and graveyard semantics. Full consumption keeps
+    // this branch from swallowing adjacent exile classes.
+    if let Some((count, target_text)) = parse_exile_count_prefix(rest_text, rest_lower) {
+        let (target, remainder) = parse_target_with_ctx(target_text, ctx);
+        let is_card_filter = matches!(
+            &target,
+            TargetFilter::Typed(filter) if filter.type_filters == vec![TypeFilter::Card]
+        );
+        if is_card_filter
+            && target.extract_in_zone() == Some(Zone::Graveyard)
+            && terminal_punctuation_only(remainder)
+        {
+            return Some(ZoneCounterImperativeAst::Exile {
+                origin: Some(Zone::Graveyard),
+                target,
+                all: false,
+                enter_with_counters: vec![],
+                multi_target: Some(MultiTargetSpec::exact(count)),
+            });
+        }
     }
 
     // CR 608.2k: thread `ctx` through so bare "it"/"them" anaphors in trigger
@@ -11683,20 +11773,24 @@ pub(super) fn parse_imperative_family_ast(
         // CR 500.7: "take an extra turn after this one"
         // CR 726.1: "take the initiative"
         "take" | "takes" => {
-            if alt((
-                value((), tag::<_, _, OracleError<'_>>("take the initiative")),
-                value((), tag("takes the initiative")),
+            if all_consuming(terminated(
+                alt((
+                    value((), tag::<_, _, OracleError<'_>>("take the initiative")),
+                    value((), tag("takes the initiative")),
+                )),
+                opt(tag(".")),
             ))
-            .parse(lower)
+            .parse(lower.trim())
             .is_ok()
             {
                 Some(ImperativeFamilyAst::TakeTheInitiative)
-            } else if nom_primitives::scan_contains(lower, "extra turn") {
-                Some(ImperativeFamilyAst::GainKeyword(Effect::ExtraTurn {
-                    target: TargetFilter::Controller,
-                }))
             } else {
-                None
+                nom_parse_lower(lower.trim(), parse_extra_turn).map(|count| {
+                    ImperativeFamilyAst::GainKeyword(Effect::ExtraTurn {
+                    target: TargetFilter::Controller,
+                    count,
+                    })
+                })
             }
         }
         // CR 702.26a + CR 702.26c: "phase out" / "phases out" / "phase in" /
@@ -12285,6 +12379,14 @@ pub(super) fn try_parse_player_counter(lower: &str) -> Option<ImperativeFamilyAs
         } else {
             return None;
         };
+
+    // "additional" is a printed adjective after the quantity, not part of the
+    // player-counter kind. Keep the parsed quantity unchanged and consume it
+    // with nom before the counter-kind authority validates the remainder.
+    let (counter_kind, _) = opt(tag::<_, _, OracleError<'_>>("additional "))
+        .parse(counter_kind)
+        .ok()?;
+    let counter_kind = counter_kind.trim();
 
     // Validate: counter kind should be a single word (no spaces) to avoid false positives
     // like "gets +1/+1 counter" which is an object counter, not a player counter.
@@ -13347,7 +13449,7 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             clause.multi_target = multi_target;
             clause
         }
-        // CR 115.1d + CR 601.2c + CR 700.4: sibling of the `Return` arm above
+        // CR 115.1d + CR 601.2c + CR 608.2c: sibling of the `Return` arm above
         // for the `origin.is_some()` shape ("return up to N cards from your
         // graveyard to your hand" lowers to a `ChangeZone`, not a `Bounce`,
         // when an explicit origin zone is present — Ill-Gotten Gains). Mirrors
@@ -13565,8 +13667,9 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             )));
             clause
         }
-        // CR 700.4 (#5649): a COUNTED graveyard exile ("exile that many cards
-        // from your graveyard", Nefarious Lich) captured a `multi_target`; the
+        // CR 107.1 + CR 608.2c + CR 701.13a: a counted graveyard exile
+        // ("exile that many cards from your graveyard", Nefarious Lich)
+        // captured a `multi_target`; the
         // bare-Effect lowering below produces a `ChangeZone` that cannot carry
         // the count, so thread it onto the clause here (mirroring the Tap/Untap
         // arm). The runtime resolves the card selection via the shared
@@ -15050,7 +15153,7 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{ParitySource, ZoneChoiceChooser};
+    use crate::types::ability::{ParitySource, TargetChoiceTiming, ZoneChoiceChooser};
 
     /// Matrix row 18 — the mana ROLE must survive the cost-resource AST
     /// round-trip byte-for-byte.
@@ -16295,6 +16398,26 @@ mod tests {
             panic!("{input}: expected Attach, got {result:?}");
         };
         assert_eq!(target, TargetFilter::ParentTarget);
+    }
+
+    #[test]
+    fn parse_attach_parent_attachment_to_created_referent_keeps_roles_distinct() {
+        let input = "attach that Equipment to it";
+        let lower = input.to_lowercase();
+        let mut ctx = ParseContext {
+            parent_target_available: true,
+            token_created_in_chain: true,
+            ..Default::default()
+        };
+        let result = parse_utility_imperative_ast(input, &lower, &mut ctx);
+        let Some(UtilityImperativeAst::Attach {
+            attachment, target, ..
+        }) = result
+        else {
+            panic!("{input}: expected Attach, got {result:?}");
+        };
+        assert_eq!(attachment, TargetFilter::ParentTarget);
+        assert_eq!(target, TargetFilter::LastCreated);
     }
 
     #[test]
@@ -18489,6 +18612,48 @@ mod tests {
             }
             other => panic!("Expected GivePlayerCounter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_player_counter_additional_preserves_each_quantity_form() {
+        for (text, expected_kind, expected_count) in [
+            (
+                "get an additional poison counter",
+                PlayerCounterKind::Poison,
+                QuantityExpr::Fixed { value: 1 },
+            ),
+            (
+                "gets two additional experience counters",
+                PlayerCounterKind::Experience,
+                QuantityExpr::Fixed { value: 2 },
+            ),
+            (
+                "get that many additional rad counters",
+                PlayerCounterKind::Rad,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+            ),
+        ] {
+            match try_parse_player_counter(text) {
+                Some(ImperativeFamilyAst::GivePlayerCounter {
+                    counter_kind,
+                    count,
+                }) => {
+                    assert_eq!(counter_kind, expected_kind, "wrong kind for {text:?}");
+                    assert_eq!(count, expected_count, "wrong quantity for {text:?}");
+                }
+                other => panic!("Expected GivePlayerCounter for {text:?}, got {other:?}"),
+            }
+        }
+        assert!(
+            try_parse_player_counter("get an additional charge counter").is_none(),
+            "an unknown counter kind must still fail closed"
+        );
+        assert!(
+            try_parse_player_counter("get an additional +1/+1 counter").is_none(),
+            "an object counter must not become a player counter"
+        );
     }
 
     #[test]
@@ -23678,64 +23843,172 @@ mod tests {
         }
     }
 
-    /// #5649 review (matthewevans): the `Fixed`-count arm of
-    /// `parse_exile_count_from_your_graveyard` fixes 8 of the 9 affected cards
-    /// (Aegis Sculptor / Bloodcurdler / Egon / Insatiable Frugivore / Kroxa /
-    /// Emeritus / Ultimecia — "exile <N> cards from your graveyard"), while the
-    /// "that many" arm covers Nefarious Lich. Pin both arms AND the negative that
-    /// the possessive "your graveyard" anchor keeps the top-of-library impulse
-    /// idiom (owned by `parse_dynamic_count_phrase`) untouched.
+    /// CR 107.1 + CR 608.2c: the quantity-prefix parser preserves fixed and
+    /// event-context counts while leaving the possessor-qualified zone phrase
+    /// for the shared target grammar.
     #[test]
-    fn exile_count_from_your_graveyard_binds_fixed_and_dynamic_counts() {
-        // Fixed-count arm — the eight numeric cards.
+    fn exile_count_prefix_binds_fixed_and_dynamic_counts() {
+        let parse = |text: &str| {
+            parse_exile_count_prefix(text, &text.to_ascii_lowercase())
+                .map(|(quantity, remainder)| (quantity, remainder.to_string()))
+        };
+
         assert_eq!(
-            parse_exile_count_from_your_graveyard("two cards from your graveyard"),
-            Some(QuantityExpr::Fixed { value: 2 })
+            parse("two cards from your graveyard"),
+            Some((
+                QuantityExpr::Fixed { value: 2 },
+                "cards from your graveyard".to_string()
+            ))
         );
         assert_eq!(
-            parse_exile_count_from_your_graveyard("eight cards from your graveyard"),
-            Some(QuantityExpr::Fixed { value: 8 })
+            parse("eight cards from their graveyard"),
+            Some((
+                QuantityExpr::Fixed { value: 8 },
+                "cards from their graveyard".to_string()
+            ))
         );
-        // Dynamic arm — Nefarious Lich.
         assert_eq!(
-            parse_exile_count_from_your_graveyard("that many cards from your graveyard"),
-            Some(QuantityExpr::Ref {
-                qty: QuantityRef::EventContextAmount
-            })
+            parse("that many cards from your graveyard"),
+            Some((
+                QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount
+                },
+                "cards from your graveyard".to_string()
+            ))
         );
-        // Negatives: the possessive "your graveyard" anchor must never capture the
-        // top-of-library impulse idiom.
+        assert_eq!(parse("a card from their graveyard"), None);
         assert_eq!(
-            parse_exile_count_from_your_graveyard("the top two cards of your library"),
+            parse("five target cards from an opponent's graveyard"),
             None
         );
-        assert_eq!(
-            parse_exile_count_from_your_graveyard("two cards from the top of your library"),
-            None
-        );
+        assert_eq!(parse("the top two cards of your library"), None);
 
         // End-to-end: a fixed graveyard exile rides the clause's `MultiTargetSpec`.
         let def = crate::parser::oracle_effect::parse_effect_chain(
             "exile two cards from your graveyard",
             AbilityKind::Spell,
         );
-        assert!(
-            matches!(
-                &*def.effect,
-                Effect::ChangeZone {
-                    origin: Some(crate::types::zones::Zone::Graveyard),
-                    destination: crate::types::zones::Zone::Exile,
-                    ..
-                }
-            ),
-            "expected a graveyard->exile ChangeZone, got {:?}",
-            def.effect
+        let Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Exile,
+            target: TargetFilter::Typed(target),
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!(
+                "expected a graveyard->exile ChangeZone, got {:?}",
+                def.effect
+            );
+        };
+        assert_eq!(
+            target,
+            &TypedFilter::card()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                }]),
+            "a fixed 'your graveyard' count must remain controller-relative"
         );
         assert_eq!(
             def.multi_target,
             Some(MultiTargetSpec::exact(QuantityExpr::Fixed { value: 2 })),
             "the count must ride the clause MultiTargetSpec as exact(Fixed {{ 2 }})"
         );
+
+        let dynamic = crate::parser::oracle_effect::parse_effect_chain(
+            "exile that many cards from your graveyard",
+            AbilityKind::Spell,
+        );
+        assert_eq!(
+            dynamic.multi_target,
+            Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            })),
+            "Nefarious Lich's dynamic event count must remain exact"
+        );
+    }
+
+    /// SHAPE — Carrion Wurm's verbatim Oracle text must preserve both the exact
+    /// count and the accepting-player-relative graveyard filter.
+    #[test]
+    fn carrion_wurm_trigger_preserves_exact_scoped_graveyard_exile() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "Whenever this creature attacks or blocks, any player may exile three cards from their graveyard. If a player does, this creature assigns no combat damage this turn.",
+            "Carrion Wurm",
+            &[],
+            &["Creature".to_string()],
+            &["Zombie".to_string(), "Wurm".to_string()],
+        );
+        let trigger = parsed.triggers.first().expect("Carrion Wurm trigger");
+        let execute = trigger.execute.as_ref().expect("trigger execute");
+        assert!(
+            !crate::parser::oracle::has_unimplemented(execute),
+            "verbatim Carrion Wurm trigger must parse fully: {execute:?}"
+        );
+        let Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Exile,
+            target: TargetFilter::Typed(target),
+            ..
+        } = execute.effect.as_ref()
+        else {
+            panic!("expected graveyard-to-exile ChangeZone, got {execute:?}");
+        };
+        assert_eq!(
+            target,
+            &TypedFilter::card().properties(vec![
+                FilterProp::Owned {
+                    controller: ControllerRef::ScopedPlayer,
+                },
+                FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                },
+            ])
+        );
+        assert_eq!(
+            execute.multi_target,
+            Some(MultiTargetSpec::exact(QuantityExpr::Fixed { value: 3 }))
+        );
+        assert_eq!(execute.target_choice_timing, TargetChoiceTiming::Resolution);
+    }
+
+    #[test]
+    fn singular_and_adjacent_exile_grammars_remain_on_existing_paths() {
+        let singular = crate::parser::oracle_effect::parse_effect_chain(
+            "exile a card from their graveyard",
+            AbilityKind::Spell,
+        );
+        assert_eq!(singular.multi_target, None);
+        assert!(matches!(
+            singular.effect.as_ref(),
+            Effect::ChangeZone {
+                target: TargetFilter::Typed(target),
+                ..
+            } if target.properties.contains(&FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            })
+        ));
+
+        let up_to = crate::parser::oracle_effect::parse_effect_chain(
+            "exile up to three cards from your graveyard",
+            AbilityKind::Spell,
+        );
+        assert_eq!(
+            up_to.multi_target,
+            Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 3 }))
+        );
+
+        let any_number = crate::parser::oracle_effect::parse_effect_chain(
+            "exile any number of cards from your graveyard",
+            AbilityKind::Spell,
+        );
+        assert_eq!(any_number.multi_target, Some(MultiTargetSpec::unlimited(0)));
+
+        let top = crate::parser::oracle_effect::parse_effect_chain(
+            "exile the top three cards of your library",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(top.effect.as_ref(), Effect::ExileTop { .. }));
     }
 
     /// Ill-Gotten Gains class (issue filed alongside this fix): "return up to

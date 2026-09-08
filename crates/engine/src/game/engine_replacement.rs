@@ -886,6 +886,30 @@ fn handle_replacement_choice_inner(
                         "CoinFlip replacement reached the optional-choice resume path"
                     );
                 }
+                // CR 706.1 + CR 616.1: die-roll replacements (Barbarian Class,
+                // Pixie Guide, Wyll) are Mandatory, but being mandatory does NOT
+                // keep them off this path: two of them applying to the same
+                // instruction is a CR 616.1 ordering choice, which is exactly the
+                // marquee dice-matters interaction (Barbarian Class + Pixie
+                // Guide, or Wyll + Pixie Guide). Delegate to the die-roll
+                // resolver's own authority with the bound modified event — its
+                // raised count and its ACCUMULATED CR 706.6 ignore rules ride
+                // that event and must not be re-derived — mirroring the
+                // `SearchFound` arm below.
+                //
+                // A re-suspension (a CR 706.6 ignore tie-break, or a results
+                // branch's own choice) is returned as-is; a completed roll falls
+                // through to the shared drain below, exactly as every other
+                // completed resume arm does.
+                event @ ProposedEvent::RollDice { .. } => {
+                    match effects::roll_die::resume_roll_dice_after_replacement(
+                        state, event, events,
+                    ) {
+                        Ok(Some(waiting)) => return Ok(waiting),
+                        Ok(None) => {}
+                        Err(error) => return Err(EngineError::InvalidAction(format!("{error}"))),
+                    }
+                }
                 // CR 701.23a + CR 614.6: modified SearchFound events are delivered by
                 // the search-resolution continuation. This arm is reached only
                 // when CR 616 ordering required a replacement choice; the bound
@@ -2144,7 +2168,7 @@ pub(super) fn handle_copy_target_choice(
                 ResolvedAbility::new(
                     Effect::BecomeCopy {
                         target: TargetFilter::Any,
-                        recipient: TargetFilter::SelfRef,
+                        recipient: crate::types::ability::CopyRecipient::Source,
                         duration: None,
                         mana_value_limit: None,
                         additional_modifications: Vec::new(),
@@ -2374,7 +2398,7 @@ pub(super) fn handle_copy_target_choice(
             ResolvedAbility::new(
                 Effect::BecomeCopy {
                     target: TargetFilter::Any,
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     duration: None,
                     mana_value_limit: None,
                     additional_modifications: Vec::new(),
@@ -6315,7 +6339,7 @@ mod tests {
             },
             Effect::BecomeCopy {
                 target: TargetFilter::ExiledCardByIndex { index: 0 },
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(crate::types::ability::Duration::Permanent),
                 mana_value_limit: None,
                 additional_modifications: Vec::new(),
@@ -6625,7 +6649,7 @@ mod tests {
                 AbilityKind::Spell,
                 Effect::BecomeCopy {
                     target: TargetFilter::SpecificObject { id: chosen },
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     duration: Some(crate::types::ability::Duration::Permanent),
                     mana_value_limit: None,
                     additional_modifications: Vec::new(),
@@ -7243,7 +7267,7 @@ mod tests {
                     .execute(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::BecomeCopy {
-                            recipient: TargetFilter::SelfRef,
+                            recipient: crate::types::ability::CopyRecipient::Source,
                             target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
                             duration: None,
                             mana_value_limit: None,
@@ -7453,7 +7477,7 @@ mod tests {
                     .execute(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::BecomeCopy {
-                            recipient: TargetFilter::SelfRef,
+                            recipient: crate::types::ability::CopyRecipient::Source,
                             target: copy_filter,
                             duration: None,
                             mana_value_limit: None,
@@ -7578,7 +7602,7 @@ mod tests {
                     .execute(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::BecomeCopy {
-                            recipient: TargetFilter::SelfRef,
+                            recipient: crate::types::ability::CopyRecipient::Source,
                             target: copy_filter,
                             duration: None,
                             mana_value_limit: None,
@@ -8252,7 +8276,7 @@ mod tests {
             AbilityKind::Spell,
             Effect::BecomeCopy {
                 target: TargetFilter::Any,
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(Duration::Permanent),
                 mana_value_limit: Some(CopyManaValueLimit::AmountSpentToCastSource),
                 additional_modifications: Vec::new(),
@@ -8266,7 +8290,7 @@ mod tests {
             AbilityKind::Spell,
             Effect::BecomeCopy {
                 target: TargetFilter::Any,
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(Duration::Permanent),
                 mana_value_limit: None,
                 additional_modifications: Vec::new(),

@@ -9,7 +9,12 @@ use crate::game::deck_loading::{deserialize_draft_set_codes, DeckEntry};
 use crate::parser::oracle::{compute_deck_copy_limit_from_text, oracle_text_allows_commander};
 use crate::types::card::{CardFace, CardRules, PrintedCardRef};
 use crate::types::card_type::{CoreType, Supertype};
-use crate::types::format::{DeckCopyLimit, FormatConfig, GameFormat, SideboardPolicy};
+use crate::types::custom_format::{
+    passes_legacy_axis_gate, CommandZoneMode, LegalityRules, SetCode,
+};
+use crate::types::format::{
+    DeckCopyLimit, FormatConfig, GameFormat, SelectedFormat, SideboardPolicy,
+};
 use crate::types::keywords::{Keyword, PartnerType};
 use crate::types::mana::{ManaColor, ManaCost};
 use crate::types::match_config::MatchType;
@@ -35,7 +40,7 @@ pub struct DeckCompatibilityRequest {
     #[serde(default)]
     pub signature_spell: Vec<String>,
     #[serde(default)]
-    pub selected_format: Option<GameFormat>,
+    pub selected_format: Option<SelectedFormat>,
     #[serde(default)]
     pub selected_match_type: Option<MatchType>,
     #[serde(default = "default_player_count")]
@@ -56,25 +61,6 @@ pub struct DeckCompatibilityRequest {
         deserialize_with = "deserialize_draft_set_codes"
     )]
     pub draft_set_codes: Vec<String>,
-    /// The resolved copy-limit ceiling to enforce for this request's
-    /// `selected_format`, threaded in by a trusted caller from an
-    /// already-validated `FormatConfig.default_deck_copy_limit` (see
-    /// `FormatConfig`'s `Deserialize` impl in `types::format`, which refuses
-    /// to let a built-in format's stored value be more permissive than
-    /// `GameFormat::default_deck_copy_limit()` allows). `None` means "no
-    /// resolved config available" — every consumer falls back to the bare
-    /// `GameFormat::default_deck_copy_limit()` method via
-    /// `resolved_copy_limit`, identical to this crate's pre-fix behavior.
-    ///
-    /// `#[serde(skip_deserializing)]`: this field can NEVER be set from an
-    /// external deserialization boundary — the WASM bridge's
-    /// `evaluate_deck_compatibility_js` and friends deserialize
-    /// `DeckCompatibilityRequest` directly from untrusted client JSON, and
-    /// this field must never become a second, independently-forgeable
-    /// channel for the same claim `FormatConfig::deserialize` already gates.
-    /// Only trusted Rust code building this struct by hand may populate it.
-    #[serde(skip_deserializing)]
-    pub default_deck_copy_limit: Option<DeckCopyLimit>,
 }
 
 /// Engine-authored deck-builder state for selecting an Oathbreaker's signature
@@ -93,7 +79,7 @@ pub fn signature_spell_selection_policy(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
 ) -> SignatureSpellSelectionPolicy {
-    if request.selected_format != Some(GameFormat::Oathbreaker) {
+    if request.selected_format.as_ref().map(SelectedFormat::tag) != Some(GameFormat::Oathbreaker) {
         return SignatureSpellSelectionPolicy::None;
     }
 
@@ -126,17 +112,19 @@ pub fn signature_spell_selection_policy(
 /// the main deck into the dedicated companion slot. Candidate evaluation uses
 /// the same typed predicate as pregame reveal validation.
 pub fn companion_candidates(db: &CardDatabase, request: &DeckCompatibilityRequest) -> Vec<String> {
-    // `GameFormat::uses_commander()` returns `Err` for `Custom` (a bare
+    // `SelectedFormat::rules()` returns `Err` for `Tag(Custom(_))` (a bare
     // GameFormat cannot resolve it — see types::format). `selected_format`
     // arrives from an untrusted request (this function is exposed directly
-    // via engine-wasm's `companion_candidates_js`). No companion-candidate
-    // resolution exists for Custom formats yet, so treating an `Err`/absent
-    // format the same as any other non-commander format (empty result) is
-    // the honest answer.
+    // via engine-wasm's `companion_candidates_js`), so it can only ever be a
+    // `Tag` (see the Wire-Inertness Invariant on `SelectedFormat`) — but no
+    // companion-candidate resolution exists for Custom formats yet anyway,
+    // so treating an `Err`/absent format the same as any other non-commander
+    // format (empty result) is the honest answer.
     let uses_commander = request
         .selected_format
-        .and_then(|format| format.uses_commander().ok())
-        .unwrap_or(false);
+        .as_ref()
+        .and_then(|selected| selected.rules().ok())
+        .is_some_and(|rules| rules.uses_commander);
     if !uses_commander {
         return Vec::new();
     }
@@ -262,34 +250,40 @@ pub fn evaluate_deck_compatibility(
     let color_identity = collect_color_identity(db, request);
     let color_distribution = collect_main_deck_color_distribution(db, request);
 
-    let (mut selected_format_compatible, mut selected_format_reasons) = evaluate_selected_format(
-        db,
-        request,
-        &unknown_cards,
-        &standard,
-        &commander,
-        bo3_ready,
-    );
+    let (mut selected_format_compatible, mut selected_format_reasons) =
+        evaluate_selected_format(db, request, &unknown_cards, bo3_ready);
 
     // UI-HINT ONLY. This function feeds the lobby's live deck-legality chip
-    // (`classifyCompatResult` reads `None` as "idle"/no opinion). The engine
-    // genuinely cannot evaluate Custom-format legality yet — there is no
-    // per-card `CustomFormatRules` resolver — so a hard "illegal" badge would
-    // assert a rules verdict nothing computed. "No opinion" is the honest hint.
+    // (`classifyCompatResult` reads `None` as "idle"/no opinion). Phase 1d
+    // wired a real evaluator (`evaluate_custom_format`), but the Wire-Inertness
+    // Invariant on `SelectedFormat` means this WASM-facing function can only
+    // ever receive a bare `Tag(Custom(_))` — never the `Resolved` variant the
+    // evaluator needs — so `selected.rules()` is unconditionally `Err` here and
+    // the engine genuinely has no verdict to report. A hard "illegal" badge
+    // would assert a rules verdict nothing computed. "No opinion" is the
+    // honest hint.
     //
     // Scoped three ways so this can never widen into a real permission:
     //   1. It lives HERE, not in `evaluate_selected_format`, which stays
     //      fail-closed because it also backstops the authoritative gate.
     //   2. The authoritative gate (`validate_deck_for_format`) has its own
-    //      independent Custom guard above and never reaches this code.
-    //   3. Only the exact `CUSTOM_FORMAT_UNSUPPORTED` sentinel is downgraded —
-    //      a genuinely different future rejection (a real card-pool failure
-    //      once a resolver exists, "BO3 requires a sideboard", ...) still
-    //      surfaces normally.
+    //      independent unresolvable-format guard above and never reaches this
+    //      code.
+    //   3. Only the exact `CUSTOM_FORMAT_UNRESOLVED` sentinel is downgraded —
+    //      a genuinely different rejection (a real card-pool failure from
+    //      `evaluate_custom_format`, one of the other three definite-verdict
+    //      Custom sentinels, "BO3 requires a sideboard", ...) still surfaces
+    //      normally. In production this function never sees anything else for
+    //      Custom, precisely because of the Wire-Inertness Invariant — but the
+    //      check stays keyed on the sentinel, not on "is Custom", so a future
+    //      caller that DOES hand this function a `Resolved` custom config gets
+    //      its real verdict instead of a silently swallowed one.
     // The P2P host's per-guest deck-kick gate must NOT use this function; it
     // has its own always-strict `evaluate_deck_format_gate`.
-    if matches!(request.selected_format, Some(GameFormat::Custom(_)))
-        && selected_format_reasons == [CUSTOM_FORMAT_UNSUPPORTED.to_string()]
+    if matches!(
+        request.selected_format.as_ref().map(SelectedFormat::tag),
+        Some(GameFormat::Custom(_))
+    ) && selected_format_reasons == [CUSTOM_FORMAT_UNRESOLVED.to_string()]
     {
         selected_format_compatible = None;
         selected_format_reasons = Vec::new();
@@ -333,14 +327,20 @@ fn evaluate_deck_compatibility_summary(
     DeckCompatibilityResult {
         standard: CompatibilityCheck {
             compatible: matches!(
-                (request.selected_format, selected_format_compatible),
+                (
+                    request.selected_format.as_ref().map(SelectedFormat::tag),
+                    selected_format_compatible
+                ),
                 (Some(GameFormat::Standard), Some(true))
             ),
             reasons: Vec::new(),
         },
         commander: CompatibilityCheck {
             compatible: matches!(
-                (request.selected_format, selected_format_compatible),
+                (
+                    request.selected_format.as_ref().map(SelectedFormat::tag),
+                    selected_format_compatible
+                ),
                 (Some(GameFormat::Commander), Some(true))
             ),
             reasons: Vec::new(),
@@ -373,33 +373,37 @@ pub fn validate_deck_for_format(
     // `validate_name_deck_for_format_full` runs, and that is called at the real
     // `CreateGameWithSettings` / `initialize_game` boundaries
     // (`phase-server/src/main.rs`, `engine-wasm/src/lib.rs`). It therefore fails
-    // closed on Custom *on its own*, independently of whatever
+    // closed *on its own* whenever the selected format cannot resolve real
+    // rules — `SelectedFormat::rules()` is `Err` only for a bare
+    // `Tag(Custom(_))` (see types::format) — independently of whatever
     // `evaluate_selected_format` below decides — a future change to that shared
-    // function's Custom handling (it also feeds the non-authoritative UI-hint
-    // path in `evaluate_deck_compatibility`, which deliberately downgrades this
-    // exact sentinel to "no opinion") can never reopen this gate by accident.
-    // Same shared wording as every other Custom rejection, so the three paths
-    // agree on one sentence — see `validate_name_deck_for_format_with_sig`.
-    if matches!(request.selected_format, Some(GameFormat::Custom(_))) {
-        return Err(vec![CUSTOM_FORMAT_UNSUPPORTED.to_string()]);
+    // function's unresolvable-format handling (it also feeds the
+    // non-authoritative UI-hint path in `evaluate_deck_compatibility`, which
+    // deliberately downgrades this exact sentinel to "no opinion") can never
+    // reopen this gate by accident. Once `rules()` succeeds — as it always
+    // does for a trusted `Resolved` Custom config, e.g. one built by
+    // `validate_name_deck_for_format_full` itself — this guard steps aside and
+    // `evaluate_selected_format`'s own `evaluate_custom_format` arm decides on
+    // the real, resolved rules. Same shared wording as every other
+    // unresolvable-format rejection, so the two paths agree on one sentence —
+    // see `validate_name_deck_for_format_with_sig`, which still answers a bare
+    // `GameFormat` (never a `SelectedFormat`) and so keeps its own equivalent
+    // "is Custom" test.
+    if request
+        .selected_format
+        .as_ref()
+        .is_some_and(|selected| selected.rules().is_err())
+    {
+        return Err(vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]);
     }
     let unknown_cards = collect_unknown_cards(db, request);
-    let standard = evaluate_standard(db, request, &unknown_cards);
-    let commander = evaluate_commander(db, request, &unknown_cards);
     // CR 100.4a / CR 903.5e: A "BO3-ready" deck is one with a real sideboard
     // the format actually uses. Decks that declare a commander are
     // Commander-style (CR 903) — their submitted sideboard slot is Phase's
     // builder-only Maybeboard staging area and the engine drops it at load
     // time, so they are never BO3-ready regardless of slot occupancy.
     let bo3_ready = !request.sideboard.is_empty() && request.commander.is_empty();
-    let (compatible, reasons) = evaluate_selected_format(
-        db,
-        request,
-        &unknown_cards,
-        &standard,
-        &commander,
-        bo3_ready,
-    );
+    let (compatible, reasons) = evaluate_selected_format(db, request, &unknown_cards, bo3_ready);
     match compatible {
         Some(false) => Err(reasons),
         _ => Ok(()),
@@ -485,14 +489,17 @@ pub fn validate_name_deck_for_format_with_sig(
     selected_format: GameFormat,
     selected_match_type: Option<MatchType>,
 ) -> Result<(), Vec<String>> {
-    // A bare-GameFormat holder can legitimately pass Custom here (e.g. from
-    // untrusted input). Route it through the same shared rejection text
-    // `evaluate_selected_format`/`evaluate_selected_format_summary` already
-    // use (CUSTOM_FORMAT_UNSUPPORTED) instead of `FormatConfig::for_format`'s
-    // differently-worded "no default exists" error, so all three Custom-
-    // rejection paths agree on one wording — never three drifting ones.
+    // A bare `GameFormat` holder can legitimately pass Custom here (e.g. from
+    // untrusted input). Unlike `validate_deck_for_format`, this function has no
+    // `SelectedFormat` to call `.rules()` on — only the bare tag — so it keeps
+    // its own direct `GameFormat::Custom` test rather than the `rules().is_err()`
+    // check used elsewhere. Route it through the same shared rejection text
+    // `validate_deck_for_format` uses for an unresolvable format
+    // (CUSTOM_FORMAT_UNRESOLVED) instead of `FormatConfig::for_format`'s
+    // differently-worded "no default exists" error, so both unresolvable-format
+    // rejection paths agree on one wording — never two drifting ones.
     if matches!(selected_format, GameFormat::Custom(_)) {
-        return Err(vec![CUSTOM_FORMAT_UNSUPPORTED.to_string()]);
+        return Err(vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]);
     }
     let format_config = FormatConfig::for_format(selected_format)
         .expect("format is guaranteed non-Custom by the preceding check");
@@ -537,16 +544,28 @@ pub fn validate_name_deck_for_format_full(
         planar_deck: planar_deck.to_vec(),
         scheme_deck: scheme_deck.to_vec(),
         signature_spell: signature_spell.to_vec(),
-        selected_format: Some(format_config.format),
+        // The sole production construction site of `SelectedFormat::Resolved`
+        // (Wire-Inertness Invariant clause (2) on `SelectedFormat`) — trusted
+        // Rust handing off the `&FormatConfig` it already holds.
+        selected_format: Some(SelectedFormat::Resolved(Box::new(format_config.clone()))),
         selected_match_type,
         player_count,
         summary_only: false,
         draft_set_codes: draft_set_codes.to_vec(),
-        default_deck_copy_limit: Some(format_config.default_deck_copy_limit),
     };
     validate_deck_for_format(db, &request)
 }
 
+/// Format-INDEPENDENT reference column — `evaluate_deck_compatibility:222` is
+/// its sole caller (a fix round removed `validate_deck_for_format`'s own use
+/// of this reference column; it now calls `evaluate_constructed` fresh via
+/// `evaluate_selected_format` instead), and runs this for EVERY request
+/// regardless of selection. `result.standard` renders as the STD badge
+/// (`client/src/components/menu/MyDecks.tsx:411`,
+/// `client/src/pages/GameSetupPage.tsx:438`). It must therefore read the
+/// REGISTRY config for its own format, never `request`'s resolved rules —
+/// doing the latter would report a different selected format's resolved
+/// ceiling in the Standard column.
 fn evaluate_standard(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
@@ -556,17 +575,122 @@ fn evaluate_standard(
         db,
         request,
         unknown_cards,
-        GameFormat::Standard,
-        LegalityFormat::Standard,
+        &FormatConfig::standard(),
+        CardPoolAuthority::LegalityTable(LegalityFormat::Standard),
         "Standard",
-        GameFormat::Standard.sideboard_policy(),
     )
 }
 
-/// Shared validation for constructed formats (Standard, Pioneer, Pauper, etc.):
-/// checks unknown cards, no commander slot, minimum 60 cards, sideboard size,
-/// combined main+sideboard 4-per-name limit, and legality against the given
-/// `LegalityFormat`.
+/// Where a constructed-shaped evaluation's per-card legality verdict comes
+/// from: the built-in `LegalityFormat` table for a sanctioned format, or a
+/// custom format's own declared card pool (`DeclaredPool`) for
+/// `GameFormat::Custom`. Both resolve to the same four-variant
+/// [`LegalityStatus`] — this type only decides WHICH source answers; it never
+/// introduces a fifth verdict.
+#[derive(Debug, Clone, Copy)]
+enum CardPoolAuthority<'a> {
+    LegalityTable(LegalityFormat),
+    Declared(&'a DeclaredPool),
+}
+
+impl CardPoolAuthority<'_> {
+    fn status(self, db: &CardDatabase, name: &str) -> Option<LegalityStatus> {
+        match self {
+            CardPoolAuthority::LegalityTable(format) => db.legality_status(name, format),
+            CardPoolAuthority::Declared(pool) => pool.status(db, name),
+        }
+    }
+}
+
+/// A custom format's resolved card pool: which cards are IN the pool (by
+/// printing — `legal_sets: None` means unrestricted), overlaid with its
+/// banned/restricted lists. Built once per evaluation by [`Self::resolve`]
+/// from a [`LegalityRules`] value, never assembled piecemeal.
+///
+/// `Debug` is required because [`CardPoolAuthority`] borrows this type and
+/// derives `Debug` itself.
+#[derive(Debug)]
+struct DeclaredPool {
+    legal_sets: Option<Vec<SetCode>>,
+    /// CR 201.3b: canonical (`canonical_deck_count_key`) names, so a banned
+    /// entry naming a split/DFC's whole-card identity ("Fire // Ice") matches
+    /// a decklist naming just one face ("Fire"). A banned/restricted entry
+    /// that does not itself resolve to a real card silently matches nothing —
+    /// that is a preset-authoring integrity concern, deferred to the
+    /// `custom_format_registry()` landing phase, not an evaluator concern.
+    banned: HashSet<String>,
+    restricted: HashSet<String>,
+}
+
+impl DeclaredPool {
+    fn resolve(db: &CardDatabase, rules: &LegalityRules) -> Self {
+        Self {
+            legal_sets: rules.legal_sets.clone(),
+            banned: rules
+                .banned
+                .iter()
+                .map(|name| canonical_deck_count_key(db, name))
+                .collect(),
+            restricted: rules
+                .restricted
+                .iter()
+                .map(|name| canonical_deck_count_key(db, name))
+                .collect(),
+        }
+    }
+
+    /// Order: pool membership → banned → restricted → legal. Returns `None`
+    /// (never `Some(LegalityStatus::NotLegal)`) for a card outside a declared
+    /// `legal_sets` restriction, matching `LegalityTable`'s own "no data for
+    /// this format" `None` — both feed the same "(not legal in
+    /// {format_label})" message in the shared evaluator, so the two card-pool
+    /// authorities must report absence identically.
+    fn status(&self, db: &CardDatabase, name: &str) -> Option<LegalityStatus> {
+        if let Some(sets) = &self.legal_sets {
+            if !printed_in_any_set(db, name, sets) {
+                return None;
+            }
+        }
+        let canonical = canonical_deck_count_key(db, name);
+        if self.banned.contains(&canonical) {
+            return Some(LegalityStatus::Banned);
+        }
+        if self.restricted.contains(&canonical) {
+            return Some(LegalityStatus::Restricted);
+        }
+        Some(LegalityStatus::Legal)
+    }
+}
+
+/// ANY-quantified membership (CR 100.6's tournament-rules card-pool concept —
+/// no numbered CR governs custom-format legal-sets restrictions directly):
+/// whether `name` has at least one printing whose set code appears in `sets`.
+/// Case-insensitive (`eq_ignore_ascii_case`), matching this module's existing
+/// set-code convention (`draft_set_concessions`) — never uppercase-normalize.
+///
+/// Fails CLOSED when `db.printings_for` returns `None`: "no evidence of a
+/// legal printing" is not "a legal printing." Two production paths hit this
+/// today: `phase-server` under `PHASE_DEV_FIXTURE=1` (`main.rs:2055-2062` →
+/// `from_mtgjson` → `oracle_loader.rs:147`'s empty printings index) and
+/// `CardDatabase::default()` (`server-core/src/draft_session.rs:1369`) — in
+/// both, every card in the deck is rejected as "(not legal in
+/// {format_label})" rather than silently passing a `legal_sets`-restricted
+/// custom format.
+fn printed_in_any_set(db: &CardDatabase, name: &str, sets: &[SetCode]) -> bool {
+    let Some(printings) = db.printings_for(name) else {
+        return false;
+    };
+    printings.iter().any(|printed| {
+        sets.iter()
+            .any(|allowed| allowed.0.eq_ignore_ascii_case(printed))
+    })
+}
+
+/// Shared validation for constructed-shaped formats (Standard, Pioneer,
+/// Pauper, etc., and — since Phase 1d — a non-command-zone custom format):
+/// checks unknown cards, no commander slot, the format's own deck-size rule,
+/// sideboard size, combined main+sideboard copy-limit ceiling, and legality
+/// against the given [`CardPoolAuthority`].
 ///
 /// CR 100.2a + CR 100.4a: The 4-card-per-name limit applies to the combined
 /// deck and sideboard, with basic lands and "A deck can have any number"
@@ -575,10 +699,9 @@ fn evaluate_constructed(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
-    format: GameFormat,
-    legality_format: LegalityFormat,
+    format_rules: &FormatConfig,
+    pool: CardPoolAuthority<'_>,
     format_label: &str,
-    sideboard_policy: SideboardPolicy,
 ) -> CompatibilityCheck {
     let mut reasons = Vec::new();
 
@@ -590,27 +713,34 @@ fn evaluate_constructed(
         reasons.push(format!("{format_label} decks do not use a commander slot"));
     }
 
-    if request.main_deck.len() < 60 {
+    // CR 100.5 / CR 903.5a: the format's own deck-size rule is authoritative —
+    // never re-derive a hardcoded 60 by hand.
+    if !format_rules.deck_size.accepts(request.main_deck.len()) {
         reasons.push(format!(
-            "Main deck has {} cards (minimum 60)",
+            "{format_label} deck must have {} cards (found {})",
+            format_rules.deck_size.requirement_phrase(),
             request.main_deck.len()
         ));
     }
 
-    // CR 100.4a: In constructed play, the sideboard may contain at most 15 cards.
-    if let SideboardPolicy::Limited(max) = sideboard_policy {
-        if request.sideboard.len() as u32 > max {
+    // CR 100.4: Sideboard availability and its size are format rules.
+    match format_rules.sideboard_policy {
+        SideboardPolicy::Forbidden if !request.sideboard.is_empty() => {
+            reasons.push(format!("{format_label} does not allow a sideboard"));
+        }
+        SideboardPolicy::Limited(max) if request.sideboard.len() as u32 > max => {
             reasons.push(format!(
                 "Sideboard has {} cards (maximum {})",
                 request.sideboard.len(),
                 max
             ));
         }
+        SideboardPolicy::Forbidden | SideboardPolicy::Limited(_) | SideboardPolicy::Unlimited => {}
     }
 
     // CR 100.2a + CR 100.4a: The copy limit applies to main + sideboard
-    // combined, at the ceiling the request's resolved format config carries.
-    let limit = resolved_copy_limit(request, format);
+    // combined, at the ceiling the resolved format config carries.
+    let limit = format_rules.default_deck_copy_limit;
     let counts = combined_copy_counts(db, request, CommandZoneNetting::CountVerbatim);
     let over_limit = copy_limit_violations(db, &counts, limit);
     if !over_limit.is_empty() {
@@ -623,13 +753,11 @@ fn evaluate_constructed(
         if unknown_cards.contains(name) {
             continue;
         }
-        match db.legality_status(name, legality_format) {
+        match pool.status(db, name) {
             Some(LegalityStatus::Legal) => {}
-            // CR 100.2b: A card on a format's restricted list is legal but
-            // a deck may contain at most one copy of it. Vintage is the
-            // canonical user, but the rule is format-general — any format
-            // whose legality table marks a card `Restricted` follows the
-            // same 1-copy ceiling, enforced below. The card itself is not
+            // CR 100.6: Tournament rules may limit a card's use. Phase's
+            // `Restricted` status represents the established one-copy
+            // format-policy, enforced below; the card itself is not
             // "illegal" — that was the bug that flagged Power 9 as banned
             // in Vintage.
             Some(LegalityStatus::Restricted) => {
@@ -659,7 +787,8 @@ fn evaluate_constructed(
         ));
     }
 
-    // CR 100.2b: Restricted cards may appear at most once in a deck.
+    // CR 100.6: Tournament rules may limit a card's use; Phase's `Restricted`
+    // status uses the established one-copy format-policy.
     let restricted_violations = restricted_copy_violations(db, &counts, &restricted_canonical);
     if !restricted_violations.is_empty() {
         reasons.push(summarize_cards(
@@ -675,10 +804,111 @@ fn evaluate_constructed(
     }
 }
 
+/// The gates every custom-format evaluation path (`evaluate_custom_format`,
+/// `quick_custom_format_check`) must pass before its declared card pool can be
+/// trusted, plus the pool itself on success. `Err(reason)` names exactly one
+/// of the three non-`UNRESOLVED` sentinels documented on
+/// [`CUSTOM_FORMAT_UNRESOLVED`] — see that doc comment for which of the three
+/// is genuinely production-reachable versus defense-in-depth.
+fn custom_format_pool(
+    db: &CardDatabase,
+    format_rules: &FormatConfig,
+) -> Result<DeclaredPool, String> {
+    let Some(rules) = format_rules.custom_rules.as_deref() else {
+        return Err(CUSTOM_FORMAT_MISSING_RULES.to_string());
+    };
+    // Equivalent to `format_rules.command_zone_holds_decklist_commander()`
+    // (by that method's own doc comment, every `Enabled` command zone
+    // designates a decklist commander and `Disabled` never does) — matched
+    // directly on `rules.structural.command_zone_mode` here since this
+    // function already holds `rules` and the indirection would add nothing.
+    if matches!(
+        rules.structural.command_zone_mode,
+        CommandZoneMode::Enabled { .. }
+    ) {
+        return Err(CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED.to_string());
+    }
+    if !passes_legacy_axis_gate(&rules.legality.legacy) {
+        return Err(CUSTOM_FORMAT_UNIMPLEMENTED_LEGACY_AXIS.to_string());
+    }
+    Ok(DeclaredPool::resolve(db, &rules.legality))
+}
+
+/// Phase 1d: the real custom-format evaluator, reached only for a `Resolved`
+/// Custom `FormatConfig` (an unresolvable bare `Tag(Custom(_))` is answered
+/// earlier by the `rules().is_err()` guards in `evaluate_selected_format` /
+/// `validate_deck_for_format`). Scoped to non-command-zone (constructed-shaped)
+/// custom formats only — see `custom_format_pool`'s gates — and otherwise a
+/// thin wrapper: it builds the declared card pool and delegates the entire
+/// deck-shape check to the same [`evaluate_constructed`] every built-in
+/// constructed format uses, just pointed at [`CardPoolAuthority::Declared`]
+/// instead of a [`LegalityFormat`] table.
+fn evaluate_custom_format(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    unknown_cards: &BTreeSet<String>,
+    format_rules: &FormatConfig,
+) -> CompatibilityCheck {
+    let pool = match custom_format_pool(db, format_rules) {
+        Ok(pool) => pool,
+        Err(reason) => {
+            return CompatibilityCheck {
+                compatible: false,
+                reasons: vec![reason],
+            }
+        }
+    };
+    let format_label = format_rules.format.label();
+    evaluate_constructed(
+        db,
+        request,
+        unknown_cards,
+        format_rules,
+        CardPoolAuthority::Declared(&pool),
+        &format_label,
+    )
+}
+
+/// Summary-path twin of [`evaluate_custom_format`] — see its doc comment.
+///
+/// The frontend cannot reach this today: `DeckCompatibilityRequest.selected_format`
+/// is wire-inert (Wire-Inertness Invariant, `types::format::SelectedFormat`) —
+/// its JSON form is always the bare `GameFormat` tag, never `Resolved` — so a
+/// WASM-boundary request always fails the `rules().is_err()` guard above this
+/// dispatch arm before reaching here. The path forward is NOT a `Resolved`
+/// variant on the wire (that would violate the invariant), but a separate
+/// gated parameter alongside the request: deserialize a full `FormatConfig`
+/// through its own gated `Deserialize` and pass it independently, exactly as
+/// `maxDeckCopies(name, format_config)` (`engine-wasm/src/lib.rs`'s
+/// `max_deck_copies_for_format`) already threads a resolved `FormatConfig`
+/// across the boundary rather than smuggling one through `DeckCompatibilityRequest`.
+fn quick_custom_format_check(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    format_rules: &FormatConfig,
+) -> QuickCheckResult {
+    let pool = match custom_format_pool(db, format_rules) {
+        Ok(pool) => pool,
+        Err(reason) => return QuickCheckResult::incompatible(reason),
+    };
+    let format_label = format_rules.format.label();
+    quick_constructed_check(
+        db,
+        request,
+        format_rules,
+        CardPoolAuthority::Declared(&pool),
+        &format_label,
+    )
+}
+
+// Called from BOTH `evaluate_selected_format`'s Planechase arm (the full
+// path) and `quick_planechase_check` (the summary path's Planechase arm) —
+// both already hold `format_rules` and pass it straight through.
 fn evaluate_planechase(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
+    format_rules: &FormatConfig,
 ) -> CompatibilityCheck {
     let mut reasons = Vec::new();
 
@@ -694,14 +924,19 @@ fn evaluate_planechase(
     if !request.commander.is_empty() {
         reasons.push("Planechase decks do not use a commander slot".to_string());
     }
-    if request.main_deck.len() < 60 {
+    // CR 100.5: `DeckSizeRule::accepts` is the sole authority — Planechase's
+    // registry value is `Minimum(60)`, so this is behavior-neutral versus the
+    // hardcoded `< 60` it replaces.
+    if !format_rules.deck_size.accepts(request.main_deck.len()) {
+        let format_label = format_rules.format.label();
         reasons.push(format!(
-            "Main deck has {} cards (minimum 60)",
+            "{format_label} deck must have {} cards (found {})",
+            format_rules.deck_size.requirement_phrase(),
             request.main_deck.len()
         ));
     }
 
-    let limit = resolved_copy_limit(request, GameFormat::Planechase);
+    let limit = format_rules.default_deck_copy_limit;
     let counts = combined_copy_counts(db, request, CommandZoneNetting::CountVerbatim);
     let over_limit = copy_limit_violations(db, &counts, limit);
     if !over_limit.is_empty() {
@@ -780,10 +1015,14 @@ fn evaluate_planechase(
     }
 }
 
+// Called from BOTH `evaluate_selected_format`'s Archenemy arm (the full
+// path) and `quick_archenemy_check` (the summary path's Archenemy arm) —
+// both already hold `format_rules` and pass it straight through.
 fn evaluate_archenemy(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
+    format_rules: &FormatConfig,
 ) -> CompatibilityCheck {
     let mut reasons = Vec::new();
 
@@ -799,14 +1038,19 @@ fn evaluate_archenemy(
     if !request.commander.is_empty() {
         reasons.push("Archenemy decks do not use a commander slot".to_string());
     }
-    if request.main_deck.len() < 60 {
+    // CR 100.5: `DeckSizeRule::accepts` is the sole authority — Archenemy's
+    // registry value is `Minimum(60)`, so this is behavior-neutral versus the
+    // hardcoded `< 60` it replaces.
+    if !format_rules.deck_size.accepts(request.main_deck.len()) {
+        let format_label = format_rules.format.label();
         reasons.push(format!(
-            "Main deck has {} cards (minimum 60)",
+            "{format_label} deck must have {} cards (found {})",
+            format_rules.deck_size.requirement_phrase(),
             request.main_deck.len()
         ));
     }
 
-    let limit = resolved_copy_limit(request, GameFormat::Archenemy);
+    let limit = format_rules.default_deck_copy_limit;
     let counts = combined_copy_counts(db, request, CommandZoneNetting::CountVerbatim);
     let over_limit = copy_limit_violations(db, &counts, limit);
     if !over_limit.is_empty() {
@@ -876,6 +1120,11 @@ fn validate_scheme_deck(db: &CardDatabase, scheme_deck: &[String], reasons: &mut
     }
 }
 
+/// Format-INDEPENDENT reference column — see the doc comment on
+/// `evaluate_standard`, which states the same invariant for its own format:
+/// `evaluate_deck_compatibility:223` is this function's sole caller. This one
+/// feeds `result.commander` / the CMD badge and must never read `request`'s
+/// resolved rules.
 fn evaluate_commander(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
@@ -886,7 +1135,7 @@ fn evaluate_commander(
         request,
         unknown_cards,
         CommanderVariantRules::commander(),
-        GameFormat::Commander,
+        &FormatConfig::commander(),
     )
 }
 
@@ -1021,7 +1270,7 @@ fn deck_entries_for_names(db: &CardDatabase, names: &[String]) -> Vec<DeckEntry>
 fn validate_commander_companion(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
-    format: GameFormat,
+    format_rules: &FormatConfig,
     reasons: &mut Vec<String>,
 ) {
     if request.companion.is_empty() {
@@ -1030,7 +1279,7 @@ fn validate_commander_companion(
     if request.companion.len() != 1 {
         reasons.push(format!(
             "{} decks may register exactly one companion (found {})",
-            format.label(),
+            format_rules.format.label(),
             request.companion.len()
         ));
         return;
@@ -1043,14 +1292,11 @@ fn validate_commander_companion(
     let companion = DeckEntry::from_resolved_face(db, face, 1);
     let main = deck_entries_for_names(db, &request.main_deck);
     let commanders = deck_entries_for_names(db, &request.commander);
-    // `format` here is always a real Commander/Brawl-family built-in — this
-    // function is only ever dispatched from evaluate_commander_with_format,
-    // evaluate_brawl, and quick_commander_check, each already gated to a
-    // guaranteed non-Custom format — so `.uses_commander()` is guaranteed
-    // `Ok` here.
-    let uses_commander = format
-        .uses_commander()
-        .expect("validate_commander_companion is only dispatched for a built-in format");
+    // Reads the STORED `uses_commander` field rather than the bare
+    // `GameFormat::uses_commander()` method: `format_rules` may be a
+    // `Resolved` custom config for which the bare method would return `Err`
+    // (see `SelectedFormat`) — the stored field is always available.
+    let uses_commander = format_rules.uses_commander;
     let starting = companion_starting_deck(&main, &commanders, uses_commander);
     if !is_eligible_companion(&companion, &starting, &commanders, uses_commander) {
         reasons.push(format!(
@@ -1065,7 +1311,7 @@ fn validate_commander_companion(
 /// DuelCommander's 30-life / 1v1-only rules are expressed in `FormatConfig`,
 /// not deck validation.
 ///
-/// A fact one twin DERIVES from `game_format` and the other HARD-CODES is a
+/// A fact one twin DERIVES from `format_rules` and the other HARD-CODES is a
 /// divergence: the full and summary paths would then state different verdicts
 /// for the same request. Derive on both sides, or pass on both sides — the
 /// invariant is that the two agree, not that any particular fact is derived.
@@ -1079,17 +1325,15 @@ fn evaluate_commander_with_format(
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
     rules: CommanderVariantRules,
-    game_format: GameFormat,
+    format_rules: &FormatConfig,
 ) -> CompatibilityCheck {
-    let legality_format = game_format.legality_format();
-    let format_label = game_format.label();
+    let legality_format = format_rules.format.legality_format();
+    let format_label = format_rules.format.label();
     // CR 903.5a / CR 903.13f(1): the format's `DeckSizeRule` is the single
     // authority for min-vs-exact. Compared only through `accepts`, never by
     // hand — CR 903.13f(1) sets a minimum with NO maximum, which a literal
     // equality cannot express.
-    let deck_size = FormatConfig::for_format(game_format)
-        .expect("evaluate_commander_with_format is only dispatched for a built-in commander format")
-        .deck_size;
+    let deck_size = format_rules.deck_size;
     // CR 903.5e: the sideboard is dropped at game load for Commander-style
     // formats. Re-scope the request so singleton, color-identity, and legality
     // checks operate on the actual game deck.
@@ -1173,7 +1417,7 @@ fn evaluate_commander_with_format(
     // caller.
     let counts = combined_copy_counts(db, request, CommandZoneNetting::NetAgainstMainDeck);
     let singleton_violations =
-        copy_limit_violations(db, &counts, resolved_copy_limit(request, game_format));
+        copy_limit_violations(db, &counts, format_rules.default_deck_copy_limit);
     if !singleton_violations.is_empty() {
         reasons.push(summarize_cards(
             "Singleton violations",
@@ -1248,7 +1492,7 @@ fn evaluate_commander_with_format(
         ));
     }
 
-    validate_commander_companion(db, request, game_format, &mut reasons);
+    validate_commander_companion(db, request, format_rules, &mut reasons);
 
     CompatibilityCheck {
         compatible: reasons.is_empty(),
@@ -1286,7 +1530,7 @@ fn evaluate_brawl(
     unknown_cards: &BTreeSet<String>,
     legality_format: LegalityFormat,
     format_label: &str,
-    game_format: GameFormat,
+    format_rules: &FormatConfig,
 ) -> CompatibilityCheck {
     // CR 903.5e (Brawl variant): drop the sideboard slot before shape /
     // singleton / identity checks — it is not part of the loaded deck.
@@ -1318,7 +1562,7 @@ fn evaluate_brawl(
         }
     }
 
-    validate_commander_companion(db, request, game_format, &mut reasons);
+    validate_commander_companion(db, request, format_rules, &mut reasons);
 
     // CR 903.5e (via Brawl variant): Brawl formats do not start the game with
     // a sideboard. Extra entries in the submitted list are silently ignored at
@@ -1327,9 +1571,7 @@ fn evaluate_brawl(
     // CR 903.5a (via Brawl variant): the format's rule is authoritative for the
     // total card count (main + commander, accounting for commander listed in
     // main) — never re-derive min-vs-exact here.
-    let deck_size = FormatConfig::for_format(game_format)
-        .expect("evaluate_brawl is only dispatched for a Brawl-family GameFormat")
-        .deck_size;
+    let deck_size = format_rules.deck_size;
     let represented_in_main = commanders_represented_in_main(db, request);
     let total_cards = request.main_deck.len() + (request.commander.len() - represented_in_main);
     if !deck_size.accepts(total_cards) {
@@ -1344,7 +1586,7 @@ fn evaluate_brawl(
     // the shared helper.
     let counts = combined_copy_counts(db, request, CommandZoneNetting::NetAgainstMainDeck);
     let singleton_violations =
-        copy_limit_violations(db, &counts, resolved_copy_limit(request, game_format));
+        copy_limit_violations(db, &counts, format_rules.default_deck_copy_limit);
     if !singleton_violations.is_empty() {
         reasons.push(summarize_cards(
             "Singleton violations",
@@ -1501,10 +1743,14 @@ pub(crate) fn tiny_leaders_companion_banned(name: &str) -> bool {
     name_in_list(name, TINY_LEADERS_COMPANION_BANNED)
 }
 
+// Called from BOTH `evaluate_selected_format`'s TinyLeaders arm (the full
+// path) and `quick_tiny_leaders_check` (the summary path's TinyLeaders arm)
+// — both already hold `format_rules` and pass it straight through.
 fn evaluate_tiny_leaders(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
+    format_rules: &FormatConfig,
 ) -> CompatibilityCheck {
     let mut reasons = Vec::new();
 
@@ -1578,12 +1824,9 @@ fn evaluate_tiny_leaders(
         ));
     }
 
+    let limit = format_rules.default_deck_copy_limit;
     let counts = combined_copy_counts(db, request, CommandZoneNetting::NetAgainstMainDeck);
-    let singleton_violations = copy_limit_violations(
-        db,
-        &counts,
-        resolved_copy_limit(request, GameFormat::TinyLeaders),
-    );
+    let singleton_violations = copy_limit_violations(db, &counts, limit);
     if !singleton_violations.is_empty() {
         reasons.push(summarize_cards(
             "Singleton violations",
@@ -1691,9 +1934,10 @@ fn evaluate_tiny_leaders(
 fn quick_tiny_leaders_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
+    format_rules: &FormatConfig,
 ) -> QuickCheckResult {
     let unknown_cards = collect_unknown_cards(db, request);
-    let check = evaluate_tiny_leaders(db, request, &unknown_cards);
+    let check = evaluate_tiny_leaders(db, request, &unknown_cards, format_rules);
     QuickCheckResult {
         reason: check.reasons.into_iter().next(),
         unknown_cards,
@@ -1819,10 +2063,14 @@ fn is_instant_or_sorcery(face: &CardFace) -> bool {
 }
 
 /// Oathbreaker RC: full deck compatibility check.
+// Called from BOTH `evaluate_selected_format`'s Oathbreaker arm (the full
+// path) and `quick_oathbreaker_check` (the summary path's Oathbreaker arm)
+// — both already hold `format_rules` and pass it straight through.
 fn evaluate_oathbreaker(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
+    format_rules: &FormatConfig,
 ) -> CompatibilityCheck {
     let mut reasons = Vec::new();
 
@@ -1921,12 +2169,9 @@ fn evaluate_oathbreaker(
     // `CommandZoneNetting::NetAgainstMainDeck`, which resolves both command-zone
     // slots by card identity (CR 709.2 / CR 712.1: one physical card) rather
     // than by raw spelling.
+    let limit = format_rules.default_deck_copy_limit;
     let counts = combined_copy_counts(db, request, CommandZoneNetting::NetAgainstMainDeck);
-    let singleton_violations = copy_limit_violations(
-        db,
-        &counts,
-        resolved_copy_limit(request, GameFormat::Oathbreaker),
-    );
+    let singleton_violations = copy_limit_violations(db, &counts, limit);
     if !singleton_violations.is_empty() {
         reasons.push(summarize_cards(
             "Singleton violations",
@@ -2096,9 +2341,10 @@ fn quick_momir_check(db: &CardDatabase, request: &DeckCompatibilityRequest) -> Q
 fn quick_oathbreaker_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
+    format_rules: &FormatConfig,
 ) -> QuickCheckResult {
     let unknown_cards = collect_unknown_cards(db, request);
-    let check = evaluate_oathbreaker(db, request, &unknown_cards);
+    let check = evaluate_oathbreaker(db, request, &unknown_cards, format_rules);
     QuickCheckResult {
         reason: check.reasons.into_iter().next(),
         unknown_cards,
@@ -2108,9 +2354,10 @@ fn quick_oathbreaker_check(
 fn quick_planechase_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
+    format_rules: &FormatConfig,
 ) -> QuickCheckResult {
     let unknown_cards = collect_unknown_cards(db, request);
-    let check = evaluate_planechase(db, request, &unknown_cards);
+    let check = evaluate_planechase(db, request, &unknown_cards, format_rules);
     QuickCheckResult {
         reason: check.reasons.into_iter().next(),
         unknown_cards,
@@ -2120,33 +2367,69 @@ fn quick_planechase_check(
 fn quick_archenemy_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
+    format_rules: &FormatConfig,
 ) -> QuickCheckResult {
     let unknown_cards = collect_unknown_cards(db, request);
-    let check = evaluate_archenemy(db, request, &unknown_cards);
+    let check = evaluate_archenemy(db, request, &unknown_cards, format_rules);
     QuickCheckResult {
         reason: check.reasons.into_iter().next(),
         unknown_cards,
     }
 }
 
-/// Single authority for the Phase 1a "no `CustomFormatRules` resolver exists
-/// yet" rejection text, shared by the summary and full deck-compatibility
-/// paths so the two can never drift.
-const CUSTOM_FORMAT_UNSUPPORTED: &str =
-    "Custom format deck-compatibility checks are not yet supported.";
+/// The Custom-format rejection sentinels shared by the summary and full
+/// deck-compatibility paths (and the authoritative `validate_deck_for_format`
+/// gate) so no two call sites can drift apart on wording. Four consts, not
+/// one, because only ONE of them names "nothing was computed" — the other
+/// three are definite verdicts about a format whose rules the engine DOES
+/// hold, and a UI-hint caller must see them as real `Some(false)`
+/// rejections, never silently downgraded to "no opinion" the way
+/// `evaluate_deck_compatibility` downgrades the first.
+///
+/// - [`CUSTOM_FORMAT_UNRESOLVED`]: `SelectedFormat::rules()` returned `Err` —
+///   a bare, untrusted `Tag(Custom(_))` with no `FormatConfig` behind it at
+///   all (see the Wire-Inertness Invariant on `SelectedFormat`,
+///   `types::format`). The ONLY sentinel `evaluate_deck_compatibility`'s "no
+///   opinion" downgrade matches: there is genuinely no rules verdict to
+///   report.
+/// - [`CUSTOM_FORMAT_MISSING_RULES`]: `rules()` succeeded but
+///   `FormatConfig.custom_rules` is `None`. Defense-in-depth only —
+///   `validate_custom_rules_consistency` already forbids this shape at
+///   `FormatConfig::deserialize`.
+/// - [`CUSTOM_FORMAT_UNIMPLEMENTED_LEGACY_AXIS`]: the resolved rules declare
+///   a `LegacyRuleSet` axis outside `IMPLEMENTED_LEGACY_AXES`.
+///   Defense-in-depth only — `FormatConfig::deserialize` already rejects an
+///   undeclared axis via `passes_legacy_axis_gate`, and
+///   `FormatConfig::for_custom_rules` (the only resolver) is total and
+///   applies no gate of its own.
+/// - [`CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED`]: the resolved rules declare
+///   `CommandZoneMode::Enabled`. The one genuinely PRODUCTION-REACHABLE gate
+///   of these last three: `CustomFormatDef::from_lobby_config` produces
+///   `Enabled` whenever a host saves a Commander/Brawl/Tiny-Leaders/
+///   Oathbreaker-shaped lobby as a custom format, and no commander-style
+///   evaluator is wired for custom formats yet — this phase only widens the
+///   constructed-shaped (no command zone) evaluation path.
+const CUSTOM_FORMAT_UNRESOLVED: &str = "This format's rules could not be resolved.";
+const CUSTOM_FORMAT_MISSING_RULES: &str = "Custom format is missing its declared rules.";
+const CUSTOM_FORMAT_UNIMPLEMENTED_LEGACY_AXIS: &str =
+    "Custom format declares a legacy rules axis the engine does not enforce yet.";
+const CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED: &str =
+    "Custom format deck-compatibility checks are not yet supported for command-zone formats.";
 
 fn evaluate_selected_format_summary(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
 ) -> (Option<bool>, Vec<String>, BTreeSet<String>) {
-    let Some(format) = request.selected_format else {
+    let Some(selected) = request.selected_format.as_ref() else {
         return (None, Vec::new(), BTreeSet::new());
     };
+    let format = selected.tag();
 
-    // `GameFormat::uses_commander()` returns `Err` for `Custom` (a bare
-    // GameFormat cannot resolve it — see types::format), and the companion /
-    // signature-spell pre-guards below call it. `selected_format` arrives from
-    // an untrusted request, so Custom must be answered before those guards run.
+    // `SelectedFormat::rules()` returns `Err` only for a bare `Tag(Custom(_))`
+    // (see types::format's Wire-Inertness Invariant), and the companion /
+    // signature-spell pre-guards below need the resolved rules. `selected_format`
+    // arrives from an untrusted request, so an unresolvable format must be
+    // answered before those guards run.
     //
     // The answer is "no opinion" (`None`), matching the idle downgrade
     // `evaluate_deck_compatibility` applies to the full path: this function is
@@ -2157,12 +2440,10 @@ fn evaluate_selected_format_summary(
     // so answering honestly here grants nothing. Verified by tracing every
     // caller; keep it that way — a new caller outside that chain must use
     // `evaluate_deck_format_gate` instead.
-    if matches!(format, GameFormat::Custom(_)) {
+    let Ok(format_rules) = selected.rules() else {
         return (None, Vec::new(), BTreeSet::new());
-    }
-    let uses_commander = format
-        .uses_commander()
-        .expect("format is guaranteed non-Custom by the preceding check");
+    };
+    let uses_commander = format_rules.uses_commander;
 
     if !uses_commander && !request.companion.is_empty() {
         return (
@@ -2189,10 +2470,9 @@ fn evaluate_selected_format_summary(
         GameFormat::Standard => quick_constructed_check(
             db,
             request,
-            GameFormat::Standard,
-            LegalityFormat::Standard,
+            &format_rules,
+            CardPoolAuthority::LegalityTable(LegalityFormat::Standard),
             "Standard",
-            GameFormat::Standard.sideboard_policy(),
         ),
         GameFormat::Pioneer
         | GameFormat::Modern
@@ -2204,16 +2484,15 @@ fn evaluate_selected_format_summary(
         | GameFormat::Pauper => quick_constructed_check(
             db,
             request,
-            format,
-            format.legality_format().unwrap(),
+            &format_rules,
+            CardPoolAuthority::LegalityTable(format.legality_format().unwrap()),
             &format.label(),
-            format.sideboard_policy(),
         ),
         GameFormat::Commander => quick_commander_check(
             db,
             request,
             CommanderVariantRules::commander(),
-            GameFormat::Commander,
+            &format_rules,
         ),
         GameFormat::PauperCommander | GameFormat::DuelCommander => quick_commander_check(
             db,
@@ -2223,7 +2502,7 @@ fn evaluate_selected_format_summary(
                 GameFormat::DuelCommander => CommanderVariantRules::duel_commander(),
                 _ => unreachable!("commander variant branch only handles PDH and Duel"),
             },
-            format,
+            &format_rules,
         ),
         // CR 903.13f: Commander Draft deck construction follows CR 903.5 with
         // three exceptions, so it routes through the SHARED commander
@@ -2235,28 +2514,23 @@ fn evaluate_selected_format_summary(
             db,
             request,
             CommanderVariantRules::commander_draft(commander_draft_partner_grant(request)),
-            format,
+            &format_rules,
         ),
-        GameFormat::TinyLeaders => quick_tiny_leaders_check(db, request),
-        GameFormat::Oathbreaker => quick_oathbreaker_check(db, request),
+        GameFormat::TinyLeaders => quick_tiny_leaders_check(db, request, &format_rules),
+        GameFormat::Oathbreaker => quick_oathbreaker_check(db, request, &format_rules),
         GameFormat::Momir => quick_momir_check(db, request),
-        GameFormat::Planechase => quick_planechase_check(db, request),
-        GameFormat::Archenemy => quick_archenemy_check(db, request),
+        GameFormat::Planechase => quick_planechase_check(db, request, &format_rules),
+        GameFormat::Archenemy => quick_archenemy_check(db, request, &format_rules),
         GameFormat::Brawl | GameFormat::HistoricBrawl => {
-            quick_brawl_check(db, request, &format.label(), format)
+            quick_brawl_check(db, request, &format.label(), &format_rules)
         }
         GameFormat::FreeForAll | GameFormat::TwoHeadedGiant | GameFormat::Limited => {
             QuickCheckResult::compatible()
         }
-        // UNREACHABLE: the early guard above answers Custom (as "no opinion")
-        // before `uses_commander()` would return `Err` for it. Present for
-        // exhaustiveness only, and deliberately kept fail-closed rather than
-        // mirrored to the guard's `None`: if that guard is ever removed, the
-        // safe regression is a visible "not yet supported" rejection, never a
-        // silent pass. No CustomFormatRules resolver exists yet (Phase 1d).
-        GameFormat::Custom(_) => {
-            QuickCheckResult::incompatible(CUSTOM_FORMAT_UNSUPPORTED.to_string())
-        }
+        // Phase 1d: reachable for a `Resolved` Custom config (the early guard
+        // above only answers "no opinion" for an unresolvable bare
+        // `Tag(Custom(_))`), and delegates to the real evaluator.
+        GameFormat::Custom(_) => quick_custom_format_check(db, request, &format_rules),
     };
 
     (
@@ -2297,30 +2571,38 @@ impl QuickCheckResult {
 fn quick_constructed_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
-    format: GameFormat,
-    legality_format: LegalityFormat,
+    format_rules: &FormatConfig,
+    pool: CardPoolAuthority<'_>,
     format_label: &str,
-    sideboard_policy: SideboardPolicy,
 ) -> QuickCheckResult {
     if !request.commander.is_empty() {
         return QuickCheckResult::incompatible(format!(
             "{format_label} decks do not use a commander slot"
         ));
     }
-    if request.main_deck.len() < 60 {
+    // CR 100.5 / CR 903.5a: the format's own deck-size rule is authoritative —
+    // never re-derive a hardcoded 60 by hand.
+    if !format_rules.deck_size.accepts(request.main_deck.len()) {
         return QuickCheckResult::incompatible(format!(
-            "Main deck has {} cards (minimum 60)",
+            "{format_label} deck must have {} cards (found {})",
+            format_rules.deck_size.requirement_phrase(),
             request.main_deck.len()
         ));
     }
-    if let SideboardPolicy::Limited(max) = sideboard_policy {
-        if request.sideboard.len() as u32 > max {
+    match format_rules.sideboard_policy {
+        SideboardPolicy::Forbidden if !request.sideboard.is_empty() => {
+            return QuickCheckResult::incompatible(format!(
+                "{format_label} does not allow a sideboard"
+            ));
+        }
+        SideboardPolicy::Limited(max) if request.sideboard.len() as u32 > max => {
             return QuickCheckResult::incompatible(format!(
                 "Sideboard has {} cards (maximum {})",
                 request.sideboard.len(),
                 max
             ));
         }
+        SideboardPolicy::Forbidden | SideboardPolicy::Limited(_) | SideboardPolicy::Unlimited => {}
     }
 
     let mut counts: HashMap<String, u32> = HashMap::new();
@@ -2332,7 +2614,7 @@ fn quick_constructed_check(
         }
         let canonical = canonical_deck_count_key(db, name);
         *counts.entry(canonical.clone()).or_insert(0) += 1;
-        match db.legality_status(&resolved, legality_format) {
+        match pool.status(db, &resolved) {
             Some(LegalityStatus::Legal) => {}
             Some(LegalityStatus::Restricted) => {
                 restricted.insert(canonical);
@@ -2351,7 +2633,7 @@ fn quick_constructed_check(
         }
     }
 
-    let limit = resolved_copy_limit(request, format);
+    let limit = format_rules.default_deck_copy_limit;
     if let Some(reason) = copy_limit_violations(db, &counts, limit).into_iter().next() {
         return QuickCheckResult::incompatible(format!("{}: {reason}", copy_limit_label(limit)));
     }
@@ -2368,20 +2650,18 @@ fn quick_constructed_check(
 }
 
 /// Summary-path twin of [`evaluate_commander_with_format`], and bound by the
-/// same invariant: a fact one twin derives from `game_format` and the other
+/// same invariant: a fact one twin derives from `format_rules` and the other
 /// hard-codes is a divergence between the full and summary verdicts for the
 /// same deck. The two must state the same answer for the same request.
 fn quick_commander_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     rules: CommanderVariantRules,
-    game_format: GameFormat,
+    format_rules: &FormatConfig,
 ) -> QuickCheckResult {
-    let legality_format = game_format.legality_format();
-    let format_label = game_format.label();
-    let expected = FormatConfig::for_format(game_format)
-        .expect("quick_commander_check is only dispatched for a built-in commander format")
-        .deck_size;
+    let legality_format = format_rules.format.legality_format();
+    let format_label = format_rules.format.label();
+    let expected = format_rules.deck_size;
     // CR 702.124g: at most two commanders. Pre-existing and unchanged by this
     // phase; named here so a later reader does not mistake draft-core's two
     // authorities for the complete set.
@@ -2408,7 +2688,7 @@ fn quick_commander_check(
     }
 
     let mut companion_reasons = Vec::new();
-    validate_commander_companion(db, request, game_format, &mut companion_reasons);
+    validate_commander_companion(db, request, format_rules, &mut companion_reasons);
     if let Some(reason) = companion_reasons.into_iter().next() {
         return QuickCheckResult::incompatible(reason);
     }
@@ -2518,12 +2798,11 @@ fn quick_commander_check(
 
     // CR 903.5b: other than basic lands, each card in a Commander deck must
     // have a different English name — but CR 903.13f(2) disapplies that for
-    // Commander Draft. The limit is a format axis, so this asks `game_format`
+    // Commander Draft. The limit is a format axis, so this asks `format_rules`
     // the same question the full validator asks and the two cannot disagree.
-    if let Some(reason) =
-        copy_limit_violations(db, &counts, resolved_copy_limit(request, game_format))
-            .into_iter()
-            .next()
+    if let Some(reason) = copy_limit_violations(db, &counts, format_rules.default_deck_copy_limit)
+        .into_iter()
+        .next()
     {
         return QuickCheckResult::incompatible(format!("Singleton violations: {reason}"));
     }
@@ -2532,13 +2811,13 @@ fn quick_commander_check(
 }
 
 /// `legality_format` is no longer a parameter: `quick_commander_check` derives
-/// it from `game_format`, and nothing else in this function consulted it. That
-/// also removes an `unwrap()` on `legality_format()` at the call site.
+/// it from `format_rules`, and nothing else in this function consulted it.
+/// That also removes an `unwrap()` on `legality_format()` at the call site.
 fn quick_brawl_check(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     format_label: &str,
-    game_format: GameFormat,
+    format_rules: &FormatConfig,
 ) -> QuickCheckResult {
     if request.commander.len() != 1 {
         return QuickCheckResult::incompatible(format!(
@@ -2567,7 +2846,7 @@ fn quick_brawl_check(
             // CR 903.13f(3) is scoped to Commander Draft; Brawl never grants.
             partner_grant: None,
         },
-        game_format,
+        format_rules,
     )
 }
 
@@ -2575,22 +2854,19 @@ fn evaluate_selected_format(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
     unknown_cards: &BTreeSet<String>,
-    standard: &CompatibilityCheck,
-    commander: &CompatibilityCheck,
     bo3_ready: bool,
 ) -> (Option<bool>, Vec<String>) {
-    let Some(format) = request.selected_format else {
+    let Some(selected) = request.selected_format.as_ref() else {
         return (None, Vec::new());
     };
+    let format = selected.tag();
 
-    // See `evaluate_selected_format_summary`: Custom must be answered before
-    // the `uses_commander()`-calling pre-guards, which return `Err` for it.
-    if matches!(format, GameFormat::Custom(_)) {
-        return (Some(false), vec![CUSTOM_FORMAT_UNSUPPORTED.to_string()]);
-    }
-    let uses_commander = format
-        .uses_commander()
-        .expect("format is guaranteed non-Custom by the preceding check");
+    // See `evaluate_selected_format_summary`: an unresolvable format must be
+    // answered before the `uses_commander`-reading pre-guards.
+    let Ok(format_rules) = selected.rules() else {
+        return (Some(false), vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]);
+    };
+    let uses_commander = format_rules.uses_commander;
 
     if !uses_commander && !request.companion.is_empty() {
         return (
@@ -2614,16 +2890,31 @@ fn evaluate_selected_format(
     let mut reasons = Vec::new();
     let mut compatible = match format {
         GameFormat::Standard => {
-            if !standard.compatible {
-                reasons.extend(standard.reasons.clone());
+            let check = evaluate_constructed(
+                db,
+                request,
+                unknown_cards,
+                &format_rules,
+                CardPoolAuthority::LegalityTable(LegalityFormat::Standard),
+                "Standard",
+            );
+            if !check.compatible {
+                reasons.extend(check.reasons);
             }
-            standard.compatible
+            check.compatible
         }
         GameFormat::Commander => {
-            if !commander.compatible {
-                reasons.extend(commander.reasons.clone());
+            let check = evaluate_commander_with_format(
+                db,
+                request,
+                unknown_cards,
+                CommanderVariantRules::commander(),
+                &format_rules,
+            );
+            if !check.compatible {
+                reasons.extend(check.reasons);
             }
-            commander.compatible
+            check.compatible
         }
         GameFormat::Pioneer
         | GameFormat::Modern
@@ -2637,10 +2928,9 @@ fn evaluate_selected_format(
                 db,
                 request,
                 unknown_cards,
-                format,
-                format.legality_format().unwrap(),
+                &format_rules,
+                CardPoolAuthority::LegalityTable(format.legality_format().unwrap()),
                 &format.label(),
-                format.sideboard_policy(),
             );
             if !check.compatible {
                 reasons.extend(check.reasons);
@@ -2661,7 +2951,7 @@ fn evaluate_selected_format(
                     GameFormat::DuelCommander => CommanderVariantRules::duel_commander(),
                     _ => unreachable!("commander variant branch only handles PDH and Duel"),
                 },
-                format,
+                &format_rules,
             );
             if !check.compatible {
                 reasons.extend(check.reasons);
@@ -2675,7 +2965,7 @@ fn evaluate_selected_format(
                 unknown_cards,
                 format.legality_format().unwrap(),
                 &format.label(),
-                format,
+                &format_rules,
             );
             if !check.compatible {
                 reasons.extend(check.reasons);
@@ -2683,14 +2973,14 @@ fn evaluate_selected_format(
             check.compatible
         }
         GameFormat::TinyLeaders => {
-            let check = evaluate_tiny_leaders(db, request, unknown_cards);
+            let check = evaluate_tiny_leaders(db, request, unknown_cards, &format_rules);
             if !check.compatible {
                 reasons.extend(check.reasons);
             }
             check.compatible
         }
         GameFormat::Oathbreaker => {
-            let check = evaluate_oathbreaker(db, request, unknown_cards);
+            let check = evaluate_oathbreaker(db, request, unknown_cards, &format_rules);
             if !check.compatible {
                 reasons.extend(check.reasons);
             }
@@ -2704,14 +2994,14 @@ fn evaluate_selected_format(
             check.compatible
         }
         GameFormat::Planechase => {
-            let check = evaluate_planechase(db, request, unknown_cards);
+            let check = evaluate_planechase(db, request, unknown_cards, &format_rules);
             if !check.compatible {
                 reasons.extend(check.reasons);
             }
             check.compatible
         }
         GameFormat::Archenemy => {
-            let check = evaluate_archenemy(db, request, unknown_cards);
+            let check = evaluate_archenemy(db, request, unknown_cards, &format_rules);
             if !check.compatible {
                 reasons.extend(check.reasons);
             }
@@ -2725,7 +3015,7 @@ fn evaluate_selected_format(
                 request,
                 unknown_cards,
                 CommanderVariantRules::commander_draft(commander_draft_partner_grant(request)),
-                format,
+                &format_rules,
             );
             if !check.compatible {
                 reasons.extend(check.reasons);
@@ -2733,13 +3023,15 @@ fn evaluate_selected_format(
             check.compatible
         }
         GameFormat::FreeForAll | GameFormat::TwoHeadedGiant | GameFormat::Limited => true,
-        // See evaluate_selected_format_summary's Custom arm: no
-        // CustomFormatRules resolver exists yet. `false` is the honest,
-        // fail-closed "not yet supported" signal. Reached only for
-        // exhaustiveness — the early guard above answers Custom first.
+        // Phase 1d: reachable for a `Resolved` Custom config (the early guard
+        // above only fails closed for an unresolvable bare `Tag(Custom(_))`),
+        // and delegates to the real evaluator.
         GameFormat::Custom(_) => {
-            reasons.push(CUSTOM_FORMAT_UNSUPPORTED.to_string());
-            false
+            let check = evaluate_custom_format(db, request, unknown_cards, &format_rules);
+            if !check.compatible {
+                reasons.extend(check.reasons);
+            }
+            check.compatible
         }
     };
 
@@ -3254,10 +3546,11 @@ fn copy_limit_violations(
     violations
 }
 
-/// CR 100.2b: Flag any card the active format marks as `Restricted` whose
-/// combined main+sideboard count exceeds 1. The 1-copy ceiling is
-/// format-general — Vintage is the canonical consumer, but the rule applies
-/// to any format whose legality table uses `Restricted`.
+/// CR 100.6: Tournament rules may limit a card's use. Flag any card the
+/// active format marks as `Restricted` whose combined main+sideboard count
+/// exceeds Phase's established one-copy format-policy. Vintage is the
+/// canonical consumer, but the policy applies to any format whose legality
+/// table uses `Restricted`.
 /// `restricted_canonical` is the set of canonical (DFC-resolved, lowercased)
 /// names that the legality table marks as `Restricted` for the active format;
 /// `counts` is the combined main+sideboard map produced by `combined_copy_counts`.
@@ -3285,22 +3578,6 @@ fn restricted_copy_violations(
         violations.insert(format!("{display} ({count} copies)"));
     }
     violations
-}
-
-/// CR 100.2a / CR 100.2b / CR 903.5b: the copy-limit ceiling every
-/// `evaluate_*`/`quick_*` dispatch function must enforce for `format`,
-/// honoring a caller-threaded resolved value
-/// (`DeckCompatibilityRequest::default_deck_copy_limit`) when present and
-/// falling back to the bare `GameFormat::default_deck_copy_limit()`
-/// otherwise — identical to every one of these functions' pre-fix
-/// behavior when no resolved config is threaded in. This is admission's
-/// single authority for the format-default half of the copy rule, mirroring
-/// `max_deck_copies`'s query-shaped counterpart so the two can never
-/// diverge for a request that carries a resolved config.
-fn resolved_copy_limit(request: &DeckCompatibilityRequest, format: GameFormat) -> DeckCopyLimit {
-    request
-        .default_deck_copy_limit
-        .unwrap_or_else(|| format.default_deck_copy_limit())
 }
 
 /// CR 100.2a / CR 100.4a: the violation-message prefix for an overrun of
@@ -3371,28 +3648,71 @@ fn effective_copy_limit(
 /// distinct violation (`restricted_copy_violations`), so the shared helper must
 /// keep the two failures separable. A caller asking "how many may I have?"
 /// wants the one ceiling that actually binds.
+///
+/// Admission (every `evaluate_*`/`quick_*` dispatch function in this module)
+/// now reads the identical field off the identical type — `format_rules.
+/// default_deck_copy_limit`, threaded in via `SelectedFormat::rules()` — so
+/// the two halves of the copy rule can never diverge.
+///
+/// Dispatches on the format DISCRIMINANT (`format_config.format`), never on
+/// whether `custom_rules` happens to be populated: matching on
+/// `custom_rules.is_some()` instead would put two representable-but-invalid
+/// states in the wrong arm — `(format: Vintage, custom_rules: Some(..))`
+/// would silently drop Vintage's restricted list, and `(Custom(_),
+/// custom_rules: None)` would apply no cap at all (fail-OPEN, against this
+/// function's own fail-closed `UpTo(1)` convention below).
+/// `validate_custom_rules_consistency` enforces the `format ==
+/// Custom(id) ⟺ custom_rules == Some(rules with that id)` biconditional only
+/// inside `FormatConfig::deserialize` (an ingress property), never as a type
+/// invariant `FormatConfig` itself enforces — so a caller holding a bare,
+/// non-deserialized `FormatConfig` value can still violate it, and this
+/// function is `pub`.
+///
+/// Pre-existing, but newly load-bearing: `max_deck_copies_for_format`
+/// (`engine-wasm/src/lib.rs:999-1000`) returns `DeckCopyLimit::Unlimited`
+/// whenever the `FormatConfig` JSON it receives fails to deserialize. A stale
+/// localStorage custom-format save — exactly what the deserialize equality
+/// gate rejects after a host edits, say, seat count without re-deriving the
+/// rest of the config — therefore leaves the deck builder's `+` control
+/// unbounded instead of enforcing this function's declared limit.
 pub fn max_deck_copies(
     db: &CardDatabase,
     name: &str,
     format_config: &FormatConfig,
 ) -> DeckCopyLimit {
-    // CR 100.2b: a card the format's legality table marks Restricted is legal
-    // at no more than one copy, whichever way the format default or the card's
-    // printed override would otherwise point. Vintage is the canonical user,
-    // but the lookup is format-general.
-    if format_config
-        .format
-        .legality_format()
-        .and_then(|legality_format| db.legality_status(name, legality_format))
-        .is_some_and(|status| status == LegalityStatus::Restricted)
-    {
+    let canonical = canonical_deck_count_key(db, name);
+    // CR 100.6: a card a format's tournament rules mark Restricted is legal at
+    // no more than one copy, whichever way the format default or the card's
+    // printed override would otherwise point. Vintage is the canonical
+    // built-in user, but the rule is format-general.
+    let restricted =
+        match format_config.format {
+            GameFormat::Custom(_) => {
+                // A custom format's restricted list lives on `custom_rules`, never
+                // on the built-in `LegalityFormat` table (`legality_format()` is
+                // always `None` for `Custom` — see `types::format.rs`).
+                // `custom_rules: None` here means this `FormatConfig` never passed
+                // `validate_custom_rules_consistency` — should be unreachable, but
+                // if it happens, fail CLOSED: treat it as restricted (`UpTo(1)`),
+                // matching this function's own fail-closed convention, rather than
+                // silently applying no cap.
+                let Some(rules) = format_config.custom_rules.as_deref() else {
+                    return DeckCopyLimit::UpTo(1);
+                };
+                rules.legality.restricted.iter().any(|restricted_name| {
+                    canonical_deck_count_key(db, restricted_name) == canonical
+                })
+            }
+            _ => format_config
+                .format
+                .legality_format()
+                .and_then(|legality_format| db.legality_status(name, legality_format))
+                .is_some_and(|status| status == LegalityStatus::Restricted),
+        };
+    if restricted {
         return DeckCopyLimit::UpTo(1);
     }
-    effective_copy_limit(
-        db,
-        &canonical_deck_count_key(db, name),
-        format_config.default_deck_copy_limit,
-    )
+    effective_copy_limit(db, &canonical, format_config.default_deck_copy_limit)
 }
 
 /// CR 100.2a / CR 903.5b: Resolve a card's deck-construction copy-limit override.
@@ -3855,7 +4175,12 @@ fn subtype_partner_match(
 mod tests {
     use super::*;
 
-    use crate::types::custom_format::CustomFormatId;
+    use crate::types::custom_format::{
+        CombatDamageTiming, CommanderEligibilityRule, CustomFormatDef, CustomFormatId,
+        CustomFormatRules, LegacyRuleSet, LegendRuleScope, ManaBurnPolicy, PrintingFidelity,
+        ReprintPolicy, StructuralRules, WishOutsideGameScope,
+    };
+    use crate::types::format::DeckSizeRule;
     use crate::types::keywords::PartnerType;
     use serde_json::{Map, Value};
 
@@ -3884,6 +4209,7 @@ mod tests {
                     "commander": "legal",
                     "premodern": "legal",
                     "pioneer": "legal",
+                    "modern": "legal",
                     "pauper": "legal",
                     "standardbrawl": "legal",
                     "brawl": "legal"
@@ -3916,6 +4242,7 @@ mod tests {
                     "commander": "legal",
                     "premodern": "legal",
                     "pioneer": "legal",
+                    "modern": "legal",
                     "pauper": "legal",
                     "standardbrawl": "legal",
                     "brawl": "legal"
@@ -4357,12 +4684,11 @@ mod tests {
             planar_deck,
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Planechase),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Planechase)),
             selected_match_type: None,
             player_count,
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         }
     }
 
@@ -4407,12 +4733,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck,
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Archenemy),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Archenemy)),
             selected_match_type: None,
             player_count: 4,
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         }
     }
 
@@ -4420,7 +4745,7 @@ mod tests {
     fn archenemy_accepts_valid_twenty_card_scheme_deck() {
         let db = archenemy_test_db();
         let request = archenemy_request(scheme_names(20));
-        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new(), &FormatConfig::archenemy());
 
         assert!(check.compatible, "reasons: {:?}", check.reasons);
     }
@@ -4429,7 +4754,7 @@ mod tests {
     fn archenemy_rejects_short_scheme_deck() {
         let db = archenemy_test_db();
         let request = archenemy_request(scheme_names(19));
-        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new(), &FormatConfig::archenemy());
 
         assert!(!check.compatible);
         assert!(
@@ -4448,7 +4773,7 @@ mod tests {
         let mut scheme_deck = scheme_names(18);
         scheme_deck.extend(["Scheme 1".to_string(), "Scheme 1".to_string()]);
         let request = archenemy_request(scheme_deck);
-        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new(), &FormatConfig::archenemy());
 
         assert!(!check.compatible);
         assert!(
@@ -4467,7 +4792,7 @@ mod tests {
         let mut scheme_deck = scheme_names(19);
         scheme_deck.push("Legal Standard".to_string());
         let request = archenemy_request(scheme_deck);
-        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new(), &FormatConfig::archenemy());
 
         assert!(!check.compatible);
         assert!(
@@ -4486,7 +4811,7 @@ mod tests {
         let mut scheme_deck = scheme_names(19);
         scheme_deck.push("Unsupported Scheme".to_string());
         let request = archenemy_request(scheme_deck);
-        let check = evaluate_archenemy(&db, &request, &BTreeSet::new());
+        let check = evaluate_archenemy(&db, &request, &BTreeSet::new(), &FormatConfig::archenemy());
 
         assert!(!check.compatible);
         assert!(
@@ -4505,7 +4830,8 @@ mod tests {
 
         for (player_count, minimum) in [(2, 20), (3, 30), (4, 40)] {
             let short = planechase_request(player_count, plane_names(minimum - 1));
-            let check = evaluate_planechase(&db, &short, &BTreeSet::new());
+            let check =
+                evaluate_planechase(&db, &short, &BTreeSet::new(), &FormatConfig::planechase());
             assert!(
                 !check.compatible,
                 "{player_count}-player Planechase must reject a {minimum_minus_one}-card planar deck",
@@ -4521,7 +4847,8 @@ mod tests {
             );
 
             let exact = planechase_request(player_count, plane_names(minimum));
-            let check = evaluate_planechase(&db, &exact, &BTreeSet::new());
+            let check =
+                evaluate_planechase(&db, &exact, &BTreeSet::new(), &FormatConfig::planechase());
             assert!(
                 check.compatible,
                 "{player_count}-player Planechase must accept exactly {minimum} planar cards, reasons: {:?}",
@@ -4536,7 +4863,12 @@ mod tests {
         let mut planar_deck = plane_names(15);
         planar_deck.extend(phenomenon_names(5));
 
-        let check = evaluate_planechase(&db, &planechase_request(2, planar_deck), &BTreeSet::new());
+        let check = evaluate_planechase(
+            &db,
+            &planechase_request(2, planar_deck),
+            &BTreeSet::new(),
+            &FormatConfig::planechase(),
+        );
 
         assert!(!check.compatible, "five phenomena exceeds the 2-player cap");
         assert!(
@@ -4555,7 +4887,12 @@ mod tests {
         let mut planar_deck = plane_names(19);
         planar_deck.push("Plane 1".to_string());
 
-        let check = evaluate_planechase(&db, &planechase_request(2, planar_deck), &BTreeSet::new());
+        let check = evaluate_planechase(
+            &db,
+            &planechase_request(2, planar_deck),
+            &BTreeSet::new(),
+            &FormatConfig::planechase(),
+        );
 
         assert!(
             !check.compatible,
@@ -4576,7 +4913,12 @@ mod tests {
         let mut planar_deck = plane_names(19);
         planar_deck.push("Legal Standard".to_string());
 
-        let check = evaluate_planechase(&db, &planechase_request(2, planar_deck), &BTreeSet::new());
+        let check = evaluate_planechase(
+            &db,
+            &planechase_request(2, planar_deck),
+            &BTreeSet::new(),
+            &FormatConfig::planechase(),
+        );
 
         assert!(
             !check.compatible,
@@ -4595,7 +4937,12 @@ mod tests {
     #[test]
     fn planechase_empty_custom_planar_deck_is_allowed() {
         let db = planechase_test_db();
-        let check = evaluate_planechase(&db, &planechase_request(2, Vec::new()), &BTreeSet::new());
+        let check = evaluate_planechase(
+            &db,
+            &planechase_request(2, Vec::new()),
+            &BTreeSet::new(),
+            &FormatConfig::planechase(),
+        );
 
         assert!(
             check.compatible,
@@ -4707,6 +5054,26 @@ mod tests {
                 "color_override": null,
                 "scryfall_oracle_id": null,
                 "legalities": { "commander": "legal" }
+            },
+            "small spell": {
+                "name": "Small Spell",
+                "mana_cost": { "type": "Cost", "shards": [], "generic": 1 },
+                "card_type": { "supertypes": [], "core_types": ["Sorcery"], "subtypes": [] },
+                "power": null,
+                "toughness": null,
+                "loyalty": null,
+                "defense": null,
+                "oracle_text": null,
+                "non_ability_text": null,
+                "flavor_name": null,
+                "keywords": [],
+                "abilities": [],
+                "triggers": [],
+                "static_abilities": [],
+                "replacements": [],
+                "color_override": null,
+                "scryfall_oracle_id": null,
+                "legalities": { "commander": "legal" }
             }
         })
         .to_string()
@@ -4728,7 +5095,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4757,7 +5123,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -4907,7 +5272,8 @@ mod tests {
         );
     }
 
-    /// CR 100.2b: the restricted list is a copy ceiling, so the query the deck
+    /// CR 100.6: Tournament rules may limit a card's use; Phase's restricted
+    /// list uses its established one-copy format-policy, so the query the deck
     /// builder gates its increment control on has to honour it — otherwise the
     /// `+` stays live through four Black Lotuses and the deck only fails later,
     /// at validation. The restriction is format-scoped: the same card is a
@@ -4968,7 +5334,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let counts = combined_copy_counts(&db, &request, CommandZoneNetting::NetAgainstMainDeck);
@@ -4994,7 +5359,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5018,12 +5382,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: true,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5047,12 +5410,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: vec!["Grub Commander".to_string()],
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let full = evaluate_deck_compatibility(&db, &request);
@@ -5104,12 +5466,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let full = evaluate_deck_compatibility(&db, &request);
@@ -5148,12 +5509,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let full = evaluate_deck_compatibility(&db, &request);
@@ -5200,7 +5560,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5228,12 +5587,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: Some(MatchType::Bo3),
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let with_sideboard = DeckCompatibilityRequest {
             sideboard: vec!["Legal Standard".to_string()],
@@ -5268,7 +5626,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5298,7 +5655,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5369,12 +5725,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::PauperCommander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::PauperCommander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5446,12 +5801,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::PauperCommander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::PauperCommander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5522,12 +5876,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::PauperCommander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::PauperCommander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5558,7 +5911,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5581,16 +5933,15 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::FreeForAll),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::FreeForAll)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let thg_request = DeckCompatibilityRequest {
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::TwoHeadedGiant),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::TwoHeadedGiant)),
             ..request.clone()
         };
 
@@ -5615,12 +5966,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: Some(MatchType::Bo1),
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let commander_request = DeckCompatibilityRequest {
             main_deck: expand("Legal Standard", 99),
@@ -5630,12 +5980,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: Some(MatchType::Bo1),
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let standard_result = evaluate_deck_compatibility(&db, &standard_request);
@@ -5670,12 +6019,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Pioneer),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Pioneer)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &legal_request);
         assert_eq!(result.selected_format_compatible, Some(true));
@@ -5692,12 +6040,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Premodern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5716,12 +6063,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Premodern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5744,12 +6090,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Premodern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -5773,12 +6118,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Premodern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &commander_request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -5795,12 +6139,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Premodern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &oversize_sideboard);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -5819,12 +6162,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Premodern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Premodern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &copy_limit);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -5896,7 +6238,7 @@ mod tests {
             GameFormat::Custom(CustomFormatId(1)),
             None,
         );
-        assert_eq!(result, Err(vec![CUSTOM_FORMAT_UNSUPPORTED.to_string()]));
+        assert_eq!(result, Err(vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]));
     }
 
     /// A deck that is genuinely, fully legal in Standard — 4 copies of a
@@ -5913,30 +6255,30 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(format),
+            selected_format: Some(SelectedFormat::Tag(format)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         }
     }
 
-    /// The AUTHORITATIVE game-creation gate keeps rejecting Custom on its own,
-    /// independently of `evaluate_selected_format`'s answer. This is the guard
-    /// that makes `evaluate_deck_compatibility`'s "no opinion" UI downgrade
-    /// safe: revert the `GameFormat::Custom(_)` guard at the top of
-    /// `validate_deck_for_format` and this assertion flips to `Ok(())`, because
-    /// the downgrade path and this path would then share one verdict.
+    /// The AUTHORITATIVE game-creation gate keeps rejecting an unresolvable
+    /// bare Custom tag on its own, independently of `evaluate_selected_format`'s
+    /// answer. This is the guard that makes `evaluate_deck_compatibility`'s
+    /// "no opinion" UI downgrade safe: revert the `rules().is_err()` guard at
+    /// the top of `validate_deck_for_format` and this assertion flips to
+    /// `Ok(())`, because the downgrade path and this path would then share one
+    /// verdict.
     #[test]
     fn validate_deck_for_format_rejects_custom_independently_of_the_ui_hint() {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
         let request = fully_legal_standard_request(GameFormat::Custom(CustomFormatId(1)));
         assert_eq!(
             validate_deck_for_format(&db, &request),
-            Err(vec![CUSTOM_FORMAT_UNSUPPORTED.to_string()]),
-            "the authoritative gate must fail closed on Custom even for a deck \
-             that is fully legal in a real format"
+            Err(vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]),
+            "the authoritative gate must fail closed on an unresolvable Custom tag even for a \
+             deck that is fully legal in a real format"
         );
     }
 
@@ -5968,7 +6310,7 @@ mod tests {
             !gate.compatible,
             "the guest-kick gate must never silently pass a Custom-format deck"
         );
-        assert_eq!(gate.reasons, vec![CUSTOM_FORMAT_UNSUPPORTED.to_string()]);
+        assert_eq!(gate.reasons, vec![CUSTOM_FORMAT_UNRESOLVED.to_string()]);
 
         // The whole point of the split: the UI-hint function, on this exact
         // request, deliberately answers "no opinion" instead. If these two ever
@@ -5990,12 +6332,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Pauper),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Pauper)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &illegal_request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6023,19 +6364,17 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let check = evaluate_constructed(
             &db,
             &request,
             &unknown_cards,
-            GameFormat::Pioneer,
-            LegalityFormat::Pioneer,
+            &FormatConfig::pioneer(),
+            CardPoolAuthority::LegalityTable(LegalityFormat::Pioneer),
             "Pioneer",
-            GameFormat::Pioneer.sideboard_policy(),
         );
         assert!(!check.compatible);
-        assert!(check.reasons.iter().any(|r| r.contains("minimum 60")));
+        assert!(check.reasons.iter().any(|r| r.contains("at least 60")));
         assert!(check
             .reasons
             .iter()
@@ -6053,12 +6392,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Brawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Brawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(true));
@@ -6075,12 +6413,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Brawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Brawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(true));
@@ -6097,12 +6434,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Brawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Brawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6126,12 +6462,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Brawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Brawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6152,12 +6487,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Brawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Brawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6178,12 +6512,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::HistoricBrawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::HistoricBrawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6204,12 +6537,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::TinyLeaders),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::TinyLeaders)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -6246,12 +6578,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::TinyLeaders),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::TinyLeaders)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -6278,12 +6609,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::TinyLeaders),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::TinyLeaders)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -6311,12 +6641,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::HistoricBrawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::HistoricBrawl)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(true));
@@ -6324,7 +6653,7 @@ mod tests {
         // Same deck should fail Standard Brawl
         let brawl_request = DeckCompatibilityRequest {
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Brawl),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Brawl)),
             ..request
         };
         let brawl_result = evaluate_deck_compatibility(&db, &brawl_request);
@@ -6731,12 +7060,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = validate_deck_for_format(&db, &request);
         assert!(result.is_err());
@@ -6766,12 +7094,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         assert!(validate_deck_for_format(&db, &request).is_ok());
     }
@@ -6787,12 +7114,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: vec!["Legal Standard".to_string()],
-            selected_format: Some(GameFormat::Modern),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Modern)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let full = evaluate_deck_compatibility(&db, &request);
@@ -6827,12 +7153,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::FreeForAll),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::FreeForAll)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         assert!(validate_deck_for_format(&db, &request).is_ok());
     }
@@ -6848,12 +7173,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: vec!["Big Spell".to_string()],
-            selected_format: Some(GameFormat::Oathbreaker),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Oathbreaker)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -6889,7 +7213,6 @@ mod tests {
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         assert!(validate_deck_for_format(&db, &request).is_ok());
     }
@@ -6908,12 +7231,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(
@@ -6935,12 +7257,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6964,12 +7285,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -6991,12 +7311,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(true));
@@ -7019,12 +7338,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -7074,12 +7392,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(true));
@@ -7102,12 +7419,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(!result.commander.compatible);
@@ -7131,12 +7447,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
         let result = evaluate_deck_compatibility(&db, &request);
@@ -7197,12 +7512,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(
@@ -7262,12 +7576,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(
@@ -7292,12 +7605,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(
@@ -7322,12 +7634,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let err = validate_deck_for_format(&db, &request)
             .expect_err("16-card sideboard must be rejected at registration");
@@ -7348,12 +7659,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::FreeForAll),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::FreeForAll)),
             selected_match_type: Some(MatchType::Bo3),
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &no_sideboard);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -7381,12 +7691,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = validate_deck_for_format(&db, &request);
         assert!(result.is_err());
@@ -7487,12 +7796,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(
@@ -7515,12 +7823,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(
@@ -7543,12 +7850,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(
@@ -7575,12 +7881,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert!(
@@ -7624,9 +7929,10 @@ mod tests {
 
     #[test]
     fn vintage_one_copy_of_restricted_card_is_legal() {
-        // CR 100.2b: A restricted card is legal in Vintage at no more than
-        // one copy. Regression for a bug where `is_legal()` rejected the
-        // `Restricted` status, marking Power 9 as illegal in Vintage decks.
+        // CR 100.6: Tournament rules may limit a card's use. Phase's
+        // `Restricted` status uses a one-copy format-policy. Regression for a
+        // bug where `is_legal()` rejected the status, marking Power 9 as
+        // illegal in Vintage decks.
         let db = CardDatabase::from_json_str(&vintage_test_db()).unwrap();
         let mut main = vec!["Black Lotus".to_string()];
         main.extend(expand("Island", 59));
@@ -7638,12 +7944,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Vintage),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Vintage)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(
@@ -7656,9 +7961,10 @@ mod tests {
 
     #[test]
     fn vintage_two_copies_of_restricted_card_violate_one_copy_limit() {
-        // CR 100.2b: Two copies of a restricted card violate the 1-copy
-        // ceiling — the deck must be flagged, but the message is
-        // "More than 1 copy of a restricted card", not "banned".
+        // CR 100.6: Tournament rules may limit a card's use. Two copies
+        // violate Phase's restricted-card policy — the deck must be flagged,
+        // but the message is "More than 1 copy of a restricted card", not
+        // "banned".
         let db = CardDatabase::from_json_str(&vintage_test_db()).unwrap();
         let mut main = expand("Black Lotus", 2);
         main.extend(expand("Island", 58));
@@ -7670,12 +7976,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Vintage),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Vintage)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
         let result = evaluate_deck_compatibility(&db, &request);
         assert_eq!(result.selected_format_compatible, Some(false));
@@ -7707,12 +8012,11 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Momir),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Momir)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         }
     }
 
@@ -7880,38 +8184,68 @@ mod tests {
     }
 
     #[test]
-    fn resolved_copy_limit_falls_back_to_the_bare_method_when_unset() {
-        let request = DeckCompatibilityRequest::default();
+    fn selected_format_tag_falls_back_to_the_bare_method_default() {
+        let selected = SelectedFormat::Tag(GameFormat::Standard);
         assert_eq!(
-            resolved_copy_limit(&request, GameFormat::Standard),
+            selected.rules().unwrap().default_deck_copy_limit,
             GameFormat::Standard.default_deck_copy_limit()
         );
     }
 
     #[test]
-    fn resolved_copy_limit_prefers_a_threaded_resolved_value() {
-        let request = DeckCompatibilityRequest {
-            default_deck_copy_limit: Some(DeckCopyLimit::UpTo(1)),
-            ..Default::default()
+    fn selected_format_resolved_prefers_its_own_threaded_value() {
+        let stricter = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(1),
+            ..FormatConfig::standard()
         };
+        let selected = SelectedFormat::Resolved(Box::new(stricter));
         assert_eq!(
-            resolved_copy_limit(&request, GameFormat::Standard),
+            selected.rules().unwrap().default_deck_copy_limit,
             DeckCopyLimit::UpTo(1)
         );
     }
 
+    /// V4 (Verification Matrix): the untrusted-boundary counterpart to
+    /// `SelectedFormat`'s Wire-Inertness Invariant — supersedes the deleted
+    /// `deck_compatibility_request_default_deck_copy_limit_is_wire_inert`
+    /// test, whose subject (`DeckCompatibilityRequest.default_deck_copy_limit`)
+    /// no longer exists.
     #[test]
-    fn deck_compatibility_request_default_deck_copy_limit_is_wire_inert() {
-        // `#[serde(skip_deserializing)]` must hold: the WASM bridge
-        // deserializes this struct straight from untrusted client JSON, and
-        // this field must never become a second forgeable channel for the
-        // claim `FormatConfig::deserialize` already gates.
+    fn deck_compatibility_request_selected_format_is_wire_inert() {
+        // Positive control: `FormatConfig` really does serialize to a JSON
+        // object, so the negative assertion below is not vacuous.
+        assert!(serde_json::to_value(FormatConfig::standard())
+            .unwrap()
+            .is_object());
+
         let json = serde_json::json!({
-            "selected_format": "Standard",
-            "default_deck_copy_limit": { "type": "Unlimited" }
+            "selected_format": {
+                "format": "Standard",
+                "starting_life": 20,
+                "min_players": 2,
+                "max_players": 2,
+                "deck_size": { "type": "Minimum", "data": 60 },
+                "singleton": false,
+                "command_zone": false,
+                "commander_damage_threshold": null,
+                "team_based": false,
+                "uses_commander": false,
+                "sideboard_policy": { "type": "Unlimited" },
+                "default_deck_copy_limit": { "type": "Unlimited" },
+            }
         });
-        let request: DeckCompatibilityRequest = serde_json::from_value(json).unwrap();
-        assert_eq!(request.default_deck_copy_limit, None);
+        let result: Result<DeckCompatibilityRequest, _> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "a full FormatConfig object must never deserialize into selected_format"
+        );
+
+        let tag_json = serde_json::json!({ "selected_format": "Standard" });
+        let request: DeckCompatibilityRequest = serde_json::from_value(tag_json).unwrap();
+        assert_eq!(
+            request.selected_format,
+            Some(SelectedFormat::Tag(GameFormat::Standard))
+        );
     }
 
     #[test]
@@ -7967,8 +8301,17 @@ mod tests {
         }
     }
 
+    /// `evaluate_standard` remains category (b): it hardcodes
+    /// `&FormatConfig::standard()` for the reference-column STD badge and
+    /// never reads the request's resolved rules. But `evaluate_selected_format`'s
+    /// literal `GameFormat::Standard` arm is a SEPARATE call — it invokes
+    /// `evaluate_constructed` fresh with this request's own `format_rules`,
+    /// exactly like every other format's arm. A `Resolved` config's stricter
+    /// `default_deck_copy_limit` on a literal Standard selection is therefore
+    /// honored by the authoritative admission path, matching
+    /// `evaluate_{planechase,archenemy}_honors_a_stricter_resolved_copy_limit`.
     #[test]
-    fn validate_name_deck_for_format_full_honors_a_stricter_resolved_copy_limit() {
+    fn validate_name_deck_for_format_full_honors_a_stricter_resolved_copy_limit_on_standard() {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
         let stricter_config = FormatConfig {
             default_deck_copy_limit: DeckCopyLimit::UpTo(1),
@@ -7990,11 +8333,58 @@ mod tests {
             None,
             default_player_count(),
         ) {
-            Err(reasons) => assert!(reasons.iter().any(|r| r.contains("Red Card"))),
+            Err(reasons) => assert!(
+                reasons.iter().any(|r| r.contains("More than 1 cop")),
+                "reasons: {reasons:?}"
+            ),
             Ok(()) => panic!(
-                "2 copies of Red Card must be rejected under a FormatConfig whose resolved \
-                 default_deck_copy_limit is UpTo(1) — proves evaluate_constructed reads the \
-                 threaded field rather than the hardcoded UpTo(4)"
+                "the literal GameFormat::Standard admission arm must call evaluate_constructed \
+                 fresh with this request's resolved format_rules, honoring a stricter \
+                 default_deck_copy_limit exactly like every other format's arm"
+            ),
+        }
+    }
+
+    /// Commander sibling of the Standard test above — the registry's own
+    /// Commander `default_deck_copy_limit` is already `UpTo(1)` (a singleton
+    /// format), so `UpTo(0)` (not `UpTo(1)`) is the value that is actually
+    /// STRICTER than the registry and therefore discriminates: reverting the
+    /// `evaluate_selected_format` Commander arm to reuse the precomputed,
+    /// registry-only `commander: &CompatibilityCheck` would let this exact
+    /// fixture's single "Legal Standard" copy pass (1 <= registry's 1), so
+    /// this assertion flips to `Ok` under that regression.
+    #[test]
+    fn validate_name_deck_for_format_full_honors_a_stricter_resolved_copy_limit_on_commander() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let stricter_config = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(0),
+            ..FormatConfig::commander()
+        };
+        let mut main = expand("Legal Standard", 1);
+        main.extend(expand("Plains", 98));
+        match validate_name_deck_for_format_full(
+            &db,
+            &main,
+            &[],
+            &["Legal Commander".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            &stricter_config,
+            None,
+            default_player_count(),
+        ) {
+            Err(reasons) => assert!(
+                reasons.iter().any(|r| r.contains("Legal Standard")),
+                "reasons: {reasons:?}"
+            ),
+            Ok(()) => panic!(
+                "the literal GameFormat::Commander admission arm must call \
+                 evaluate_commander_with_format fresh with this request's resolved \
+                 format_rules, honoring a stricter default_deck_copy_limit exactly like every \
+                 other format's arm"
             ),
         }
     }
@@ -8009,16 +8399,74 @@ mod tests {
             ..planechase_request(2, plane_names(20))
         };
 
-        let unthreaded = evaluate_planechase(&db, &base, &BTreeSet::new());
+        let unthreaded =
+            evaluate_planechase(&db, &base, &BTreeSet::new(), &FormatConfig::planechase());
         assert!(unthreaded.compatible, "reasons: {:?}", unthreaded.reasons);
 
+        let stricter_rules = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(1),
+            ..FormatConfig::planechase()
+        };
         let stricter = DeckCompatibilityRequest {
-            default_deck_copy_limit: Some(DeckCopyLimit::UpTo(1)),
+            selected_format: Some(SelectedFormat::Resolved(Box::new(stricter_rules.clone()))),
             ..base
         };
-        let check = evaluate_planechase(&db, &stricter, &BTreeSet::new());
+        let check = evaluate_planechase(&db, &stricter, &BTreeSet::new(), &stricter_rules);
         assert!(!check.compatible, "reasons: {:?}", check.reasons);
         assert!(check.reasons.iter().any(|r| r.contains("Legal Standard")));
+    }
+
+    /// Representative sibling of `evaluate_planechase_honors_a_stricter_
+    /// resolved_copy_limit`, but through `evaluate_deck_compatibility`'s
+    /// `summary_only` dispatch — `evaluate_selected_format_summary` ->
+    /// `quick_planechase_check` -> `evaluate_planechase`. Fix 4 threaded
+    /// `format_rules` into `quick_planechase_check` as a parameter rather
+    /// than a re-derivation; a caller that silently passed the WRONG value
+    /// (e.g. a hardcoded `&FormatConfig::planechase()` instead of the
+    /// request's own resolved `format_rules`) would still compile, so only
+    /// an end-to-end assertion through the real dispatch — not the
+    /// compiler — can catch that class of mistake. The other three
+    /// (`Archenemy`/`TinyLeaders`/`Oathbreaker`) share the identical
+    /// `quick_*_check(db, request, &format_rules)` wiring pattern at the
+    /// same call site (`evaluate_selected_format_summary`) and are not
+    /// separately hostile-fixture-tested this round.
+    #[test]
+    fn summary_planechase_honors_a_stricter_resolved_copy_limit() {
+        let db = planechase_test_db();
+        let mut main = expand("Legal Standard", 2);
+        main.extend(expand("Plains", 58));
+        let base = DeckCompatibilityRequest {
+            main_deck: main,
+            summary_only: true,
+            ..planechase_request(2, plane_names(20))
+        };
+
+        let baseline = evaluate_deck_compatibility(&db, &base);
+        assert_eq!(
+            baseline.selected_format_compatible,
+            Some(true),
+            "reasons: {:?}",
+            baseline.selected_format_reasons
+        );
+
+        let stricter_rules = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(1),
+            ..FormatConfig::planechase()
+        };
+        let stricter = DeckCompatibilityRequest {
+            selected_format: Some(SelectedFormat::Resolved(Box::new(stricter_rules))),
+            ..base
+        };
+        let result = evaluate_deck_compatibility(&db, &stricter);
+        assert_eq!(result.selected_format_compatible, Some(false));
+        assert!(
+            result
+                .selected_format_reasons
+                .iter()
+                .any(|r| r.contains("Legal Standard")),
+            "reasons: {:?}",
+            result.selected_format_reasons
+        );
     }
 
     #[test]
@@ -8031,23 +8479,33 @@ mod tests {
             ..archenemy_request(scheme_names(20))
         };
 
-        let unthreaded = evaluate_archenemy(&db, &base, &BTreeSet::new());
+        let unthreaded =
+            evaluate_archenemy(&db, &base, &BTreeSet::new(), &FormatConfig::archenemy());
         assert!(unthreaded.compatible, "reasons: {:?}", unthreaded.reasons);
 
+        let stricter_rules = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(1),
+            ..FormatConfig::archenemy()
+        };
         let stricter = DeckCompatibilityRequest {
-            default_deck_copy_limit: Some(DeckCopyLimit::UpTo(1)),
+            selected_format: Some(SelectedFormat::Resolved(Box::new(stricter_rules.clone()))),
             ..base
         };
-        let check = evaluate_archenemy(&db, &stricter, &BTreeSet::new());
+        let check = evaluate_archenemy(&db, &stricter, &BTreeSet::new(), &stricter_rules);
         assert!(!check.compatible, "reasons: {:?}", check.reasons);
         assert!(check.reasons.iter().any(|r| r.contains("Legal Standard")));
     }
 
     #[test]
-    fn evaluate_tiny_leaders_honors_a_looser_resolved_copy_limit() {
+    fn evaluate_tiny_leaders_honors_a_stricter_resolved_copy_limit() {
         let db = CardDatabase::from_json_str(&tiny_leaders_test_db_json()).unwrap();
-        let mut main = expand("Big Spell", 2);
-        main.extend(expand("Plains", 47));
+        // "Small Spell" (MV 1, colorless, not on the Tiny Leaders deck-ban
+        // list — unlike "Sol Ring", which IS banned) clears the Tiny Leaders
+        // MV <= 3 cost-identity cap at a single copy, so the registry-default
+        // baseline below is actually fully compatible rather than merely
+        // "still has a singleton violation but for an unrelated reason".
+        let mut main = expand("Small Spell", 1);
+        main.extend(expand("Plains", 48));
         let base = DeckCompatibilityRequest {
             main_deck: main,
             sideboard: Vec::new(),
@@ -8056,31 +8514,34 @@ mod tests {
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::TinyLeaders),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::TinyLeaders)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
-        let unthreaded = evaluate_tiny_leaders(&db, &base, &BTreeSet::new());
-        assert!(
-            unthreaded
-                .reasons
-                .iter()
-                .any(|r| r.contains("Singleton violations")),
-            "reasons: {:?}",
-            unthreaded.reasons
-        );
+        let unthreaded =
+            evaluate_tiny_leaders(&db, &base, &BTreeSet::new(), &FormatConfig::tiny_leaders());
+        assert!(unthreaded.compatible, "reasons: {:?}", unthreaded.reasons);
 
-        let looser = DeckCompatibilityRequest {
-            default_deck_copy_limit: Some(DeckCopyLimit::Unlimited),
+        // `UpTo(0)` is strictly stricter than the registry's `UpTo(1)`
+        // (CR 903.5b's Tiny Leaders singleton default) under
+        // `DeckCopyLimit::permits_no_more_than`, matching the admissible
+        // "equal-or-stricter" direction `built_in_axes_no_looser_than_rules`
+        // allows through — unlike `Unlimited`, which that gate would reject
+        // outright as looser than the registry.
+        let stricter_rules = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(0),
+            ..FormatConfig::tiny_leaders()
+        };
+        let stricter = DeckCompatibilityRequest {
+            selected_format: Some(SelectedFormat::Resolved(Box::new(stricter_rules.clone()))),
             ..base
         };
-        let check = evaluate_tiny_leaders(&db, &looser, &BTreeSet::new());
+        let check = evaluate_tiny_leaders(&db, &stricter, &BTreeSet::new(), &stricter_rules);
         assert!(
-            !check
+            check
                 .reasons
                 .iter()
                 .any(|r| r.contains("Singleton violations")),
@@ -8090,27 +8551,35 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_oathbreaker_honors_a_looser_resolved_copy_limit() {
+    fn evaluate_oathbreaker_honors_a_stricter_resolved_copy_limit() {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        // A single copy of the non-basic "Red Card" plus 59 (copy-exempt)
+        // Plains — legal under the registry's `UpTo(1)` default, unlike the
+        // original 60-copy fixture, which already violated even the
+        // registry default and so could never isolate a STRICTER-than-
+        // registry ceiling (the direction `built_in_axes_no_looser_than_rules`
+        // actually admits).
+        let mut main = expand("Red Card", 1);
+        main.extend(expand("Plains", 59));
         let base = DeckCompatibilityRequest {
-            main_deck: expand("Red Card", 60),
+            main_deck: main,
             sideboard: Vec::new(),
             commander: Vec::new(),
             companion: Vec::new(),
             planar_deck: Vec::new(),
             scheme_deck: Vec::new(),
             signature_spell: Vec::new(),
-            selected_format: Some(GameFormat::Oathbreaker),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Oathbreaker)),
             selected_match_type: None,
             player_count: default_player_count(),
             summary_only: false,
             draft_set_codes: Vec::new(),
-            default_deck_copy_limit: None,
         };
 
-        let unthreaded = evaluate_oathbreaker(&db, &base, &BTreeSet::new());
+        let unthreaded =
+            evaluate_oathbreaker(&db, &base, &BTreeSet::new(), &FormatConfig::oathbreaker());
         assert!(
-            unthreaded
+            !unthreaded
                 .reasons
                 .iter()
                 .any(|r| r.contains("Singleton violations")),
@@ -8118,13 +8587,21 @@ mod tests {
             unthreaded.reasons
         );
 
-        let looser = DeckCompatibilityRequest {
-            default_deck_copy_limit: Some(DeckCopyLimit::Unlimited),
+        // `UpTo(0)` is strictly stricter than the registry's `UpTo(1)` under
+        // `DeckCopyLimit::permits_no_more_than` — the admissible direction —
+        // unlike the `Unlimited` this test previously used, which
+        // `built_in_axes_no_looser_than_rules` would reject outright.
+        let stricter_rules = FormatConfig {
+            default_deck_copy_limit: DeckCopyLimit::UpTo(0),
+            ..FormatConfig::oathbreaker()
+        };
+        let stricter = DeckCompatibilityRequest {
+            selected_format: Some(SelectedFormat::Resolved(Box::new(stricter_rules.clone()))),
             ..base
         };
-        let check = evaluate_oathbreaker(&db, &looser, &BTreeSet::new());
+        let check = evaluate_oathbreaker(&db, &stricter, &BTreeSet::new(), &stricter_rules);
         assert!(
-            !check
+            check
                 .reasons
                 .iter()
                 .any(|r| r.contains("Singleton violations")),
@@ -8184,7 +8661,6 @@ mod tests {
         // through `evaluate_deck_compatibility`, the production entry point.
         let request = DeckCompatibilityRequest {
             main_deck: std::iter::repeat_n(whole.to_string(), 60).collect(),
-            default_deck_copy_limit: Some(DeckCopyLimit::Unlimited),
             ..Default::default()
         };
         let legality = evaluate_format_legality(&db, &request);
@@ -8326,7 +8802,7 @@ mod tests {
         let request = DeckCompatibilityRequest {
             main_deck: main,
             commander: vec!["Tovolar, Dire Overlord // Tovolar, the Midnight Scourge".to_string()],
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8366,7 +8842,7 @@ mod tests {
         let request = DeckCompatibilityRequest {
             main_deck: main,
             commander: vec!["Tovolar, Dire Overlord".to_string()],
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8402,7 +8878,7 @@ mod tests {
         let request = DeckCompatibilityRequest {
             main_deck: main,
             commander: vec!["Tovolar, Dire Overlord".to_string()],
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8516,7 +8992,7 @@ mod tests {
             let request = DeckCompatibilityRequest {
                 main_deck: main.clone(),
                 commander: vec![composite.to_string()],
-                selected_format: Some(GameFormat::Commander),
+                selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
                 summary_only,
                 player_count: default_player_count(),
                 ..Default::default()
@@ -8560,7 +9036,7 @@ mod tests {
                 main_deck: main.clone(),
                 commander: vec!["Ob Front // Ob Back".to_string()],
                 signature_spell: vec!["Sig Front // Sig Back".to_string()],
-                selected_format: Some(GameFormat::Oathbreaker),
+                selected_format: Some(SelectedFormat::Tag(GameFormat::Oathbreaker)),
                 summary_only,
                 player_count: default_player_count(),
                 ..Default::default()
@@ -8597,7 +9073,7 @@ mod tests {
             main_deck: main,
             commander: vec!["Ob Front".to_string()],
             signature_spell: vec!["Sig Front // Sig Back".to_string()],
-            selected_format: Some(GameFormat::Oathbreaker),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Oathbreaker)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8640,7 +9116,7 @@ mod tests {
             // Both command-zone slots resolve to the SAME card.
             commander: vec!["Ob Front".to_string()],
             signature_spell: vec!["Ob Front // Ob Back".to_string()],
-            selected_format: Some(GameFormat::Oathbreaker),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Oathbreaker)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8672,7 +9148,7 @@ mod tests {
             main_deck: main,
             commander: vec!["Ob Front".to_string()],
             signature_spell: vec!["Sig Front".to_string()],
-            selected_format: Some(GameFormat::Oathbreaker),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Oathbreaker)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8705,7 +9181,7 @@ mod tests {
         let request = DeckCompatibilityRequest {
             main_deck: main,
             commander: vec!["Fire".to_string()],
-            selected_format: Some(GameFormat::Standard),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Standard)),
             player_count: default_player_count(),
             ..Default::default()
         };
@@ -8726,5 +9202,623 @@ mod tests {
             "five main-deck copies must still trip CR 100.2a: {:?}",
             result.selected_format_reasons
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 1d: `evaluate_custom_format` / `quick_custom_format_check` /
+    // `DeclaredPool` / `CardPoolAuthority`.
+    // -----------------------------------------------------------------
+
+    /// A constructed-shaped `CustomFormatRules` (no command zone, unrestricted
+    /// card pool) with `deck_size`/`default_deck_copy_limit` set by the
+    /// caller — the shared base every loop test below specializes.
+    fn base_custom_rules(
+        deck_size: DeckSizeRule,
+        default_deck_copy_limit: DeckCopyLimit,
+    ) -> CustomFormatRules {
+        CustomFormatRules {
+            id: CustomFormatId(1),
+            structural: StructuralRules {
+                starting_life: 20,
+                min_players: 2,
+                max_players: 4,
+                deck_size,
+                singleton: false,
+                command_zone_mode: CommandZoneMode::Disabled,
+                range_of_influence: None,
+                team_based: false,
+                sideboard_policy: SideboardPolicy::Unlimited,
+                default_deck_copy_limit,
+            },
+            legality: LegalityRules {
+                legal_sets: None,
+                banned: Vec::new(),
+                restricted: Vec::new(),
+                legacy: LegacyRuleSet::default(),
+            },
+        }
+    }
+
+    fn deck_with_copies(name: &str, count: usize, total: usize) -> Vec<String> {
+        let mut deck = expand(name, count);
+        deck.extend(expand("Plains", total.saturating_sub(count)));
+        deck
+    }
+
+    fn card_json_with_printings(name: &str, printings: &[&str]) -> Value {
+        serde_json::json!({
+            "name": name,
+            "mana_cost": { "type": "NoCost" },
+            "card_type": { "supertypes": [], "core_types": [], "subtypes": [] },
+            "power": null, "toughness": null, "loyalty": null, "defense": null,
+            "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+            "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+            "color_override": null, "scryfall_oracle_id": null, "legalities": {},
+            "printings": printings
+        })
+    }
+
+    fn card_json_without_printings(name: &str) -> Value {
+        serde_json::json!({
+            "name": name,
+            "mana_cost": { "type": "NoCost" },
+            "card_type": { "supertypes": [], "core_types": [], "subtypes": [] },
+            "power": null, "toughness": null, "loyalty": null, "defense": null,
+            "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+            "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+            "color_override": null, "scryfall_oracle_id": null, "legalities": {}
+        })
+    }
+
+    /// A `CardDatabase` fixture carrying REAL `printings` data, unlike
+    /// `test_db_json` (whose cards all omit `printings` entirely — every pool
+    /// assertion against that fixture would pass vacuously even against a
+    /// `printed_in_any_set` that always returned `false`). Carries:
+    /// - "In Pool Card": printed in `MH3` (uppercase, as MTGJSON stores set
+    ///   codes) — the POSITIVE case every negative below is paired against.
+    /// - "Out Of Pool Card": printed only in `ABC`, a set no rule value below
+    ///   ever declares legal.
+    /// - "Delver of Secrets" / "Insectile Aberration": a two-entry DFC, each
+    ///   carrying its OWN `printings: ["MH3"]` (mirroring how real card data
+    ///   duplicates printings onto both faces — see `CardDatabase::
+    ///   is_front_face_key`'s doc comment) — so a decklist naming the card by
+    ///   its BACK face alone still resolves printings via `lookup_key`'s
+    ///   exact-match step, with no front-face collapse involved.
+    /// - "No Printings Card": `printings` omitted entirely, so
+    ///   `from_export_entries` never populates `printings_index` for it
+    ///   (`if !entry.printings.is_empty()`) — `db.printings_for` returns
+    ///   `None`, the fail-closed case.
+    fn custom_pool_db_json() -> String {
+        let mut cards = Map::new();
+        cards.insert(
+            "in pool card".to_string(),
+            card_json_with_printings("In Pool Card", &["MH3"]),
+        );
+        cards.insert(
+            "out of pool card".to_string(),
+            card_json_with_printings("Out Of Pool Card", &["ABC"]),
+        );
+        cards.insert(
+            "delver of secrets".to_string(),
+            card_json_with_printings("Delver of Secrets", &["MH3"]),
+        );
+        cards.insert(
+            "insectile aberration".to_string(),
+            card_json_with_printings("Insectile Aberration", &["MH3"]),
+        );
+        cards.insert(
+            "no printings card".to_string(),
+            card_json_without_printings("No Printings Card"),
+        );
+        Value::Object(cards).to_string()
+    }
+
+    /// Every non-negative pool assertion here is paired with a positive on the
+    /// SAME `DeclaredPool` (same `rules` value), so a `printed_in_any_set`
+    /// that always returned `false` would fail the positives instead of
+    /// silently passing every negative.
+    #[test]
+    fn declared_pool_status_uses_real_printings_data() {
+        let db = CardDatabase::from_json_str(&custom_pool_db_json()).unwrap();
+        // F4: the RULES side declares a lowercase set code; MTGJSON-style
+        // printings are uppercase ("MH3"). `eq_ignore_ascii_case`, never
+        // uppercase-normalized, so this row exercises the lowercase-on-the-
+        // rules-side direction.
+        let rules = LegalityRules {
+            legal_sets: Some(vec![SetCode("mh3".to_string())]),
+            banned: Vec::new(),
+            restricted: Vec::new(),
+            legacy: LegacyRuleSet::default(),
+        };
+        let pool = DeclaredPool::resolve(&db, &rules);
+
+        // Positive: printed in MH3, matched via the lowercase "mh3" rule.
+        assert_eq!(
+            pool.status(&db, "In Pool Card"),
+            Some(LegalityStatus::Legal)
+        );
+
+        // Negative, paired with the positive above on the SAME rules value: a
+        // card printed only in a set the rules never declare legal is
+        // rejected (`None`, matching `LegalityTable`'s own "no data" `None`).
+        assert_eq!(pool.status(&db, "Out Of Pool Card"), None);
+
+        // DFC back-face name: looked up directly (its own storage key, no
+        // front-face collapse via `CardDatabase::lookup_key`), and its own
+        // duplicated `printings: ["MH3"]` resolves identically to the front
+        // face.
+        assert_eq!(
+            pool.status(&db, "Insectile Aberration"),
+            Some(LegalityStatus::Legal)
+        );
+
+        // Omitted printings: fails CLOSED — paired with the "In Pool Card"
+        // positive above on the same rules value.
+        assert_eq!(pool.status(&db, "No Printings Card"), None);
+    }
+
+    /// CR 201.3b: a banned/restricted entry naming a split/DFC's whole-card
+    /// identity ("Fire // Ice") must match a decklist naming just one face
+    /// ("Fire"), and banned beats restricted when a name (implausibly)
+    /// appears on both lists.
+    #[test]
+    fn declared_pool_banned_beats_restricted_and_matches_canonical_names() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let rules = LegalityRules {
+            legal_sets: None,
+            banned: vec!["Legal Standard".to_string()],
+            restricted: vec!["Legal Standard".to_string(), "Not Standard".to_string()],
+            legacy: LegacyRuleSet::default(),
+        };
+        let pool = DeclaredPool::resolve(&db, &rules);
+
+        // Banned beats restricted for a name on both lists.
+        assert_eq!(
+            pool.status(&db, "Legal Standard"),
+            Some(LegalityStatus::Banned)
+        );
+        // Restricted-only name.
+        assert_eq!(
+            pool.status(&db, "Not Standard"),
+            Some(LegalityStatus::Restricted)
+        );
+        // Positive, paired with the two negatives above on the same rules
+        // value: a name on neither list is Legal.
+        assert_eq!(pool.status(&db, "Plains"), Some(LegalityStatus::Legal));
+    }
+
+    // -----------------------------------------------------------------
+    // `max_deck_copies`'s `Custom(_)` restricted-list branch. This is the
+    // deck-BUILDER query authority (`pub fn`), distinct from the
+    // deck-VALIDATION authority above (`DeclaredPool`/`evaluate_custom_format`)
+    // — both must read the same declared restricted list, but neither calls
+    // the other, so each needs its own coverage or the two can silently
+    // diverge (exactly the class of divergence this function's own doc
+    // comment says can never happen).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn max_deck_copies_custom_restricted_list_paired_with_positive() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut rules = base_custom_rules(DeckSizeRule::Minimum(60), DeckCopyLimit::UpTo(4));
+        rules.legality.restricted = vec!["Legal Standard".to_string()];
+        let config = FormatConfig::for_custom_rules(&rules);
+
+        // Restricted card under a Custom config: capped at 1, overriding the
+        // format's own more permissive `default_deck_copy_limit` (UpTo(4)).
+        assert_eq!(
+            max_deck_copies(&db, "Legal Standard", &config),
+            DeckCopyLimit::UpTo(1)
+        );
+        // Paired positive on the SAME config: a name on the restricted list
+        // reads the declared default straight through. A stubbed-out
+        // restricted check that always returned `UpTo(1)` would fail this
+        // assertion instead of silently passing the one above.
+        assert_eq!(
+            max_deck_copies(&db, "Not Standard", &config),
+            DeckCopyLimit::UpTo(4)
+        );
+    }
+
+    #[test]
+    fn max_deck_copies_custom_restricted_list_matches_canonical_names() {
+        // CR 201.3b / CR 709.2: a restricted entry spelled as a split card's
+        // front-face name ("Fire") must match a decklist naming the full
+        // composite name ("Fire // Ice") — proving this reads through
+        // `canonical_deck_count_key` (which resolves the composite name to
+        // its front face via `CardDatabase::lookup_key`'s `//`-split), not
+        // raw string equality between the two spellings.
+        let mut cards = Map::new();
+        cards.insert("fire".to_string(), card_json_without_printings("Fire"));
+        let db = CardDatabase::from_json_str(&Value::Object(cards).to_string()).unwrap();
+
+        let mut rules = base_custom_rules(DeckSizeRule::Minimum(60), DeckCopyLimit::UpTo(4));
+        rules.legality.restricted = vec!["Fire".to_string()];
+        let config = FormatConfig::for_custom_rules(&rules);
+
+        assert_eq!(
+            max_deck_copies(&db, "Fire // Ice", &config),
+            DeckCopyLimit::UpTo(1),
+            "a restricted entry spelled as the front face must match a decklist entry spelled \
+             as the composite split-card name"
+        );
+    }
+
+    #[test]
+    fn max_deck_copies_custom_missing_rules_fails_closed_to_up_to_one() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        // Defense-in-depth, same shape as `custom_format_pool`'s own
+        // `custom_rules: None` gate: should never occur in practice
+        // (`validate_custom_rules_consistency` forbids it at `Deserialize`),
+        // but a trusted, non-deserialized `FormatConfig` can still construct
+        // it directly.
+        let config = FormatConfig {
+            custom_rules: None,
+            ..FormatConfig::for_custom_rules(&base_custom_rules(
+                DeckSizeRule::Minimum(60),
+                DeckCopyLimit::Unlimited,
+            ))
+        };
+        assert_eq!(
+            max_deck_copies(&db, "Legal Standard", &config),
+            DeckCopyLimit::UpTo(1),
+            "custom_rules: None must fail CLOSED to UpTo(1), never silently apply no cap"
+        );
+    }
+
+    #[test]
+    fn max_deck_copies_built_in_arm_is_unchanged_by_the_discriminant_dispatch() {
+        // Regression guard for the discriminant-dispatch fix (F1): if the
+        // match were ever flipped to dispatch on `custom_rules.is_some()`
+        // instead of `format_config.format`, a built-in format's OWN
+        // restricted list — read from the `LegalityFormat` table, since
+        // built-ins carry no `custom_rules` at all — would silently stop
+        // being consulted, because `custom_rules.is_some()` is `false` for
+        // every built-in format.
+        let db = CardDatabase::from_json_str(&vintage_test_db()).unwrap();
+        assert_eq!(
+            max_deck_copies(&db, "Black Lotus", &FormatConfig::vintage()),
+            DeckCopyLimit::UpTo(1)
+        );
+    }
+
+    #[test]
+    fn custom_format_copy_limit_accepts_at_n_rejects_at_n_plus_one() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        for limit in [
+            DeckCopyLimit::UpTo(1),
+            DeckCopyLimit::UpTo(2),
+            DeckCopyLimit::UpTo(4),
+            DeckCopyLimit::Unlimited,
+        ] {
+            let rules = base_custom_rules(DeckSizeRule::Minimum(60), limit);
+            let config = FormatConfig::for_custom_rules(&rules);
+
+            let accept_n = match limit {
+                DeckCopyLimit::UpTo(n) => n as usize,
+                DeckCopyLimit::Unlimited => 60,
+            };
+            let accept_request = DeckCompatibilityRequest {
+                main_deck: deck_with_copies("Legal Standard", accept_n, 60),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(config.clone()))),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            assert!(
+                validate_deck_for_format(&db, &accept_request).is_ok(),
+                "{limit:?} must accept {accept_n} copies of one name"
+            );
+
+            if let DeckCopyLimit::UpTo(n) = limit {
+                let reject_request = DeckCompatibilityRequest {
+                    main_deck: deck_with_copies("Legal Standard", n as usize + 1, 60),
+                    selected_format: Some(SelectedFormat::Resolved(Box::new(config))),
+                    player_count: default_player_count(),
+                    ..Default::default()
+                };
+                assert!(
+                    validate_deck_for_format(&db, &reject_request).is_err(),
+                    "{limit:?} must reject {} copies of one name",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn custom_format_deck_size_accepts_at_floor_rejects_below_it() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        for deck_size in [
+            DeckSizeRule::Minimum(40),
+            DeckSizeRule::Exactly(60),
+            DeckSizeRule::Minimum(100),
+        ] {
+            let rules = base_custom_rules(deck_size, DeckCopyLimit::Unlimited);
+            let config = FormatConfig::for_custom_rules(&rules);
+            let n = deck_size.min_cards() as usize;
+
+            let accept_request = DeckCompatibilityRequest {
+                main_deck: expand("Plains", n),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(config.clone()))),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            assert!(
+                validate_deck_for_format(&db, &accept_request).is_ok(),
+                "{deck_size:?} must accept exactly {n} cards"
+            );
+
+            let reject_request = DeckCompatibilityRequest {
+                main_deck: expand("Plains", n - 1),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(config.clone()))),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            assert!(
+                validate_deck_for_format(&db, &reject_request).is_err(),
+                "{deck_size:?} must reject {} cards",
+                n - 1
+            );
+
+            if let DeckSizeRule::Exactly(_) = deck_size {
+                let over_request = DeckCompatibilityRequest {
+                    main_deck: expand("Plains", n + 1),
+                    selected_format: Some(SelectedFormat::Resolved(Box::new(config))),
+                    player_count: default_player_count(),
+                    ..Default::default()
+                };
+                assert!(
+                    validate_deck_for_format(&db, &over_request).is_err(),
+                    "Exactly({n}) must reject {} cards",
+                    n + 1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn custom_format_rejects_every_undeclared_legacy_axis() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        // Loops over every axis NOT in `IMPLEMENTED_LEGACY_AXES` — currently
+        // all four, since that list is empty; a future phase populating it
+        // narrows this loop automatically (each entry is still exercised
+        // above by `passes_legacy_axis_gate`'s own direct assertion, so a
+        // freshly-implemented axis fails loudly here instead of silently
+        // dropping out).
+        let non_default_rulesets = [
+            LegacyRuleSet {
+                mana_burn: ManaBurnPolicy::Obsolete,
+                ..LegacyRuleSet::default()
+            },
+            LegacyRuleSet {
+                damage_timing: CombatDamageTiming::OnStack,
+                ..LegacyRuleSet::default()
+            },
+            LegacyRuleSet {
+                wish_scope: WishOutsideGameScope::PreM10ReachesExile,
+                ..LegacyRuleSet::default()
+            },
+            LegacyRuleSet {
+                legend_rule_scope: LegendRuleScope::PreM14AnyController,
+                ..LegacyRuleSet::default()
+            },
+        ];
+        for legacy in non_default_rulesets {
+            assert!(
+                !passes_legacy_axis_gate(&legacy),
+                "IMPLEMENTED_LEGACY_AXES is empty, so every non-default axis must fail the \
+                 gate: {legacy:?}"
+            );
+            let mut rules = base_custom_rules(DeckSizeRule::Minimum(60), DeckCopyLimit::Unlimited);
+            rules.legality.legacy = legacy;
+            // `for_custom_rules` is total and applies no gate of its own, so
+            // this exercises `evaluate_custom_format`'s OWN defense-in-depth
+            // check, not `FormatConfig::deserialize`'s.
+            let config = FormatConfig::for_custom_rules(&rules);
+            let request = DeckCompatibilityRequest {
+                main_deck: expand("Plains", 60),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(config))),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_deck_for_format(&db, &request),
+                Err(vec![CUSTOM_FORMAT_UNIMPLEMENTED_LEGACY_AXIS.to_string()])
+            );
+        }
+    }
+
+    /// Only [`CUSTOM_FORMAT_UNRESOLVED`] is downgraded to "no opinion" by
+    /// `evaluate_deck_compatibility`; the other three Custom sentinels are
+    /// definite verdicts about a format whose rules the engine DOES hold, and
+    /// must surface as real `Some(false)` rejections.
+    #[test]
+    fn only_the_unresolved_sentinel_is_downgraded_to_no_opinion() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+
+        let unresolved_request = DeckCompatibilityRequest {
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Custom(CustomFormatId(1)))),
+            ..Default::default()
+        };
+        let hint = evaluate_deck_compatibility(&db, &unresolved_request);
+        assert_eq!(hint.selected_format_compatible, None);
+        assert!(hint.selected_format_reasons.is_empty());
+
+        let mut command_zone_rules =
+            base_custom_rules(DeckSizeRule::Exactly(100), DeckCopyLimit::UpTo(1));
+        command_zone_rules.structural.command_zone_mode = CommandZoneMode::Enabled {
+            commander_damage_threshold: Some(21),
+            eligibility_rule: CommanderEligibilityRule::Standard,
+        };
+        let command_zone_config = FormatConfig::for_custom_rules(&command_zone_rules);
+        let command_zone_request = DeckCompatibilityRequest {
+            main_deck: expand("Plains", 100),
+            selected_format: Some(SelectedFormat::Resolved(Box::new(command_zone_config))),
+            player_count: default_player_count(),
+            ..Default::default()
+        };
+        let result = evaluate_deck_compatibility(&db, &command_zone_request);
+        assert_eq!(result.selected_format_compatible, Some(false));
+        assert_eq!(
+            result.selected_format_reasons,
+            vec![CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED.to_string()]
+        );
+        // The summary dispatch must agree with the full one.
+        let mut summary_request = command_zone_request;
+        summary_request.summary_only = true;
+        let summary_result = evaluate_deck_compatibility(&db, &summary_request);
+        assert_eq!(summary_result.selected_format_compatible, Some(false));
+        assert_eq!(
+            summary_result.selected_format_reasons,
+            vec![CUSTOM_FORMAT_COMMAND_ZONE_UNSUPPORTED.to_string()]
+        );
+
+        let mut legacy_rules =
+            base_custom_rules(DeckSizeRule::Minimum(60), DeckCopyLimit::Unlimited);
+        legacy_rules.legality.legacy.mana_burn = ManaBurnPolicy::Obsolete;
+        let legacy_config = FormatConfig::for_custom_rules(&legacy_rules);
+        let legacy_request = DeckCompatibilityRequest {
+            main_deck: expand("Plains", 60),
+            selected_format: Some(SelectedFormat::Resolved(Box::new(legacy_config))),
+            player_count: default_player_count(),
+            ..Default::default()
+        };
+        let result = evaluate_deck_compatibility(&db, &legacy_request);
+        assert_eq!(result.selected_format_compatible, Some(false));
+        assert_eq!(
+            result.selected_format_reasons,
+            vec![CUSTOM_FORMAT_UNIMPLEMENTED_LEGACY_AXIS.to_string()]
+        );
+
+        // Defense-in-depth: `custom_rules: None` should never occur in
+        // practice (`validate_custom_rules_consistency` forbids it at
+        // `Deserialize`), but a trusted, non-deserialized `FormatConfig` can
+        // still construct it directly, as this row does.
+        let missing_config = FormatConfig {
+            custom_rules: None,
+            ..FormatConfig::for_custom_rules(&base_custom_rules(
+                DeckSizeRule::Minimum(60),
+                DeckCopyLimit::Unlimited,
+            ))
+        };
+        let missing_request = DeckCompatibilityRequest {
+            main_deck: expand("Plains", 60),
+            selected_format: Some(SelectedFormat::Resolved(Box::new(missing_config))),
+            player_count: default_player_count(),
+            ..Default::default()
+        };
+        let result = evaluate_deck_compatibility(&db, &missing_request);
+        assert_eq!(result.selected_format_compatible, Some(false));
+        assert_eq!(
+            result.selected_format_reasons,
+            vec![CUSTOM_FORMAT_MISSING_RULES.to_string()]
+        );
+    }
+
+    /// Third entry point for the bare-Tag rejection, alongside
+    /// `validate_deck_for_format_rejects_custom_independently_of_the_ui_hint`
+    /// and `evaluate_deck_format_gate_rejects_custom_even_for_an_otherwise_legal_deck`
+    /// (which together cover `validate_deck_for_format`, `evaluate_deck_format_gate`,
+    /// and the full `evaluate_deck_compatibility` dispatch) — this one is the
+    /// `summary_only` dispatch. Uses `fully_legal_standard_request` so the
+    /// rejection is demonstrably about the format, not a degenerate deck.
+    #[test]
+    fn evaluate_deck_compatibility_summary_reports_no_opinion_for_an_otherwise_legal_custom_deck() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut request = fully_legal_standard_request(GameFormat::Custom(CustomFormatId(1)));
+        request.summary_only = true;
+        let hint = evaluate_deck_compatibility(&db, &request);
+        assert_eq!(hint.selected_format_compatible, None);
+        assert!(hint.selected_format_reasons.is_empty());
+    }
+
+    /// `reprint_policy` / `printing_fidelity` are `CustomFormatDef`-only
+    /// display/registry metadata — `evaluate_custom_format` only ever sees the
+    /// resolved `FormatConfig` (via `FormatConfig::for_custom_rules`), which
+    /// has no field for either. Two defs built from the SAME rules but
+    /// different metadata resolve to byte-identical configs.
+    #[test]
+    fn reprint_policy_has_no_effect_on_custom_format_evaluation() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let rules = base_custom_rules(DeckSizeRule::Minimum(60), DeckCopyLimit::UpTo(4));
+        let def_a = CustomFormatDef {
+            rules: rules.clone(),
+            label: "A".to_string(),
+            short_label: "A".to_string(),
+            description: "A".to_string(),
+            reprint_policy: None,
+            printing_fidelity: PrintingFidelity::NotApplicable,
+        };
+        let def_b = CustomFormatDef {
+            rules,
+            label: "B".to_string(),
+            short_label: "B".to_string(),
+            description: "B".to_string(),
+            reprint_policy: Some(ReprintPolicy::AllowAnyPrinting),
+            printing_fidelity: PrintingFidelity::SetCodeApproximation,
+        };
+        assert_eq!(
+            FormatConfig::for_custom_rules(&def_a.rules),
+            FormatConfig::for_custom_rules(&def_b.rules),
+            "reprint_policy/printing_fidelity are CustomFormatDef-only metadata and must not \
+             change the resolved FormatConfig the evaluator reads"
+        );
+
+        let request = DeckCompatibilityRequest {
+            main_deck: expand("Plains", 60),
+            selected_format: Some(SelectedFormat::Resolved(Box::new(
+                FormatConfig::for_custom_rules(&def_a.rules),
+            ))),
+            player_count: default_player_count(),
+            ..Default::default()
+        };
+        assert!(validate_deck_for_format(&db, &request).is_ok());
+    }
+
+    /// Reach-guard: the `evaluate_constructed`/`quick_constructed_check`
+    /// widening to `format_rules.deck_size.accepts(..)` must not change
+    /// behavior for the built-in constructed formats that were already
+    /// `Minimum(60)` before this phase.
+    #[test]
+    fn constructed_formats_still_reject_59_and_accept_60() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        for format in [GameFormat::Standard, GameFormat::Modern, GameFormat::Pauper] {
+            let mut short_deck = legal_60_main("Legal Standard");
+            short_deck.pop();
+            let short_request = DeckCompatibilityRequest {
+                main_deck: short_deck,
+                selected_format: Some(SelectedFormat::Tag(format)),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            let result = evaluate_deck_compatibility(&db, &short_request);
+            assert_eq!(
+                result.selected_format_compatible,
+                Some(false),
+                "{format:?} must reject 59 cards"
+            );
+            assert!(
+                result
+                    .selected_format_reasons
+                    .iter()
+                    .any(|r| r.contains("at least 60") && r.contains("found 59")),
+                "{format:?} reasons: {:?}",
+                result.selected_format_reasons
+            );
+
+            let full_request = DeckCompatibilityRequest {
+                main_deck: legal_60_main("Legal Standard"),
+                selected_format: Some(SelectedFormat::Tag(format)),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            let result = evaluate_deck_compatibility(&db, &full_request);
+            assert_eq!(
+                result.selected_format_compatible,
+                Some(true),
+                "{format:?} must accept 60 cards, reasons: {:?}",
+                result.selected_format_reasons
+            );
+        }
     }
 }

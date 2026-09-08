@@ -7,11 +7,42 @@ use crate::parser::oracle_ir::doc::{
 use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
-    AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment, DoorLockOp,
-    PlayerRelation, SpellStackToGraveyardReplacement,
+    AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment,
+    DamageKindFilter, DoorLockOp, PlayerRelation, SpellStackToGraveyardReplacement,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
+
+#[test]
+fn teferi_master_of_time_minus_ten_preserves_two_extra_turns() {
+    let oracle = "You may activate loyalty abilities of Teferi on any player's turn any time you could cast an instant.\n\
+[+1]: Draw a card, then discard a card.\n\
+[−3]: Target creature you don't control phases out. (Treat it and anything attached to it as though they don't exist until its controller's next turn.)\n\
+[−10]: Take two extra turns after this one.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Teferi, Master of Time",
+        &[],
+        &["Planeswalker".into()],
+        &["Teferi".into()],
+    );
+    let minus_ten = parsed
+        .abilities
+        .iter()
+        .find(|ability| matches!(&ability.cost, Some(AbilityCost::Loyalty { amount: -10 })))
+        .expect("Teferi's -10 loyalty ability parses");
+    assert!(matches!(
+        minus_ten.effect.as_ref(),
+        Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 2 },
+        }
+    ));
+    assert!(!matches!(
+        minus_ten.effect.as_ref(),
+        Effect::Unimplemented { .. }
+    ));
+}
 
 /// CR 607.2d + CR 614.1c: only an as-enters replacement whose separate static
 /// reads `IsChosenCardType` is promoted from its locally-labeled list.
@@ -200,7 +231,7 @@ fn copy_chosen_host_relation_synthesizes_only_the_selected_source_and_preserves_
                 AbilityKind::Spell,
                 Effect::BecomeCopy {
                     target: TargetFilter::Any,
-                    recipient: TargetFilter::SelfRef,
+                    recipient: crate::types::ability::CopyRecipient::Source,
                     duration: None,
                     mana_value_limit: None,
                     additional_modifications: vec![
@@ -944,6 +975,49 @@ fn activation_during_gate_composes_turn_role_and_window_axes() {
             r.abilities[0].activation_restrictions
         );
     }
+}
+
+#[test]
+fn activated_ability_any_upkeep_restriction_uses_unscoped_upkeep_condition() {
+    const DWARVEN_ARMORY: &str =
+        "{2}, Sacrifice a land: Put a +2/+2 counter on target creature. Activate only during any upkeep step.";
+    const TOLARIA: &str = "{T}: Add {U}.\n{T}: Target creature loses banding and all \"bands with other\" abilities until end of turn. Activate only during any upkeep step.";
+    let expected = ActivationRestriction::RequiresCondition {
+        condition: Some(ParsedCondition::IsDuringUpkeep),
+    };
+    fn has_unimplemented(definition: &AbilityDefinition) -> bool {
+        matches!(definition.effect.as_ref(), Effect::Unimplemented { .. })
+            || definition
+                .sub_ability
+                .as_deref()
+                .is_some_and(has_unimplemented)
+    }
+
+    let armory = parse(DWARVEN_ARMORY, "Dwarven Armory", &[], &["Enchantment"], &[]);
+    assert_eq!(armory.abilities.len(), 1, "got {:#?}", armory.abilities);
+    assert!(
+        armory.abilities[0]
+            .activation_restrictions
+            .contains(&expected),
+        "Dwarven Armory must retain its any-upkeep restriction: {:#?}",
+        armory.abilities[0]
+    );
+    assert!(
+        !has_unimplemented(&armory.abilities[0]),
+        "Dwarven Armory's parsed ability must not retain an unimplemented timing tail: {:#?}",
+        armory.abilities[0]
+    );
+
+    let tolaria = parse(TOLARIA, "Tolaria", &[], &["Land"], &[]);
+    assert_eq!(tolaria.abilities.len(), 2, "got {:#?}", tolaria.abilities);
+    assert!(
+        tolaria
+            .abilities
+            .iter()
+            .any(|ability| ability.activation_restrictions.contains(&expected)),
+        "Tolaria's second ability must retain its any-upkeep restriction: {:#?}",
+        tolaria.abilities
+    );
 }
 
 /// CR 508.1: a STANDALONE combat-window activation gate — "Activate only before
@@ -27222,6 +27296,194 @@ fn owlbear_cub_attacked_player_land_threshold_predicate_is_bound() {
     assert_eq!(attack.condition, None);
 }
 
+/// Issue #8391 — Cartographer's Hawk's recipient-relative land comparison is
+/// part of the combat-damage event, not an intervening-if condition. The
+/// complete, verbatim Oracle text also pins the existing bounce/search chain.
+#[test]
+fn cartographers_hawk_damage_recipient_predicate_is_bound_to_the_event() {
+    let parsed = parse(
+        "Flying\nWhen this creature deals combat damage to a player who controls more lands than you, return it to its owner's hand. If you do, you may search your library for a Plains card, put it onto the battlefield tapped, then shuffle.",
+        "Cartographer's Hawk",
+        &[Keyword::Flying],
+        &["Creature"],
+        &["Bird"],
+    );
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Cartographer's Hawk must parse without an Unimplemented effect: {parsed:#?}"
+    );
+
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|trigger| trigger.mode == TriggerMode::DamageDone)
+        .expect("Cartographer's Hawk must retain its combat-damage trigger");
+    assert_eq!(trigger.damage_kind, DamageKindFilter::CombatOnly);
+    assert_eq!(trigger.valid_source, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        trigger.condition, None,
+        "the event predicate is not CR 603.4"
+    );
+    assert_eq!(
+        trigger.valid_target,
+        Some(TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::ControlsCount {
+                relation: PlayerRelation::All,
+                filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+                comparator: Comparator::GT,
+                count: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::new(TypeFilter::Land).controller(ControllerRef::You),
+                        ),
+                    },
+                }),
+            }),
+        }),
+        "the damaged player must be compared with the trigger controller"
+    );
+
+    let bounce = trigger
+        .execute
+        .as_deref()
+        .expect("the trigger must retain its effect chain");
+    assert!(
+        matches!(
+            bounce.effect.as_ref(),
+            Effect::Bounce {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "Cartographer's Hawk must begin by returning itself: {bounce:#?}"
+    );
+    let search = bounce
+        .sub_ability
+        .as_deref()
+        .expect("the successful bounce must continue to the optional Plains search");
+    assert!(search.optional, "\"you may search\" must remain optional");
+    assert!(matches!(
+        search.effect.as_ref(),
+        Effect::SearchLibrary { .. }
+    ));
+    let put_plains = search
+        .sub_ability
+        .as_deref()
+        .expect("the search must continue to putting the chosen Plains onto the battlefield");
+    assert!(matches!(
+        put_plains.effect.as_ref(),
+        Effect::ChangeZone {
+            enter_tapped: crate::types::zones::EtbTapState::Tapped,
+            ..
+        }
+    ));
+    assert!(matches!(
+        put_plains
+            .sub_ability
+            .as_deref()
+            .map(|definition| definition.effect.as_ref()),
+        Some(Effect::Shuffle { .. })
+    ));
+}
+
+/// The generic subject-led and article/source-led production routes must emit
+/// the same relative-recipient filter. The negative rows ensure neither route
+/// silently degrades an unmodelled `who` clause to its broad player noun.
+#[test]
+fn damage_recipient_relative_predicates_have_route_parity_and_fail_closed() {
+    let expected = TargetFilter::PlayerMatching {
+        player: Box::new(PlayerFilter::ControlsCount {
+            relation: PlayerRelation::All,
+            filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+            comparator: Comparator::GT,
+            count: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::new(TypeFilter::Land).controller(ControllerRef::You),
+                    ),
+                },
+            }),
+        }),
+    };
+    for (name, text) in [
+        (
+            "Generic Damage Recipient",
+            "Whenever ~ deals combat damage to a player who controls more lands than you, draw a card.",
+        ),
+        (
+            "Article Damage Recipient",
+            "Whenever a creature deals combat damage to a player who controls more lands than you, draw a card.",
+        ),
+    ] {
+        let parsed = parse(text, name, &[], &["Creature"], &[]);
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|trigger| trigger.mode == TriggerMode::DamageDone)
+            .unwrap_or_else(|| panic!("{name} must parse as DamageDone: {parsed:#?}"));
+        assert_eq!(trigger.valid_target, Some(expected.clone()));
+        assert_eq!(trigger.condition, None);
+        assert!(
+            !parsed_has_unimplemented(&parsed),
+            "{name}: supported recipient predicate must not leave an Unimplemented effect: {parsed:#?}"
+        );
+    }
+
+    for (name, text) in [
+        (
+            "Unsupported generic recipient predicate",
+            "Whenever ~ deals combat damage to a player who has drawn three cards this turn, draw a card.",
+        ),
+        (
+            "Partial generic recipient predicate",
+            "Whenever ~ deals combat damage to a player who controls more lands than you and controls a Forest, draw a card.",
+        ),
+        (
+            "Opponent recipient predicate",
+            "Whenever a creature deals combat damage to an opponent who controls more lands than you, draw a card.",
+        ),
+    ] {
+        let parsed = parse(text, name, &[], &["Creature"], &[]);
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .all(|trigger| matches!(trigger.mode, TriggerMode::Unknown(_))),
+            "{name}: an unmodelled recipient predicate must be terminally Unknown: {parsed:#?}"
+        );
+        assert!(
+            !parsed.triggers.iter().any(|trigger| {
+                trigger.mode == TriggerMode::DamageDone
+                    && matches!(
+                        trigger.valid_target,
+                        None | Some(TargetFilter::Player) | Some(TargetFilter::Typed(_))
+                    )
+            }),
+            "{name}: must not retain a broad damage-recipient filter: {parsed:#?}"
+        );
+    }
+
+    for (name, text) in [
+        (
+            "Plain player recipient",
+            "Whenever ~ deals combat damage to a player, draw a card.",
+        ),
+        (
+            "Plain opponent recipient",
+            "Whenever a creature deals combat damage to an opponent, draw a card.",
+        ),
+    ] {
+        let parsed = parse(text, name, &[], &["Creature"], &[]);
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .any(|trigger| trigger.mode == TriggerMode::DamageDone),
+            "{name}: an unqualified recipient must remain supported: {parsed:#?}"
+        );
+    }
+}
+
 /// V11 — consume-on-success: a `who`-headed clause the predicate grammar cannot
 /// model must fall to `Effect::Unimplemented`, never silently leave the broad
 /// `Player` scope behind (that is precisely the bug being fixed).
@@ -28067,7 +28329,7 @@ fn render_net_reaches_every_nested_description_carrier() {
 
     parsed.abilities.push(carrier(Effect::BecomeCopy {
         target: TargetFilter::Any,
-        recipient: TargetFilter::SelfRef,
+        recipient: crate::types::ability::CopyRecipient::Source,
         duration: None,
         mana_value_limit: None,
         additional_modifications: vec![granted("become_copy")],
@@ -28780,4 +29042,277 @@ fn where_x_that_creature_stat_binds_target_only_when_the_clause_announces_one() 
             "{name}: per-object power/toughness scopes changed"
         );
     }
+}
+
+/// CR 115.1 + CR 601.2c + CR 603.2 + CR 102.2: the Exodus Oath cycle prints a
+/// two-conjunct relative clause on its player TARGET — "who controls more
+/// ⟨type⟩ than they do and is their opponent". Both conjuncts are announcement
+/// restrictions (CR 601.2c), so both must survive into the announced filter.
+///
+/// Revert-failing: drop the relative-clause hook in `oracle_target`'s player
+/// head-noun arm and every row below collapses to the bare
+/// `TargetFilter::Player` that let Oath of Druids resolve on every upkeep
+/// regardless of the board.
+///
+/// The threshold's `ObjectCount` filter carries
+/// `ControllerRef::TriggeringPlayer`, NOT `You`: "they" anaphors the clause's
+/// subject ("that player", the upkeep player), which on these cards is a
+/// different seat from the enchantment's controller.
+#[test]
+fn oath_cycle_binds_the_target_player_relative_clause() {
+    use crate::types::ability::{
+        Comparator, ControllerRef, PlayerFilter, PlayerRelation, QuantityExpr, QuantityRef,
+        TypeFilter,
+    };
+
+    let expected = |ty: TypeFilter| {
+        let bare = TypedFilter::new(ty);
+        TargetFilter::And {
+            filters: vec![
+                TargetFilter::PlayerMatching {
+                    player: Box::new(PlayerFilter::ControlsCount {
+                        relation: PlayerRelation::All,
+                        filter: TargetFilter::Typed(bare.clone()),
+                        comparator: Comparator::GT,
+                        count: Box::new(QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(
+                                    bare.controller(ControllerRef::TriggeringPlayer),
+                                ),
+                            },
+                        }),
+                    }),
+                },
+                TargetFilter::PlayerMatching {
+                    player: Box::new(PlayerFilter::OpponentOfTriggeringPlayer),
+                },
+            ],
+        }
+    };
+
+    for (name, oracle, ty) in [
+        (
+            "Oath of Druids",
+            "At the beginning of each player's upkeep, that player chooses target player who controls more creatures than they do and is their opponent. The first player may reveal cards from the top of their library until they reveal a creature card.",
+            TypeFilter::Creature,
+        ),
+        (
+            "Oath of Lieges",
+            "At the beginning of each player's upkeep, that player chooses target player who controls more lands than they do and is their opponent. The first player may search their library for a basic land card, put that card onto the battlefield, then shuffle.",
+            TypeFilter::Land,
+        ),
+    ] {
+        let parsed = parse(oracle, name, &[], &["Enchantment"], &[]);
+        let trigger = parsed
+            .triggers
+            .first()
+            .unwrap_or_else(|| panic!("{name} must produce an upkeep trigger: {parsed:#?}"));
+        let execute = trigger
+            .execute
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} trigger must carry an ability: {parsed:#?}"));
+        let Effect::TargetOnly { target } = &*execute.effect else {
+            panic!("{name} sentence 1 must announce a target slot: {parsed:#?}");
+        };
+        assert_eq!(
+            target.clone(),
+            expected(ty),
+            "{name}: the printed relative clause must bind both conjuncts"
+        );
+    }
+}
+
+/// CR 608.2c consume-on-success, target-position mirror. A player-target
+/// relative clause the grammar can model only in PART must decline entirely:
+/// binding the prefix leaves an UNDER-restricted target, which is the same
+/// silent-drop failure the hook exists to eliminate. The remaining Oath cycle
+/// members are the live corpus rows for this — their predicates are not
+/// modelled, so they must NOT come back with the comparative half bound.
+#[test]
+fn unmodelled_target_player_clause_does_not_bind_a_partial_restriction() {
+    for (name, oracle) in [
+        (
+            "Oath of Mages",
+            "At the beginning of each player's upkeep, that player chooses target player who has more life than they do and is their opponent. The first player may have this enchantment deal 1 damage to the second player.",
+        ),
+        (
+            "Oath of Ghouls",
+            "At the beginning of each player's upkeep, that player chooses target player whose graveyard has fewer creature cards in it than their graveyard does and is their opponent. The first player may return a creature card from their graveyard to their hand.",
+        ),
+        (
+            // The comparative half alone ("more creatures than they do") is
+            // modelled, but the printed clause continues past it. Binding the
+            // modelled prefix would drop the rest of the restriction.
+            "Partial Oath Clause",
+            "At the beginning of each player's upkeep, that player chooses target player who controls more creatures than they do and controls a Forest. The first player may draw a card.",
+        ),
+    ] {
+        let parsed = parse(oracle, name, &[], &["Enchantment"], &[]);
+        for trigger in &parsed.triggers {
+            let Some(execute) = trigger.execute.as_ref() else {
+                continue;
+            };
+            if let Effect::TargetOnly { target } = &*execute.effect {
+                assert!(
+                    !matches!(target, TargetFilter::PlayerMatching { .. })
+                        && !matches!(target, TargetFilter::And { .. }),
+                    "{name}: a clause the grammar cannot model in full must not bind a \
+                     partial player predicate, got {target:?}"
+                );
+            }
+        }
+    }
+}
+
+/// CR 601.2c + CR 603.3d: the controller announces every target UNLESS the card
+/// prints a different subject on the choosing sentence. That subject becomes the
+/// ability's `target_chooser`, so the engine routes target selection to the
+/// named player instead of the source's controller.
+///
+/// Revert-failing: delete the `target_announcer_from_subject` call in
+/// `lower_subject_predicate_ast` and every row's `target_chooser` goes back to
+/// `None`, silently handing the Oath cycle's choice to the enchantment's
+/// controller on every player's upkeep.
+///
+/// The negative rows are the gate: a subject-led sentence that *acts* rather
+/// than announcing, and a choosing sentence whose subject already IS the
+/// controller, must both leave the CR 601.2c default in place.
+#[test]
+fn printed_subject_of_a_choosing_sentence_becomes_the_target_chooser() {
+    use crate::types::ability::ControllerRef;
+
+    // Announcer rows: `(name, oracle, expected chooser)`.
+    for (name, oracle, expected) in [
+        (
+            "Oath of Druids",
+            "At the beginning of each player's upkeep, that player chooses target player who controls more creatures than they do and is their opponent. The first player may reveal cards from the top of their library until they reveal a creature card.",
+            TargetFilter::ScopedPlayer,
+        ),
+        (
+            "Oath of Mages",
+            "At the beginning of each player's upkeep, that player chooses target player who has more life than they do and is their opponent. The first player may have this enchantment deal 1 damage to the second player.",
+            TargetFilter::ScopedPlayer,
+        ),
+    ] {
+        let parsed = parse(oracle, name, &[], &["Enchantment"], &[]);
+        let trigger = parsed
+            .triggers
+            .first()
+            .unwrap_or_else(|| panic!("{name} must produce an upkeep trigger: {parsed:#?}"));
+        let execute = trigger
+            .execute
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} trigger must carry an ability: {parsed:#?}"));
+        assert!(
+            matches!(&*execute.effect, Effect::TargetOnly { .. }),
+            "{name} sentence 1 must announce a target slot: {parsed:#?}"
+        );
+        assert_eq!(
+            execute.target_chooser,
+            Some(expected),
+            "{name}: the printed subject of the choosing sentence must announce the target"
+        );
+    }
+
+    // CR 102.2 + CR 601.2c: "An opponent chooses target creature they control"
+    // (Echo Chamber) — the player-shaped subject is normalized to the dedicated
+    // `Opponent` chooser, the shape the runtime resolves with the multiplayer
+    // announcing-opponent rule.
+    let echo = parse(
+        "{4}, {T}: An opponent chooses target creature they control. Create a token that's a copy of that creature.",
+        "Echo Chamber",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    let ability = echo
+        .abilities
+        .first()
+        .expect("Echo Chamber must produce an activated ability");
+    assert_eq!(
+        ability.target_chooser,
+        Some(TargetFilter::Opponent),
+        "an opponent-subject choosing sentence announces via the Opponent chooser: {echo:#?}"
+    );
+
+    // Negative: the subject ACTS, it does not announce. Retribution's targets are
+    // announced by its own first sentence (subject = the controller); the second
+    // sentence's "That player" is the sacrificing actor.
+    let retribution = parse(
+        "Choose two target creatures controlled by the same opponent. That player chooses and sacrifices one of those creatures. Put a -1/-1 counter on the other.",
+        "Retribution",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(
+        retribution
+            .abilities
+            .iter()
+            .all(|a| a.target_chooser.is_none()),
+        "an acting subject must not become the target announcer: {retribution:#?}"
+    );
+
+    // Negative — CR 115.10a + CR 608.2d: the designated thing is NOT a target,
+    // so there is no announcement to route. These read almost identically to the
+    // rows above once the subject is stripped; the printed word "target" is the
+    // only difference, and on "Target opponent chooses a creature they control"
+    // it belongs to the SUBJECT, not to the chosen creature.
+    for (name, oracle, types) in [
+        (
+            "Imperial Edict",
+            "Target opponent chooses a creature they control. Destroy that creature.",
+            "Sorcery",
+        ),
+        (
+            "Archfiend of Depravity",
+            "At the beginning of each opponent's end step, that player chooses up to two creatures they control, then sacrifices the rest.",
+            "Creature",
+        ),
+        (
+            "Wormfang Crab",
+            "When this creature enters, an opponent chooses a permanent you control other than this creature and exiles it.",
+            "Creature",
+        ),
+    ] {
+        let parsed = parse(oracle, name, &[], &[types], &[]);
+        let choosers: Vec<_> = parsed
+            .abilities
+            .iter()
+            .map(|a| a.target_chooser.clone())
+            .chain(
+                parsed
+                    .triggers
+                    .iter()
+                    .filter_map(|t| t.execute.as_ref())
+                    .map(|e| e.target_chooser.clone()),
+            )
+            .collect();
+        assert!(
+            choosers.iter().all(Option::is_none),
+            "{name}: an untargeted CR 608.2d selection has no target to announce, \
+             got {choosers:?}"
+        );
+    }
+
+    // Negative: a choosing sentence whose subject is the controller keeps the
+    // CR 601.2c default rather than storing a redundant `You` chooser.
+    let controller_subject = parse(
+        "When this creature enters, you choose target creature an opponent controls.",
+        "Controller Subject Probe",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert!(
+        controller_subject
+            .triggers
+            .iter()
+            .filter_map(|t| t.execute.as_ref())
+            .all(|e| e.target_chooser.is_none()),
+        "a controller subject leaves the CR 601.2c default: {controller_subject:#?}"
+    );
+    // Keep the unused-import guard honest: `ControllerRef` names the axis the
+    // normalization above reads off the subject's `Typed` shape.
+    let _ = ControllerRef::Opponent;
 }

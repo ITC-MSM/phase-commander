@@ -1544,6 +1544,227 @@ impl DieRollModifier {
     }
 }
 
+/// CR 706.6: What a die-roll replacement does with the extra dice it caused to
+/// be rolled. "If a player is instructed to ignore a roll, that roll is
+/// considered to have never happened. No abilities trigger because of the
+/// ignored roll, and no effects apply to that roll." When the lowest is tied
+/// among several, the player chooses which to ignore (CR 706.6, 2nd sentence).
+///
+/// Distinct axis from [`DieRollModifier`] (CR 706.2), which adjusts a roll's
+/// RESULT rather than removing a roll. The two must not be unified: CR 706.2b
+/// governs the case where two or more effects contend to modify the SAME
+/// natural result (the player who rolled picks one to apply, considering
+/// reroll effects before increase/decrease effects) — a contention procedure
+/// with no analogue for ignoring, since CR 706.6 removes the roll from
+/// consideration entirely rather than competing to change its value.
+///
+/// The ignore set is decided on NATURAL results (CR 706.2 — "the number
+/// indicated on the top face of the die before any modifiers") before any
+/// modifier is applied, because CR 706.6 forbids ANY effect applying to an
+/// ignored roll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum DieRollIgnoreRule {
+    /// "and ignore the lowest roll" — Barbarian Class, Pixie Guide, Wyll.
+    ///
+    /// The symmetric `Highest` leaf is deliberately absent: a Scryfall corpus
+    /// check for `o:"ignore the highest roll"` returns ZERO cards, while
+    /// `o:"ignore the lowest roll"` returns exactly the three above. Adding an
+    /// unprinted leaf would be speculative surface threaded through
+    /// `ignorable_indices`, `ignorable_indices_for_rules`, and the roll-to-visit
+    /// auto-pick with no card to validate it — the same policy that makes the
+    /// parser reject "that many dice plus N" for N > 1. If a card ever prints
+    /// it, add the leaf and the matching `alt()` arm together.
+    ///
+    /// The same policy retired the former `PlayerChoice` ("and ignore one")
+    /// leaf. A corpus query for the exact grammar the parser accepted —
+    /// `instead roll that many dice plus one and ignore one` — returns ZERO
+    /// cards, and each nearby printing needs work this leaf did not do:
+    /// Ichor Elixir is planar (CR 706.7), Krark's Other Thumb uses neither the
+    /// "that many dice plus one" count form nor the " and ignore one" tail,
+    /// Probability Flux is a duration-bounded ANY-player form the
+    /// controller-scoped antecedent does not match, and Bamboozling Beeble /
+    /// Squid Fire Knight are one-shot targeted activated abilities whose
+    /// chooser is the ability's CONTROLLER, not the roller — a distinction
+    /// `WaitingFor::DieKeepChoice` cannot express, since it carries one
+    /// `player` who both rolls and ignores. Keeping the leaf also forced
+    /// `ignore_outcome_for_rules` to model a mixed `[Lowest, PlayerChoice]`
+    /// run, and that path dropped the `Lowest` forcing — offering the roller a
+    /// set that let them KEEP a roll CR 706.6 requires them to ignore. Whoever
+    /// prints the first real card here needs the chooser axis designed first.
+    Lowest,
+}
+
+/// CR 706.6: The result of applying a run of die-roll ignore rules to a set of
+/// natural results — split into the rolls that MUST be ignored and the tie the
+/// roller breaks.
+///
+/// The split is the whole point of the type. CR 706.6's second sentence gives
+/// the roller a choice only "if multiple results are tied"; every roll that is
+/// strictly lower than the tie boundary is determined, not chosen. Collapsing
+/// both into one candidate list would let a roller ignore a roll the rules
+/// forced them to keep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DieRollIgnoreOutcome {
+    /// Rolls that must be ignored regardless of any choice.
+    pub forced: Vec<usize>,
+    /// Rolls tied at the boundary, among which the roller chooses. Empty when
+    /// the outcome is fully determined.
+    pub tied: Vec<usize>,
+    /// Total rolls to ignore — `forced.len()` plus how many of `tied` are picked.
+    pub ignore_count: usize,
+}
+
+impl DieRollIgnoreOutcome {
+    /// Every index the roller may legally end up ignoring, forced and tied
+    /// alike. Sorted and deduplicated.
+    pub fn candidates(&self) -> Vec<usize> {
+        let mut all = self.forced.clone();
+        all.extend(self.tied.iter().copied());
+        all.sort_unstable();
+        all.dedup();
+        all
+    }
+
+    /// CR 706.6: whether the roller has a real decision. False when the ignored
+    /// set is fully determined, which is what lets the caller skip the prompt.
+    pub fn needs_choice(&self) -> bool {
+        !self.tied.is_empty() && self.forced.len() < self.ignore_count
+    }
+
+    /// How many of the tied rolls the roller must pick.
+    pub fn picks_from_tied(&self) -> usize {
+        self.ignore_count.saturating_sub(self.forced.len())
+    }
+}
+
+impl DieRollIgnoreRule {
+    /// CR 706.6: Which of `naturals` this rule permits the roller to ignore.
+    ///
+    /// Computed over the NATURAL results (CR 706.2) — never the post-modifier
+    /// actuals — because CR 706.6 says no effects apply to an ignored roll, and
+    /// applying a modifier to it in order to rank it would be such an effect.
+    ///
+    /// `Lowest` returns every index tied at the extreme, which is exactly
+    /// CR 706.6's second sentence: with a unique lowest the returned slice has
+    /// length 1 and the engine resolves it with no prompt; with a tie the roller
+    /// chooses among them.
+    ///
+    /// # Single-roll invariant
+    ///
+    /// The returned slice is the CANDIDATE SET for ignoring exactly ONE roll,
+    /// never for ignoring several. CR 706.6 removes a single roll and breaks a
+    /// tie by having the player choose "one of those rolls"; there is no
+    /// printed "ignore the two lowest" form, and `DieRollIgnoreRule` carries no
+    /// count. `Lowest` therefore returns only the indices tied at the ONE
+    /// extreme — for `[1, 2, 5]` it yields `[0]`, not the two smallest. The
+    /// parser enforces the matching half by rejecting "that many dice plus N"
+    /// for N > 1.
+    ///
+    /// Ignoring SEVERAL rolls is expressed by having several rules — CR 706.6
+    /// applies once per instructing effect, so two stacked replacements
+    /// (Barbarian Class + Pixie Guide) each contribute one rule and each removes
+    /// one roll. Use [`Self::ignorable_indices_for_rules`] for that case; it
+    /// composes this single-roll method rather than reinterpreting its slice.
+    pub fn ignorable_indices(self, naturals: &[u8]) -> Vec<usize> {
+        // One arm, and deliberately an exhaustive `match` rather than a direct
+        // `naturals.iter().min()`: a new leaf must not compile until someone
+        // decides which extreme (if any) it ranks by. A free-choice leaf in
+        // particular ranks by NONE, and `attractions::unprompted_ignored_indices`
+        // documents why that case needs a prompt rather than a silent pick.
+        let extreme = match self {
+            DieRollIgnoreRule::Lowest => naturals.iter().min(),
+        };
+        let Some(&extreme) = extreme else {
+            return Vec::new();
+        };
+        naturals
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &value)| (value == extreme).then_some(index))
+            .collect()
+    }
+
+    /// CR 706.6: The candidate set for ignoring one roll per rule in `rules`,
+    /// together with how many rolls must be ignored.
+    ///
+    /// CR 706.6 applies once per INSTRUCTING effect, so N applied die-roll
+    /// replacements ignore N rolls. The rules are applied in order, each one
+    /// consuming a roll from the pool the earlier ones left behind: a `Lowest`
+    /// rule takes the lowest REMAINING natural, so `[Lowest, Lowest]` over
+    /// `[1, 3, 6]` yields candidates `{0, 1}` and a count of 2 — never the
+    /// lowest roll twice.
+    ///
+    /// Returns `(candidates, ignore_count)` where `candidates` is sorted and
+    /// deduplicated. `ignore_count` is clamped to `candidates.len()`, because a
+    /// rule that finds an empty remaining pool (more rules than dice) can ignore
+    /// nothing.
+    ///
+    /// When `candidates.len() == ignore_count` the roller has no decision — the
+    /// set is forced and the caller resolves it with no prompt. A larger
+    /// candidate set is a genuine CR 706.6 tie-break ("the player chooses one of
+    /// those rolls to be ignored"), extended to `ignore_count` picks.
+    pub fn ignorable_indices_for_rules(rules: &[Self], naturals: &[u8]) -> (Vec<usize>, usize) {
+        let outcome = Self::ignore_outcome_for_rules(rules, naturals);
+        (outcome.candidates(), outcome.ignore_count)
+    }
+
+    /// CR 706.6: The full outcome of applying `rules` to `naturals` — which
+    /// rolls are FORCED to be ignored, which are merely tied candidates the
+    /// roller picks among, and how many must go in total.
+    ///
+    /// Splitting forced from tied is what keeps a stacked run honest. Barbarian
+    /// Class's own Gatherer ruling states the multi-copy case plainly: "if you
+    /// have multiple Barbarian Class cards, you roll that many additional dice
+    /// and ignore that many of the lowest rolls" — with two copies over naturals
+    /// `[4, 7, 7]` the 4 is not a choice, and only the tie between the two 7s
+    /// is. A flat candidate list cannot express that: it would offer `{0, 1, 2}`
+    /// for two picks and let the roller ignore both 7s while KEEPING the 4,
+    /// which CR 706.6 does not permit.
+    ///
+    /// For a homogeneous run of `Lowest` the forced/tied split is computed in
+    /// one pass over the sorted naturals rather than by accumulating each rule's
+    /// tied set into a union — the N lowest rolls are one determined set, and
+    /// only the tie AT the Nth boundary is a genuine player decision.
+    pub fn ignore_outcome_for_rules(rules: &[Self], naturals: &[u8]) -> DieRollIgnoreOutcome {
+        let ignore_count = rules.len().min(naturals.len());
+        if ignore_count == 0 {
+            return DieRollIgnoreOutcome::default();
+        }
+
+        // Homogeneous `Lowest` run: the N lowest naturals are the ignored set.
+        // Everything strictly below the Nth-lowest value must go; everything
+        // equal to it is the tie the roller breaks.
+        let mut order: Vec<usize> = (0..naturals.len()).collect();
+        order.sort_unstable_by_key(|&index| naturals[index]);
+        let boundary = naturals[order[ignore_count - 1]];
+
+        let mut forced = Vec::new();
+        let mut tied = Vec::new();
+        for (index, &value) in naturals.iter().enumerate() {
+            if value < boundary {
+                forced.push(index);
+            } else if value == boundary {
+                tied.push(index);
+            }
+        }
+
+        // A clean split with no tie at the boundary leaves `tied` holding
+        // exactly the rolls still owed; fold it into `forced` so the caller sees
+        // a fully determined set and raises no prompt.
+        if forced.len() + tied.len() == ignore_count {
+            forced.append(&mut tied);
+            forced.sort_unstable();
+        }
+
+        DieRollIgnoreOutcome {
+            forced,
+            tied,
+            ignore_count,
+        }
+    }
+}
+
 impl std::str::FromStr for Parity {
     type Err = ();
     fn from_str(s: &str) -> Result<Self, ()> {
@@ -2039,13 +2260,16 @@ impl CastFromZoneDriver {
     }
 
     /// CR 611.2a: Reconcile this driver with a durational scope the parser
-    /// stamped on the grant AFTER the clause body was lowered (a leading
-    /// "Until end of turn, …" via `with_clause_duration`, or a stripped trailing
-    /// "… this turn"). A stated duration means the controller casts at a LATER
-    /// priority window, which is the defining property of a lingering
-    /// permission — so a resolution-scoped window degrades to one. The two
-    /// single-card mechanisms are unchanged here; the paid-cast downgrade has
-    /// its own narrower guard at the clause seam.
+    /// stamped on the grant AFTER the clause body was lowered — a leading
+    /// "Until end of turn, …", a stripped trailing "… this turn", or a duration
+    /// carried onto a coordinated cast conjunct. Every seam that stamps one
+    /// calls this. A stated duration means the controller casts at a LATER
+    /// priority window (CR 117.1a), which is the defining property of a
+    /// lingering permission — so both resolution-scoped mechanisms are asked to
+    /// degrade, the batch window and the single card alike. CR 118.9 governs
+    /// what the permission costs, never when it is exercised, so payment is not
+    /// part of this question. Only the batch window can REFUSE, and only when it
+    /// carries a bound; see the next paragraph.
     ///
     /// `None` is a REFUSAL, and the fallible return type is the point: the
     /// degrade is expressed as `for_batch_bounds(LingeringPermission, …)`, so a
@@ -2061,12 +2285,24 @@ impl CastFromZoneDriver {
             CastFromZoneDriver::ResolutionWindow { bounds } => {
                 Self::for_batch_bounds(CastMechanism::LingeringPermission, bounds)
             }
-            // CR 608.2g: the two single-card mechanisms carry no batch bound to
-            // lose, so a stated duration leaves them untouched (the paid
-            // `DuringResolution` → lingering move for a chosen single target
-            // — Emry, Lurker in the Loch — has its own narrower guard at the
-            // trailing-duration seam, which runs before this call).
-            other => Some(other),
+            // CR 608.2g + CR 117.1a: a during-resolution cast happens AS the
+            // ability resolves, with no priority window in between. A stated
+            // lifetime says the opposite, so the two are mutually exclusive and
+            // the single-card mechanism degrades as well — carrying no batch
+            // bound, it can never refuse. This arm used to answer
+            // `Some(DuringResolution)`, with the degrade hand-written at ONE
+            // seam behind a `without_paying_mana_cost: false` guard, so every
+            // FREE single-card grant with a printed lifetime kept a one-shot
+            // mechanism its own text contradicts. CR 118.9 governs what the
+            // permission COSTS, not when it is exercised. The affected cards are
+            // measured in the double parse cited by the change that moved this
+            // arm, not listed here, where the list would go stale unnoticed.
+            CastFromZoneDriver::DuringResolution => Some(CastFromZoneDriver::LingeringPermission),
+            // Already the lingering mechanism; a stated duration only stamps its
+            // lifetime.
+            CastFromZoneDriver::LingeringPermission => {
+                Some(CastFromZoneDriver::LingeringPermission)
+            }
         }
     }
 }
@@ -13638,6 +13874,113 @@ pub enum CopyManaValueLimit {
     AmountSpentToCastSource,
 }
 
+/// CR 707.2 + CR 115.1 + CR 611.2c: WHICH object(s) become the copy.
+///
+/// A bare `TargetFilter` cannot express this axis, because the two non-source
+/// readings are spelled with the SAME filter shape and differ only in whether
+/// the object is announced as a target:
+///
+/// - Shuri, Wakandan Inventor — "**Target** artifact you control becomes a copy
+///   of a second target artifact you control" — recipient `Typed(Artifact, You)`,
+///   **announced** (CR 115.1: declared as the ability is put on the stack, so it
+///   takes a target slot and is rechecked for legality on resolution per
+///   CR 608.2b).
+/// - Mirrorweave — "**Each other** creature becomes a copy of target
+///   nonlegendary creature" — recipient `Typed(Creature, [Other])`, **not
+///   announced**; the set is determined as the spell resolves (CR 611.2c).
+///
+/// Collapsing both onto `TargetFilter` forced the parser to throw one of them
+/// away, which is exactly the defect this axis fixes. `SubjectApplication`
+/// already draws this trichotomy at parse time; it previously had nowhere to
+/// record it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type", content = "filter")]
+pub enum CopyRecipient {
+    /// CR 707.2: the ability's own source — `~`, or an anaphoric "it"/"this
+    /// creature" naming it. Every self-copy card (Mirage Mirror, Thespian's
+    /// Stage, Lazav, Volrath, Clone-style ETB replacements, …). This is the
+    /// default and is skipped during serialization, so those cards round-trip
+    /// byte-identically.
+    #[default]
+    Source,
+    /// CR 115.1: an announced target, declared BEFORE the copy source in the
+    /// printed order (CR 601.2c). Shuri, True Polymorph, Shapesharer, Saheeli
+    /// Sublime Artificer, The Animus, Reflection Net, Kaya Spirits' Justice.
+    Target(TargetFilter),
+    /// CR 611.2c: an untargeted recipient set, determined only as the effect
+    /// resolves and then locked. Covers mass subjects (Mirrorweave, Mirrorform,
+    /// Niko's "Shards you control") and untargeted single-object anaphors such
+    /// as `AttachedTo` (Assimilation Aegis' enchanted/equipped host).
+    Untargeted(TargetFilter),
+}
+
+impl CopyRecipient {
+    /// The recipient's selection filter, when it has one. `Source` carries no
+    /// filter — it names the ability source directly.
+    pub fn filter(&self) -> Option<&TargetFilter> {
+        match self {
+            CopyRecipient::Source => None,
+            CopyRecipient::Target(filter) | CopyRecipient::Untargeted(filter) => Some(filter),
+        }
+    }
+
+    /// CR 115.1: the filter that is ANNOUNCED as a target slot, if any.
+    ///
+    /// `Target` is *defined* as the announced reading, so this is unconditional
+    /// for that variant. Six authorities key off this one function — both slot
+    /// builders, both target assigners, the chain target-sink predicate, and
+    /// the resolver's copy-source index — and they are consistent only if all
+    /// six agree on whether slot 0 is the recipient. A predicate that could
+    /// decline a `Target` here (e.g. a context-ref guard) would silently
+    /// collapse the recipient and the copy source onto the same declared
+    /// object, so the context-ref case is excluded by [`Self::targeted`]
+    /// instead — at construction and on deserialization, never here.
+    pub fn announced_filter(&self) -> Option<&TargetFilter> {
+        match self {
+            CopyRecipient::Target(filter) => Some(filter),
+            CopyRecipient::Source | CopyRecipient::Untargeted(_) => None,
+        }
+    }
+
+    /// CR 115.1 + CR 608.2k: build the recipient for a DECLARED-target subject,
+    /// routing a context ref to [`Self::Untargeted`].
+    ///
+    /// A context ref (`SelfRef`, `TriggeringSource`, `ParentTarget`, …) resolves
+    /// from chain or event context rather than a player's announcement, so it
+    /// can never occupy a target slot. This constructor is the single place that
+    /// decision is made, which is what lets [`Self::announced_filter`] stay
+    /// unconditional; see its doc for why a guard there would be wrong.
+    pub fn targeted(filter: TargetFilter) -> Self {
+        if filter.is_context_ref() {
+            CopyRecipient::Untargeted(filter)
+        } else {
+            CopyRecipient::Target(filter)
+        }
+    }
+
+    pub fn is_source(&self) -> bool {
+        matches!(self, CopyRecipient::Source)
+    }
+}
+
+/// CR 115.1: re-apply [`CopyRecipient::targeted`]'s invariant on the way in.
+///
+/// The parser can never emit a context-ref `Target`, but `Deserialize` is a
+/// second entry point: a hand-edited or corrupted mid-resolution snapshot could
+/// otherwise introduce `Target(TriggeringSource)`, which would collapse the
+/// recipient and the copy source onto one declared object across all six
+/// authorities. Normalizing here keeps the invariant a property of the type
+/// rather than of one construction site.
+fn deserialize_copy_recipient<'de, D>(deserializer: D) -> Result<CopyRecipient, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match CopyRecipient::deserialize(deserializer)? {
+        CopyRecipient::Target(filter) => CopyRecipient::targeted(filter),
+        other => other,
+    })
+}
+
 /// CR 702.179c-d: Direction of a speed change. Typed (not a bool) so the
 /// `Effect::ChangeSpeed` handler dispatches exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -15448,17 +15791,19 @@ pub enum Effect {
     BecomeCopy {
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
-        /// CR 707.2 + CR 611.2c: the object(s) that BECOME the copy. `SelfRef`
-        /// (default) = the source `~` (all existing single-subject cards,
-        /// byte-identical). A typed group filter ("Shards you control", Niko) or
-        /// `ParentTarget` selects a mass recipient set, snapshotted to concrete
-        /// ids at resolution (locked per 611.2c). Mirrors
-        /// `GainActivatedAbilitiesOfTarget.recipient`.
+        /// CR 707.2 + CR 115.1 + CR 611.2c: the object(s) that BECOME the copy.
+        /// `Source` (default) = the ability's own source `~` — every existing
+        /// single-subject copy card, byte-identical. `Target(..)` is an
+        /// announced recipient declared BEFORE the copy source (Shuri, True
+        /// Polymorph); `Untargeted(..)` is a resolution-time recipient set
+        /// (Mirrorweave, Niko's "Shards you control", Assimilation Aegis'
+        /// attached host). See [`CopyRecipient`].
         #[serde(
-            default = "default_target_filter_self_ref",
-            skip_serializing_if = "target_filter_is_self_ref"
+            default,
+            skip_serializing_if = "CopyRecipient::is_source",
+            deserialize_with = "deserialize_copy_recipient"
         )]
-        recipient: TargetFilter,
+        recipient: CopyRecipient,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -17519,11 +17864,17 @@ pub enum Effect {
         profile: Option<FaceDownProfile>,
     },
     /// CR 500.7: Take an extra turn after this one. The target determines who
-    /// takes the extra turn (usually Controller for "take an extra turn").
-    /// Extra turns are stored as a LIFO stack — most recently created taken first.
+    /// takes the extra turn (usually Controller for "take an extra turn"). `count`
+    /// defaults to one for legacy serialized effects. Extra turns are stored as a
+    /// LIFO stack — most recently created taken first.
     ExtraTurn {
         #[serde(default = "default_target_filter_controller")]
         target: TargetFilter,
+        #[serde(
+            default = "default_quantity_one",
+            skip_serializing_if = "is_default_quantity_one"
+        )]
+        count: QuantityExpr,
     },
     /// CR 606.3: Grant the resolved target player the right to activate each of
     /// their planeswalkers' loyalty abilities `amount` additional times this
@@ -17998,6 +18349,10 @@ fn default_player_filter_controller() -> PlayerFilter {
 
 fn default_quantity_one() -> QuantityExpr {
     QuantityExpr::Fixed { value: 1 }
+}
+
+fn is_default_quantity_one(quantity: &QuantityExpr) -> bool {
+    matches!(quantity, QuantityExpr::Fixed { value: 1 })
 }
 
 fn default_duration_until_end_of_turn() -> Duration {
@@ -21075,6 +21430,9 @@ impl Effect {
             Effect::GrantExtraLoyaltyActivations { amount, .. } => {
                 f(amount);
             }
+            Effect::ExtraTurn { count, .. } => {
+                f(count);
+            }
             Effect::SkipNextTurn { count, .. } => {
                 f(count);
             }
@@ -21257,7 +21615,6 @@ impl Effect {
             | Effect::ManifestDread
             | Effect::TurnFaceUp { .. }
             | Effect::TurnFaceDown { .. }
-            | Effect::ExtraTurn { .. }
             | Effect::Double { .. }
             | Effect::RuntimeHandled { .. }
             | Effect::Specialize
@@ -21327,6 +21684,7 @@ impl Effect {
             | Effect::ChooseDrawnThisTurnPayOrTopdeck { count, .. }
             | Effect::Manifest { count, .. }
             | Effect::Cloak { count, .. }
+            | Effect::ExtraTurn { count, .. }
             | Effect::SkipNextTurn { count, .. }
             | Effect::SkipNextStep { count, .. }
             | Effect::AdditionalPhase { count, .. }
@@ -21436,7 +21794,6 @@ impl Effect {
             | Effect::Goad { .. }
             | Effect::Detain { .. }
             | Effect::SetRoomDoorLock { .. }
-            | Effect::ExtraTurn { .. }
             | Effect::Transform { .. }
             | Effect::FlipPermanent { .. }
             | Effect::RevealTop { .. }
@@ -21591,6 +21948,7 @@ impl Effect {
             | Effect::ChooseDrawnThisTurnPayOrTopdeck { count, .. }
             | Effect::Manifest { count, .. }
             | Effect::Cloak { count, .. }
+            | Effect::ExtraTurn { count, .. }
             | Effect::SkipNextTurn { count, .. }
             | Effect::SkipNextStep { count, .. }
             | Effect::AdditionalPhase { count, .. }
@@ -21700,7 +22058,6 @@ impl Effect {
             | Effect::Goad { .. }
             | Effect::Detain { .. }
             | Effect::SetRoomDoorLock { .. }
-            | Effect::ExtraTurn { .. }
             | Effect::Transform { .. }
             | Effect::FlipPermanent { .. }
             | Effect::RevealTop { .. }
@@ -27890,6 +28247,17 @@ pub struct ReplacementDefinition {
     /// every declared scope against an independently derived one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draw_scope: Option<DrawReplacementScope>,
+    /// CR 706.6: What to do with the extra dice a count-raising die-roll
+    /// replacement caused to be rolled ("instead roll that many dice plus one
+    /// and ignore the lowest roll"). `Some` only when `event` is
+    /// [`ReplacementEvent::RollDice`]; `None` otherwise.
+    ///
+    /// Read by exactly one consumer, `roll_dice_applier`
+    /// (`game/replacement.rs`), which snapshots it onto
+    /// `ProposedEvent::RollDice.ignore_rule` — `ApplyResult` carries nothing but
+    /// the modified event, so that field is the only channel to `roll_die.rs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub die_ignore_rule: Option<DieRollIgnoreRule>,
     /// CR 701.31 + CR 901.9c: which planeswalk cause this definition watches.
     /// `None` means [`PlaneswalkReplacementScope::Any`]. Set to
     /// [`PlaneswalkReplacementScope::PlanarDieOnly`] for Fixed Point in Time.
@@ -28178,6 +28546,7 @@ impl ReplacementDefinition {
             event,
             draw_scope: None,
             planeswalk_scope: None,
+            die_ignore_rule: None,
             execute: None,
             runtime_execute: None,
             mode: ReplacementMode::Mandatory,
@@ -34489,6 +34858,61 @@ mod tests {
                 scope: ObjectScope::Target,
             }
         );
+    }
+
+    #[test]
+    fn extra_turn_quantity_serde_is_backward_compatible() {
+        let legacy: Effect = serde_json::from_str(r#"{"type":"ExtraTurn"}"#).unwrap();
+        assert!(matches!(
+            &legacy,
+            Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+            }
+        ));
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("count").is_none());
+
+        let two = Effect::ExtraTurn {
+            target: TargetFilter::Player,
+            count: QuantityExpr::Fixed { value: 2 },
+        };
+        let json = serde_json::to_value(&two).unwrap();
+        assert_eq!(json["count"]["value"], serde_json::json!(2));
+        assert_eq!(serde_json::from_value::<Effect>(json).unwrap(), two);
+
+        let dynamic = Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name: "X".into() },
+            },
+        };
+        let dynamic_json = serde_json::to_value(&dynamic).unwrap();
+        assert!(dynamic_json.get("count").is_some());
+        assert_eq!(
+            serde_json::from_value::<Effect>(dynamic_json).unwrap(),
+            dynamic
+        );
+    }
+
+    #[test]
+    fn extra_turn_quantity_is_reached_by_all_generic_authorities() {
+        let mut effect = Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name: "X".into() },
+            },
+        };
+        let dynamic = effect.count_expr().cloned().unwrap();
+        let mut visited = Vec::new();
+        effect.for_each_quantity_expr(&mut |quantity| visited.push(quantity.clone()));
+        assert_eq!(visited, vec![dynamic]);
+
+        *effect.count_expr_mut().unwrap() = QuantityExpr::Fixed { value: 2 };
+        assert_eq!(effect.count_expr(), Some(&QuantityExpr::Fixed { value: 2 }));
+        visited.clear();
+        effect.for_each_quantity_expr(&mut |quantity| visited.push(quantity.clone()));
+        assert_eq!(visited, vec![QuantityExpr::Fixed { value: 2 }]);
     }
 
     #[test]

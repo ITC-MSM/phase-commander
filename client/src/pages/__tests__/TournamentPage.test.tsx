@@ -519,6 +519,45 @@ describe("TournamentPage gated actions render from the broadcast", () => {
   });
 });
 
+describe("TournamentPage Bo1 result entry", () => {
+  // The Bo1 regression at the page/request boundary. A two-seat Bo1 event opens
+  // the report dialog with NO game-wins inputs, and a decisive report reaches
+  // the wire with an EMPTY tally — the only shape the broker accepts for Bo1. A
+  // dialog gated on seat count (as before ⓪) would send `{alice:0, bob:0}`,
+  // which the broker rejects, leaving a Bo1 event unreportable through the page.
+  it("reports a Bo1 head-to-head result with an empty tally", async () => {
+    const user = userEvent.setup();
+    const fake = makeFakeSocket();
+    primeSocket(fake);
+    useMultiplayerStore.setState({
+      tournamentCredentials: { TOUR01: playerCredential("alice") },
+    });
+    await mountWith(
+      fake,
+      h2hView("TOUR01", {
+        summary: summaryFor("TOUR01", { match_type: "Bo1" }),
+      }),
+    );
+
+    await user.click(screen.getByRole("button", { name: "Report Result" }));
+    const dialog = screen.getByRole("dialog");
+    // No per-game tally is offered for a Bo1 event.
+    expect(within(dialog).queryByText("Game wins")).not.toBeInTheDocument();
+    await user.click(within(dialog).getByLabelText("Alice"));
+    await user.click(screen.getByRole("button", { name: "Submit Result" }));
+    await settle();
+
+    expect(fake.tally("ReportMatchResult")).toBe(1);
+    const { outcome } = fake.frame("ReportMatchResult")?.data as {
+      outcome: {
+        Decisive: { winner: string; game_wins: Record<string, number> };
+      };
+    };
+    expect(outcome.Decisive.winner).toBe("alice");
+    expect(outcome.Decisive.game_wins).toEqual({});
+  });
+});
+
 // ── V11 — no page ever writes a view from an RPC result ──────────────────
 
 describe("TournamentPage RPC-result provenance", () => {
@@ -627,6 +666,42 @@ describe("TournamentPage broadcast scoping", () => {
       fake.deliver("TournamentRemoved", { code: "TOUR01" });
     });
     expect(screen.getByText("No tournament with that code.")).toBeTruthy();
+  });
+});
+
+// The v7 format badge. The pill (a `bg-sky-500/15` chip) resolves the label
+// through the registry, and must NOT render on the no-format path — the wire
+// sends an explicit `null` there, not `undefined`.
+describe("TournamentPage format badge", () => {
+  it("renders the format label when the summary carries one", async () => {
+    const fake = makeFakeSocket();
+    primeSocket(fake);
+    const view = h2hView("TOUR01", {
+      summary: { ...summaryFor("TOUR01"), format: "Commander" },
+    });
+    const { container } = await mountWith(fake, view);
+
+    expect(screen.getByText("Commander")).toBeTruthy();
+    expect(container.querySelector(".bg-sky-500\\/15")).not.toBeNull();
+  });
+
+  it("renders no format pill when the summary format is null", async () => {
+    const fake = makeFakeSocket();
+    primeSocket(fake);
+    const view = h2hView("TOUR01", {
+      summary: { ...summaryFor("TOUR01"), format: null },
+    });
+    const { container } = await mountWith(fake, view);
+
+    expect(container.querySelector(".bg-sky-500\\/15")).toBeNull();
+  });
+
+  it("renders no format pill when the summary omits format (pre-v7 broker)", async () => {
+    const fake = makeFakeSocket();
+    primeSocket(fake);
+    const { container } = await mountWith(fake, h2hView());
+
+    expect(container.querySelector(".bg-sky-500\\/15")).toBeNull();
   });
 });
 

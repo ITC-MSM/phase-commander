@@ -4,9 +4,9 @@ import type { ConnectionMode } from "../../stores/multiplayerStore";
 
 /**
  * Selected-segment styling per mode. This is the app's EXISTING colour
- * language for the two connection modes — emerald for the official server,
- * cyan for P2P (`LobbyView`'s host button tones, `HostSetup`'s `accentTone`) —
- * which until now was only ever shown and never explained.
+ * language for the two connection modes — emerald for dedicated hosting,
+ * cyan for P2P (`HostSetup`'s `accentTone`, which the rest of this form
+ * follows) — which until now was only ever shown and never explained.
  */
 const SELECTED_TONE: Record<ConnectionMode, string> = {
   server:
@@ -14,20 +14,14 @@ const SELECTED_TONE: Record<ConnectionMode, string> = {
   p2p: "bg-cyan-400/15 text-cyan-100 shadow-[inset_0_0_0_1px] shadow-cyan-300/25",
 };
 
-/** Render order. Neither mode is recommended over the other; server is first
- *  only because it is the auto-assigned default. */
-const MODES: readonly ConnectionMode[] = ["server", "p2p"];
-
-const SEGMENT_SIZE = {
-  sm: "px-2.5 py-1 text-[11px]",
-  md: "px-2 py-2 text-xs",
-} as const;
+const MODES: readonly ConnectionMode[] = ["p2p", "server"];
 
 /**
- * The authority on which transport a session uses: a dedicated server or a
- * direct peer-to-peer connection. Rendered in the lobby header and at the top
- * of Host Game, so the choice is visible and one click to reverse from either
- * screen.
+ * The authority on which transport a HOSTED session uses: a dedicated server
+ * or a direct peer-to-peer connection. Rendered at the top of Host Game and
+ * nowhere else — it configures a game being created, alongside the room name,
+ * password and lobby listing. Browsing and joining are deliberately not
+ * governed by it: `MultiplayerPage` routes a join on the shape of the code.
  *
  * Buttons with `aria-pressed`, matching the incumbent button-based segmented
  * control (`components/draft/BotDifficultySelector`). `role="radio"` is
@@ -39,11 +33,11 @@ const SEGMENT_SIZE = {
 export function ConnectionModeSwitch({
   value,
   onChange,
-  size = "md",
+  dedicatedAvailable = true,
 }: {
   value: ConnectionMode;
   onChange: (mode: ConnectionMode) => void;
-  size?: keyof typeof SEGMENT_SIZE;
+  dedicatedAvailable?: boolean;
 }) {
   const { t } = useTranslation("multiplayer");
 
@@ -59,9 +53,10 @@ export function ConnectionModeSwitch({
           <button
             key={mode}
             type="button"
+            disabled={mode === "server" && !dedicatedAvailable}
             onClick={() => onChange(mode)}
             aria-pressed={selected}
-            className={`flex-1 cursor-pointer whitespace-nowrap rounded-lg font-medium transition-colors ${SEGMENT_SIZE[size]} ${
+            className={`min-h-11 flex-1 cursor-pointer whitespace-nowrap rounded-lg px-2 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
               selected
                 ? SELECTED_TONE[mode]
                 : "text-white/45 hover:bg-white/[0.05] hover:text-white/70"

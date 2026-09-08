@@ -24,7 +24,11 @@ import { isFormatConfigShape } from "../adapter/format-config-shape";
 import { findSavedCustomFormat } from "../services/customFormats";
 import { AI_DIFFICULTIES } from "../constants/ai";
 import { FORMAT_REGISTRY } from "../data/formatRegistry";
-import { serverProtocolRejection, type ServerInfo } from "../adapter/ws-adapter";
+import {
+  MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE,
+  serverProtocolRejection,
+  type ServerInfo,
+} from "../adapter/ws-adapter";
 import {
   clearWsSession,
   loadWsSession,
@@ -47,6 +51,7 @@ import {
   endTournamentOver,
   getTournamentOver,
   joinTournamentOver,
+  matchTypeNeedsCapability,
   reportMatchResultOver,
   startTournamentRoundOver,
   subscribeTournamentsOver,
@@ -124,10 +129,12 @@ type ConnectionStatus = "disconnected" | "connecting" | "connected";
 type HostingStatus = "idle" | "connecting" | "waiting";
 
 /**
- * The transport a multiplayer session runs over: a dedicated server, or a
- * direct peer-to-peer mesh. The player picks it explicitly in the lobby's
- * connection switch, so it lives here rather than being derived from
- * {@link MultiplayerState.hostingServer}.
+ * The transport a HOSTED multiplayer session runs over: a dedicated server, or
+ * a direct peer-to-peer mesh. The player picks it explicitly on Host Game, so
+ * it lives here rather than being derived from
+ * {@link MultiplayerState.hostingServer}. Browsing and joining are NOT scoped
+ * by it — the lobby serves both transports and a join is routed by the shape
+ * of the code.
  */
 export type ConnectionMode = "server" | "p2p";
 
@@ -932,6 +939,28 @@ export interface TournamentNotAuthorized {
 }
 
 /**
+ * A `CreateTournament` request refused **locally, before any frame is sent**,
+ * because the tournament broker's advertised lobby protocol cannot honor a
+ * capability the request needs — today, an explicit Bo1 head-to-head structure
+ * against a broker below {@link MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE}, which would
+ * otherwise silently run as Bo3.
+ *
+ * Modelled on {@link TournamentNotAuthorized}: same `{ ok: false; reason;
+ * message }` skeleton so `if (!r.ok)` narrows uniformly, plus a **typed**
+ * `neededLobbyVersion` the UI can read instead of parsing the English message.
+ * Like `not_authorized`, it is decided from a broker-advertised fact and puts
+ * nothing on the wire — never read it as "the tournament was created".
+ */
+export interface TournamentIncompatible {
+  ok: false;
+  reason: "incompatible";
+  /** The lobby protocol version the requested capability requires. */
+  neededLobbyVersion: number;
+  /** Human-readable fallback; the UI wraps it via an i18n key. */
+  message: string;
+}
+
+/**
  * What a token-gated tournament action resolves to: the wire result, widened
  * by exactly one locally-produced failure member. Every failure member keeps
  * the same `{ ok: false; reason; message }` skeleton, so `if (!r.ok)`
@@ -1153,24 +1182,25 @@ interface MultiplayerState {
   playerId: string;
   displayName: string;
   /**
-   * Where this client hosts and registers games — the P2P broker target and
-   * the server-run hosting endpoint. `null` is the direct-codes sentinel:
-   * no lobby is browsed and `MultiplayerPage` runs in P2P mode, so any
-   * `userLobbySources` are inert until a hosting server is chosen again.
-   * A non-null value is always a valid `ws(s)://` URL (enforced at
-   * `setHostingServer`, migration and hydration).
+   * Preferred lobby authority for direct-code lookup and custom P2P brokering.
+   * A Full authority does not replace the official P2P broker. Dedicated games
+   * choose their own endpoint per session; browsing subscribes to all sources.
+   * `null` is a legacy direct-code preference migrated by MultiplayerPage.
+   * Non-null URLs are validated by the setter and persistence boundary.
    */
   hostingServer: string | null;
   /**
-   * The connection mode the player chose in the lobby's connection switch, or
-   * `null` when they have never chosen one. PERSISTED, so the choice survives
-   * a reload and the ordinary lobby → game → lobby round trip.
+   * The connection mode the player chose on Host Game, or `null` when they
+   * have never chosen one. PERSISTED, so the choice survives a reload and the
+   * ordinary lobby → game → lobby round trip.
    *
    * `null` is the load-bearing "absent" sentinel: `MultiplayerPage` falls back
    * to deriving the mode from {@link MultiplayerState.hostingServer} only
-   * while this is `null`, which is what lets a legacy blob with a `null`
-   * anchor still boot into P2P. A non-null initial would make "never chosen"
-   * indistinguishable from "chose server" and destroy that preference.
+   * while this is `null`. A non-null initial would make "never chosen"
+   * indistinguishable from "chose server" and destroy that preference. The
+   * page also converts a legacy `null` anchor — the old "None (P2P only)"
+   * pick — into an explicit `"p2p"` here as it seeds an anchor, so that
+   * preference outlives the derivation it used to depend on.
    */
   connectionMode: ConnectionMode | null;
   /** Hand-added lobby authorities. Persisted; built-in presets are derived
@@ -1307,7 +1337,8 @@ interface MultiplayerActions {
   startP2PHostingSession: (
     settings: HostingSettings,
     deck: HostingDeck,
-    opts: { useBroker: boolean; roomName?: string | null },
+    // The probed broker for this attempt; null explicitly opts out of the lobby.
+    opts: { brokerUrl: string | null; roomName?: string | null },
   ) => Promise<boolean>;
   /**
    * Transfers the pre-game host adapter to the matching game route. Once
@@ -1382,7 +1413,9 @@ interface MultiplayerActions {
   /** Create a tournament and remember its organizer token. */
   createTournament: (
     req: CreateTournamentRequest,
-  ) => Promise<TournamentRpcResult<TournamentCreatedReply>>;
+  ) => Promise<
+    TournamentRpcResult<TournamentCreatedReply> | TournamentIncompatible
+  >;
   /** Join a tournament and remember its player token and player key. */
   joinTournament: (
     code: string,
@@ -2713,7 +2746,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         };
 
         set({
-          hostIsPublic: opts.useBroker && settings.public,
+          hostIsPublic: opts.brokerUrl !== null && settings.public,
           hostingStatus: "connecting",
           hostGameCode: null,
           hostSession: {
@@ -2788,15 +2821,8 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
             releaseAttempt();
             return false;
           }
-          if (opts.useBroker) {
-            // Unreachable through `MultiplayerPage`: `useBroker` is only set
-            // after the hosting server's own socket reported `LobbyOnly`. The
-            // throw lands in this function's catch and resets hosting.
-            const brokerUrl = get().hostingServer;
-            if (brokerUrl === null) {
-              throw new Error("No hosting server to register on.");
-            }
-            broker = await openBrokerClient(brokerUrl);
+          if (opts.brokerUrl !== null) {
+            broker = await openBrokerClient(opts.brokerUrl);
             if (!isCurrentAttempt()) {
               releaseAttempt();
               return false;
@@ -2888,7 +2914,7 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
           destroyHostedRoom = null;
 
           set({
-            hostIsPublic: opts.useBroker && settings.public,
+            hostIsPublic: opts.brokerUrl !== null && settings.public,
             hostingStatus: "waiting",
             hostGameCode: host.roomCode,
             hostSession: {
@@ -3327,8 +3353,42 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
         };
       },
 
-      createTournament: async (req) =>
-        runTournamentRpc(set, get, async (socket, signal) => {
+      createTournament: async (req) => {
+        // `runTournamentRpc` is inlined here (its whole body is this url check
+        // plus `withOriginSocket`) so the pre-send capability gate below can read
+        // the SOCKET's negotiated `lobbyProtocolVersion` — the same authority the
+        // gated RPCs read — and return the locally-produced `TournamentIncompatible`
+        // that the generic `runTournamentRpc<T>` return shape cannot carry.
+        const url = tournamentBroadcastUrl(get);
+        if (url === null) {
+          return {
+            ok: false,
+            reason: "connection_lost",
+            message: "Lobby connection unavailable. Check your server address.",
+          };
+        }
+        return withOriginSocket(set, get, url, async (socket, signal) => {
+          // Refuse a match structure this broker cannot honor BEFORE any frame
+          // is sent, so an explicit Bo1 head-to-head choice is never silently
+          // run as Bo3 by a pre-v8 broker (which discards `match_type`). Reads
+          // the exact socket's advertised version; an absent one predates v8, so
+          // it fails closed. Mirrors the local `not_authorized` refusal — a
+          // broker-advertised fact, nothing on the wire.
+          const version = socket.serverInfo.lobbyProtocolVersion;
+          if (
+            matchTypeNeedsCapability(req.arity, req.matchType) &&
+            (version === undefined || version < MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE)
+          ) {
+            return {
+              ok: false,
+              reason: "incompatible",
+              neededLobbyVersion: MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE,
+              // Non-localized fallback for logs/non-UI consumers. The user-facing
+              // copy is rendered from the typed `neededLobbyVersion` via the
+              // `errors.incompatible` catalog entry, not from this string.
+              message: `The selected match structure needs a server speaking lobby protocol ${MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE}; this one speaks ${version ?? "an older version"} and would apply its default structure instead. Nothing was sent.`,
+            };
+          }
           const result = await createTournamentOver(socket, req, { signal });
           if (result.ok) {
             // Keyed by the code in the REPLY: `CreateTournament` carries no
@@ -3343,7 +3403,8 @@ export const useMultiplayerStore = create<MultiplayerState & MultiplayerActions>
             }));
           }
           return result;
-        }),
+        });
+      },
 
       joinTournament: async (code, displayName) =>
         runTournamentRpc(set, get, async (socket, signal) => {

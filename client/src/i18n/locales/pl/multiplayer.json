@@ -1,4 +1,22 @@
 {
+  "lan": {
+    "title": "Sieć lokalna",
+    "guidance": "Wpisz adres serwera, aby dołączyć ręcznie. Strony HTTPS wymagają bezpiecznego serwera wss://; użyj aplikacji komputerowej dla lokalnych adresów ws://.",
+    "unavailable": "Hostowanie i wyszukiwanie LAN wymaga aktualnej aplikacji komputerowej.",
+    "checking": "Sprawdzanie obsługi LAN…",
+    "start": "Rozpocznij hostowanie LAN",
+    "stop": "Zatrzymaj hostowanie LAN",
+    "scan": "Znajdź serwery LAN",
+    "pending": "Przetwarzanie…",
+    "running": "Hostowanie LAN jest aktywne. Udostępnij adres graczom w swojej sieci.",
+    "empty": "Nie znaleziono serwerów LAN. Sprawdź, czy gospodarz działa w tej samej sieci, i spróbuj ponownie.",
+    "add": "Dodaj serwer",
+    "copy": "Kopiuj adres",
+    "copied": "Adres skopiowany",
+    "error": "Operacja LAN nie powiodła się. {{detail}}",
+    "added": "Dodano serwer. Użyj serwera dedykowanego, gdy połączenie będzie zgodne i gotowe.",
+    "originUnavailable": "Hostowanie LAN jest niedostępne dla tej wersji lub pochodzenia aplikacji."
+  },
   "concedeDialog": {
     "title": "Poddać grę?",
     "game": {
@@ -180,7 +198,6 @@
     "createDraft": "Utwórz draft"
   },
   "lobbyView": {
-    "directConnection": "Połączenie bezpośrednie",
     "onlineLobby": "Poczekalnia online",
     "online": "{{count}} online",
     "format": "Format",
@@ -193,14 +210,10 @@
     "noFormatGames": "Brak gier {{format}} w tej chwili.",
     "noOpenGames": "Brak otwartych gier w tej chwili.",
     "showAllFormats": "Pokaż wszystkie formaty",
-    "p2pNotice": "Tryb peer-to-peer. Hostuj lub dołącz bezpośrednio za pomocą 5-znakowego kodu pokoju.",
-    "joinByCode": "Dołącz za pomocą kodu",
     "joinATable": "Dołącz do stołu",
-    "p2pCodePlaceholder": "Wpisz 5-znakowy kod P2P",
     "serverCodePlaceholder": "Wpisz kod lub KOD@IP:PORT",
     "join": "Dołącz",
     "host": "Hostuj",
-    "hostP2PDescription": "Utwórz bezpośredni pokój dla jednego przeciwnika.",
     "hostServerDescription": "Otwórz pokój i czekaj na graczy.",
     "hostDraft": "Hostuj draft",
     "hostGame": "Hostuj grę",
@@ -211,6 +224,7 @@
     "invalidJoinServer": "Adres serwera w tym kodzie jest nieprawidłowy."
   },
   "hostSetup": {
+    "dedicatedUnavailable": "Żaden serwer dedykowany nie jest teraz dostępny. Możesz hostować grę przez P2P.",
     "hostDirectMatch": "Hostuj mecz bezpośredni",
     "hostMatch": "Hostuj mecz",
     "p2pNotice": "Tryb peer-to-peer. Ten pokój łączy graczy bezpośrednio, zamiast działać na serwerze.",

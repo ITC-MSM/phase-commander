@@ -386,9 +386,10 @@ pub(crate) fn parse_target_with_disjunctive_restriction(text: &str) -> (TargetFi
     (filter, &rest[consumed..])
 }
 
-/// CR 205.2a + CR 601.2h: Fold an INDEFINITE-ARTICLE-led right conjunct onto an
+/// CR 205.2a + CR 601.2h: Fold a DETERMINER-led right conjunct onto an
 /// already-parsed left conjunct — "another creature or an artifact"
-/// (Mold Folk's `{1}, Sacrifice another creature or an artifact:`).
+/// (Mold Folk's `{1}, Sacrifice another creature or an artifact:`) and the
+/// mirror-image "an artifact or another creature" (Malevolent Noble).
 ///
 /// Takes `base` and `rest` rather than parsing the phrase itself, and that split
 /// is LOAD-BEARING, not a style choice. In this surface "another" scopes only the
@@ -483,12 +484,26 @@ pub(crate) fn fold_article_led_type_union(base: TargetFilter, rest: &str) -> (Ta
     )
 }
 
-/// The connector of an article-led type union: `" or an "` / `" and/or a "`,
-/// returning the byte count consumed through the article. Requires a bare type
-/// word after the article and refuses the article-led BARE-card branch
+/// The connector of a determiner-led type union: `" or an "` / `" and/or a "` /
+/// `" or another "`, returning the byte count consumed up to the point where
+/// `parse_type_phrase_folding` should resume. Requires a bare type word after
+/// the determiner and refuses the article-led BARE-card branch
 /// ("or a card with disturb" — Shipwreck Sifters), which is a
 /// keyword-membership disjunct folded at the trigger layer rather than a
 /// card-type union. `input` is already lowercased.
+///
+/// THE INDEFINITE ARTICLE IS CONSUMED, "ANOTHER" IS NOT, and that asymmetry is
+/// load-bearing. "a"/"an" carry no filter content, and `parse_type_phrase_folding`
+/// has no article arm, so they must be eaten here. "another" DOES carry filter
+/// content — it excludes the ability's source from the leg it determines — and
+/// `parse_type_phrase_folding` is the single authority that turns that word into
+/// `FilterProp::Another`. Eating it here would silently drop the restriction from
+/// the right conjunct and let the source pay for itself: Malevolent Noble's
+/// "Sacrifice an artifact or another creature" would accept Malevolent Noble as
+/// its own creature leg. So the offset stops before "another" and hands the word
+/// on. Only the RIGHT conjunct is affected; the caller
+/// ([`fold_article_led_type_union`]) applies the left conjunct's own scoping
+/// before folding, exactly as its doc comment requires.
 fn parse_article_led_type_union_connector(input: &str) -> Option<usize> {
     let total = input.len();
     let (rest, _) = multispace0::<_, OracleError<'_>>(input).ok()?;
@@ -498,13 +513,18 @@ fn parse_article_led_type_union_connector(input: &str) -> Option<usize> {
     if is_article_led_bare_card(rest) {
         return None;
     }
-    let (after_article, _) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
-        .parse(rest)
-        .ok()?;
-    if !starts_with_type_word(after_article) {
-        return None;
-    }
-    Some(total - after_article.len())
+    // Longest-match-first: "another " is tried before "an ", which cannot match
+    // it anyway ("another"[2] is not a space) but the order documents intent.
+    let resume_at =
+        if let Ok((after_another, _)) = tag::<_, _, OracleError<'_>>("another ").parse(rest) {
+            starts_with_type_word(after_another).then_some(rest)?
+        } else {
+            let (after_article, _) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a ")))
+                .parse(rest)
+                .ok()?;
+            starts_with_type_word(after_article).then_some(after_article)?
+        };
+    Some(total - resume_at.len())
 }
 
 /// One disjunct of a heterogeneous relative-clause restriction (see
@@ -1250,6 +1270,67 @@ pub fn parse_target_with_syntax<'a>(
                         }
                         leg_text = &rest[rest_lower.len() - next_leg.len()..];
                     }
+                }
+            }
+            // CR 115.1 + CR 601.2c + CR 603.3d: a `who`-headed relative clause
+            // narrows the PLAYER TARGET's legal domain, and every conjunct of it
+            // is load-bearing at announcement. Discarding it here — leaving the
+            // broad player noun behind and letting the caller drop the remainder
+            // — is what let the Exodus Oath cycle announce ANY player and resolve
+            // on every upkeep regardless of the printed comparison (Oath of
+            // Druids, Oath of Lieges). This is the target-position mirror of the
+            // trigger-event hook in `oracle_trigger`, and it shares that hook's
+            // two rules: the clause must be modelled in FULL, and it must end at
+            // a real clause boundary.
+            //
+            // Each conjunct becomes its own `PlayerMatching` leg; a single
+            // conjunct stays unwrapped so the common one-restriction shape does
+            // not grow a redundant `And`. The bare `TargetFilter::Player` head
+            // noun is the identity for a player population (CR 102.1) and is
+            // dropped from the conjunction; any narrower head noun ("target
+            // opponent") is kept as its own leg so the base and predicate axes
+            // compose instead of one shadowing the other.
+            //
+            // The attempt is SPECULATIVE, so it runs against a cloned
+            // `ParseContext` and commits with `*ctx = tentative_ctx` only once the
+            // clause is accepted — the same discipline the damage-chain
+            // recognizers use. The inner type-phrase parse mutates `ctx`
+            // (`relative_player_scope`, the printed-colour choice, …), and a
+            // declined clause must not leak those writes into the fallback parse.
+            // Every head-noun tag above stops before the separating space, so the
+            // remainder begins with the character AFTER the noun: a space before
+            // a relative clause, or ","/"."/eof otherwise. Peel that one space
+            // with the same `tag(" ")` the trigger-side hook uses, so both seams
+            // hand the predicate grammar an identically normalized slice.
+            let after_noun_orig = &text[lower.len() - after_player.len()..];
+            let after_noun = tag::<_, _, OracleError<'_>>(" ")
+                .parse(after_noun_orig)
+                .map_or(after_noun_orig, |(after, _)| after);
+            let mut tentative_ctx = ctx.clone();
+            if let Ok((clause_rest, predicates)) =
+                super::oracle_effect::parse_target_player_relative_clause(
+                    after_noun,
+                    &mut tentative_ctx,
+                )
+            {
+                let clause_rest_lower = clause_rest.to_lowercase();
+                if nom_primitives::peek_clause_terminator(&clause_rest_lower).is_ok() {
+                    *ctx = tentative_ctx;
+                    let mut legs: Vec<TargetFilter> = Vec::new();
+                    if !matches!(player_filter, TargetFilter::Player) {
+                        legs.push(player_filter.clone());
+                    }
+                    legs.extend(predicates.into_iter().map(|player| {
+                        TargetFilter::PlayerMatching {
+                            player: Box::new(player),
+                        }
+                    }));
+                    let bound = if legs.len() == 1 {
+                        legs.remove(0)
+                    } else {
+                        TargetFilter::And { filters: legs }
+                    };
+                    return (bound, clause_rest, syntax);
                 }
             }
             return (
@@ -2099,9 +2180,9 @@ pub(super) fn parse_definite_parent_reference<'a>(
     // Optional trailing "card"/"cards" zone qualifier (Goblin Welder's "the
     // artifact card"). When present, the anaphor names a non-battlefield
     // (card-zone) slot.
-    let (rest, is_card) = match parse_card_or_cards_word(after_type_word.trim_start()) {
-        Ok((r, _)) => (r, true),
-        Err(_) => (after_type_word, false),
+    let (rest, zone_class) = match parse_card_or_cards_word(after_type_word.trim_start()) {
+        Ok((r, _)) => (r, AnaphorZoneClass::CardInNonBattlefieldZone),
+        Err(_) => (after_type_word, AnaphorZoneClass::BattlefieldPermanent),
     };
     // A possessive continuation ("the creature's controller") is a distinct
     // anaphor class (controller/owner of the slot), not a bare slot reference —
@@ -2119,8 +2200,12 @@ pub(super) fn parse_definite_parent_reference<'a>(
     // CR 601.2c: each anaphor names exactly one earlier slot — bind only a
     // UNIQUE match; zero or ≥2 matches fall through as `None`.
     let mut matched: Option<usize> = None;
+    // CR 205.3: `parse_type_filter_word` yields only card types and subtypes, so
+    // this call site can never produce `AnaphorNoun::Token` — the token arm is
+    // reachable only from the demonstrative-route gate in `conditions.rs`.
+    let anaphor_noun = AnaphorNoun::Type(anaphor_type);
     for (index, slot) in slots.iter().enumerate() {
-        if slot_matches_anaphor(&anaphor_type, is_card, slot) {
+        if slot_matches_anaphor(&anaphor_noun, zone_class, slot) {
             if matched.is_some() {
                 return None;
             }
@@ -2130,29 +2215,71 @@ pub(super) fn parse_definite_parent_reference<'a>(
     matched.map(|index| (TargetFilter::ParentTargetSlot { index }, rest))
 }
 
-/// CR 205.3 + CR 400.1: Whether a declared target slot filter matches a definite
-/// anaphor's parsed `(type token, is-card)`. Type match is by core-type
-/// membership or subtype equality; the card qualifier requires the slot to be
-/// (`is_card`) or not be (`!is_card`) in a non-battlefield card zone.
-fn slot_matches_anaphor(anaphor_type: &TypeFilter, is_card: bool, slot: &TargetFilter) -> bool {
+/// CR 205.3 + CR 111.1: the matching axis a demonstrative or definite anaphor's
+/// noun contributes. "token" is NOT a card type (CR 111.1) — it is the
+/// `FilterProp::Token` object property — so the axis is a typed enum rather than
+/// a bare `TypeFilter`, which could not express it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum AnaphorNoun {
+    /// A card type ("creature", "artifact", "land") or a subtype used as the
+    /// printed noun ("Equipment", "Aura") — CR 205.3.
+    Type(TypeFilter),
+    /// CR 111.1: a token is not a card type; it is an object property.
+    Token,
+}
+
+/// CR 400.1 + CR 601.2c: which zone class an anaphor names. A bare demonstrative
+/// or definite noun names a battlefield permanent; a printed "card"/"cards"
+/// qualifier names an object in another zone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AnaphorZoneClass {
+    /// A bare demonstrative or definite noun ("that token", "the artifact")
+    /// names a battlefield permanent (CR 400.1).
+    BattlefieldPermanent,
+    /// An explicit "card"/"cards" qualifier ("the artifact card") names an
+    /// object in a non-battlefield zone (Goblin Welder's graveyard slot).
+    CardInNonBattlefieldZone,
+}
+
+/// CR 400.1: the zone class a declared target slot filter itself denotes. A slot
+/// with no zone property, or one explicitly scoped to the battlefield, is a
+/// permanent; any other zone property makes it a card in that zone.
+fn slot_zone_class(slot: &TargetFilter) -> AnaphorZoneClass {
+    match slot.extract_in_zone() {
+        Some(zone) if zone != Zone::Battlefield => AnaphorZoneClass::CardInNonBattlefieldZone,
+        _ => AnaphorZoneClass::BattlefieldPermanent,
+    }
+}
+
+/// CR 205.3 + CR 400.1: Whether a declared target slot filter matches an
+/// anaphor's parsed noun and zone class. Type match is by core-type membership,
+/// subtype equality, or — CR 111.1 — the token object property; the zone
+/// conjunct requires the slot's own derived `AnaphorZoneClass` to equal the
+/// anaphor's, so a graveyard-scoped slot never answers a bare demonstrative.
+pub(super) fn slot_matches_anaphor(
+    noun: &AnaphorNoun,
+    zone_class: AnaphorZoneClass,
+    slot: &TargetFilter,
+) -> bool {
     let TargetFilter::Typed(tf) = slot else {
         return false;
     };
-    let type_ok = match anaphor_type {
-        TypeFilter::Subtype(sub) => tf
+    let type_ok = match noun {
+        AnaphorNoun::Type(TypeFilter::Subtype(sub)) => tf
             .get_subtype()
             .is_some_and(|slot_sub| slot_sub.eq_ignore_ascii_case(sub)),
-        other => tf.type_filters.iter().any(|t| t == other),
+        // CR 111.1: a token is not a card type; a "that token" anaphor names a
+        // slot carrying the token object property.
+        AnaphorNoun::Token => tf.properties.iter().any(|p| matches!(p, FilterProp::Token)),
+        AnaphorNoun::Type(other) => tf.type_filters.iter().any(|t| t == other),
     };
     if !type_ok {
         return false;
     }
-    // A "card" lives in a non-battlefield zone (Goblin Welder's graveyard slot);
-    // a battlefield permanent carries no such zone property.
-    let slot_is_card = slot
-        .extract_in_zone()
-        .is_some_and(|zone| zone != Zone::Battlefield);
-    slot_is_card == is_card
+    // CR 400.1: a bare demonstrative names a battlefield permanent; a printed
+    // "card" qualifier names a non-battlefield zone (Goblin Welder's graveyard
+    // slot). The two classes must agree.
+    slot_zone_class(slot) == zone_class
 }
 
 /// CR 201.2: Match a clause boundary that ends a card name in a board-filter

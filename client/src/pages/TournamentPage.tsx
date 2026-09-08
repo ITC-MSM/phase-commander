@@ -9,6 +9,7 @@ import type {
   TournamentView,
 } from "../adapter/types";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
+import { formatMetadata } from "../data/formatRegistry";
 import { useInShell } from "../components/chrome/ShellContext";
 import { MenuParticles } from "../components/menu/MenuParticles";
 import { MenuPanel, MenuShell } from "../components/menu/MenuShell";
@@ -387,7 +388,9 @@ export function TournamentPage() {
             >
               {"message" in failure
                 ? t(failure.key, { message: failure.message })
-                : t(failure.key)}
+                : "needed" in failure
+                  ? t(failure.key, { needed: failure.needed })
+                  : t(failure.key)}
             </div>
           )}
 
@@ -409,6 +412,23 @@ export function TournamentPage() {
                 <span className="rounded-[5px] border border-indigo-300/20 bg-indigo-500/15 px-1.5 py-0.5 font-semibold text-indigo-200">
                   {t(`bracket.${view.summary.bracket}`)}
                 </span>
+                {/* The game-format label, resolved to its human name through the
+                    shared registry (the engine is the source of truth for the
+                    list). Absent when the organizer named none, or against a
+                    pre-v7 broker. Never recomputed — a display label only. */}
+                {view.summary.format != null && (
+                  <span className="rounded-[5px] border border-sky-300/20 bg-sky-500/15 px-1.5 py-0.5 font-semibold text-sky-200">
+                    {formatMetadata(view.summary.format)?.label ??
+                      view.summary.format}
+                  </span>
+                )}
+                {/* The resolved match structure (Bo1 / Bo3), read off the summary.
+                    Absent against a pre-v8 broker. Reuses the create-form labels. */}
+                {view.summary.match_type !== undefined && (
+                  <span className="rounded-[5px] border border-teal-300/20 bg-teal-500/15 px-1.5 py-0.5 font-semibold text-teal-200">
+                    {t(`create.matchType${view.summary.match_type}`)}
+                  </span>
+                )}
                 <span className="text-slate-400">
                   {"seats" in arity
                     ? t(arity.key, { seats: arity.seats })
@@ -547,6 +567,7 @@ export function TournamentPage() {
                 <ReportResultDialog
                   isOpen
                   pairing={freshPairing}
+                  matchType={view?.summary.match_type}
                   submitting={busy !== null}
                   onSubmit={handleReport}
                   onCancel={() => setReporting(null)}
