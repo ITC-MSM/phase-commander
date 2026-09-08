@@ -1521,6 +1521,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         GameEvent::CreatureExploited {
             exploiter,
             sacrificed,
+            ..
         } => vec![
             card_seg(state, *exploiter),
             text(" exploits "),
