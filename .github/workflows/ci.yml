@@ -630,7 +630,7 @@ jobs:
         # Pass data/ explicitly — the binary's default lookup is
         # `client/public/card-data.json` which doesn't exist on the ci.yml
         # path (card-data is generated directly into data/ above).
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.repository == 'phase-rs/phase' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: cargo semantic-audit data/
 
       - name: Stamp shared card_data_hash on coverage + audit JSONs
@@ -646,7 +646,7 @@ jobs:
         # that happened to populate it. semantic-audit.json is not cached, so it
         # is still stamped in place. The uploads below publish the stamped copy,
         # so R2 artifacts keep exactly their current shape.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.repository == 'phase-rs/phase' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
           HASH=$(sha256sum data/card-data.json | awk '{print substr($1, 1, 16)}')
           jq --arg h "$HASH" '. + {card_data_hash: $h}' data/semantic-audit.json > data/semantic-audit.json.tmp
@@ -654,7 +654,7 @@ jobs:
           jq --arg h "$HASH" '. + {card_data_hash: $h}' data/coverage-data.json > data/coverage-data.stamped.json
 
       - name: Upload data to R2 (preview)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.repository == 'phase-rs/phase' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -682,7 +682,7 @@ jobs:
         # bounded by distinct parser states, not commit count. best-effort
         # (continue-on-error): a missed publish just defers a PR's comment to
         # "baseline pending" until the next main push, never wedges main.
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.repository == 'phase-rs/phase' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
