@@ -4602,10 +4602,12 @@ mod tests {
     use engine::game::scenario_db::GameScenarioDbExt;
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, CategoryChooserScope, ContinuousModification,
-        ControllerRef, Duration, Effect, EffectKind, ManaProduction, PlayerFilter, PtValue,
-        QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, StaticDefinition,
-        TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, CategoryChooserScope, CommanderOwnership,
+        ContinuousModification, ControllerRef, Duration, Effect, EffectKind, ManaProduction,
+        ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, PtValue,
+        QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, StaticCondition,
+        StaticDefinition, TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition,
+        TypedFilter,
     };
     use engine::types::ability::{ChoiceType, ChosenAttribute};
     use engine::types::card_type::CoreType;
@@ -6849,6 +6851,68 @@ mod tests {
         id
     }
 
+    /// Real Drown in Dreams structure: a spell-level `ModalChoice` with two
+    /// independent Spell roots (draw X, mill twice X), not an embedded choice.
+    fn add_drown_in_dreams(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(1_544_805_279_936_282_634),
+            owner,
+            "Drown in Dreams".to_string(),
+            Zone::Hand,
+        );
+        let object = state.objects.get_mut(&id).unwrap();
+        object.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            generic: 2,
+        };
+        object.card_types.core_types.push(CoreType::Instant);
+        *Arc::make_mut(&mut object.abilities) = vec![
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string(),
+                        },
+                    },
+                    target: TargetFilter::Player,
+                },
+            ),
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Mill {
+                    count: QuantityExpr::Multiply {
+                        factor: 2,
+                        inner: Box::new(QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        }),
+                    },
+                    target: TargetFilter::Player,
+                    destination: Zone::Graveyard,
+                },
+            ),
+        ];
+        object.modal = Some(ModalChoice {
+            min_choices: 1,
+            max_choices: 1,
+            mode_count: 2,
+            constraints: vec![ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: ModalSelectionCondition::Static {
+                    condition: StaticCondition::ControlsCommander {
+                        ownership: CommanderOwnership::Any,
+                    },
+                },
+                max_choices: 2,
+                otherwise_max_choices: 1,
+            }],
+            ..ModalChoice::default()
+        });
+        id
+    }
+
     fn activate_score(scored: &[(GameAction, f64)], source: ObjectId) -> Option<f64> {
         scored.iter().find_map(|(action, score)| match action {
             GameAction::ActivateAbility { source_id, .. } if *source_id == source => Some(*score),
@@ -6910,6 +6974,136 @@ mod tests {
         assert!(
             score.is_finite(),
             "with X >= 1 affordable the gate stands down; activation must score finite"
+        );
+    }
+
+    #[test]
+    fn drown_in_dreams_modal_xcast_gate_rejects_zero_and_allows_one() {
+        let mut zero_state = make_state();
+        let drown = add_drown_in_dreams(&mut zero_state, PlayerId(0));
+        // Pay Drown's fixed {2}{U} component while leaving X at zero.
+        add_mana(&mut zero_state, PlayerId(0), ManaType::Colorless, 2);
+        add_mana(&mut zero_state, PlayerId(0), ManaType::Blue, 1);
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(1);
+        let session = AiSession::arc_from_game(&zero_state);
+        let zero_scores = score_candidates_core(&zero_state, PlayerId(0), &config, &session, None);
+        let zero_cast_score = zero_scores
+            .iter()
+            .find_map(|(action, score)| {
+                matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == drown)
+                    .then_some(*score)
+            })
+            .expect("real Priority root candidate must include Drown in Dreams");
+        assert!(
+            !zero_cast_score.is_finite(),
+            "Drown at max X=0 must be rejected, got {zero_cast_score}"
+        );
+        assert!(
+            action_score(&zero_scores, &GameAction::PassPriority).is_finite(),
+            "PassPriority remains a finite Priority alternative"
+        );
+        assert_eq!(
+            choose_action(
+                &zero_state,
+                PlayerId(0),
+                &config,
+                &mut SmallRng::seed_from_u64(1),
+            ),
+            Some(GameAction::PassPriority),
+            "the rejected zero-X cast cannot beat PassPriority"
+        );
+
+        let mut one_state = make_state();
+        let one_drown = add_drown_in_dreams(&mut one_state, PlayerId(0));
+        add_mana(&mut one_state, PlayerId(0), ManaType::Colorless, 3);
+        add_mana(&mut one_state, PlayerId(0), ManaType::Blue, 1);
+        let one_session = AiSession::arc_from_game(&one_state);
+        let one_scores =
+            score_candidates_core(&one_state, PlayerId(0), &config, &one_session, None);
+        assert!(
+            one_scores.iter().any(|(action, score)| {
+                matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == one_drown)
+                    && score.is_finite()
+            }),
+            "Drown at max X=1 remains a finite root candidate"
+        );
+
+        let cast = build_decision_context(&one_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == one_drown)
+            })
+            .expect("the finite Drown root carries a real cast candidate");
+        let mode_state = apply_candidate(&one_state, &cast)
+            .expect("casting the real modal spell reaches mode selection");
+        assert!(
+            matches!(mode_state.waiting_for, WaitingFor::ModeChoice { .. }),
+            "Drown must pause for its real spell-level mode choice"
+        );
+        let selected_mode = choose_action(
+            &mode_state,
+            PlayerId(0),
+            &config,
+            &mut SmallRng::seed_from_u64(2),
+        )
+        .expect("AI selects a real Drown mode");
+        let mode_candidate = build_decision_context(&mode_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.action == selected_mode)
+            .expect("selected mode is engine-issued");
+        let target_state = apply_candidate(&mode_state, &mode_candidate)
+            .expect("selecting the mode continues the cast");
+        assert!(
+            matches!(target_state.waiting_for, WaitingFor::TargetSelection { .. }),
+            "the chosen Drown mode must declare its player target before X"
+        );
+        let selected_target = choose_action(
+            &target_state,
+            PlayerId(0),
+            &config,
+            &mut SmallRng::seed_from_u64(3),
+        )
+        .expect("AI selects a legal player target for Drown");
+        let target_candidate = build_decision_context(&target_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.action == selected_target)
+            .expect("selected target is engine-issued");
+        let x_state = apply_candidate(&target_state, &target_candidate)
+            .expect("declaring the target continues to X selection");
+        assert!(
+            matches!(x_state.waiting_for, WaitingFor::ChooseXValue { max: 1, .. }),
+            "the paid fixed component leaves exactly X=1 affordable"
+        );
+        assert_eq!(
+            choose_action(
+                &x_state,
+                PlayerId(0),
+                &AiConfig::default(),
+                &mut SmallRng::seed_from_u64(4),
+            ),
+            Some(GameAction::ChooseX { value: 1 }),
+            "the real X-value policy prefers the funded modal X"
+        );
+        let chosen_x_candidate = build_decision_context(&x_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.action == GameAction::ChooseX { value: 1 })
+            .expect("ChooseX(1) is engine-issued");
+        let paid_state = apply_candidate(&x_state, &chosen_x_candidate)
+            .expect("choosing X=1 continues to payment");
+        assert_eq!(
+            paid_state
+                .stack
+                .iter()
+                .find(|entry| entry.source_id == one_drown)
+                .and_then(|entry| entry.ability())
+                .expect("the paid modal spell reaches the stack")
+                .chosen_x,
+            Some(1),
+            "the chosen X propagates into the resolved spell ability"
         );
     }
     #[test]
