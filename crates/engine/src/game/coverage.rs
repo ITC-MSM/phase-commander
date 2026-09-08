@@ -8344,11 +8344,12 @@ fn strip_parenthesized_reminder(line: &str) -> String {
 /// `sub_ability` purely so the resolver can swap it in at resolution time --
 /// not because it is a structural detail of the base line, unlike the
 /// token-nested-static / modal-bullet children this function was hardened
-/// against crediting. Recognize the fold via the `AbilityCondition::ConditionInstead`
-/// marker, which `fmt_ability_condition` is the single authority for
-/// rendering as an "instead if (...)" conditional detail -- so the override
-/// is credited as its own effective line without resurrecting the general
-/// nested-child crediting that regressed other cards.
+/// against crediting. A cross-line fold retains the child's original
+/// `source_text`; an inline "... instead" sub-ability does not. Require that
+/// printed-line receipt in addition to the `AbilityCondition::ConditionInstead`
+/// marker, which `fmt_ability_condition` renders as an "instead if (...)"
+/// conditional detail. This keeps inline children from masking unrelated
+/// silent drops while still crediting separately printed overrides.
 fn count_effective_parsed_items(items: &[ParsedItem]) -> usize {
     items
         .iter()
@@ -8364,9 +8365,13 @@ fn count_self_replacement_override_children(item: &ParsedItem) -> usize {
         .iter()
         .filter(|child| {
             child
-                .details
-                .iter()
-                .any(|(key, value)| key == "conditional" && value.starts_with("instead if ("))
+                .source_text
+                .as_deref()
+                .is_some_and(|source| !source.trim().is_empty())
+                && child
+                    .details
+                    .iter()
+                    .any(|(key, value)| key == "conditional" && value.starts_with("instead if ("))
         })
         .count()
 }
@@ -14631,6 +14636,42 @@ mod tests {
             &mut missing,
         );
         assert_eq!(missing, vec!["SilentDrop:1_of_2"]);
+    }
+
+    #[test]
+    fn self_replacement_credit_requires_a_distinct_printed_line_receipt() {
+        let conditional_details = vec![(
+            "conditional".to_string(),
+            "instead if (you have 5 or less life)".to_string(),
+        )];
+        let child = |source_text| ParsedItem {
+            category: ParseCategory::Ability,
+            label: "Token".to_string(),
+            source_text,
+            supported: true,
+            details: conditional_details.clone(),
+            children: vec![],
+        };
+        let root = ParsedItem {
+            category: ParseCategory::Ability,
+            label: "Token".to_string(),
+            source_text: Some("Create two tokens.".to_string()),
+            supported: true,
+            details: vec![],
+            children: vec![
+                child(None),
+                child(Some(
+                    "Fateful hour — If you have 5 or less life, create five of those tokens instead."
+                        .to_string(),
+                )),
+            ],
+        };
+
+        assert_eq!(
+            count_effective_parsed_items(&[root]),
+            2,
+            "only the separately printed override may add coverage credit"
+        );
     }
 
     #[test]
