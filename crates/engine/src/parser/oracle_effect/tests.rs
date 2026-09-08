@@ -17509,6 +17509,157 @@ fn conditional_protection_grant_routes_through_ability_ir() {
     assert!(def.sub_ability.is_none());
 }
 
+const FIVE_COLOR_PROTECTION_BODY: &str = "It gains protection from white if you control a Plains, from blue if you control an Island, from black if you control a Swamp, from red if you control a Mountain, and from green if you control a Forest.";
+
+fn assert_five_color_protection_on(def: &AbilityDefinition, affected: TargetFilter) {
+    use crate::types::keywords::{Keyword, ProtectionTarget};
+    use crate::types::mana::ManaColor;
+
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected protection GenericEffect, got {:?}", def.effect);
+    };
+    assert_eq!(static_abilities.len(), 5);
+    let granted: Vec<_> = static_abilities
+        .iter()
+        .map(|ability| {
+            assert_eq!(ability.affected, Some(affected.clone()));
+            let [ContinuousModification::AddKeyword {
+                keyword: Keyword::Protection(color),
+            }] = ability.modifications.as_slice()
+            else {
+                panic!(
+                    "expected one protection grant, got {:?}",
+                    ability.modifications
+                );
+            };
+            color.clone()
+        })
+        .collect();
+    assert_eq!(
+        granted,
+        vec![
+            ProtectionTarget::Color(ManaColor::White),
+            ProtectionTarget::Color(ManaColor::Blue),
+            ProtectionTarget::Color(ManaColor::Black),
+            ProtectionTarget::Color(ManaColor::Red),
+            ProtectionTarget::Color(ManaColor::Green),
+        ]
+    );
+}
+
+#[test]
+fn flare_of_faith_binds_its_instead_body_to_the_selected_creature() {
+    let def = parse_effect_chain(
+        "Target creature gets +2/+2 until end of turn. If it's a Human, instead it gets +3/+3 and gains indestructible until end of turn.",
+        AbilityKind::Spell,
+    );
+    let Effect::Pump {
+        power,
+        toughness,
+        target: TargetFilter::Typed(target),
+    } = def.effect.as_ref()
+    else {
+        panic!("expected targeted root pump, got {:?}", def.effect);
+    };
+    assert!(target.type_filters.contains(&TypeFilter::Creature));
+    assert_eq!(*power, PtValue::Fixed(2));
+    assert_eq!(*toughness, PtValue::Fixed(2));
+
+    let instead = def
+        .sub_ability
+        .as_ref()
+        .unwrap_or_else(|| panic!("expected Human instead branch, got {def:?}"));
+    let Some(AbilityCondition::ConditionInstead { inner }) = instead.condition.as_ref() else {
+        panic!(
+            "expected ConditionInstead Human gate, got {:?}",
+            instead.condition
+        );
+    };
+    let AbilityCondition::TargetMatchesFilter {
+        filter: TargetFilter::Typed(filter),
+        ..
+    } = inner.as_ref()
+    else {
+        panic!("expected Human target filter, got {inner:?}");
+    };
+    assert!(filter
+        .type_filters
+        .contains(&TypeFilter::Subtype("Human".to_string())));
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = instead.effect.as_ref()
+    else {
+        panic!(
+            "expected ParentTarget Human override, got {:?}",
+            instead.effect
+        );
+    };
+    assert!(static_abilities.iter().any(|ability| {
+        ability.affected == Some(TargetFilter::ParentTarget)
+            && ability
+                .modifications
+                .contains(&ContinuousModification::AddPower { value: 3 })
+            && ability
+                .modifications
+                .contains(&ContinuousModification::AddToughness { value: 3 })
+            && ability
+                .modifications
+                .contains(&ContinuousModification::AddKeyword {
+                    keyword: Keyword::Indestructible,
+                })
+    }));
+}
+
+#[test]
+fn generic_instead_child_uses_the_standalone_protection_recognizer_with_parent_target() {
+    let def = parse_effect_chain(
+        &format!(
+            "Target creature gets +2/+2. If it's a Human, instead {FIVE_COLOR_PROTECTION_BODY}"
+        ),
+        AbilityKind::Spell,
+    );
+    let instead = def
+        .sub_ability
+        .as_ref()
+        .expect("expected generic instead branch");
+    assert_five_color_protection_on(instead, TargetFilter::ParentTarget);
+}
+
+#[test]
+fn standalone_protection_body_keeps_self_reference_without_a_parent_target() {
+    let def = parse_effect_chain(FIVE_COLOR_PROTECTION_BODY, AbilityKind::Spell);
+    assert_five_color_protection_on(&def, TargetFilter::SelfRef);
+}
+
+#[test]
+fn standalone_protection_bypass_isolates_outer_context_except_parent_target() {
+    let mut outer_ctx = ParseContext {
+        subject: Some(TargetFilter::SelfRef),
+        actor: Some(ControllerRef::Opponent),
+        current_trigger_index: Some(3),
+        in_trigger: true,
+        parent_target_available: true,
+        ..ParseContext::default()
+    };
+    let original_ctx = outer_ctx.clone();
+
+    let def = lower_ability_ir(&parse_ability_ir(
+        FIVE_COLOR_PROTECTION_BODY,
+        AbilityKind::Spell,
+        ChainLoweringMode::Standalone,
+        &mut outer_ctx,
+    ));
+
+    assert_five_color_protection_on(&def, TargetFilter::ParentTarget);
+    assert_eq!(
+        outer_ctx, original_ctx,
+        "standalone bypass must not mutate its caller"
+    );
+}
+
 /// The extracted keyword-word → kind combinator (deduplicated with the static
 /// `each … has <kw>` clause) recognizes every graveyard-cast keyword.
 #[test]
@@ -43064,23 +43215,46 @@ fn flip_n_coins_emits_flip_coins_variant() {
     );
 }
 
-/// CR 614.10: "Target opponent skips their next turn." (no X, no flip)
-/// parses as a standalone SkipNextTurn with count=1 and opponent target.
+/// CR 614.10: skipping a future turn replaces that turn with nothing.
+/// Controller and targeted phrases share the parser's optional count grammar.
 #[test]
-fn target_opponent_skips_next_turn_parses() {
-    let def = parse_effect_chain("Target opponent skips their next turn.", AbilityKind::Spell);
-    let Effect::SkipNextTurn { target, count } = &*def.effect else {
-        panic!("expected SkipNextTurn, got {:?}", def.effect);
-    };
-    assert_eq!(
-        count,
-        &crate::types::ability::QuantityExpr::Fixed { value: 1 }
-    );
-    assert!(matches!(
-        target,
-        TargetFilter::Typed(tf)
-            if tf.controller == Some(ControllerRef::Opponent)
-    ));
+fn skip_next_turn_parses_controller_and_targeted_singular_plural_forms() {
+    for (text, expected_count) in [
+        ("You skip your next turn.", 1),
+        ("You skip your next two turns.", 2),
+        ("Skip your next turn.", 1),
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(
+            matches!(
+                &*def.effect,
+                Effect::SkipNextTurn {
+                    target: TargetFilter::Controller,
+                    count: crate::types::ability::QuantityExpr::Fixed { value },
+                } if *value == expected_count
+            ),
+            "expected controller to skip {expected_count} turn(s), got {:?}",
+            def.effect
+        );
+    }
+
+    for (text, expected_count) in [
+        ("Target opponent skips their next turn.", 1),
+        ("Target opponent skips their next two turns.", 2),
+    ] {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        assert!(
+            matches!(
+                &*def.effect,
+                Effect::SkipNextTurn {
+                    target: TargetFilter::Typed(tf),
+                    count: crate::types::ability::QuantityExpr::Fixed { value },
+                } if tf.controller == Some(ControllerRef::Opponent) && *value == expected_count
+            ),
+            "expected opponent to skip {expected_count} turn(s), got {:?}",
+            def.effect
+        );
+    }
 }
 
 /// CR 614.10a: "You skip your next untap step" is a one-shot step skip,
@@ -61612,41 +61786,33 @@ fn a_free_cast_grant_with_a_stated_lifetime_is_a_lingering_permission() {
     }
 }
 
-/// CR 611.2a: the HAND-ORIGIN row of the same reconciliation, which no
-/// integration fixture can reach — its runtime is the named gap below. "Until
-/// end of turn, you may cast spells from your hand without paying their mana
-/// costs" (Chandra, Flame's Catalyst's ultimate) is a hand-origin free cast, so
-/// `during_resolution_for_filter_cast_clause` selects `DuringResolution`, and
-/// the stated lifetime then degrades it.
+/// CR 601.2b + CR 118.9 + CR 611.2a: the HAND-ORIGIN row of this class does not
+/// take the lingering `CastFromZone` mechanism at all — it is promoted out of
+/// `CastFromZone` entirely.
 ///
-/// DISCRIMINATING: this row is why the degrade belongs in
-/// `with_lingering_duration` rather than in an `if let` at one seam. A wider
-/// guard at the trailing-duration block in `lower_imperative_clause` would have
-/// reached the trailing-duration members of the class — MEASURED, a reach
-/// marker there fires over the corpus — but never this one: a sentence-leading
-/// duration is stamped around the body lowering, after `lower_imperative_clause`
-/// has returned, so it never sees that gate. Only the shared authority covers
-/// both.
+/// "Until end of turn, you may cast spells from your hand without paying their
+/// mana costs" (Chandra, Flame's Catalyst's ultimate) is Omniscience for a turn.
+/// A per-object `CastingPermission` cannot express it: those are stamped once per
+/// card at resolution (`CastFromZoneDriver::for_batch_bounds`' capability table
+/// says that mechanism "writes an INDEPENDENT `CastingPermission` per object"),
+/// so a card DRAWN
+/// LATER in the same turn would never be covered, and the printed effect covers
+/// it. `apply_duration_to_effect` therefore rewrites the grant into the
+/// mechanism that can hold it — `StaticMode::CastFromHandFree`, the one this
+/// exact sentence already lowers to when a permanent prints it as a static
+/// (Omniscience, the Tamiyo emblem) — carried as a duration-bound player grant.
 ///
-/// A PARSE CLAIM, NOT A BEHAVIOUR CLAIM. Chandra is the hand-origin card this
-/// change gives the lingering mechanism to — Twinning Glass is hand-origin too,
-/// but it loses an invented duration and keeps its during-resolution cast — and
-/// at runtime it moves nothing: MEASURED end-to-end
-/// through `GameRunner` with and without the degrade, the ultimate stops at the
-/// same `WaitingFor::EffectZoneChoice { effect_kind: CastFromZone, zone: Hand,
-/// up_to: true, duration: None }` either way — a pick-one-now offer raised
-/// while the ability resolves, with no permission recorded on any hand card and
-/// none castable afterwards. `resolve` consults the driver before that branch —
-/// for the library one-shot and for `window_bounds()` — but neither route's
-/// remaining conditions hold for a hand pool with no resolved targets, and the
-/// branch it does take reads neither the driver nor the duration
-/// (`open_private_zone_cast_selection` writes `duration: None` as a literal).
-/// So the hand-origin half of this class stays as wrong as it is on main;
-/// repairing it is runtime work this change does not do. What the
-/// assertion below buys today is an honest AST and export for that card, and
-/// the one seam through which a later runtime fix can see the lifetime at all.
+/// GATED ON THE STATED LIFETIME. Electrodominance prints nearly the same sentence
+/// WITHOUT one and is a genuine CR 608.2g resolution-time pick; it never reaches
+/// `apply_duration_to_effect` and keeps its `DuringResolution` driver. That row
+/// is pinned by `paid_chosen_target_cast_is_during_resolution_for_each_supported_zone`
+/// and by the runtime fixtures in `cast_from_zone`'s own module tests.
+///
+/// The runtime half is measured end-to-end in
+/// `lasting_cast_from_hand_permission`, including the row this AST exists for: a
+/// card drawn AFTER the ultimate resolved is castable for free.
 #[test]
-fn a_leading_duration_also_degrades_the_cast_mechanism() {
+fn a_leading_duration_promotes_a_free_hand_cast_to_a_player_permission() {
     // Verbatim Oracle text (`client/public/card-data.json`, key
     // `chandra, flame's catalyst`), the ultimate alone.
     let def = parse_effect_chain(
@@ -61656,35 +61822,73 @@ fn a_leading_duration_also_degrades_the_cast_mechanism() {
     );
     let mut casts = Vec::new();
     collect_cast_from_zone_defs(&def, &mut casts);
-    assert_eq!(
-        casts.len(),
-        1,
-        "reach guard — the ultimate must produce exactly one cast grant, got {casts:?}"
-    );
-    let Effect::CastFromZone {
-        without_paying_mana_cost,
-        duration,
-        driver,
-        ..
-    } = &*casts[0].effect
-    else {
-        unreachable!("filtered above");
-    };
     assert!(
-        *without_paying_mana_cost,
-        "reach guard — the free, hand-origin shape the filter-form authority sends to \
-         `DuringResolution`"
+        casts.is_empty(),
+        "the promotion must leave no `CastFromZone` behind — a per-object grant is \
+         exactly the mechanism this class cannot use; got {casts:?}"
     );
+
+    let mut grants = Vec::new();
+    collect_hand_free_permission_defs(&def, &mut grants);
+    assert_eq!(
+        grants.len(),
+        1,
+        "reach guard — the ultimate must produce exactly one player-scoped free-cast \
+         permission, got {grants:?}"
+    );
+    let (duration, static_def) = &grants[0];
     assert_eq!(
         *duration,
         Some(Duration::UntilEndOfTurn),
-        "the sentence-leading lifetime must reach the effect's own duration slot"
+        "CR 611.2a: the sentence-leading lifetime must reach the grant's duration slot"
     );
-    assert_eq!(
-        *driver, LingeringPermission,
-        "CR 611.2a + CR 117.1a: \"Until end of turn\" means the spells are cast at later \
-         priority windows, not as the ultimate resolves"
+    assert!(
+        matches!(
+            static_def.mode,
+            StaticMode::CastFromHandFree {
+                frequency: CastFrequency::Unlimited,
+                origin: CastFreeOrigin::Hand,
+            }
+        ),
+        "CR 601.2b: \"you may cast spells\" prints no per-turn cap and names the hand \
+         as the origin; got {:?}",
+        static_def.mode
     );
+    assert!(
+        static_def.modifications.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::CastFromHandFree { .. }
+            }
+        )),
+        "the mode must also ride in `modifications` — that is the shape \
+         `effects::effect::register_transient_effect` dispatches on; got {:?}",
+        static_def.modifications
+    );
+}
+
+/// Collect `(duration, static_definition)` for every `GenericEffect` in `def`
+/// whose statics carry a `CastFromHandFree` mode. Sibling of
+/// `collect_cast_from_zone_defs`, walking the same `sub_ability` chain.
+fn collect_hand_free_permission_defs(
+    def: &AbilityDefinition,
+    out: &mut Vec<(Option<Duration>, StaticDefinition)>,
+) {
+    if let Effect::GenericEffect {
+        static_abilities,
+        duration,
+        ..
+    } = &*def.effect
+    {
+        for static_def in static_abilities {
+            if matches!(static_def.mode, StaticMode::CastFromHandFree { .. }) {
+                out.push((duration.clone(), static_def.clone()));
+            }
+        }
+    }
+    if let Some(sub) = def.sub_ability.as_ref() {
+        collect_hand_free_permission_defs(sub, out);
+    }
 }
 
 /// CR 608.2i: "a spell that WAS CAST this turn" looks back at a previous game

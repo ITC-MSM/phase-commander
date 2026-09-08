@@ -12473,7 +12473,7 @@ fn parse_skip_step_name(input: &str) -> OracleResult<'_, StepSkipTarget> {
 
 /// CR 614.10: Parse "[subject] skip[s] [their|your] next [N] turn[s]" — temporal
 /// penalty effect. Handles:
-///   - "you skip your next turn" / "skip your next turn" → Controller, 1
+///   - "you skip your next [N] turn[s]" / "skip your next [N] turn[s]" → Controller, N
 ///   - "target opponent skips their next turn" → Opponent-target, 1
 ///   - "target player skips their next turn" → Player-target, 1
 ///   - "target opponent skips their next N turns" → Opponent-target, N
@@ -12482,54 +12482,56 @@ fn parse_skip_step_name(input: &str) -> OracleResult<'_, StepSkipTarget> {
 ///     multiplier is supplied by the outer `Effect::FlipCoins` loop, which
 ///     invokes this handler once per heads).
 fn try_parse_skip_next_turn(tp: TextPair) -> Option<ParsedEffectClause> {
-    // Bare subjectless form (controller skips).
-    if nom_on_lower(tp.original, tp.lower, |input| {
-        alt((
-            value((), tag::<_, _, OracleError<'_>>("you skip your next turn")),
-            value((), tag("skip your next turn")),
-        ))
-        .parse(input)
-    })
-    .is_some()
-    {
-        return Some(parsed_clause(Effect::SkipNextTurn {
-            target: TargetFilter::Controller,
-            count: QuantityExpr::Fixed { value: 1 },
-        }));
-    }
-
-    // Targeted form: "target {opponent|player} skips their next [N|X] turn[s]".
-    // Guard on the lowercase prefix before delegating to `parse_target`.
-    nom::combinator::peek(alt((
-        tag::<_, _, OracleError<'_>>("target opponent "),
-        tag("target player "),
-    )))
-    .parse(tp.lower)
-    .ok()?;
-
-    // Delegate the target extraction to the canonical parser so any future
-    // target shape ("target opponent of your choice", etc.) picks it up.
-    let (target, after_target_orig) = super::oracle_target::parse_target(tp.original);
-    let after_target_lower = &tp.lower[tp.lower.len() - after_target_orig.len()..];
-
-    // Verb: " skips " / " skip " (surrounding spaces keep word boundary safe).
-    let (after_verb_lower, _) = alt((tag::<_, _, OracleError<'_>>(" skips "), tag(" skip ")))
-        .parse(after_target_lower)
+    // Both subject forms share the count and `turn[s]` grammar below. Keep the
+    // controller prefix in nom so plural counts use the same `parse_count_expr`
+    // authority as targeted effects.
+    let (target, after_next_orig) = if let Some((_, after_next_orig)) =
+        nom_on_lower(tp.original, tp.lower, |input| {
+            value(
+                (),
+                alt((
+                    tag::<_, _, OracleError<'_>>("you skip your next "),
+                    tag("skip your next "),
+                )),
+            )
+            .parse(input)
+        }) {
+        (TargetFilter::Controller, after_next_orig)
+    } else {
+        // Targeted form: "target {opponent|player} skips their next [N|X] turn[s]".
+        // Guard on the lowercase prefix before delegating to `parse_target`.
+        nom::combinator::peek(alt((
+            tag::<_, _, OracleError<'_>>("target opponent "),
+            tag("target player "),
+        )))
+        .parse(tp.lower)
         .ok()?;
 
-    // Possessive: "their next " / "your next ".
-    let (after_next_lower, _) = alt((
-        tag::<_, _, OracleError<'_>>("their next "),
-        tag("your next "),
-    ))
-    .parse(after_verb_lower)
-    .ok()?;
+        // Delegate the target extraction to the canonical parser so any future
+        // target shape ("target opponent of your choice", etc.) picks it up.
+        let (target, after_target_orig) = super::oracle_target::parse_target(tp.original);
+        let after_target_lower = &tp.lower[tp.lower.len() - after_target_orig.len()..];
+
+        // Verb: " skips " / " skip " (surrounding spaces keep word boundary safe).
+        let (after_verb_lower, _) = alt((tag::<_, _, OracleError<'_>>(" skips "), tag(" skip ")))
+            .parse(after_target_lower)
+            .ok()?;
+
+        // Possessive: "their next " / "your next ".
+        let (after_next_lower, _) = alt((
+            tag::<_, _, OracleError<'_>>("their next "),
+            tag("your next "),
+        ))
+        .parse(after_verb_lower)
+        .ok()?;
+        let after_next_orig = &tp.original[tp.lower.len() - after_next_lower.len()..];
+        (target, after_next_orig)
+    };
 
     // Optional count between "next " and "turn[s]". Default to 1 if the very
     // next token is "turn"/"turns" (e.g. "skips their next turn"). When
     // `parse_count_expr` succeeds it trims leading whitespace on the remainder,
     // so match "turn[s]" without a leading-space prefix below.
-    let after_next_orig = &tp.original[tp.lower.len() - after_next_lower.len()..];
     let (count, after_count_orig) = if let Some((expr, after_num_orig)) =
         super::oracle_util::parse_count_expr(after_next_orig)
     {
@@ -23358,20 +23360,23 @@ fn lower_subject_predicate_ast(
             if let Some(wrapped) = wrap_target_subject_damage(clause.clone(), &subject) {
                 return wrapped;
             }
-            // CR 608.2c + CR 109.4 + CR 701.16a: `Effect::Investigate` is a
-            // fieldless unit variant with no player slot for `inject_subject_target`
-            // to stamp the subject onto, so an explicit non-caster subject ("That
-            // player investigates" — Declaration in Stone, where "that player" is
-            // the controller of the exiled target) would be silently dropped and
-            // the Clue handed to the caster. Record the subject as a pending
-            // `player_scope` (consumed by the effect-chain loop) so resolution fans
-            // the Investigate out to the anchored player instead. Only lifts an
-            // explicit parent-target player anaphor; a bare "investigate" leaves
-            // `affected == SelfRef`/`Controller` and is untouched (caster default).
-            if matches!(clause.effect, Effect::Investigate) {
+            // CR 608.2c + CR 109.4 + CR 701.16a + CR 701.53a: Investigate and
+            // Incubate have no player slot for `inject_subject_target` to stamp
+            // the subject onto. An explicit non-caster subject ("That player
+            // investigates" / "Its controller incubates") must therefore become
+            // a pending `player_scope`, so the effect-chain loop resolves the
+            // fieldless effect as the anchored player. A bare predicate retains
+            // `affected == SelfRef`/`Controller` and the caster default.
+            if matches!(clause.effect, Effect::Investigate | Effect::Incubate { .. }) {
                 if let Some(scope) = player_scope_from_parent_target_subject(&affected) {
                     ctx.pending_player_scope = Some(scope);
                 }
+            }
+
+            // CR 701.16a + CR 608.2c + CR 400.7: only Investigate supports the
+            // "for each ... this way" repetition grammar below. Incubate carries
+            // its own count expression and must not inherit this repeat-for path.
+            if matches!(clause.effect, Effect::Investigate) {
                 // CR 701.16a + CR 608.2c + CR 400.7: "investigate FOR EACH nontoken
                 // creature exiled this way" — the fieldless Investigate carries no
                 // count slot, so lift the "for each <filter> … this way" suffix to a
@@ -32913,7 +32918,10 @@ pub(crate) fn parse_ability_ir(
     // chain path after a decline.
     let conditional_protection = match mode {
         ChainLoweringMode::Standalone => {
-            let mut bypass_ctx = ParseContext::default();
+            let mut bypass_ctx = ParseContext {
+                parent_target_available: ctx.parent_target_available,
+                ..ParseContext::default()
+            };
             parse_conditional_protection_grant_ir(text, kind, &mut bypass_ctx)
         }
         ChainLoweringMode::WithContext => parse_conditional_protection_grant_ir(text, kind, ctx),
@@ -33020,6 +33028,29 @@ pub(crate) fn parse_ability_ir_with_context(
     ctx: &mut ParseContext,
 ) -> AbilityIr {
     parse_ability_ir(text, kind, ChainLoweringMode::WithContext, ctx)
+}
+
+/// Parse a nested effect body with only its parent-target binding preserved.
+///
+/// Nested replacement bodies are independent ability parses: parser-local state
+/// from their enclosing clause must not leak into them. `ParentTarget` is the
+/// sole inherited binding because it names the earlier selected object that the
+/// nested body's pronouns may continue to reference.
+pub(super) fn parse_child_ability_with_parent_target(
+    text: &str,
+    kind: AbilityKind,
+    parent_target_available: bool,
+) -> AbilityDefinition {
+    let mut child_ctx = ParseContext {
+        parent_target_available,
+        ..ParseContext::default()
+    };
+    lower_ability_ir(&parse_ability_ir(
+        text,
+        kind,
+        ChainLoweringMode::Standalone,
+        &mut child_ctx,
+    ))
 }
 
 /// The algebraic identity T8 rests on, written literally:
@@ -35297,28 +35328,32 @@ pub(crate) fn parse_effect_chain_ir(
         // destroy working branches. So we only remember the verdict, and enforce it
         // at the LAST resort — immediately before the generic emission at the tail
         // of this loop, where every other owner has already had its chance.
-        let instead_condition_unlowerable =
-            match try_parse_generic_instead_clause(normalized_text, kind, ctx) {
-                conditions::InsteadLowering::Branch(instead_def) if !builder.is_empty() => {
-                    builder
-                        .clause(
-                            normalized_text,
-                            placeholder_parsed_clause("instead_clause_placeholder"),
-                            chunk.boundary_after,
-                            ClauseDisposition::ReplaceMeaning {
-                                kind: ReplaceMeaningKind::Instead(instead_def),
-                            },
-                        )
-                        .push();
-                    continue;
-                }
-                // A branch with no antecedent in this chain (empty builder) keeps its
-                // historical fall-through, as does anything this grammar does not own.
-                conditions::InsteadLowering::Branch(_) | conditions::InsteadLowering::NotOwned => {
-                    false
-                }
-                conditions::InsteadLowering::ConditionUnlowerable => true,
-            };
+        let instead_parent_target_available =
+            ctx.parent_target_available || chain_has_prior_typed_referent(builder.clauses(), false);
+        let instead_condition_unlowerable = match try_parse_generic_instead_clause(
+            normalized_text,
+            kind,
+            ctx,
+            instead_parent_target_available,
+        ) {
+            conditions::InsteadLowering::Branch(instead_def) if !builder.is_empty() => {
+                builder
+                    .clause(
+                        normalized_text,
+                        placeholder_parsed_clause("instead_clause_placeholder"),
+                        chunk.boundary_after,
+                        ClauseDisposition::ReplaceMeaning {
+                            kind: ReplaceMeaningKind::Instead(instead_def),
+                        },
+                    )
+                    .push();
+                continue;
+            }
+            // A branch with no antecedent in this chain (empty builder) keeps its
+            // historical fall-through, as does anything this grammar does not own.
+            conditions::InsteadLowering::Branch(_) | conditions::InsteadLowering::NotOwned => false,
+            conditions::InsteadLowering::ConditionUnlowerable => true,
+        };
 
         let has_card_predicate_guess = chain_has_card_predicate_guess(builder.clauses());
         let (predicate_guess_cond, predicate_guess_text) = if has_card_predicate_guess {
