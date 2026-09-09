@@ -1044,6 +1044,70 @@ pub(super) fn strip_if_you_do_conditional(text: &str) -> (Option<AbilityConditio
     (None, text.to_string())
 }
 
+/// CR 603.12 + CR 603.4 + CR 608.2a: A reflexive connector can introduce a
+/// separate triggered ability with an intervening-if condition: "When you do,
+/// if <condition>, <body>." Keep the creation marker and the guard as a flat
+/// root `And`, so the runtime checks the guard when the trigger would be created
+/// and checks it again as that stack object resolves.
+///
+/// The general conditional parser is deliberately conservative. If it cannot
+/// represent the guard, the deferred variant retains both the reflexive marker
+/// and the original remainder. Downstream specialized strippers (for example
+/// counter thresholds) still get their established chance to parse it; if they
+/// decline too, the chain parser emits an `Unimplemented` effect before an
+/// optional-clause fallback can discard the guard.
+pub(super) enum ReflexiveConditionalStrip {
+    Parsed {
+        condition: Option<AbilityCondition>,
+        remainder: String,
+    },
+    DeferredWhenYouDoGuard {
+        condition: AbilityCondition,
+        remainder: String,
+    },
+}
+
+pub(super) fn strip_if_you_do_conditional_with_context(
+    text: &str,
+    ctx: &mut ParseContext,
+) -> ReflexiveConditionalStrip {
+    let (condition, remainder) = strip_if_you_do_conditional(text);
+    let Some(condition) = condition else {
+        return ReflexiveConditionalStrip::Parsed {
+            condition: None,
+            remainder,
+        };
+    };
+    if !condition.has_when_you_do_marker() {
+        return ReflexiveConditionalStrip::Parsed {
+            condition: Some(condition),
+            remainder,
+        };
+    }
+
+    let (guard, body) = strip_leading_general_conditional(&remainder, ctx);
+    match guard {
+        Some(guard) => ReflexiveConditionalStrip::Parsed {
+            condition: Some(condition.with_when_you_do_guard(guard)),
+            remainder: body,
+        },
+        // A syntactically present leading guard must never be treated like an
+        // absent one. Keep it distinguishable until every specialized guard
+        // parser has declined, rather than letting `clause_shell` strip its
+        // optional body and turn the reflexive trigger unconditional.
+        None if split_leading_conditional(&remainder).is_some() => {
+            ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+                condition,
+                remainder,
+            }
+        }
+        None => ReflexiveConditionalStrip::Parsed {
+            condition: Some(condition),
+            remainder,
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum UnlessSuffixStrip {
     Absent,
@@ -8937,6 +9001,41 @@ mod tests {
             assert_eq!(&condition, expected, "condition mismatch for {input:?}");
             assert_eq!(rest, "draw a card", "rest mismatch for {input:?}");
         }
+    }
+
+    #[test]
+    fn reflexive_connector_defers_an_unrecognized_following_guard() {
+        let text = "When you do, if the moon is blue, draw a card";
+        let stripped = strip_if_you_do_conditional_with_context(text, &mut ParseContext::default());
+
+        let ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+            condition,
+            remainder,
+        } = stripped
+        else {
+            panic!("an unsupported guard must stay distinct from a bare reflexive marker");
+        };
+        assert_eq!(condition, AbilityCondition::WhenYouDo);
+        assert_eq!(remainder, "if the moon is blue, draw a card");
+    }
+
+    #[test]
+    fn reflexive_connector_defers_a_specialized_card_type_guard() {
+        let text = "When you do, if a creature card is revealed this way, draw a card";
+        let stripped = strip_if_you_do_conditional_with_context(text, &mut ParseContext::default());
+
+        let ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+            condition,
+            remainder,
+        } = stripped
+        else {
+            panic!("the specialized card-type guard must remain available to its ordered parser");
+        };
+        assert_eq!(condition, AbilityCondition::WhenYouDo);
+        assert_eq!(
+            remainder,
+            "if a creature card is revealed this way, draw a card"
+        );
     }
 
     #[test]

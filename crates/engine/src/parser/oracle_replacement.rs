@@ -207,8 +207,13 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
 
     // --- "You may have ~ enter as a copy of [filter]" (clone replacement) ---
     // CR 707.9: "Enter as a copy" is a replacement effect modifying the ETB event.
-    if let Some(def) = parse_clone_replacement(&norm_lower, &text, card_name) {
-        return Some(def);
+    match parse_clone_replacement(&norm_lower, &text, card_name) {
+        Ok(Some(def)) => return Some(def),
+        Ok(None) => {}
+        // A recognized clone rider that could not be represented is not an
+        // absent rider. Stop this parser so the outer router records the whole
+        // source unit as an explicit `Effect::unimplemented` gap.
+        Err(()) => return None,
     }
 
     // --- "As long as ~ is tapped/untapped, [subject] enter tapped/untapped" ---
@@ -3240,14 +3245,16 @@ fn parse_clone_replacement(
     norm_lower: &str,
     original_text: &str,
     card_name: &str,
-) -> Option<ReplacementDefinition> {
+) -> Result<Option<ReplacementDefinition>, ()> {
     // CR 614.1c: Two grammatical framings of the same ETB-copy replacement class:
     //   (a) "you may have ~ enter as a copy of ..."     (Phantasmal Image class)
     //   (b) "as ~ enters, you may have it become a copy of ..." (Cursed Mirror class)
     // Both converge on "… a copy of <filter> on the battlefield [<suffix>]". The
     // verb phrase is the only grammatical difference, so we split on it via alt()
     // and share every downstream step (filter, zone, duration, except-clause).
-    let (before_copy, after_copy, enter_tapped) = find_copy_verb(norm_lower)?;
+    let Some((before_copy, after_copy, enter_tapped)) = find_copy_verb(norm_lower) else {
+        return Ok(None);
+    };
 
     // Must be preceded by "you may have" for the optional framing (CR 614.1c).
     // Both framings share this prefix — Phantasmal Image: "You may have ~ enter…",
@@ -3255,14 +3262,18 @@ fn parse_clone_replacement(
     // accidental matches on ability text containing "become a copy of" outside
     // an ETB framing (none known today but defensive against future prints).
     if !nom_primitives::scan_contains(before_copy, "you may have") {
-        return None;
+        return Ok(None);
     }
 
     // CR 400.1: Match any supported source zone. Battlefield is the existing
     // Clone/Phantasmal Image class; graveyard (Superior Spider-Man) extends the
     // same building block. The zone flows onto the filter's `FilterProp::InZone`
     // below so `find_copy_targets` can scan the correct zone without branching.
-    let (type_text, suffix, source_zone, owner_scope) = split_on_clone_source_zone(after_copy)?;
+    let Some((type_text, suffix, source_zone, owner_scope)) =
+        split_on_clone_source_zone(after_copy)
+    else {
+        return Ok(None);
+    };
     // Strip "any " / "a " / "an " article before the type phrase
     let type_text = alt((tag::<_, _, OracleError<'_>>("any "), tag("a "), tag("an ")))
         .parse(type_text)
@@ -3271,7 +3282,7 @@ fn parse_clone_replacement(
 
     let (mut filter, leftover) = parse_type_phrase_folding(type_text);
     if !leftover.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
 
     // CR 400.1: Thread the source zone onto the filter when it isn't the default
@@ -3336,6 +3347,7 @@ fn parse_clone_replacement(
     // CR 611.3 + CR 613.1a: When the suffix carries a duration phrase
     // ("until end of turn"), the copy effect is a continuous effect that ends
     // when the duration expires (Cursed Mirror class). Permanent otherwise.
+    let post_replacement_rider = parse_post_replacement_rider(post_period)?;
     let mut copy_effect = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::BecomeCopy {
@@ -3348,10 +3360,11 @@ fn parse_clone_replacement(
     )
     .description(original_text.to_string());
 
-    // CR 603.12 + CR 608.2c: Preserve literal `When` as a reflexive trigger and
-    // consume literal `If` only at this accepted replacement branch. The parent's
-    // copied-card referent is forwarded to either rider.
-    if let Some(rider) = parse_post_replacement_rider(post_period) {
+    // CR 603.12 + CR 603.4 + CR 608.2a: Preserve literal `When` as a reflexive
+    // trigger, including its intervening-if guard, and consume literal `If`
+    // only at this accepted replacement branch. The parent's copied-card
+    // referent is forwarded to either rider.
+    if let Some(rider) = post_replacement_rider {
         copy_effect = copy_effect.sub_ability(rider);
     }
 
@@ -3375,7 +3388,7 @@ fn parse_clone_replacement(
         copy_effect
     };
 
-    Some(
+    Ok(Some(
         ReplacementDefinition::new(ReplacementEvent::Moved)
             .execute(execute_effect)
             .mode(ReplacementMode::Optional { decline: None })
@@ -3385,7 +3398,7 @@ fn parse_clone_replacement(
             // permanent's own DEATH.
             .destination_zone(Zone::Battlefield)
             .description(original_text.to_string()),
-    )
+    ))
 }
 
 /// Locate the clone-verb phrase in a normalised Oracle line and return
@@ -3538,29 +3551,29 @@ fn attach_zone_to_filter(filter: TargetFilter, zone: Zone) -> TargetFilter {
 /// maps to `AbilityCondition::WhenYouDo`; the "if you do" connector maps to
 /// `AbilityCondition::EffectOutcome { OptionalEffectPerformed }`.
 /// At this owning accepted-branch seam, literal `When` keeps its CR 603.12
-/// `WhenYouDo` creation gate, while literal `If` has its CR 608.2c performed gate
-/// consumed because reaching the replacement's execute branch proves acceptance.
-/// Any other condition fails closed. Returns None when the text doesn't start
-/// with a connector or the chain parser produces an unimplemented effect (so
-/// the caller can fall back to the plain BecomeCopy replacement without a
-/// reflexive trigger).
-fn parse_post_replacement_rider(post_period: &str) -> Option<AbilityDefinition> {
-    use crate::types::ability::AbilityCondition;
-
+/// `WhenYouDo` creation gate (including a root-level generic `if` guard), while
+/// literal `If` has its CR 608.2c performed gate consumed because reaching the
+/// replacement's execute branch proves acceptance.
+/// Any other condition fails closed. `Ok(None)` means the suffix contains no
+/// reflexive connector; `Err(())` means a recognized connector could not be
+/// represented and the owning replacement must fail closed rather than discard
+/// its rider.
+fn parse_post_replacement_rider(post_period: &str) -> Result<Option<AbilityDefinition>, ()> {
     // Strip the sentence terminator / separator space preceding the reflexive
     // clause. These are structural punctuation, not parsing dispatch.
     let trimmed = post_period.trim_start_matches(['.', ' ']);
     if trimmed.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Compose the prefix guard as a nom leaf via `nom_on_lower` — matches the
     // rest of this file's cost/prefix stripping pattern and leaves an `alt()`
     // seam for future reflexive-clause variants ("when that happens", etc.)
     // without reshaping the guard.
     let lower = trimmed.to_lowercase();
-    // CR 603.12 + CR 608.2c: admit the two typed connector classes;
-    // classification remains owned by the shared effect-chain parser below.
-    nom_on_lower(trimmed, &lower, |i| {
+    // CR 603.12 + CR 603.4 / CR 608.2c: admit the reflexive-trigger and inline
+    // performed-gate connector classes; classification remains owned by the
+    // shared effect-chain parser below.
+    if nom_on_lower(trimmed, &lower, |i| {
         value(
             (),
             alt((
@@ -3569,22 +3582,29 @@ fn parse_post_replacement_rider(post_period: &str) -> Option<AbilityDefinition> 
             )),
         )
         .parse(i)
-    })?;
+    })
+    .is_none()
+    {
+        return Ok(None);
+    }
     let mut def = super::oracle_effect::parse_effect_chain(trimmed, AbilityKind::Spell);
     // Reject unimplemented fallbacks — the chain parser returns
     // `Effect::Unimplemented` when no pattern matches, which would attach a
     // dead sub_ability to the clone replacement.
     if matches!(*def.effect, Effect::Unimplemented { .. }) {
-        return None;
+        return Err(());
     }
     match def.condition.take() {
-        Some(AbilityCondition::WhenYouDo) => {
-            def.condition = Some(AbilityCondition::WhenYouDo);
+        Some(condition) if condition.has_when_you_do_marker() => {
+            // Keep the complete root condition: the marker creates the reflexive
+            // trigger, while any flattened generic `if` guard is checked when
+            // that trigger resolves.
+            def.condition = Some(condition);
         }
         Some(condition) if condition.is_optional_effect_performed() => {}
-        Some(_) | None => return None,
+        Some(_) | None => return Err(()),
     }
-    Some(def)
+    Ok(Some(def))
 }
 
 /// Parse the suffix of a clone replacement, which carries the optional
@@ -8768,7 +8788,7 @@ fn attach_optional_draw_skip_rider(
     if trimmed.is_empty() {
         return Some(def);
     }
-    let rider = parse_post_replacement_rider(remainder)?;
+    let rider = parse_post_replacement_rider(remainder).ok()??;
     Some(def.execute(rider))
 }
 

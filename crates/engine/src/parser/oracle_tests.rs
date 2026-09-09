@@ -16427,21 +16427,35 @@ fn earthbender_ascension_landfall_chain() {
         def.effect,
     );
 
-    // Node 2: PutCounter(P1P1, 1, Typed(creature+You)), condition = QuantityCheck(quest >= 4)
+    // Node 2: PutCounter(P1P1, 1, Typed(creature+You)), condition = the
+    // reflexive marker plus QuantityCheck(quest >= 4).
     let node2 = def
         .sub_ability
         .as_ref()
         .expect("should have node 2 (P1P1 counter)");
+    let Some(AbilityCondition::And { conditions }) = &node2.condition else {
+        panic!(
+            "Node 2 must keep both the reflexive marker and quest gate, got {:?}",
+            node2.condition
+        );
+    };
     assert!(
-        matches!(
-            &node2.condition,
-            Some(AbilityCondition::QuantityCheck {
+        node2
+            .condition
+            .as_ref()
+            .is_some_and(AbilityCondition::has_when_you_do_marker),
+        "Node 2 must remain a separate reflexive trigger"
+    );
+    assert!(
+        conditions.iter().any(|condition| matches!(
+            condition,
+            AbilityCondition::QuantityCheck {
                 lhs: QuantityExpr::Ref { qty: QuantityRef::CountersOn { scope: ObjectScope::Source, counter_type: Some(counter_type) } },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 4 },
-            }) if *counter_type == crate::types::counter::CounterType::Generic("quest".to_string())
-        ),
-        "Node 2 condition should be QuantityCheck(quest >= 4), got {:?}",
+            } if *counter_type == crate::types::counter::CounterType::Generic("quest".to_string())
+        )),
+        "Node 2 condition should retain QuantityCheck(quest >= 4), got {:?}",
         node2.condition,
     );
     match &*node2.effect {
@@ -16486,6 +16500,248 @@ fn earthbender_ascension_landfall_chain() {
         }
         other => panic!("Node 3 should be GenericEffect(trample), got {other:?}"),
     }
+}
+
+/// SHAPE — CR 603.12 + CR 603.4 + CR 608.2a: the reflexive marker and its
+/// intervening-if graveyard threshold are distinct facts. The marker creates
+/// the separate trigger; the quantity check is checked when that trigger would
+/// be created and again when it resolves.
+#[test]
+fn a_sigil_of_myrkul_keeps_reflexive_marker_and_graveyard_guard() {
+    use crate::types::ability::{
+        AbilityCondition, Comparator, CountScope, QuantityExpr, QuantityRef, TypeFilter, ZoneRef,
+    };
+
+    let parsed = parse_oracle_text(
+        "At the beginning of combat on your turn, mill a card. When you do, if there are four or more creature cards in your graveyard, put a +1/+1 counter on target creature you control and it gains deathtouch until end of turn.",
+        "A-Sigil of Myrkul",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    let execute = parsed
+        .triggers
+        .first()
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("the beginning-of-combat trigger must parse");
+    assert!(
+        matches!(*execute.effect, Effect::Mill { .. }),
+        "the antecedent mill must remain the parent instruction"
+    );
+
+    let rider = execute
+        .sub_ability
+        .as_deref()
+        .expect("the counter rider must remain attached to the mill");
+    assert_eq!(
+        rider.condition,
+        Some(AbilityCondition::when_you_do_with_guard(
+            AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            },
+        )),
+        "the rider must be a CR 603.12 reflexive trigger with its own CR 603.4 guard"
+    );
+    assert!(
+        matches!(*rider.effect, Effect::PutCounter { .. }),
+        "the guarded reflexive body must still reach the +1/+1 instruction"
+    );
+}
+
+/// CR 614.1c + CR 603.12 + CR 603.4 + CR 608.2a: a copy-replacement rider may
+/// carry the same reflexive marker plus intervening-if guard as an ordinary
+/// effect chain. The replacement parser must attach the complete rider rather
+/// than accepting only a bare `WhenYouDo` condition.
+#[test]
+fn guarded_clone_replacement_rider_keeps_reflexive_marker_and_guard() {
+    use crate::types::ability::AbilityCondition;
+
+    let parsed = parse(
+        "You may have Guarded Clone enter as a copy of any creature on the battlefield. When you do, if you are the monarch, draw a card.",
+        "Guarded Clone",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    let replacement = parsed
+        .replacements
+        .first()
+        .expect("the clone replacement must parse");
+    let execute = replacement
+        .execute
+        .as_deref()
+        .expect("the clone replacement must have an execute definition");
+    assert!(
+        matches!(*execute.effect, Effect::BecomeCopy { .. }),
+        "the replacement must retain the copy instruction"
+    );
+
+    let rider = execute
+        .sub_ability
+        .as_deref()
+        .expect("the guarded reflexive rider must remain attached to the copy instruction");
+    assert_eq!(
+        rider.condition,
+        Some(AbilityCondition::when_you_do_with_guard(
+            AbilityCondition::IsMonarch
+        )),
+        "the CR 603.12 marker and CR 603.4 guard must both survive"
+    );
+    assert!(
+        matches!(*rider.effect, Effect::Draw { .. }),
+        "the guarded rider must retain its draw instruction"
+    );
+}
+
+/// CR 603.12 + CR 603.4: an unmodeled intervening-if condition between a
+/// reflexive connector and an optional body is not an optional bare
+/// `WhenYouDo` rider. Once every specialized guard parser has declined, retain
+/// it as an explicit gap rather than letting the optional-clause shell discard
+/// the guard.
+#[test]
+fn unmodeled_guarded_reflexive_optional_fails_closed() {
+    use crate::parser::oracle_effect::parse_effect_chain;
+    use crate::types::ability::AbilityKind;
+
+    let def = parse_effect_chain(
+        "When you do, if the moon is full, you may draw a card",
+        AbilityKind::Spell,
+    );
+
+    let Effect::Unimplemented { name, description } = def.effect.as_ref() else {
+        panic!(
+            "an unmodeled reflexive guard must not become an unconditional optional effect: {def:?}"
+        );
+    };
+    assert_eq!(name, "when_you_do_guard");
+    assert!(
+        description
+            .as_deref()
+            .is_some_and(|fragment| fragment.contains("if the moon is full")),
+        "the explicit gap must retain the unmodeled guard"
+    );
+    assert!(
+        !def.optional,
+        "the unmodeled reflexive rider must not retain an unconditional may-choice"
+    );
+}
+
+/// CR 614.1c + CR 603.12 + CR 603.4: clone-replacement riders use the same
+/// effect-chain path. An unsupported intervening-if condition must reject the
+/// entire replacement so the source remains an explicit parser gap rather than
+/// a supported clone with its rider silently discarded. Once the replacement
+/// parser rejects that partial result, the outer static router owns the whole
+/// source line and records `static_structure`; the standalone test above checks
+/// the inner effect-chain parser's `when_you_do_guard` identity directly.
+#[test]
+fn unmodeled_guarded_clone_replacement_rider_fails_closed() {
+    let parsed = parse(
+        "You may have Guarded Clone enter as a copy of any creature on the battlefield. When you do, if the moon is full, you may draw a card.",
+        "Guarded Clone",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert!(
+        parsed.replacements.is_empty(),
+        "the unsupported rider must prevent a partial clone replacement, got {:?}",
+        parsed.replacements
+    );
+    assert!(
+        parsed
+            .abilities
+            .iter()
+            .any(|ability| matches!(
+                &*ability.effect,
+                Effect::Unimplemented { name, description }
+                    if name == "static_structure"
+                        && description.as_deref().is_some_and(|fragment| {
+                            fragment.contains("enter as a copy of any creature")
+                                && fragment.contains("if the moon is full")
+                        })
+            )),
+        "the rejected clone source must retain both the clone and its unsupported guard in the outer static-structure gap, got {:?}",
+        parsed.abilities
+    );
+}
+
+/// SHAPE — CR 603.12 + CR 603.4 + CR 608.2a: the general condition parser
+/// deliberately defers "if a creature card is revealed this way" to the
+/// ordered specialized card-type parser. The specialized parser must preserve
+/// both that guard and the separate reflexive-trigger marker.
+#[test]
+fn deferred_reflexive_card_type_guard_reaches_specialized_parser() {
+    use crate::parser::oracle_effect::parse_effect_chain;
+    use crate::types::ability::{AbilityCondition, AbilityKind};
+    use crate::types::card_type::CoreType;
+
+    let def = parse_effect_chain(
+        "reveal the top card of your library. When you do, if a creature card is revealed this way, draw a card",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(*def.effect, Effect::RevealTop { .. }));
+
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("the reflexive draw must remain attached to the reveal");
+    assert_eq!(
+        rider.condition,
+        Some(AbilityCondition::when_you_do_with_guard(
+            AbilityCondition::RevealedHasCardType {
+                card_types: vec![CoreType::Creature],
+                additional_filter: None,
+                subtype_filter: None,
+            }
+        )),
+        "the deferred guard must be claimed by the specialized card-type parser"
+    );
+    assert!(matches!(*rider.effect, Effect::Draw { .. }));
+}
+
+/// Dominion Saboteur's verified Oracle text carries a clone rider whose
+/// counter-copying instruction is not represented yet. The recognized rider
+/// must therefore reject the partial CR 614.1c replacement and remain an
+/// explicit parser gap instead of silently dropping printed rules text.
+#[test]
+fn dominion_saboteur_unsupported_clone_rider_fails_closed() {
+    let parsed = parse(
+        "You may have this creature enter as a copy of any artifact or creature on the battlefield, except it isn't legendary. If you do, it enters with additional counters on it equal to the same number and kinds of counters the copied permanent has on it.",
+        "Dominion Saboteur",
+        &[],
+        &["Creature"],
+        &["Shapeshifter"],
+    );
+    assert!(
+        parsed.replacements.is_empty(),
+        "the unsupported counter-copying rider must reject the partial clone replacement"
+    );
+    assert!(
+        parsed
+            .abilities
+            .iter()
+            .any(|ability| matches!(
+                &*ability.effect,
+                Effect::Unimplemented { name, description }
+                    if name == "static_structure"
+                        && description.as_deref().is_some_and(|fragment| {
+                            fragment.contains(
+                                "additional counters on it equal to the same number and kinds of counters"
+                            )
+                        })
+            )),
+        "the rejected Dominion Saboteur text must retain the unsupported counter-copying rider as the explicit gap, got {:?}",
+        parsed.abilities
+    );
 }
 
 #[test]
