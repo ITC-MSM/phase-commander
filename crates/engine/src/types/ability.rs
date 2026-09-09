@@ -5961,6 +5961,22 @@ pub enum FilterProp {
     /// it", and the broader "<subject> gets +N/+M for each Aura/Equipment
     /// attached to it" family.
     AttachedToRecipient,
+    /// CR 303.4 + CR 301.5: True when the matched object's `attached_to` field
+    /// resolves to a PLAYER equal to the player identified by `player`. This is
+    /// the player-referent counterpart of `AttachedToSource`/`AttachedToRecipient`
+    /// (both of which resolve against an OBJECT referent) — a Curse (or any
+    /// other player-enchanting Aura) needs to count SIBLING permanents attached
+    /// to a specific player, not to a creature. Reuses `ControllerRef` (resolved
+    /// via `controller_ref_player`/`source_enchanted_player`) rather than adding
+    /// a narrower "which player" type, since every "which player" axis this
+    /// needs (the enchanted player, a target player, "you", …) is already
+    /// expressed there. Powers "the number of Curses attached to [enchanted
+    /// player]" (Curse of Thirst, Curse of Surveillance) — `player` is
+    /// `ControllerRef::EnchantedPlayer` there, resolved against the counting
+    /// ability's own source (itself a Curse attached to the same player).
+    AttachedToPlayer {
+        player: ControllerRef,
+    },
     /// CR 303.4 + CR 301.5: Matches objects that have at least one attachment of the
     /// given kind whose controller matches `controller`. Unlike `EnchantedBy`/`EquippedBy`
     /// (which are source-relative — match when THIS source is attached to the object),
@@ -6819,6 +6835,10 @@ pub mod source_exclusion_bool_compat {
 /// action), distinguished by destination (battlefield vs. hand).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThisWayCause {
+    /// CR 701.24c-e + CR 400.3: the member (or an explicitly designated empty
+    /// population) is the subject of a compound instruction that moves cards
+    /// into their owners' libraries and then shuffles those libraries.
+    OwnerLibraryShuffleSubject,
     /// CR 701.13a: the member was exiled this way.
     Exiled,
     /// CR 701.21a: the member was sacrificed this way (cause survives a
@@ -13607,6 +13627,23 @@ pub enum LibraryPosition {
     },
 }
 
+/// CR 701.24a + CR 701.24d: Whether a mass move into a library is the move
+/// component of one parser-emitted “shuffle this set into that library” action.
+/// Ordinary mass moves retain the zone pipeline's per-object library behavior;
+/// `TerminalShuffle` reserves the single shuffle for the chained `Shuffle`
+/// instruction after every member has moved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type")]
+pub enum MassLibraryShuffleMode {
+    #[default]
+    PerObject,
+    TerminalShuffle,
+}
+
+fn is_default_mass_library_shuffle_mode(mode: &MassLibraryShuffleMode) -> bool {
+    matches!(mode, MassLibraryShuffleMode::PerObject)
+}
+
 /// CR 401.4 + CR 701.23a + CR 608.2c: Presentation metadata for a library-search
 /// choice. The engine supplies this because the continuation determines whether
 /// the owner may arrange the selected cards in one library position.
@@ -14227,6 +14264,160 @@ impl FaceDownProfile {
     }
 }
 
+/// Digital-only Alchemy (no CR entry for "perpetually"): the CLOSED set of
+/// quoted-ability grant kinds that `GameObject::apply_perpetual_modification`
+/// can install onto a persistent baseline.
+///
+/// `ContinuousModification` is the engine-wide 57-variant layer vocabulary; only
+/// three of its kinds have a persistent-baseline installer. Carrying that subset
+/// as its OWN type (rather than a `Vec<ContinuousModification>` guarded by a
+/// separate predicate) makes the acceptance gate and the installer the same
+/// authority: [`PerpetualModification::GrantAbility`] cannot be constructed
+/// holding a kind the installer does not handle, and adding a variant here is a
+/// compile error in `apply_perpetual_modification` until it is installed. The
+/// previous shape — a `matches!` gate in the parser plus a wildcard arm in the
+/// installer — could drift silently: widening the gate recorded the modification
+/// in `perpetual_mods` while installing nothing.
+///
+/// Wire-compatible with the `ContinuousModification` subset it mirrors: same
+/// `#[serde(tag = "type")]`, same variant names, same field names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum PerpetualGrantModification {
+    /// A bare evergreen/parameterized keyword ("~ has flying") — installed onto
+    /// `keywords` + `base_keywords`.
+    AddKeyword { keyword: Keyword },
+    /// A restriction/permission static ("~ can't block", CR 509.1b) — installed
+    /// as a synthetic self-affecting `StaticDefinition` onto `static_definitions`
+    /// + `base_static_definitions`.
+    AddStaticMode {
+        #[serde(deserialize_with = "crate::types::statics::deserialize_static_mode_fwd")]
+        mode: StaticMode,
+    },
+    /// A full spell/activated ability body (Topsoil Turner's "{T}: Add {G}{G}."
+    /// and Ethereal Grasp's "{8}: Untap this creature.") — installed onto
+    /// `abilities` + `base_abilities`. Agent of Raffine's superficially similar
+    /// "You may spend mana as though it were mana of any color to cast this
+    /// spell." is REJECTED before it ever reaches this variant — see
+    /// `TryFrom<ContinuousModification>`'s `GenericEffect`-static gate below,
+    /// which fails the whole grant closed rather than install a board-wide
+    /// mana concession under a "this spell only" card.
+    GrantAbility { definition: Box<AbilityDefinition> },
+}
+
+impl TryFrom<ContinuousModification> for PerpetualGrantModification {
+    /// The rejected modification, returned intact so a caller can report which
+    /// kind failed the gate.
+    type Error = ContinuousModification;
+
+    /// Fail-closed: any kind without a persistent-baseline installer is rejected,
+    /// so a newly added `ContinuousModification` variant defaults to "not
+    /// perpetually installable" — the safe answer — rather than to a silent no-op
+    /// at install time. The parser turns a rejection into a whole-clause parse
+    /// failure (`Effect::Unimplemented`), never a partially applied grant.
+    fn try_from(modification: ContinuousModification) -> Result<Self, Self::Error> {
+        match modification {
+            ContinuousModification::AddKeyword { keyword } => Ok(Self::AddKeyword { keyword }),
+            ContinuousModification::AddStaticMode { mode } => Ok(Self::AddStaticMode { mode }),
+            // Fail-closed: a `GrantAbility` whose nested tree contains
+            // `Effect::Unimplemented` did not actually parse -- the quoted body
+            // fell through to the parser's honest "couldn't classify this" stub
+            // (e.g. Boareskyr Tollkeeper's "~ enters tapped." is a standalone
+            // sentence with no static/trigger/keyword recognizer). Accepting it
+            // here would install a no-op ability while the top-level effect
+            // stays `Effect::ApplyPerpetual` (never `Effect::Unimplemented`), so
+            // coverage/`cargo semantic-audit` would keep reporting the card as
+            // fully supported. Reuse `game::coverage::ability_tree_any` -- the
+            // single walker authority -- rather than reimplementing tree
+            // recursion here. Rejecting here propagates through the `Result`
+            // collect in `try_parse_perpetual_grant_ability`, which fails the
+            // whole clause closed (falls back to `Effect::unimplemented`) rather
+            // than installing a partial grant. Catch-all grants that DO fully
+            // parse (Topsoil Turner's "{T}: Add {G}{G}.", Ethereal Grasp's "{8}:
+            // Untap this creature.") carry no `Effect::Unimplemented` node and
+            // are unaffected.
+            //
+            // The predicate also checks `d.cost` for `AbilityCost::Unimplemented`
+            // (review follow-up, PR #8494, matthewevans): the catch-all's
+            // activated-ability path (`parse_quoted_ability`'s cost-separator
+            // branch, `oracle_static/grammar.rs`) sets `def.cost =
+            // Some(parse_oracle_cost(cost_text))`, and `parse_oracle_cost`
+            // returns `AbilityCost::Unimplemented` on an unrecognized leading
+            // cost verb -- the same coverage-invisible shape as an unparsed
+            // effect, just on the other half of the "[Cost]: [Effect]" pair (CR
+            // 113.3b). A parsed effect alongside an unparsed cost must fail
+            // closed exactly like an unparsed effect; checking only `d.effect`
+            // would leave that shape green. Mirrors
+            // `game::coverage::collect_unimplemented_from_tree`, which checks
+            // both `def.effect` and `def.cost` for the same reason.
+            ContinuousModification::GrantAbility { definition }
+                if crate::game::coverage::ability_tree_any(&definition, &|d| {
+                    matches!(&*d.effect, Effect::Unimplemented { .. })
+                        || matches!(&d.cost, Some(AbilityCost::Unimplemented { .. }))
+                }) =>
+            {
+                Err(ContinuousModification::GrantAbility { definition })
+            }
+            // Fail-closed (Blocker 2, PR #8494, matthewevans): a `GrantAbility`
+            // whose tree carries a nested `Effect::GenericEffect` with populated
+            // `static_abilities` describes a RESOLUTION-TIME continuous-effect
+            // grant (the Chromatic-Orrery shape: "when this ability resolves,
+            // install this static"), not a persistent baseline this installer
+            // can route. `GameObject::apply_perpetual_modification`'s
+            // `GrantAbility` arm only ever pushes the WHOLE `AbilityDefinition`
+            // onto `abilities` / `base_abilities` -- it never inspects `.effect`
+            // to extract a nested `GenericEffect`'s statics into
+            // `static_definitions` / `base_static_definitions` at grant time, so
+            // the static this clause describes is never installed as a
+            // functioning ability by that arm.
+            //
+            // Agent of Raffine (MTGJSON-verified) is the regression case: "It
+            // perpetually gains \"You may spend mana as though it were mana of
+            // any color to cast this spell.\"" has no cost separator, so
+            // `parse_quoted_ability` treats the whole quoted sentence as a
+            // spell-like effect chain and `classify_quoted_inner` falls through
+            // its default `GrantAbility` fallback (no static/trigger/keyword
+            // recognizer matched), wrapping
+            // `Effect::GenericEffect { static_abilities: [SpendManaAsAnyColor
+            // { spell_filter: None, .. }], target: Some(Controller), .. }`.
+            // Accepting it here would look green (`Effect::ApplyPerpetual`,
+            // never `Effect::Unimplemented`) while being wrong on TWO independent
+            // axes: (1) `spell_filter: None` is the documented BOARD-WIDE path
+            // (every spell the controller casts), not "this spell" -- a real
+            // rules defect, not just a coverage gap; and (2) even a correctly
+            // self-scoped static would still need a NEW self-referential runtime
+            // check, because `player_can_spend_as_any_color_for_spell_object`
+            // (static_abilities.rs) only scans `game_active_statics`
+            // (battlefield + command zone) for a granting permanent's OWN
+            // static, while CR 113.6e says an ability that modifies how that
+            // particular object can be played or cast "functions in any zone
+            // from which it could be played or cast and also on the stack" --
+            // the recipient's own hand, then briefly the stack while its own
+            // cost is paid, neither of which `game_active_statics` ever
+            // reaches. Properly threading both the self-scope AND that new
+            // check (mirroring `casting::collect_self_spell_cost_modifiers`'s
+            // existing self-referential `ModifyCost` precedent) is a separate,
+            // larger project; reject here for now rather than ship a false
+            // green, mirroring the sibling `Effect::Unimplemented` gate above.
+            ContinuousModification::GrantAbility { definition }
+                if crate::game::coverage::ability_tree_any(&definition, &|d| {
+                    matches!(
+                        &*d.effect,
+                        Effect::GenericEffect { static_abilities, .. }
+                            if !static_abilities.is_empty()
+                    )
+                }) =>
+            {
+                Err(ContinuousModification::GrantAbility { definition })
+            }
+            ContinuousModification::GrantAbility { definition } => {
+                Ok(Self::GrantAbility { definition })
+            }
+            other => Err(other),
+        }
+    }
+}
+
 /// The typed effect enum. Each variant corresponds to an effect handler.
 /// Zero HashMap<String, String> fields.
 // clippy::large_enum_variant: `Effect` is the engine's central 100+ variant
@@ -14281,6 +14472,44 @@ pub enum PerpetualModification {
     ModifyCost {
         mode: crate::types::statics::CostModifyMode,
         amount: ManaCost,
+    },
+    /// Digital-only Alchemy (no CR entry for "perpetually"): "[object] perpetually
+    /// gains \"<ability text>\"[ and \"<ability text>\"]*" — a permanent grant of
+    /// one or more FULL abilities (not just evergreen keywords or a self-cost
+    /// modifier), e.g. Ethereal Grasp's targeted creature perpetually gaining
+    /// "This creature doesn't untap during your untap step" and "{8}: Untap
+    /// this creature." or Karlach, Tiefling Berserker's returned creature
+    /// perpetually gaining "~ can't block." (CR 509.1b blocking restriction).
+    ///
+    /// Each quoted ability text is classified through the SAME single authority
+    /// used by every other quoted-ability grant
+    /// (`oracle_static::keyword_grant::classify_quoted_inner`), so the granted
+    /// text's OWN self-reference (`~`) is resolved the ordinary way once the
+    /// modification is installed on the recipient — no separate pronoun-binding
+    /// step is needed for the INNER text. What this variant exists to carry is
+    /// the OUTER grant's applied-to target, resolved by the parser
+    /// (`parse_perpetual_self_subject`) to the correct antecedent: the
+    /// ability's own parent target for a bare self-referential grant (Karlach),
+    /// or `TargetFilter::LastCreated` when the immediately preceding clause in
+    /// the same chain created the object being granted to. Agent of Raffine's
+    /// conjured duplicate is the architectural motivator for that LastCreated
+    /// antecedent, but Agent of Raffine's OWN granted ability text ("You may
+    /// spend mana as though it were mana of any color to cast this spell.") is
+    /// currently REJECTED by `PerpetualGrantModification::try_from`'s
+    /// `GenericEffect`-static gate (see its doc comment), so Agent of Raffine
+    /// does not itself reach `Effect::ApplyPerpetual` — it fails closed to
+    /// `Effect::Unimplemented` — a future card whose conjured-duplicate grant
+    /// classifies to an installable kind would exercise this binding end to
+    /// end.
+    ///
+    /// Typed as [`PerpetualGrantModification`] — the closed set of kinds the
+    /// perpetual runtime can install onto a persistent baseline — rather than
+    /// the full `ContinuousModification` vocabulary, so an uninstallable kind
+    /// cannot be represented here at all. A granted ability text that
+    /// classifies to one (e.g. a full triggered ability) fails the parse closed
+    /// rather than silently dropping part of the grant.
+    GrantAbility {
+        modifications: Vec<PerpetualGrantModification>,
     },
 }
 
@@ -15003,6 +15232,11 @@ pub enum Effect {
         /// graveyard on the bottom of their library in a random order."
         #[serde(default, skip_serializing_if = "Option::is_none")]
         library_position: Option<LibraryPosition>,
+        /// CR 701.24a + CR 701.24d: `TerminalShuffle` marks the mass-move
+        /// component of a parser-emitted "shuffle [set] into [library]"
+        /// operation. Its chained `Shuffle` owns the one library randomization.
+        #[serde(default, skip_serializing_if = "is_default_mass_library_shuffle_mode")]
+        library_shuffle: MassLibraryShuffleMode,
         /// CR 401.4: When `true`, the objects are placed in a random order
         /// (e.g. Endurance). When `false`, the owner chooses the order per
         /// CR 401.4's default rule. Independent of `library_position`.
@@ -18764,6 +18998,47 @@ pub enum VoteVisibility {
 }
 
 impl TargetFilter {
+    /// CR 608.2c + CR 701.24c: True only for the mixed-zone owner population
+    /// used by compound all-player shuffles. One operand is the iterated
+    /// player's hand; the other is every permanent that player owns. Ordinary
+    /// private-zone wheels retain explicit origins and do not use this shape.
+    pub(crate) fn is_all_player_owner_shuffle_population(&self) -> bool {
+        let TargetFilter::Or { filters } = self else {
+            return false;
+        };
+        if filters.len() != 2 {
+            return false;
+        }
+
+        let is_scoped_hand = |filter: &TargetFilter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller: Some(ControllerRef::ScopedPlayer),
+                    properties,
+                }) if type_filters.is_empty()
+                    && properties.as_slice() == [FilterProp::InZone { zone: Zone::Hand }]
+            )
+        };
+        let is_owned_permanent = |filter: &TargetFilter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller: None,
+                    properties,
+                }) if type_filters.as_slice() == [TypeFilter::Permanent]
+                    && properties.as_slice() == [FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer,
+                    }]
+            )
+        };
+
+        (is_scoped_hand(&filters[0]) && is_owned_permanent(&filters[1]))
+            || (is_scoped_hand(&filters[1]) && is_owned_permanent(&filters[0]))
+    }
+
     /// CR 508.3d + CR 508.5a: True when this filter denotes a PLAYER population
     /// rather than an object population — the distinction
     /// `trigger_matchers::matching_attack_events` uses to decide whether an
@@ -33731,6 +34006,40 @@ mod tests {
         assert_eq!(mods, deserialized);
     }
 
+    /// Non-blocking item 3 (review round on PR #8494, matthewevans): the
+    /// `AbilityCost::Unimplemented` half of `PerpetualGrantModification::
+    /// try_from`'s `ContinuousModification::GrantAbility` fail-closed gate
+    /// (see its doc comment) had no dedicated test -- only the
+    /// `Effect::Unimplemented` half was exercised end-to-end via the Agent of
+    /// Raffine runtime test in `effects/perpetual.rs`. A granted ability whose
+    /// COST half never parsed (an unrecognized leading cost verb, CR 113.3b)
+    /// must fail the whole grant closed exactly like an unparsed EFFECT would
+    /// -- checking only `d.effect` would leave this shape green.
+    #[test]
+    fn perpetual_grant_modification_try_from_rejects_unimplemented_cost() {
+        let granted = AbilityDefinition {
+            cost: Some(AbilityCost::Unimplemented {
+                description: "some unrecognized cost verb".to_string(),
+            }),
+            ..AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Draw {
+                    count: default_quantity_one(),
+                    target: default_target_filter_controller(),
+                },
+            )
+        };
+        let modification = ContinuousModification::GrantAbility {
+            definition: Box::new(granted),
+        };
+        let result = PerpetualGrantModification::try_from(modification.clone());
+        assert_eq!(
+            result,
+            Err(modification),
+            "a granted ability with an unparsed COST must fail the whole perpetual grant closed, not install an ability that silently ignores its own printed cost"
+        );
+    }
+
     #[test]
     fn effect_unimplemented_variant_roundtrip() {
         let effect = Effect::Unimplemented {
@@ -36480,5 +36789,63 @@ mod static_condition_traversal_tests {
             assert!(!nested_at_depth(leaf.clone())
                 .requires_unavailable_continuation(&StaticMode::CantUntap));
         }
+    }
+
+    /// Existing card-data rows omit the parser-provenance field. They must keep
+    /// their historical per-object library behavior, while a parser-produced
+    /// terminal-shuffle operation preserves its explicit marker on the wire.
+    #[test]
+    fn change_zone_all_terminal_shuffle_mode_serde_is_backward_compatible() {
+        let legacy: Effect =
+            serde_json::from_str(r#"{"type":"ChangeZoneAll","destination":"Library"}"#)
+                .expect("pre-marker ChangeZoneAll payload deserializes");
+        let Effect::ChangeZoneAll {
+            library_shuffle, ..
+        } = legacy
+        else {
+            panic!("expected ChangeZoneAll");
+        };
+        assert_eq!(library_shuffle, MassLibraryShuffleMode::PerObject);
+        let legacy_json = serde_json::to_value(Effect::ChangeZoneAll {
+            origin: None,
+            destination: Zone::Library,
+            target: TargetFilter::None,
+            enters_under: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            library_shuffle: MassLibraryShuffleMode::PerObject,
+            random_order: false,
+        })
+        .expect("default mode serializes");
+        assert!(
+            legacy_json.get("library_shuffle").is_none(),
+            "the default provenance must not churn existing serialized card data"
+        );
+
+        let terminal = Effect::ChangeZoneAll {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Library,
+            target: TargetFilter::Controller,
+            enters_under: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+            random_order: false,
+        };
+        let terminal_json = serde_json::to_value(&terminal).expect("terminal mode serializes");
+        assert_eq!(
+            terminal_json["library_shuffle"]["type"], "TerminalShuffle",
+            "the parser-produced provenance must survive the serialization boundary"
+        );
+        assert_eq!(
+            serde_json::from_value::<Effect>(terminal_json).expect("terminal mode deserializes"),
+            terminal
+        );
     }
 }

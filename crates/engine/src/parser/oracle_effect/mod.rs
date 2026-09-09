@@ -114,13 +114,13 @@ use crate::types::ability::{
     DamageModification, DamageSource, DelayedTriggerCondition, DelayedTriggerLifetime,
     DieResultBranch, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
     GameRestriction, GuessSubject, IntensityScope, IterationKindBinding, KeeperConstraint,
-    LibraryPosition, ManaProduction, ManaSpendPermission, ManaTargetRole, MultiTargetSpec,
-    NumberDistinctness, ObjectProperty, ObjectScope, OriginConstraint, PerPlayerScope,
-    PerpetualModification, PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter,
-    PlayerRelation, PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity,
-    PropertyAggregate, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
-    ReplacementCondition, ReplacementDefinition, ResolutionCastWindow, RestrictionExpiry,
-    RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
+    LibraryPosition, ManaProduction, ManaSpendPermission, ManaTargetRole, MassLibraryShuffleMode,
+    MultiTargetSpec, NumberDistinctness, ObjectProperty, ObjectScope, OriginConstraint,
+    PerPlayerScope, PerpetualModification, PlayPermissionInvalidation, PlayerChoiceDistinctness,
+    PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount, PreventionScope,
+    ProhibitedActivity, PropertyAggregate, PtValue, QuantityExpr, QuantityRef,
+    ReciprocalZoneChoiceRole, ReplacementCondition, ReplacementDefinition, ResolutionCastWindow,
+    RestrictionExpiry, RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
     SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
     StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
     TargetFilter, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource, TriggerCondition,
@@ -5507,6 +5507,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: None,
+            library_shuffle: Default::default(),
             random_order: false,
         }
     } else {
@@ -10708,7 +10709,22 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // the ONLY production path that reaches this dispatch — so the text arriving
     // here is already the short bare-keyword form and the peeled condition is
     // reattached at the chunk level.
-    if let Some(effect) = try_parse_perpetual_grant_keywords(tp) {
+    if let Some(effect) = try_parse_perpetual_grant_keywords(tp, ctx) {
+        return parsed_clause(effect);
+    }
+
+    // Digital-only Alchemy (no CR entry for "perpetually"): "[subject]
+    // perpetually gains \"<ability text>\"[ and \"<ability text>\"]*" — a
+    // persistent grant of one or more FULL abilities, not just a bare
+    // evergreen keyword or a self-cost modifier (Agent of Raffine's conjured
+    // duplicate gaining "You may spend mana as though it were mana of any
+    // color to cast this spell."; the Karlach, Tiefling Berserker cycle's
+    // returned creature gaining "~ can't block." once its self-reanimation
+    // clause is modeled). Tried after the bare-keyword-list arm (disjoint: a
+    // keyword list has no leading quote) and after the self-spell-cost arm
+    // (whose quoted body is the fixed "this spell costs ... to cast" sentence,
+    // consumed by that arm first).
+    if let Some(effect) = try_parse_perpetual_grant_ability(tp, ctx) {
         return parsed_clause(effect);
     }
 
@@ -11200,20 +11216,32 @@ fn try_parse_perpetual_modify_pt(tp: TextPair) -> Option<Effect> {
 }
 
 /// Shared self-subject prefix for the perpetual self-grant arms
-/// (`try_parse_perpetual_grant_keywords`, `try_parse_perpetual_modify_cost`).
+/// (`try_parse_perpetual_grant_keywords`, `try_parse_perpetual_modify_cost`,
+/// `try_parse_perpetual_grant_ability`).
 ///
 /// Strips `<subject> perpetually gain(s) ` and reports which target the grant
 /// resolves against:
 /// - the anaphoric `"that <type> perpetually gains ..."` form back-references the
 ///   parent target ([`TargetFilter::ParentTarget`]);
-/// - the anaphoric `"it perpetually gains ..."` form also back-references the
-///   parent target;
+/// - the anaphoric `"it perpetually gains ..."` form binds to the chain's
+///   most-recently CREATED object ([`TargetFilter::LastCreated`]) when the
+///   immediately preceding clause in the same effect chain created one — e.g.
+///   Agent of Raffine's "Conjure a duplicate ... into your hand. It
+///   perpetually gains ..." (`ctx.token_created_in_chain`, via
+///   `counter::counter_anaphor_created_token_binding`) — and otherwise falls
+///   back to the parent target, mirroring the demonstrative form (a bare "it"
+///   with no created referent back-references a prior chosen/tracked object,
+///   e.g. the self-spell cost grant's "Choose a nonland card ... It
+///   perpetually gains \"...\"");
 /// - the self forms (`~`, `this creature/artifact/…`) target the source itself
 ///   ([`TargetFilter::Any`], resolved to the source by the perpetual resolver).
 ///
 /// Returns the remainder after `gain(s) ` plus the resolved target; the caller
 /// parses the grant body.
-fn parse_perpetual_self_subject(lower: &str) -> Option<(&str, TargetFilter)> {
+fn parse_perpetual_self_subject<'a>(
+    lower: &'a str,
+    ctx: &ParseContext,
+) -> Option<(&'a str, TargetFilter)> {
     // Anaphoric back-reference: "that <type> perpetually gains ...".
     if let Ok((after_that, _)) = tag::<_, _, OracleError<'_>>("that ").parse(lower) {
         let (rest, _) = take_until::<_, _, OracleError<'_>>("perpetually ")
@@ -11239,7 +11267,54 @@ fn parse_perpetual_self_subject(lower: &str) -> Option<(&str, TargetFilter)> {
         ))
         .parse(rest)
         .ok()?;
-        return Some((rest, TargetFilter::ParentTarget));
+        // CR 608.2c: a bare "it" must have a legitimate antecedent -- it must
+        // NEVER silently default to the ability's own source (Blocker 2,
+        // review round on PR #8494). Three antecedent shapes are recognized,
+        // nearest first:
+        //
+        //  1. The chain's most-recently CREATED object (Agent of Raffine's
+        //     conjured duplicate) -- `counter::counter_anaphor_created_token_binding`.
+        //  2. An earlier SAME-CHAIN typed/chosen referent -- a prior "choose a
+        //     card in your hand" clause (`ctx.parent_target_available`) or an
+        //     immediately preceding `Effect::ChooseFromZone`
+        //     (`ctx.pending_tracked_set_origin`) -- mirrors
+        //     `parse_bound_it_perpetual_gain_cost_subject`'s own gate exactly,
+        //     since this is the identical same-chain-referent question the
+        //     cost-grant sibling arm already answers correctly.
+        //  3. The TRIGGER's own non-self subject (Gitrog, Horror of Zhava's
+        //     "whenever a land enters under your control"; Effluence
+        //     Devourer's "whenever you sacrifice ~ or another creature") --
+        //     delegated to `resolve_it_pronoun`, the single authority that
+        //     chooses both whether a bare pronoun has an antecedent and which
+        //     event-relative filter names it. In particular, sacrifice events
+        //     bind through `TriggeringSource`; `ParentTarget` cannot resolve a
+        //     `GameEvent::PermanentSacrificed` referent.
+        //
+        // A SELF trigger (Chronicler of Worship's own ETB: the trigger's
+        // `object_id == source_id`) has none of these three -- the trigger
+        // condition names no object other than the source itself, so
+        // `ParentTarget` would resolve right back to the source
+        // (targeting.rs's `ZoneChanged` guard fails when the entering object
+        // IS the source), silently installing the grant on the WRONG object
+        // when the effect clearly names a different one (the randomly-drawn
+        // Shrine card). That shape has no antecedent and fails the clause
+        // closed, falling through to `Effect::Unimplemented` -- an honest gap
+        // rather than a wrong install.
+        let target = match counter::counter_anaphor_created_token_binding("it", ctx) {
+            Some(target) => target,
+            None if ctx.parent_target_available || ctx.pending_tracked_set_origin.is_some() => {
+                TargetFilter::ParentTarget
+            }
+            None => {
+                let mut pronoun_ctx = ctx.clone();
+                let target = resolve_it_pronoun(&mut pronoun_ctx);
+                if matches!(target, TargetFilter::SelfRef) {
+                    return None;
+                }
+                target
+            }
+        };
+        return Some((rest, target));
     }
 
     let after_subject = [
@@ -11299,16 +11374,102 @@ fn parse_bound_it_perpetual_gain_cost_subject<'a>(
 
 /// Digital-only Alchemy: parse "perpetually gains [keyword(s)]" —
 /// [`PerpetualModification::GrantKeywords`] (Monoist Gravliner).
-fn try_parse_perpetual_grant_keywords(tp: TextPair) -> Option<Effect> {
+fn try_parse_perpetual_grant_keywords(tp: TextPair, ctx: &ParseContext) -> Option<Effect> {
     fn tail_done(tail: &str) -> bool {
         tail.is_empty() || tail == "."
     }
 
-    let (rest, target) = parse_perpetual_self_subject(tp.lower)?;
+    let (rest, target) = parse_perpetual_self_subject(tp.lower, ctx)?;
     let (keywords, rest) = sequence::parse_keyword_grant_list(rest)?;
     tail_done(rest).then_some(Effect::ApplyPerpetual {
         target,
         modification: crate::types::ability::PerpetualModification::GrantKeywords { keywords },
+    })
+}
+
+/// A single `"<ability text>"` segment: consumes the opening and closing
+/// quotes and returns the inner text unquoted.
+fn parse_perpetual_quoted_ability_body(input: &str) -> Option<(&str, &str)> {
+    use nom::character::complete::char;
+    let (rest, _) = char::<_, OracleError<'_>>('"').parse(input).ok()?;
+    let (rest, body) = take_until::<_, _, OracleError<'_>>("\"").parse(rest).ok()?;
+    let (rest, _) = char::<_, OracleError<'_>>('"').parse(rest).ok()?;
+    Some((rest, body))
+}
+
+/// Digital-only Alchemy (no CR entry for "perpetually"): parse "[subject]
+/// perpetually gains \"<ability text>\"[ and \"<ability text>\"]*" into a
+/// [`PerpetualModification::GrantAbility`].
+///
+/// Each quoted body is classified through the SAME single authority every
+/// other quoted-ability grant uses (`oracle_static::classify_quoted_inner`),
+/// so the granted text's OWN self-reference (`~`) resolves the ordinary way
+/// once the modification is installed on the recipient — no separate pronoun
+/// step is needed for the INNER text. What `parse_perpetual_self_subject`
+/// resolves is the OUTER grant's applied-to target (the recipient), not
+/// anything inside the quotes.
+///
+/// Honest-red: a granted body that classifies to a modification kind the
+/// runtime cannot install onto a persistent baseline (one that
+/// `PerpetualGrantModification::try_from` rejects) fails the WHOLE clause
+/// closed rather than silently dropping part of a multi-ability grant, and
+/// any unconsumed tail after the last quote (a rider this leaf cannot model)
+/// does the same.
+fn try_parse_perpetual_grant_ability(tp: TextPair, ctx: &ParseContext) -> Option<Effect> {
+    fn tail_done(tail: &str) -> bool {
+        tail.is_empty() || tail == "."
+    }
+
+    let (lower_rest, target) = parse_perpetual_self_subject(tp.lower, ctx)?;
+    // Not a CR citation -- a Rust string-slicing idiom (`oracle_util`'s
+    // `text.len() - rest.len()` offset), used because `TextPair` cannot be
+    // reconstructed here: `parse_perpetual_self_subject` returns a
+    // lowercase-only remainder. Re-derive the ORIGINAL-case remainder from how
+    // much of `tp.lower` the subject prefix consumed, so the quoted bodies
+    // below are classified with their printed casing preserved
+    // (`classify_quoted_inner`'s fallback stamps its `AbilityDefinition::description`
+    // straight from the text it is handed).
+    let consumed = tp.lower.len() - lower_rest.len();
+    let orig_rest = &tp.original[consumed..];
+
+    let (mut rest, first_body) = parse_perpetual_quoted_ability_body(orig_rest)?;
+    let mut bodies = vec![first_body];
+    while let Ok((after_and, _)) = tag::<_, _, OracleError<'_>>(" and ").parse(rest) {
+        let (after_body, body) = parse_perpetual_quoted_ability_body(after_and)?;
+        bodies.push(body);
+        rest = after_body;
+    }
+    if !tail_done(rest) {
+        return None;
+    }
+
+    let classified: Vec<crate::types::ability::ContinuousModification> = bodies
+        .into_iter()
+        .flat_map(super::oracle_static::classify_quoted_inner)
+        .collect();
+
+    // Not a CR citation -- an architectural honest-red gate. An empty list (a
+    // degenerate quote with no recognized body) would record a grant that
+    // installs nothing, and a body classifying to a kind with no
+    // persistent-baseline installer (`GrantTrigger`, `GrantReplacement`, a
+    // `GrantAbility` whose nested tree still carries `Effect::Unimplemented`,
+    // …) must fail the WHOLE clause rather than silently drop part of a
+    // multi-ability grant — so the `Result` collect short-circuits on the
+    // first rejection. `PerpetualGrantModification` is the single authority
+    // for what "installable" means (see its `TryFrom`); there is no second
+    // predicate here to drift out of sync with the installer.
+    if classified.is_empty() {
+        return None;
+    }
+    let modifications: Vec<crate::types::ability::PerpetualGrantModification> = classified
+        .into_iter()
+        .map(crate::types::ability::PerpetualGrantModification::try_from)
+        .collect::<Result<_, _>>()
+        .ok()?;
+
+    Some(Effect::ApplyPerpetual {
+        target,
+        modification: crate::types::ability::PerpetualModification::GrantAbility { modifications },
     })
 }
 
@@ -11355,10 +11516,21 @@ fn try_parse_perpetual_modify_cost(tp: TextPair, ctx: &ParseContext) -> Option<E
         .parse(tp.lower)
         .is_ok()
     {
-        parse_bound_it_perpetual_gain_cost_subject(tp.lower, ctx)
-            .map(|rest| (rest, TargetFilter::ParentTarget))?
+        let bound_rest = parse_bound_it_perpetual_gain_cost_subject(tp.lower, ctx)?;
+        // CR 608.2c: same sibling fix as `parse_perpetual_self_subject`'s bare
+        // "it" branch — when the immediately preceding clause in this chain
+        // CREATED an object (Conjure/Token/CopyTokenOf/Manifest/Cloak), "it"
+        // binds to that just-created object, not the legacy chosen/tracked
+        // antecedent `parse_bound_it_perpetual_gain_cost_subject`'s own gate
+        // (`ctx.parent_target_available || ctx.pending_tracked_set_origin`)
+        // was written for. Checked first so a genuine chain-created referent
+        // always wins; falls through to the existing ParentTarget binding
+        // otherwise, leaving every currently-passing case unchanged.
+        let target = counter::counter_anaphor_created_token_binding("it", ctx)
+            .unwrap_or(TargetFilter::ParentTarget);
+        (bound_rest, target)
     } else {
-        parse_perpetual_self_subject(tp.lower)?
+        parse_perpetual_self_subject(tp.lower, ctx)?
     };
 
     // Quoted body: "this spell costs {N} less/more to cast[.,]".
@@ -20519,12 +20691,14 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
         .parse(lower.as_str())
         .ok()?;
 
-    if let Some(ShuffleImperativeAst::ChangeZoneAllToLibrary { origins }) =
-        parse_shuffle_ast(text, &lower)
-    {
-        return Some(lower_shuffle_ast(
-            ShuffleImperativeAst::ChangeZoneAllToLibrary { origins },
-        ));
+    if let Some(ast) = parse_shuffle_ast(text, &lower) {
+        if matches!(
+            ast,
+            ShuffleImperativeAst::ChangeZoneAllToLibrary { .. }
+                | ShuffleImperativeAst::TargetedChangeZoneToLibrary { all: true, .. }
+        ) {
+            return Some(lower_shuffle_ast(ast));
+        }
     }
 
     // Try to split compound subject from the text after "shuffle "
@@ -20543,15 +20717,10 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
 
     let owner_library = is_owner_library;
 
-    // CR 701.24a: Compound shuffle is ChangeZone(first) → ChangeZone(second) → Shuffle.
-    let shuffle_def = AbilityDefinition::new(
-        AbilityKind::Spell,
-        Effect::Shuffle {
-            target: TargetFilter::Controller,
-        },
-    );
-
-    // Build ChangeZone for the second subject, chained to the Shuffle
+    // CR 701.24a + CR 400.3: Compound shuffle is
+    // ChangeZone(first) → ChangeZone(second) → the common owner-aware Shuffle.
+    // Routing the terminal node through the common constructor keeps compound
+    // and single-subject forms on the same prospective-subject authority.
     let sub_effect = Effect::ChangeZone {
         origin: None,
         destination: Zone::Library,
@@ -20567,8 +20736,9 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
         face_down_profile: None,
         enters_modified_if: None,
     };
-    let mut sub_def = AbilityDefinition::new(AbilityKind::Spell, sub_effect);
-    sub_def.sub_ability = Some(Box::new(shuffle_def));
+    let sub_clause = imperative::with_shuffle_sub_ability(sub_effect);
+    let mut sub_def = AbilityDefinition::new(AbilityKind::Spell, sub_clause.effect);
+    sub_def.sub_ability = sub_clause.sub_ability;
 
     // Build ChangeZone for the first subject as the primary effect
     let primary_effect = Effect::ChangeZone {
@@ -22247,7 +22417,21 @@ fn has_typed_target_widened(effect: &Effect) -> bool {
         | Effect::ChangeZoneAll { target, .. }
         | Effect::TargetOnly { target, .. }
         | Effect::CastFromZone { target, .. }
-        | Effect::Counter { target, .. } => target,
+        | Effect::Counter { target, .. }
+        // CR 608.2c regression (review round on PR #8494): `Effect::SetLifeTotal`
+        // is also the "a stat becomes equal to/becomes N" setter for a NAMED
+        // TARGET object, not only a player's life total (Baffling Defenses:
+        // "Target creature's base power perpetually becomes 0"; Teyo, Aegis
+        // Adept: "Up to one target creature's base power perpetually becomes
+        // equal to its toughness. It perpetually gains ...") -- its `target`
+        // field carries the SAME chosen-referent shape as every sibling arm
+        // above. Without this arm, Teyo's chained "It perpetually gains ..."
+        // lost its same-chain typed referent under the new bare-"it"
+        // fail-closed gate (`parse_perpetual_self_subject`), regressing a
+        // previously-correct card from `Effect::ApplyPerpetual` to
+        // `Effect::Unimplemented` -- discovered via a fresh coverage-parse-diff
+        // run against this PR's own fix, not assumed.
+        | Effect::SetLifeTotal { target, .. } => target,
         Effect::GenericEffect {
             target: Some(target),
             ..
@@ -23275,6 +23459,22 @@ fn lower_subject_predicate_ast(
                             _ => {}
                         }
                     }
+                    // CR 115.1a / CR 115.1c + CR 608.2c: the outer
+                    // `TargetOnly` owns the printed player target. A mass zone
+                    // move parsed from that player's possessive still carries
+                    // the imperative parser's caster default; bind only that
+                    // exact default to the outer target before nesting. The
+                    // intrinsic library continuation must be rebound here
+                    // as well because this wrapper returns before the general
+                    // subject-injection pass below. Singular moves and
+                    // already-specific mass filters retain their own target
+                    // semantics.
+                    if let Effect::ChangeZoneAll { target, .. } = &mut clause.effect {
+                        if *target == TargetFilter::Controller {
+                            *target = TargetFilter::ParentTarget;
+                        }
+                    }
+                    sync_player_into_nested_shuffle_sub(&mut clause, &TargetFilter::ParentTarget);
                     let mut sub_ability =
                         AbilityDefinition::new(AbilityKind::Spell, clause.effect.clone());
                     sub_ability.sub_ability = clause.sub_ability;
@@ -23385,7 +23585,9 @@ fn lower_subject_predicate_ast(
             }
             inject_subject_target(&mut clause.effect, &subject);
             inject_subject_into_shared_token_sequence(&mut clause, &subject);
-            sync_subject_into_nested_shuffle_sub(&mut clause, &subject);
+            if let Some(subject_filter) = subject.target.as_ref().or(subject.affected.as_ref()) {
+                sync_player_into_nested_shuffle_sub(&mut clause, subject_filter);
+            }
             // CR 109.4 + CR 608.2c (issue #534): When the subject phrase
             // resolved to the chosen player ("That player" after a
             // `Choose(Opponent)`/`Choose(Player)`), the predicate's possessive
@@ -23555,8 +23757,30 @@ fn extract_player_anchor_in_chain(clause: &ParsedEffectClause) -> Option<TargetF
     if let Some(anchor) = extract_player_anchor(&clause.effect) {
         return Some(anchor);
     }
+    // CR 115.1a + CR 608.2c: a player-only `TargetOnly` wrapper establishes
+    // the parent target as a player anchor for its nested mass library move.
+    // This is deliberately local: `ParentTarget` can also name an object, and
+    // must not become a general player-capable filter. Head Games and Jester's
+    // Mask then bind their following "Search that player's library" clause to
+    // this declared player target.
+    let parent_target_is_player = matches!(
+        &clause.effect,
+        Effect::TargetOnly { target } if target_filter_can_target_player(target)
+    );
     let mut sub = clause.sub_ability.as_deref();
     while let Some(def) = sub {
+        if parent_target_is_player
+            && matches!(
+                def.effect.as_ref(),
+                Effect::ChangeZoneAll {
+                    destination: Zone::Library,
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            )
+        {
+            return Some(TargetFilter::ParentTarget);
+        }
         if let Some(anchor) = extract_player_anchor(&def.effect) {
             return Some(anchor);
         }
@@ -23635,7 +23859,11 @@ fn repeat_for_each_this_way_suffix(pred_lower: &str) -> Option<QuantityExpr> {
 /// subject-parser default (`ParentTargetController`). Does not touch effects
 /// that already carry an explicit owner anaphor (`ParentTargetOwner`).
 fn apply_anchor_subject(effect: &mut Effect, anchor: &TargetFilter, draw_inherits_anchor: bool) {
-    if !target_filter_can_target_player(anchor) {
+    // `ParentTarget` reaches this chain-local applier only from
+    // `extract_player_anchor_in_chain`'s player-only `TargetOnly` wrapper
+    // branch. It is a player reference there, but remains excluded from the
+    // shared predicate because it can otherwise name an object.
+    if !matches!(anchor, TargetFilter::ParentTarget) && !target_filter_can_target_player(anchor) {
         return;
     }
     match effect {
@@ -23655,7 +23883,22 @@ fn apply_anchor_subject(effect: &mut Effect, anchor: &TargetFilter, draw_inherit
         } => {
             *tp = Some(anchor.clone());
         }
-        Effect::ChangeZoneAll { target, .. } if *target == TargetFilter::Controller => {
+        // A `ParentTarget` anchor is provenance-safe only for the nested mass
+        // library move that established it. Search result collection uses a
+        // `ChangeZoneAll` from exile keyed by `TrackedSet`; rebinding its
+        // controller default would turn that precise set into every card of the
+        // target player in exile.
+        Effect::ChangeZoneAll {
+            destination: Zone::Library,
+            target,
+            ..
+        } if *target == TargetFilter::Controller => {
+            *target = anchor.clone();
+        }
+        Effect::ChangeZoneAll { target, .. }
+            if !matches!(anchor, TargetFilter::ParentTarget)
+                && *target == TargetFilter::Controller =>
+        {
             *target = anchor.clone();
         }
         // CR 608.2c: a trailing "…, then draws …" continuation is a separate
@@ -24379,20 +24622,20 @@ fn parse_subject_exile_top_count(pred_lower: &str) -> QuantityExpr {
     }
 }
 
-/// Inject a subject phrase's target filter into an effect that was parsed through
-/// the imperative fallback path, where the subject was stripped before parsing.
-/// Only applies to effects with a sentinel `TargetFilter::Any` that should inherit
-/// the subject's targeting information.
-fn sync_subject_into_nested_shuffle_sub(
+/// Bind the intrinsic mass-move/library continuation of a library zone move to
+/// its player subject. Only caster-defaulted (`Controller`), unresolved (`Any`),
+/// or player-unspecified (`None`) continuation targets are rewritten;
+/// already-specific targets remain unchanged. `ParentTarget` is admitted only at
+/// this chain-local seam: it is the back-reference to the outer player
+/// `TargetOnly`, not a standalone player filter accepted by the general target
+/// validator.
+fn sync_player_into_nested_shuffle_sub(
     clause: &mut ParsedEffectClause,
-    subject: &SubjectPhraseAst,
+    subject_filter: &TargetFilter,
 ) {
-    // Issue #6965: no bound subject and no target means there is nothing to
-    // rebind — return rather than fabricate a filter.
-    let Some(subject_filter) = subject.target.as_ref().or(subject.affected.as_ref()) else {
-        return;
-    };
-    if !target_filter_can_target_player(subject_filter) {
+    if !matches!(subject_filter, TargetFilter::ParentTarget)
+        && !target_filter_can_target_player(subject_filter)
+    {
         return;
     }
 
@@ -24406,24 +24649,46 @@ fn sync_subject_into_nested_shuffle_sub(
         return;
     }
 
+    // CR 400.3: the collapsed multi-zone operand is a disjunction of typed
+    // private-zone filters. Bind every operand to the named player while
+    // preserving the zone union; the terminal shuffle selects owners through
+    // its cause-filtered tracked-set scope and is never rewritten directly.
+    if let Effect::ChangeZoneAll { target, .. } = &mut clause.effect {
+        let controller = match subject_filter {
+            TargetFilter::Controller => Some(ControllerRef::You),
+            TargetFilter::Player | TargetFilter::ParentTarget => Some(ControllerRef::TargetPlayer),
+            TargetFilter::ScopedPlayer | TargetFilter::TriggeringPlayer => {
+                Some(ControllerRef::ScopedPlayer)
+            }
+            _ => player_filter_as_controller_ref(subject_filter),
+        };
+        if let Some(controller) = controller {
+            force_controller(target, controller);
+        }
+    }
+
     let mut next = clause.sub_ability.as_mut();
     while let Some(sub) = next {
         // CR 701.24a + CR 608.2c: `lower_change_zone_all_to_library` chains
         // `ChangeZoneAll { target: Controller }` for every additional origin
-        // zone, ending in `Shuffle { target: Controller }`. When the stripped
-        // subject is a player anaphor ("that player shuffles their hand into
-        // their library" — Jace, the Mind Sculptor −12), keep the whole
-        // mass-move/shuffle chain bound to that player.
+        // zone, optionally runs `SearchLibrary { target_player: None }`, and
+        // ends in `Shuffle { target: Controller }`. When the stripped subject
+        // is a player anaphor ("that player shuffles their hand into their
+        // library" — Jace, the Mind Sculptor −12; Head Games), keep the whole
+        // library chain bound to that player.
         match &mut *sub.effect {
             Effect::ChangeZoneAll {
                 destination: Zone::Library,
                 target,
                 ..
-            }
-            | Effect::Shuffle { target }
-                if matches!(&*target, TargetFilter::Controller | TargetFilter::Any) =>
-            {
+            } if matches!(&*target, TargetFilter::Controller | TargetFilter::Any) => {
                 *target = subject_filter.clone();
+            }
+            Effect::SearchLibrary {
+                target_player: target_player @ None,
+                ..
+            } => {
+                *target_player = Some(subject_filter.clone());
             }
             _ => {}
         }
@@ -29380,6 +29645,11 @@ fn publishes_tracked_set_from_resolution(effect: &Effect) -> bool {
         || is_battlefield_return_effect(effect)
         || is_token_creating_effect(effect)
         || is_mass_coerce_static(effect)
+        // CR 701.23a + CR 608.2c: a search choice publishes its selected cards
+        // when a continuation references the chain set. Classify it as a
+        // publisher so a following "those cards" move receives the tracked-set
+        // sentinel that activates that runtime publication.
+        || matches!(effect, Effect::SearchLibrary { .. })
         || matches!(
             effect,
             Effect::PutCounter { .. }
@@ -30597,34 +30867,151 @@ fn rewrite_condition_quantity_expr(expr: &mut QuantityExpr) {
     }
 }
 
-/// CR 608.2c + CR 701.24a: An all-player whole-hand shuffle is one local
-/// instruction per player: move that player's hand into their library, then
-/// shuffle that same library. The ordinary target walker intentionally excludes
-/// `Shuffle`, so normalize only the immediate exact structural pair rather than
-/// making shuffle targets globally rewritable.
-fn normalize_all_player_hand_to_library_shuffle_targets(def: &mut AbilityDefinition) {
+/// CR 608.2c + CR 701.24a: An all-player library shuffle is one local
+/// instruction per player. Normalize only its immediate structural chain:
+/// the ordinary target walker intentionally excludes `Shuffle`, and an
+/// EventContextAmount draw after that shuffle belongs to the same iteration.
+fn normalize_all_player_ordinary_library_wheel_chain(def: &mut AbilityDefinition) {
+    let actor_default_target = |target: &TargetFilter| {
+        matches!(
+            target,
+            TargetFilter::Controller | TargetFilter::Any | TargetFilter::ScopedPlayer
+        )
+    };
+
+    // CR 608.2c + CR 701.24a: An ordinary all-player wheel lowers each private
+    // origin as a consecutive terminal-shuffle-suppressed move. Validate the
+    // complete marked chain before changing any target so an unrelated library
+    // move or concrete/anaphoric player target cannot be partially rebound.
+    if !matches!(
+        def.effect.as_ref(),
+        Effect::ChangeZoneAll {
+            origin: Some(Zone::Hand),
+            destination: Zone::Library,
+            target,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+            ..
+        } if actor_default_target(target)
+    ) {
+        return;
+    }
+
+    let mut current: &AbilityDefinition = def;
+    loop {
+        match current.effect.as_ref() {
+            Effect::ChangeZoneAll {
+                origin: Some(_),
+                destination: Zone::Library,
+                target,
+                library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+                ..
+            } if actor_default_target(target) => {
+                let Some(next) = current.sub_ability.as_deref() else {
+                    return;
+                };
+                current = next;
+            }
+            Effect::Shuffle { target } if actor_default_target(target) => break,
+            _ => return,
+        }
+    }
+
+    let mut current: &mut AbilityDefinition = def;
+    loop {
+        match current.effect.as_mut() {
+            Effect::ChangeZoneAll { target, .. } => {
+                if matches!(target, TargetFilter::Controller | TargetFilter::Any) {
+                    *target = TargetFilter::ScopedPlayer;
+                }
+                current = current
+                    .sub_ability
+                    .as_deref_mut()
+                    .expect("ordinary all-player wheel chain validated above");
+            }
+            Effect::Shuffle { target } => {
+                if matches!(target, TargetFilter::Controller | TargetFilter::Any) {
+                    *target = TargetFilter::ScopedPlayer;
+                }
+                if let Some(draw) = current.sub_ability.as_deref_mut() {
+                    if let Effect::Draw {
+                        count: QuantityExpr::Fixed { .. },
+                        target,
+                    } = draw.effect.as_mut()
+                    {
+                        if matches!(target, TargetFilter::Controller | TargetFilter::Any) {
+                            *target = TargetFilter::ScopedPlayer;
+                        }
+                    }
+                }
+                break;
+            }
+            _ => unreachable!("ordinary all-player wheel chain validated above"),
+        }
+    }
+}
+
+fn normalize_all_player_library_shuffle_chain(def: &mut AbilityDefinition) {
     if !matches!(def.player_scope, Some(PlayerFilter::All)) {
         return;
     }
+
+    normalize_all_player_ordinary_library_wheel_chain(def);
 
     let Some(shuffle) = def.sub_ability.as_deref_mut() else {
         return;
     };
 
-    let (
-        Effect::ChangeZoneAll {
-            origin: Some(Zone::Hand),
-            destination: Zone::Library,
-            target: move_target,
-            ..
-        },
-        Effect::Shuffle {
-            target: shuffle_target,
-        },
-    ) = (&mut *def.effect, &mut *shuffle.effect)
+    let Effect::ChangeZoneAll {
+        origin,
+        destination: Zone::Library,
+        target: move_target,
+        ..
+    } = &mut *def.effect
     else {
         return;
     };
+    let Effect::Shuffle {
+        target: shuffle_target,
+    } = &mut *shuffle.effect
+    else {
+        return;
+    };
+
+    // CR 608.2c + CR 121.1: The Great Aurora class keeps "then draws
+    // that many" in the same per-player shuffle instruction. Its compound
+    // population has no single origin and the subject injector copies that
+    // population filter onto the draw. Bind the move, shuffle, and draw to the
+    // enclosing All iteration instead of starting fresh nested iterations.
+    let keeps_draw_in_outer_iteration = origin.is_none()
+        && move_target.is_all_player_owner_shuffle_population()
+        && shuffle.sub_ability.as_deref().is_some_and(|draw| {
+            matches!(
+                &*draw.effect,
+                Effect::Draw {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                    target,
+                } if matches!(target, TargetFilter::Controller | TargetFilter::Any | TargetFilter::ScopedPlayer)
+                    || target == move_target
+            )
+        });
+    if keeps_draw_in_outer_iteration {
+        shuffle.player_scope = None;
+        let draw = shuffle
+            .sub_ability
+            .as_deref_mut()
+            .expect("compound all-player shuffle draw checked above");
+        let Effect::Draw { target, .. } = &mut *draw.effect else {
+            unreachable!("compound all-player shuffle draw checked above");
+        };
+        *target = TargetFilter::ScopedPlayer;
+        draw.player_scope = None;
+    }
+
+    if *origin != Some(Zone::Hand) {
+        return;
+    }
 
     // Only parser-default controller/any targets may be rebound. A concrete
     // player class or anaphoric target is semantically meaningful and must not
@@ -30780,7 +31167,7 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
     if matches!(def.player_scope, Some(PlayerFilter::All)) {
         each_target_filter_mut(&mut def.effect, &mut rewrite_filter_controller_to_scoped);
     }
-    normalize_all_player_hand_to_library_shuffle_targets(def);
+    normalize_all_player_library_shuffle_chain(def);
     // CR 406.2 + CR 610.3: Under the `OwnersOfCardsExiledBySource` scope ("the
     // owner of each card exiled with ~ puts that card on the bottom of their
     // library", Trial of a Time Lord IV), the "that card" anaphor (parsed as the
@@ -32696,6 +33083,11 @@ pub(crate) fn lower_ability_ir(ir: &AbilityIr) -> AbilityDefinition {
     let mut def = lower_effect_chain_ir(&ir.body);
     attach_die_result_branches_before_finalization(&mut def, &ir.die_results);
     finalize_effect_chain(&mut def);
+    // CR 608.2c + CR 121.1: finalization can assemble the Great Aurora class's
+    // owner-shuffle continuation after the assembly-time player-scope rewrite.
+    // Reapply the same narrow structural normalizer here, where the whole
+    // Move→Shuffle→Draw chain is stable.
+    normalize_all_player_library_shuffle_chain(&mut def);
     apply_owner_library_reveal_anchor_from_text(&mut def, &ir.source_text);
     // CR 608.2c: a root the chain cannot describe (it has no previous boundary).
     if let Some(sub_link) = ir.shell.sub_link {
@@ -33576,6 +33968,7 @@ fn parse_return_target_and_same_name_from_your_graveyard_ir(
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             }),
             None,
@@ -33967,6 +34360,7 @@ fn parse_reciprocal_graveyard_choice_ir(text: &str, kind: AbilityKind) -> Option
             enter_with_counters: Vec::new(),
             face_down_profile: None,
             library_position: None,
+            library_shuffle: Default::default(),
             random_order: false,
         },
     );
@@ -38452,6 +38846,7 @@ fn try_parse_put_zone_change_parts(
                         enter_with_counters: vec![],
                         face_down_profile: None,
                         library_position,
+                        library_shuffle: Default::default(),
                         random_order,
                     },
                     choice_count,
@@ -40388,6 +40783,7 @@ fn issue_2406_chaos_warp_owner_library_shuffle_and_reveal() {
         shuffle.effect.target_filter(),
         Some(&TargetFilter::ParentTargetOwner)
     );
+    assert_eq!(shuffle.player_scope, None);
     let reveal = shuffle
         .sub_ability
         .as_ref()

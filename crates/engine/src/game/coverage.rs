@@ -23,11 +23,11 @@ use crate::types::ability::{
     CountScope, CounterKindChooser, CounterKindDomain, CounterSourceRider, DelayedTriggerCondition,
     DieRollModifier, DoublePTMode, Duration, EachDamageRecipient, Effect, EffectOutcomeSignal,
     EffectScope, FilterProp, ForEachCategoryAction, GameRestriction, LibraryPosition,
-    ManaProduction, ObjectProperty, ObjectScope, ObjectSelectionCardinality,
-    ObjectSelectionEligibility, ParsedCondition, PerpetualModification, PlayerFilter,
-    PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-    ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality,
-    SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
+    ManaProduction, MassLibraryShuffleMode, ObjectProperty, ObjectScope,
+    ObjectSelectionCardinality, ObjectSelectionEligibility, ParsedCondition, PerpetualModification,
+    PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr,
+    QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection,
+    SharedQuality, SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
     SpellStackToGraveyardReplacement, StackAbilityKind, StaticCondition, StaticDefinition,
     TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, VoteSubject, ZoneRef,
 };
@@ -848,6 +848,9 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::EquippedBy => parts.push("equipped by self".into()),
             FilterProp::AttachedToSource => parts.push("attached to self".into()),
             FilterProp::AttachedToRecipient => parts.push("attached to it".into()),
+            FilterProp::AttachedToPlayer { player } => {
+                parts.push(format!("attached to {}", fmt_controller(player)))
+            }
             FilterProp::Unpaired => parts.push("unpaired".into()),
             FilterProp::HasAttachment {
                 kind,
@@ -2458,6 +2461,9 @@ fn fmt_characteristic_population(source: &CardTypeSetSource) -> String {
             Some(cause) => {
                 use crate::types::ability::ThisWayCause;
                 let verb = match cause {
+                    ThisWayCause::OwnerLibraryShuffleSubject => {
+                        "designated for an owner-library shuffle"
+                    }
                     ThisWayCause::Discarded => "discarded",
                     ThisWayCause::Exiled => "exiled",
                     ThisWayCause::Milled => "milled",
@@ -3104,6 +3110,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             enter_with_counters,
             face_down_profile,
             library_position,
+            library_shuffle,
             random_order,
         } => {
             if let Some(o) = origin {
@@ -3134,6 +3141,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             }
             if let Some(lp) = library_position {
                 d.push(("library_position".into(), format!("{lp:?}")));
+            }
+            if matches!(library_shuffle, MassLibraryShuffleMode::TerminalShuffle) {
+                d.push(("library_shuffle".into(), format!("{library_shuffle:?}")));
             }
             if *random_order {
                 d.push(("random_order".into(), "true".into()));
@@ -9936,7 +9946,14 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
 /// Walk an ability definition tree, visiting all nested `AbilityDefinition`s including
 /// those embedded in compound effects (`FlipCoin`, `RollDie`, `GrantAbility`, etc.).
 /// Returns `true` if the predicate returns `true` for any node in the tree.
-fn ability_tree_any(def: &AbilityDefinition, pred: &impl Fn(&AbilityDefinition) -> bool) -> bool {
+///
+/// `pub(crate)`: also the single-authority walker `PerpetualGrantModification::try_from`
+/// (`types/ability.rs`) reuses to reject a `GrantAbility` whose nested tree contains
+/// `Effect::Unimplemented` -- never reimplement tree-walking at that call site.
+pub(crate) fn ability_tree_any(
+    def: &AbilityDefinition,
+    pred: &impl Fn(&AbilityDefinition) -> bool,
+) -> bool {
     if pred(def) {
         return true;
     }
@@ -13604,6 +13621,46 @@ mod tests {
                 .iter()
                 .any(|k| k == "enters_attacking"),
             "a plain (non-attacking) ChangeZone must not add the row",
+        );
+    }
+
+    /// The parser-owned terminal shuffle changes the library action from
+    /// per-object randomization to one chained shuffle. It must therefore reach
+    /// coverage signatures, while the default remains absent to avoid churn.
+    #[test]
+    fn change_zone_all_signature_exposes_terminal_shuffle() {
+        let details = |library_shuffle| {
+            effect_details(&Effect::ChangeZoneAll {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Library,
+                target: TargetFilter::Controller,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+                library_position: None,
+                library_shuffle,
+                random_order: false,
+            })
+        };
+
+        let per_object = details(MassLibraryShuffleMode::PerObject);
+        assert!(
+            !per_object.iter().any(|(key, _)| key == "library_shuffle"),
+            "the default mode must not churn legacy coverage signatures"
+        );
+
+        let terminal = details(MassLibraryShuffleMode::TerminalShuffle);
+        assert!(
+            terminal
+                .iter()
+                .any(|(key, value)| { key == "library_shuffle" && value == "TerminalShuffle" }),
+            "the parser-emitted terminal shuffle must be visible to coverage"
+        );
+        assert_ne!(
+            per_object, terminal,
+            "per-object and terminal library shuffles must not collapse in coverage"
         );
     }
 
