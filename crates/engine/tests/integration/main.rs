@@ -924,6 +924,7 @@ mod loki_becomes_target_ability;
 mod lost_monarch_combat_damage_by_type_intervening_if;
 mod louisoix_sacrifice_counter;
 mod lurking_predators_1604_repro;
+mod machine_gods_effigy_copy_exception;
 mod madame_null_integration;
 mod madrush_cyclops_haste_grant;
 mod magmatic_scorchwing_intervening_if;
