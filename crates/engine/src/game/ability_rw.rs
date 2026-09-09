@@ -2453,6 +2453,11 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         }
         FilterProp::ProtectorMatches { controller }
         | FilterProp::Owned { controller }
+        // CR 303.4 + CR 301.5: the attachment referent is a `ControllerRef`, so
+        // whether this prop nests a frozen-12 event-context tag is exactly
+        // whether that referent is one — delegate rather than assert, mirroring
+        // the sibling `ControllerRef`-bearing props.
+        | FilterProp::AttachedToPlayer { player: controller }
         | FilterProp::MostPrevalentCreatureTypeIn {
             scope: controller, ..
         } => legacy_controller_ref(controller),
@@ -2732,6 +2737,12 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         }
         FilterProp::ProtectorMatches { controller }
         | FilterProp::Owned { controller }
+        // CR 303.4 + CR 301.5: the attachment referent is a `ControllerRef`
+        // resolved against the reading ability's OWN source (an
+        // `EnchantedPlayer` referent is that source's enchanted player), so its
+        // member-boundness is exactly the referent's — delegate rather than
+        // assert, mirroring the sibling `ControllerRef`-bearing props.
+        | FilterProp::AttachedToPlayer { player: controller }
         | FilterProp::MostPrevalentCreatureTypeIn {
             scope: controller, ..
         } => member_bound_controller_ref(controller),
@@ -4983,6 +4994,7 @@ fn rw_effect(
             enters_attacking: _,
             face_down_profile: _,
             library_position: _,
+            library_shuffle: _,
             random_order: _,
         } => {
             let (mut p, sc) = mem(target, *origin, *destination);
@@ -7731,6 +7743,17 @@ mod tests {
                 properties: vec![FilterProp::SameNameAsExiledBySource],
                 ..TypedFilter::creature()
             }),
+            // CR 303.4 + CR 301.5: an attachment-relative player referent is
+            // read against the ability's OWN source (the enchanted player of
+            // THIS Aura), so distinct sources are not one shared function —
+            // `AttachedToPlayer` must delegate its `ControllerRef` rather than
+            // answer FALSE outright.
+            TargetFilter::Typed(TypedFilter {
+                properties: vec![FilterProp::AttachedToPlayer {
+                    player: ControllerRef::EnchantedPlayer,
+                }],
+                ..TypedFilter::creature()
+            }),
         ] {
             assert!(
                 member_bound_target_filter(&f),
@@ -7748,6 +7771,15 @@ mod tests {
             TargetFilter::LastRevealed,
             TargetFilter::DefendingPlayer,
             typed_ctrl(ControllerRef::You),
+            // The delegation is the referent's own verdict, not a blanket TRUE
+            // for the prop: a controller-relative attachment referent stays
+            // member-invariant under uniformity.
+            TargetFilter::Typed(TypedFilter {
+                properties: vec![FilterProp::AttachedToPlayer {
+                    player: ControllerRef::You,
+                }],
+                ..TypedFilter::creature()
+            }),
             TargetFilter::None,
         ] {
             assert!(

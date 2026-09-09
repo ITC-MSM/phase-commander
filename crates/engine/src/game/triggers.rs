@@ -3024,7 +3024,13 @@ fn source_has_trigger_in_zone(state: &GameState, source_id: ObjectId, zone: Zone
     })
 }
 
-pub(crate) fn trigger_definition_functions_in_zone(def: &TriggerDefinition, zone: Zone) -> bool {
+/// Returns whether a trigger definition functions from `zone`.
+///
+/// CR 113.6 gives abilities their normal battlefield functionality; CR 113.6b
+/// permits an ability to state another zone where it functions. An empty
+/// `trigger_zones` list therefore means battlefield only, while an explicit
+/// list is authoritative.
+pub fn trigger_definition_functions_in_zone(def: &TriggerDefinition, zone: Zone) -> bool {
     if def.trigger_zones.is_empty() {
         zone == Zone::Battlefield
     } else {
@@ -4470,42 +4476,40 @@ fn collect_pending_triggers_with_collection(
                 ..
             } = event
             {
-                if has_prowess && *caster == controller {
-                    // Check if the cast spell is noncreature
-                    let is_noncreature = state
-                        .objects
-                        .get(spell_obj_id)
-                        .map(|obj| !obj.card_types.core_types.contains(&CoreType::Creature))
-                        .unwrap_or(false);
-
-                    if is_noncreature {
-                        let prowess_effect = Effect::Pump {
-                            power: crate::types::ability::PtValue::Fixed(1),
-                            toughness: crate::types::ability::PtValue::Fixed(1),
-                            target: TargetFilter::SelfRef,
-                        };
-                        let prowess_ability =
-                            ResolvedAbility::new(prowess_effect, Vec::new(), obj_id, controller);
-                        let prowess_trig_def = TriggerDefinition::new(TriggerMode::SpellCast)
-                            .description("Prowess".to_string());
-                        pending.push(PendingTriggerContext::single(PendingTrigger {
-                            source_id: obj_id,
-                            controller,
-                            condition: prowess_trig_def.condition,
-                            ability: Box::new(prowess_ability),
-                            timestamp,
-                            target_constraints: Vec::new(),
-                            distribute: None,
-                            trigger_event: Some(event.clone()),
-                            modal: None,
-                            mode_abilities: vec![],
-                            description: prowess_trig_def.description,
-                            may_trigger_origin: None,
-                            subject_match_count: None,
-                            die_result: None,
-                            provenance: None,
-                        }));
-                    }
+                if has_prowess
+                    && synthetic_keyword_spell_cast_trigger_applies(
+                        state,
+                        obj_id,
+                        *caster,
+                        *spell_obj_id,
+                    )
+                {
+                    let prowess_effect = Effect::Pump {
+                        power: crate::types::ability::PtValue::Fixed(1),
+                        toughness: crate::types::ability::PtValue::Fixed(1),
+                        target: TargetFilter::SelfRef,
+                    };
+                    let prowess_ability =
+                        ResolvedAbility::new(prowess_effect, Vec::new(), obj_id, controller);
+                    let prowess_trig_def = TriggerDefinition::new(TriggerMode::SpellCast)
+                        .description("Prowess".to_string());
+                    pending.push(PendingTriggerContext::single(PendingTrigger {
+                        source_id: obj_id,
+                        controller,
+                        condition: prowess_trig_def.condition,
+                        ability: Box::new(prowess_ability),
+                        timestamp,
+                        target_constraints: Vec::new(),
+                        distribute: None,
+                        trigger_event: Some(event.clone()),
+                        modal: None,
+                        mode_abilities: vec![],
+                        description: prowess_trig_def.description,
+                        may_trigger_origin: None,
+                        subject_match_count: None,
+                        die_result: None,
+                        provenance: None,
+                    }));
                 }
             }
 
@@ -6233,6 +6237,30 @@ fn collect_pending_triggers_with_collection(
         )
     });
     pending
+}
+
+/// CR 702.108a: whether this battlefield Prowess instance creates its
+/// synthesized trigger for an announced spell cast.
+///
+/// Prowess has no `TriggerDefinition`; callers that need to account for cast
+/// consequences must use this authority rather than scanning keywords ad hoc.
+pub fn synthetic_keyword_spell_cast_trigger_applies(
+    state: &GameState,
+    source_id: ObjectId,
+    caster: PlayerId,
+    spell_id: ObjectId,
+) -> bool {
+    let Some(source) = state.objects.get(&source_id) else {
+        return false;
+    };
+    let Some(spell) = state.objects.get(&spell_id) else {
+        return false;
+    };
+
+    source.zone == Zone::Battlefield
+        && source.controller == caster
+        && source.has_keyword(&Keyword::Prowess)
+        && !spell.card_types.core_types.contains(&CoreType::Creature)
 }
 
 /// Probe whether a throwaway event batch would create trigger work that uses
@@ -11931,6 +11959,11 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         FilterProp::Owned { controller } | FilterProp::ProtectorMatches { controller } => {
             controller_ref_binding_diverges(controller)
         }
+        // CR 303.4 + CR 301.5: the player referent is a `ControllerRef` like
+        // `Owned`/`ProtectorMatches` above — recurse into the same authority
+        // rather than bucketing with `AttachedToRecipient` (whose divergence is
+        // about the per-recipient `FilterContext` binding, a different axis).
+        FilterProp::AttachedToPlayer { player } => controller_ref_binding_diverges(player),
         FilterProp::MostPrevalentCreatureTypeIn { scope, .. } => {
             controller_ref_binding_diverges(scope)
         }
@@ -44046,6 +44079,7 @@ pub mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             },
             Vec::new(),
@@ -44389,6 +44423,7 @@ pub mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             },
             Vec::new(),
@@ -44450,6 +44485,7 @@ pub mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             },
             LogicalZoneProductionCarrier::BatchDelivery => Effect::BounceAll {

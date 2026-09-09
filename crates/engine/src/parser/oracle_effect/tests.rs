@@ -11,8 +11,8 @@ use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
     AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction, ModalChoice,
-    PerpetualModification, SeatDirection, TurnJournalKind,
+    CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction,
+    MassLibraryShuffleMode, ModalChoice, PerpetualModification, SeatDirection, TurnJournalKind,
 };
 use crate::types::card_type::CoreType;
 use crate::types::mana::{ManaCost, ManaCostShard};
@@ -9011,6 +9011,7 @@ fn effect_exile_target_player_graveyard_is_change_zone_all() {
                     enter_with_counters: _,
                     face_down_profile: None,
                     library_position: None,
+                    library_shuffle: _,
                     random_order: false,
                 }
             ),
@@ -9211,6 +9212,7 @@ fn effect_put_exiled_with_this_artifact_into_graveyard() {
                 enter_with_counters: _,
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: _,
                 random_order: false,
             }
         ),
@@ -13580,11 +13582,11 @@ fn effect_its_controller_manifests_top_card() {
     );
 }
 
-/// The all-player shuffle target normalizer owns only its immediate
-/// hand-to-library move/shuffle pair. It must neither retarget nearby library
+/// The all-player shuffle target normalizer owns the complete parser-marked
+/// hand-to-library wheel chain. It must neither retarget unrelated library
 /// moves nor overwrite a concrete/anaphoric player target.
 #[test]
-fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
+fn all_player_hand_shuffle_normalizer_scopes_only_the_complete_marked_wheel() {
     fn move_to_library(origin: Zone, target: TargetFilter) -> Effect {
         Effect::ChangeZoneAll {
             origin: Some(origin),
@@ -13596,6 +13598,7 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: None,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
             random_order: false,
         }
     }
@@ -13621,7 +13624,7 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
             target: TargetFilter::Any,
         },
     ]);
-    normalize_all_player_hand_to_library_shuffle_targets(&mut exact);
+    normalize_all_player_library_shuffle_chain(&mut exact);
     assert!(matches!(
         &*exact.effect,
         Effect::ChangeZoneAll {
@@ -13642,7 +13645,7 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
             target: TargetFilter::Controller,
         },
     ]);
-    normalize_all_player_hand_to_library_shuffle_targets(&mut non_hand);
+    normalize_all_player_library_shuffle_chain(&mut non_hand);
     assert!(matches!(
         &*non_hand.effect,
         Effect::ChangeZoneAll {
@@ -13666,7 +13669,7 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
             target: TargetFilter::Controller,
         },
     ]);
-    normalize_all_player_hand_to_library_shuffle_targets(&mut anaphoric_target);
+    normalize_all_player_library_shuffle_chain(&mut anaphoric_target);
     assert!(matches!(
         &*anaphoric_target.effect,
         Effect::ChangeZoneAll {
@@ -13684,40 +13687,53 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
         }
     ));
 
-    let mut intervening_move = all_player_chain(vec![
+    let mut multi_origin_wheel = all_player_chain(vec![
         move_to_library(Zone::Hand, TargetFilter::Controller),
         move_to_library(Zone::Graveyard, TargetFilter::Any),
         Effect::Shuffle {
             target: TargetFilter::Controller,
         },
-    ]);
-    normalize_all_player_hand_to_library_shuffle_targets(&mut intervening_move);
-    assert!(matches!(
-        &*intervening_move.effect,
-        Effect::ChangeZoneAll {
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 7 },
             target: TargetFilter::Controller,
+        },
+    ]);
+    normalize_all_player_library_shuffle_chain(&mut multi_origin_wheel);
+    assert!(matches!(
+        &*multi_origin_wheel.effect,
+        Effect::ChangeZoneAll {
+            target: TargetFilter::ScopedPlayer,
             ..
         }
     ));
-    let intermediate = intervening_move
+    let graveyard = multi_origin_wheel
         .sub_ability
         .as_deref()
-        .expect("intervening library move");
+        .expect("same-wheel graveyard move");
     assert!(matches!(
-        &*intermediate.effect,
+        &*graveyard.effect,
         Effect::ChangeZoneAll {
-            target: TargetFilter::Any,
+            target: TargetFilter::ScopedPlayer,
             ..
         }
     ));
+    let shuffle = graveyard.sub_ability.as_deref().expect("terminal shuffle");
     assert!(matches!(
-        &*intermediate
+        shuffle.effect.as_ref(),
+        Effect::Shuffle {
+            target: TargetFilter::ScopedPlayer,
+        }
+    ));
+    assert!(matches!(
+        shuffle
             .sub_ability
             .as_deref()
-            .expect("terminal shuffle")
-            .effect,
-        Effect::Shuffle {
-            target: TargetFilter::Controller,
+            .expect("wheel draw")
+            .effect
+            .as_ref(),
+        Effect::Draw {
+            target: TargetFilter::ScopedPlayer,
+            ..
         }
     ));
 
@@ -13731,7 +13747,7 @@ fn all_player_hand_shuffle_normalizer_requires_an_immediate_defaulted_pair() {
             target: TargetFilter::Controller,
         },
     ]);
-    normalize_all_player_hand_to_library_shuffle_targets(&mut intervening_draw);
+    normalize_all_player_library_shuffle_chain(&mut intervening_draw);
     assert!(matches!(
         &*intervening_draw.effect,
         Effect::ChangeZoneAll {
@@ -14451,6 +14467,7 @@ fn compound_shuffle_hand_and_graveyard_into_library() {
             enter_with_counters: _,
             face_down_profile: None,
             library_position: None,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
             random_order: false,
         }
     ));
@@ -14471,6 +14488,7 @@ fn compound_shuffle_hand_and_graveyard_into_library() {
             enter_with_counters: _,
             face_down_profile: None,
             library_position: None,
+            library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
             random_order: false,
         }
     ));
@@ -14532,6 +14550,379 @@ fn compound_parent_target_shuffle_hand_and_graveyard_keeps_player_scope() {
             target: TargetFilter::ParentTargetController
         }
     ));
+}
+
+#[test]
+fn great_aurora_keeps_move_shuffle_draw_inside_each_player_iteration() {
+    let def = parse_effect_chain(
+        "Each player shuffles all cards from their hand and all permanents they own into their library, then draws that many cards. Each player may put any number of land cards from their hand onto the battlefield. Exile The Great Aurora.",
+        AbilityKind::Spell,
+    );
+    assert_eq!(def.player_scope, Some(PlayerFilter::All));
+    let Effect::ChangeZoneAll {
+        origin: None,
+        destination: Zone::Library,
+        target: TargetFilter::Or { filters },
+        library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("Great Aurora must begin with one union ChangeZoneAll: {def:#?}");
+    };
+    assert_eq!(filters.len(), 2);
+    let shuffle = def.sub_ability.as_deref().expect("terminal shuffle");
+    assert!(matches!(
+        shuffle.effect.as_ref(),
+        Effect::Shuffle {
+            target: TargetFilter::ScopedPlayer
+        }
+    ));
+    assert_eq!(shuffle.player_scope, None);
+    let draw = shuffle.sub_ability.as_deref().expect("per-player draw");
+    assert!(matches!(
+        draw.effect.as_ref(),
+        Effect::Draw {
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+            target: TargetFilter::ScopedPlayer,
+        }
+    ));
+    assert_eq!(draw.player_scope, None);
+    assert_eq!(draw.sub_link, SubAbilityLink::ContinuationStep);
+}
+
+fn targeted_zone_move_tree_has_unimplemented(def: &AbilityDefinition) -> bool {
+    crate::parser::oracle::has_unimplemented(def)
+}
+
+fn assert_targeted_graveyard_shuffle_shape<'a>(
+    card_name: &str,
+    root: &'a AbilityDefinition,
+    expected_player_target: &TargetFilter,
+) -> &'a AbilityDefinition {
+    let Effect::TargetOnly { target } = root.effect.as_ref() else {
+        panic!(
+            "{card_name} must declare one outer player target, got {:?}",
+            root.effect
+        );
+    };
+    assert_eq!(
+        target, expected_player_target,
+        "{card_name} must preserve its printed player/opponent target"
+    );
+
+    let move_graveyard = root
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{card_name} must move the targeted player's graveyard"));
+    assert!(
+        matches!(
+            move_graveyard.effect.as_ref(),
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Library,
+                target: TargetFilter::ParentTarget,
+                library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+                ..
+            }
+        ),
+        "{card_name} must move the chosen player's graveyard through ParentTarget, got {:?}",
+        move_graveyard.effect
+    );
+
+    let shuffle = move_graveyard
+        .sub_ability
+        .as_deref()
+        .unwrap_or_else(|| panic!("{card_name} must shuffle after moving the graveyard"));
+    assert!(
+        matches!(
+            shuffle.effect.as_ref(),
+            Effect::Shuffle {
+                target: TargetFilter::ParentTarget
+            }
+        ),
+        "{card_name} must shuffle the same chosen player's library, got {:?}",
+        shuffle.effect
+    );
+    shuffle
+}
+
+/// CR 115.1a / CR 115.1c + CR 608.2c + CR 701.24a: the printed player target
+/// is the sole target for the graveyard-to-library instruction. Both the mass
+/// move and its intrinsic shuffle bind back to that target rather than the
+/// source's controller. These are the complete, verbatim Oracle texts of the
+/// eight cards in this grammar class.
+#[test]
+fn real_targeted_graveyard_shuffle_cards_bind_mass_move_and_shuffle_to_player_target() {
+    let cases = [
+        (
+            "Blessed Respite",
+            "Instant",
+            "Target player shuffles their graveyard into their library. Prevent all combat damage that would be dealt this turn.",
+        ),
+        (
+            "Clear the Mind",
+            "Sorcery",
+            "Target player shuffles their graveyard into their library.\nDraw a card.",
+        ),
+        (
+            "Cranial Archive",
+            "Artifact",
+            "{2}, Exile this artifact: Target player shuffles their graveyard into their library. Draw a card.",
+        ),
+        (
+            "Learn from the Past",
+            "Instant",
+            "Target player shuffles their graveyard into their library.\nDraw a card.",
+        ),
+        (
+            "Primal Command",
+            "Sorcery",
+            "Choose two —\n• Target player gains 7 life.\n• Put target noncreature permanent on top of its owner's library.\n• Target player shuffles their graveyard into their library.\n• Search your library for a creature card, reveal it, put it into your hand, then shuffle.",
+        ),
+        (
+            "Quest for Ancient Secrets",
+            "Enchantment",
+            "Whenever a card is put into your graveyard from anywhere, you may put a quest counter on Quest for Ancient Secrets.\nRemove five quest counters from Quest for Ancient Secrets and sacrifice it: Target player shuffles their graveyard into their library.",
+        ),
+        (
+            "Reminisce",
+            "Sorcery",
+            "Target player shuffles their graveyard into their library.",
+        ),
+        (
+            "Thran Foundry",
+            "Artifact",
+            "{1}, {T}, Exile this artifact: Target player shuffles their graveyard into their library.",
+        ),
+    ];
+
+    for (card_name, card_type, oracle_text) in cases {
+        let parsed = parse_oracle_text(oracle_text, card_name, &[], &[card_type.to_string()], &[]);
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .all(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                && parsed.triggers.iter().all(|trigger| {
+                    trigger
+                        .execute
+                        .as_deref()
+                        .is_none_or(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                })
+                && parsed.replacements.iter().all(|replacement| {
+                    replacement
+                        .execute
+                        .as_deref()
+                        .is_none_or(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                }),
+            "{card_name} must parse without an Unimplemented node: {parsed:#?}"
+        );
+
+        let root = if card_name == "Primal Command" {
+            &parsed.abilities[2]
+        } else {
+            &parsed.abilities[0]
+        };
+        let shuffle =
+            assert_targeted_graveyard_shuffle_shape(card_name, root, &TargetFilter::Player);
+
+        match card_name {
+            "Blessed Respite" => {
+                let prevention = shuffle
+                    .sub_ability
+                    .as_deref()
+                    .expect("Blessed Respite prevention tail");
+                assert!(matches!(
+                    prevention.effect.as_ref(),
+                    Effect::PreventDamage {
+                        amount: PreventionAmount::All,
+                        target: TargetFilter::Any,
+                        scope: PreventionScope::CombatDamage,
+                        ..
+                    }
+                ));
+                assert!(prevention.sub_ability.is_none());
+            }
+            "Clear the Mind" | "Cranial Archive" | "Learn from the Past" => {
+                let draw = shuffle
+                    .sub_ability
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{card_name} draw tail"));
+                assert!(matches!(
+                    draw.effect.as_ref(),
+                    Effect::Draw {
+                        target: TargetFilter::Controller,
+                        ..
+                    }
+                ));
+                assert!(draw.sub_ability.is_none());
+            }
+            "Primal Command" => {
+                assert!(shuffle.sub_ability.is_none());
+                let tutor = &parsed.abilities[3];
+                assert!(matches!(
+                    tutor.effect.as_ref(),
+                    Effect::SearchLibrary { .. }
+                ));
+                let put = tutor
+                    .sub_ability
+                    .as_deref()
+                    .expect("Primal Command tutor put");
+                let tutor_shuffle = put
+                    .sub_ability
+                    .as_deref()
+                    .expect("Primal Command tutor shuffle");
+                assert!(matches!(
+                    tutor_shuffle.effect.as_ref(),
+                    Effect::Shuffle {
+                        target: TargetFilter::Controller
+                    }
+                ));
+                assert!(tutor_shuffle.sub_ability.is_none());
+            }
+            _ => assert!(shuffle.sub_ability.is_none()),
+        }
+    }
+}
+
+/// CR 115.1a / CR 115.1c + CR 608.2c + CR 701.24a: Head Games and Jester's
+/// Mask keep the chosen opponent as the sole target through the hand move,
+/// search, return, and final shuffle. The search and shuffle are anaphoric
+/// consumers of the outer target; their intermediate result moves remain
+/// resolution-time chain nodes.
+#[test]
+fn real_targeted_opponent_hand_shuffle_cards_preserve_full_parent_target_chain() {
+    for (card_name, card_type, oracle_text) in [
+        (
+            "Head Games",
+            "Sorcery",
+            "Target opponent puts the cards from their hand on top of their library. Search that player's library for that many cards. The player puts those cards into their hand, then shuffles.",
+        ),
+        (
+            "Jester's Mask",
+            "Artifact",
+            "This artifact enters tapped.\n{1}, {T}, Sacrifice this artifact: Target opponent puts the cards from their hand on top of their library. Search that player's library for that many cards. That player puts those cards into their hand, then shuffles.",
+        ),
+    ] {
+        let parsed = parse_oracle_text(
+            oracle_text,
+            card_name,
+            &[],
+            &[card_type.to_string()],
+            &[],
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .all(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                && parsed.replacements.iter().all(|replacement| {
+                    replacement
+                        .execute
+                        .as_deref()
+                        .is_none_or(|ability| !targeted_zone_move_tree_has_unimplemented(ability))
+                }),
+            "{card_name} must parse without an Unimplemented node: {parsed:#?}"
+        );
+
+        let root = &parsed.abilities[0];
+        let Effect::TargetOnly { target } = root.effect.as_ref() else {
+            panic!("{card_name} must declare one outer opponent target");
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(tf)
+                if tf.type_filters.is_empty()
+                    && tf.properties.is_empty()
+                    && tf.controller == Some(ControllerRef::Opponent)
+        ));
+
+        let hand_move = root.sub_ability.as_deref().expect("targeted hand move");
+        assert!(matches!(
+            hand_move.effect.as_ref(),
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Hand),
+                destination: Zone::Library,
+                target: TargetFilter::ParentTarget,
+                library_position: Some(crate::types::ability::LibraryPosition::Top),
+                ..
+            }
+        ));
+        let search = hand_move.sub_ability.as_deref().expect("opponent search");
+        let Effect::SearchLibrary { target_player, .. } = search.effect.as_ref() else {
+            panic!("{card_name} must search the chosen opponent's library, got {:?}", search.effect);
+        };
+        assert_eq!(
+            target_player.as_ref(),
+            Some(&TargetFilter::ParentTarget),
+            "{card_name} must search the outer target's library, got {target_player:?}"
+        );
+        let put_one = search.sub_ability.as_deref().expect("search result move");
+        assert!(matches!(
+            put_one.effect.as_ref(),
+            Effect::ChangeZone {
+                origin: Some(Zone::Library),
+                destination: Zone::Hand,
+                ..
+            }
+        ));
+        let put_rest = put_one.sub_ability.as_deref().expect("tracked-set return");
+        assert!(
+            matches!(
+                put_rest.effect.as_ref(),
+                Effect::ChangeZoneAll {
+                    origin: Some(Zone::Exile),
+                    destination: Zone::Hand,
+                    target: TargetFilter::TrackedSet { .. },
+                    ..
+                }
+            ),
+            "{card_name} must return every searched card, got {:?}",
+            put_rest.effect
+        );
+        let shuffle = put_rest.sub_ability.as_deref().expect("opponent shuffle");
+        assert!(matches!(
+            shuffle.effect.as_ref(),
+            Effect::Shuffle {
+                target: TargetFilter::ParentTarget
+            }
+        ));
+        assert!(shuffle.sub_ability.is_none());
+    }
+}
+
+/// CR 701.24a: Feldon's Cane names the controller's own graveyard and library,
+/// so the targeted-player rewrite must leave both legs controller-relative.
+#[test]
+fn feldons_cane_self_graveyard_shuffle_remains_controller_relative() {
+    let parsed = parse_oracle_text(
+        "{T}, Exile this artifact: Shuffle your graveyard into your library.",
+        "Feldon's Cane",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+    let root = &parsed.abilities[0];
+    assert!(matches!(
+        root.effect.as_ref(),
+        Effect::ChangeZoneAll {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Library,
+            target: TargetFilter::Controller,
+            ..
+        }
+    ));
+    assert!(matches!(
+        root.sub_ability
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::Shuffle {
+            target: TargetFilter::Controller
+        })
+    ));
+    assert!(!targeted_zone_move_tree_has_unimplemented(root));
 }
 
 // Remaining tests truncated for space — they are identical to the original file.
@@ -20866,6 +21257,7 @@ fn reveal_partition_graveyard_primary_random_rest_to_library_bottom() {
         destination: rest_dest,
         target: rest_target,
         library_position: rest_pos,
+        library_shuffle: _,
         random_order: rest_random,
         ..
     } = &*rest.effect
@@ -20926,6 +21318,7 @@ fn reveal_partition_hand_primary_any_order_rest_to_library_bottom() {
     let Effect::ChangeZoneAll {
         destination: rest_dest,
         library_position: rest_pos,
+        library_shuffle: _,
         random_order: rest_random,
         ..
     } = &*rest.effect
@@ -25006,6 +25399,7 @@ fn exiled_cause_publishers_all_stamp_exiled_at_runtime() {
             enter_with_counters: vec![],
             face_down_profile: None,
             library_position: None,
+            library_shuffle: Default::default(),
             random_order: false,
         },
         Effect::ExileTop {
@@ -41136,15 +41530,20 @@ fn perpetual_parser_maps_grant_keywords() {
         } if keywords == vec![Keyword::Flying]
     ));
 
+    // Regression (Blocker 2, review round on PR #8494, matthewevans): a bare
+    // "it" with NO antecedent (fresh/default ParseContext, as parse_effect
+    // supplies here -- no chain-created object, no same-chain typed/chosen
+    // referent, no non-self trigger subject) must fail the whole clause
+    // closed rather than silently default to TargetFilter::ParentTarget.
+    // This standalone fragment previously asserted the pre-fix fallback
+    // behavior; see perpetual_grant_ability_rejects_standalone_bare_it_with_no_antecedent
+    // for the equivalent GrantAbility-path regression test (both arms funnel
+    // through the same parse_perpetual_self_subject gate).
     let e = parse_effect("it perpetually gains haste.");
-    assert!(matches!(
-        e,
-        Effect::ApplyPerpetual {
-            target: TargetFilter::ParentTarget,
-            modification: PerpetualModification::GrantKeywords { keywords },
-            ..
-        } if keywords == vec![Keyword::Haste]
-    ));
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "a bare 'it' with no antecedent must fail the whole clause closed, got {e:?}"
+    );
 }
 
 #[test]
@@ -41302,6 +41701,260 @@ fn perpetual_parser_maps_modify_cost() {
         ),
         "more-inside-quote-with-period must parse as Raise generic(2), got {e:?}"
     );
+}
+
+/// Karlach, Tiefling Berserker cycle: "~ perpetually gains \"This creature
+/// can't block.\"" — `classify_quoted_inner` classifies the quoted body as
+/// `ContinuousModification::AddStaticMode { mode: CantBlock }` (CR 509.1b
+/// blocking restriction), which the perpetual runtime installs directly
+/// (`GameObject::apply_perpetual_modification`'s `AddStaticMode` arm).
+#[test]
+fn perpetual_parser_maps_grant_ability_single_static_mode() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+    use crate::types::statics::StaticMode;
+
+    // "~" here, not "This creature": card-level parsing normalizes "this
+    // creature"/"this card" self-references to "~" (`normalize_card_name_refs`)
+    // BEFORE any clause reaches `classify_quoted_inner`, so `~` is the form
+    // this fragment-level helper must be fed to match production input
+    // (mirrors every neighboring `perpetual_parser_maps_*` test's convention).
+    let e = parse_effect("~ perpetually gains \"~ can't block.\"");
+    match &e {
+        Effect::ApplyPerpetual {
+            target: TargetFilter::Any,
+            modification: PerpetualModification::GrantAbility { modifications },
+        } => {
+            assert_eq!(
+                modifications,
+                &vec![PerpetualGrantModification::AddStaticMode {
+                    mode: StaticMode::CantBlock
+                }],
+                "expected a single CantBlock AddStaticMode grant"
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
+/// Multiple quoted bodies joined by " and " must each classify independently
+/// and all install (nom-combinator loop in `try_parse_perpetual_grant_ability`,
+/// not a single-quote special case) — builds for the class of multi-ability
+/// perpetual grants, not just the one-quote Karlach/Raffine cards.
+#[test]
+fn perpetual_parser_maps_grant_ability_multiple_quoted_bodies() {
+    use crate::types::ability::{PerpetualGrantModification, PerpetualModification};
+    use crate::types::keywords::Keyword;
+
+    let e = parse_effect("~ perpetually gains \"flying\" and \"vigilance\".");
+    match &e {
+        Effect::ApplyPerpetual {
+            target: TargetFilter::Any,
+            modification: PerpetualModification::GrantAbility { modifications },
+        } => {
+            assert_eq!(
+                modifications,
+                &vec![
+                    PerpetualGrantModification::AddKeyword {
+                        keyword: Keyword::Flying
+                    },
+                    PerpetualGrantModification::AddKeyword {
+                        keyword: Keyword::Vigilance
+                    },
+                ],
+                "expected both quoted keyword grants to classify and install"
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
+/// Honest-red: a granted quoted body that classifies to a modification kind
+/// the perpetual runtime cannot install onto a persistent baseline
+/// (`GrantTrigger` — a full triggered ability body has no persistent-baseline
+/// installer) must fail the WHOLE clause closed rather than silently
+/// dropping it or installing a partial/incorrect grant.
+#[test]
+fn perpetual_grant_ability_rejects_unsupported_triggered_body() {
+    let e = parse_effect("~ perpetually gains \"When ~ dies, draw a card.\"");
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "an unsupported (triggered-ability) quoted grant must fail closed, got {e:?}"
+    );
+}
+
+/// Regression (PR #8494 blocker, ntindle/matthewevans): Boareskyr Tollkeeper's
+/// full Oracle text (verified against MTGJSON's `AtomicCards.json`) is "When
+/// this creature enters, target opponent reveals all creature and land cards
+/// in their hand. Choose one of them. That card perpetually gains \"This
+/// permanent enters tapped.\"" Card-level parsing normalizes the self-reference
+/// "This permanent" to "~" (`normalize_card_name_refs`) before any clause
+/// reaches `classify_quoted_inner`, so this fragment-level test feeds the
+/// clause its already-normalized quoted body -- "~ enters tapped." -- exactly
+/// like every neighboring `perpetual_parser_maps_*` / `perpetual_grant_ability_*`
+/// test's convention.
+///
+/// "~ enters tapped." is a standalone sentence with no static/trigger/keyword
+/// recognizer: `oracle_static` only recognizes "enters tapped" as a rider on a
+/// host put-onto-battlefield effect (a token/create-and-put step), never as a
+/// freestanding sentence, so `classify_quoted_inner` falls through to its
+/// default `GrantAbility` catch-all (the tier reached when no
+/// static/trigger/keyword recognizer matches), and `parse_quoted_ability`
+/// has no handler for a bare "enters tapped" sentence either -- it lowers to
+/// `Effect::Unimplemented`. Before `PerpetualGrantModification::try_from`
+/// rejected an `Effect::Unimplemented`-bearing `GrantAbility` tree, this landed
+/// as a green `Effect::ApplyPerpetual` wrapping a no-op nested ability (the
+/// coverage-invisible gap the blocker described); the fail-closed gate must now
+/// reject it exactly like the sibling triggered-ability rejection above.
+/// Regression (Blocker 2, review round on PR #8494, matthewevans): a bare
+/// "it" with NO antecedent at all -- no chain-created object, no earlier
+/// same-chain typed/chosen referent, and no non-self trigger subject -- must
+/// fail the clause closed rather than silently default to
+/// `TargetFilter::ParentTarget` (which the runtime's general use-self
+/// fallback, CR 608.2c, would then resolve right back to the ability's own
+/// source). This is Chronicler of Worship's exact granted-ability clause in
+/// isolation: "When Chronicler of Worship enters the battlefield, put a
+/// random Shrine card from among the top seven cards of your library into
+/// your hand. It perpetually gains \"This spell costs {1} less to cast.\"
+/// Then shuffle." -- the ETB trigger's subject is `SelfRef` (Chronicler
+/// triggers on its own entry) and the "put a random ... into your hand"
+/// clause is a non-targeted, non-tracked random pick (no `ChooseFromZone`,
+/// no typed target), so NONE of the three recognized antecedent shapes
+/// apply. A fresh/default `ParseContext` (as `parse_effect` supplies)
+/// reproduces exactly this no-antecedent shape. Before this fix, the clause
+/// installed the discount onto Chronicler itself instead of the
+/// randomly-drawn Shrine card -- see
+/// `perpetual_grant_modify_cost_after_conjure_installs_on_conjured_object_and_reduces_cast_cost`
+/// (`effects/perpetual.rs`) for the sibling positive case (a LEGITIMATE
+/// antecedent) proving the correctly-targeted install actually reduces cast
+/// cost once Blocker 1's `active_zones` fix is also in place.
+#[test]
+fn perpetual_grant_ability_rejects_standalone_bare_it_with_no_antecedent() {
+    let e = parse_effect("it perpetually gains \"This spell costs {1} less to cast.\"");
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "a bare 'it' with no antecedent (Chronicler of Worship's shape) must fail the whole clause closed rather than silently install on the ability's own source, got {e:?}"
+    );
+}
+
+#[test]
+fn perpetual_grant_ability_rejects_boareskyr_tollkeeper_enters_tapped() {
+    let classified = crate::parser::oracle_static::classify_quoted_inner("~ enters tapped.");
+    let [ContinuousModification::GrantAbility { definition }] = classified.as_slice() else {
+        panic!("expected the quoted fallback to produce one granted ability, got {classified:?}");
+    };
+    assert!(
+        crate::game::coverage::ability_tree_any(definition, &|d| {
+            matches!(&*d.effect, Effect::Unimplemented { .. })
+        }),
+        "the quoted fallback must retain its unimplemented inner effect"
+    );
+    assert!(
+        crate::types::ability::PerpetualGrantModification::try_from(classified[0].clone()).is_err(),
+        "the perpetual installer must reject that unsupported granted ability"
+    );
+
+    let e = parse_effect("that card perpetually gains \"~ enters tapped.\"");
+    assert!(
+        matches!(e, Effect::Unimplemented { .. }),
+        "Boareskyr Tollkeeper's granted \"~ enters tapped.\" body has no          static/trigger/keyword recognizer and must fail the whole clause closed          rather than install a no-op ability, got {e:?}"
+    );
+}
+
+/// CR 608.2c pronoun rebinding (the Agent of Raffine / Karlach cycle shape):
+/// a bare "it" following a same-chain object-CREATING clause must bind to
+/// that just-created object (`TargetFilter::LastCreated`), not to the
+/// ability's chosen target. Uses a target-prefixed conjure-duplicate
+/// reference (`try_parse_conjure_duplicate`'s currently-modeled reference
+/// form) rather than Agent of Raffine's own "the top card of their library"
+/// / the Karlach cycle's self-reanimation phrasing, neither of which
+/// `try_parse_conjure_duplicate` / the self-reanimation clause parse yet
+/// (separate, pre-existing gaps unrelated to this pronoun fix). This test
+/// exercises the LastCreated-binding building block in isolation from those
+/// gaps: once either reference form is modeled, the real card wiring falls
+/// out for free through this same `ctx.token_created_in_chain` /
+/// `publishes_chain_created_referent` path (`Effect::Conjure` was added
+/// there specifically for this).
+#[test]
+fn perpetual_grant_after_conjure_binds_last_created_not_parent_target() {
+    let def = parse_effect_chain(
+        "Conjure a duplicate of target creature card in your graveyard into your hand. It perpetually gains \"This creature can't block.\"",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(&*def.effect, Effect::Conjure { .. }),
+        "expected Conjure, got {:?}",
+        def.effect
+    );
+    let grant = def
+        .sub_ability
+        .as_ref()
+        .expect("the perpetual grant must remain chained to the conjure");
+    match &*grant.effect {
+        Effect::ApplyPerpetual {
+            target,
+            modification: PerpetualModification::GrantAbility { modifications },
+            ..
+        } => {
+            assert_eq!(
+                target,
+                &TargetFilter::LastCreated,
+                "\"it\" must bind to the just-conjured duplicate, not ParentTarget"
+            );
+            assert_eq!(
+                modifications,
+                &vec![
+                    crate::types::ability::PerpetualGrantModification::AddStaticMode {
+                        mode: crate::types::statics::StaticMode::CantBlock
+                    }
+                ]
+            );
+        }
+        other => panic!("expected ApplyPerpetual GrantAbility, got {other:?}"),
+    }
+}
+
+/// Hangarback Assembler (MTGJSON-verified): "When this artifact enters,
+/// conjure a card named Hangarback Walker onto the battlefield, then put a
+/// +1/+1 counter on it." The trailing "it" follows the same-chain
+/// object-creating `Effect::Conjure` clause with no intervening independent
+/// instruction, so CR 608.2c anaphor binding must rebind it to the
+/// just-conjured Hangarback Walker (`TargetFilter::LastCreated`) via
+/// `publishes_chain_created_referent` (`Effect::Conjure` joined that set
+/// specifically for this pronoun class), not fall back to `SelfRef` (this
+/// permanent, Hangarback Assembler itself). SHAPE test: asserts the parsed
+/// AST directly, mirroring `perpetual_grant_after_conjure_binds_last_created_not_parent_target`
+/// above.
+#[test]
+fn counter_anaphor_after_conjure_binds_last_created() {
+    let def = parse_effect_chain(
+        "conjure a card named Hangarback Walker onto the battlefield, then put a +1/+1 counter on it.",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(&*def.effect, Effect::Conjure { .. }),
+        "expected Conjure, got {:?}",
+        def.effect
+    );
+    let counter_step = def
+        .sub_ability
+        .as_ref()
+        .expect("the counter placement must remain chained to the conjure");
+    match &*counter_step.effect {
+        Effect::PutCounter {
+            counter_type,
+            count: QuantityExpr::Fixed { value },
+            target,
+        } => {
+            assert_eq!(*counter_type, CounterType::Plus1Plus1);
+            assert_eq!(*value, 1);
+            assert_eq!(
+                target,
+                &TargetFilter::LastCreated,
+                "\"it\" must bind to the just-conjured Hangarback Walker, not SelfRef"
+            );
+        }
+        other => panic!("expected PutCounter, got {other:?}"),
+    }
 }
 
 /// Definite "that card perpetually gains ..." back-references the parent
@@ -59437,7 +60090,7 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
 /// `CanEnchant` each box a whole `TargetFilter`, `ControllerMatches` boxes a
 /// `PlayerFilter`, and `AnyOf` / `Not` recurse into `FilterProp` itself — so a
 /// stamped prop can sit arbitrarily deep, and a `_ => false` here would answer
-/// "no" at every one of those depths. The 89 leaf variants in the final arm
+/// "no" at every one of those depths. The 90 leaf variants in the final arm
 /// carry no nested filter at all.
 fn prop_has_chosen_color(p: &FilterProp) -> bool {
     match p {
@@ -59492,6 +60145,7 @@ fn prop_has_chosen_color(p: &FilterProp) -> bool {
         | FilterProp::EquippedBy
         | FilterProp::AttachedToSource
         | FilterProp::AttachedToRecipient
+        | FilterProp::AttachedToPlayer { .. }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
