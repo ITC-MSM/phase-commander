@@ -21067,6 +21067,11 @@ pub struct PendingReplacement {
     /// `candidates` has exactly one entry (the real replacement); decline is synthetic.
     #[serde(default)]
     pub is_optional: bool,
+    /// Choice authority captured when an optional replacement is offered. This
+    /// is deliberately separate from CR 616 ordering, whose chooser remains
+    /// the affected player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_player: Option<PlayerId>,
     /// CR 701.24a: the library placement requested by the original `move_object`
     /// call whose replacement consult parked here (W3 library-placement arm only).
     /// `Some` solely for a parked Library-targeting `ZoneChange`; the resume path
