@@ -10620,6 +10620,7 @@ pub(super) fn apply_where_x_effect_expression(
     // representable. Recorded here and converted to a gap node after the match
     // (the arms hold a mutable borrow of `effect`'s fields).
     let mut unbound_where_x: Option<String> = None;
+    let mut unbound_prevention_where_x: Option<String> = None;
     match effect {
         Effect::DealDamage { amount, .. }
         | Effect::DamageAll { amount, .. }
@@ -10901,7 +10902,10 @@ pub(super) fn apply_where_x_effect_expression(
                     crate::types::ability::PreventionAmount::All
                         | crate::types::ability::PreventionAmount::AllBut(_)
                 ) {
-                    *amount_dynamic = parse_where_x_quantity_expression(expr);
+                    match parse_where_x_quantity_expression(expr) {
+                        Some(quantity) => *amount_dynamic = Some(quantity),
+                        None => unbound_prevention_where_x = Some(expr.to_string()),
+                    }
                 }
             }
         }
@@ -10994,6 +10998,14 @@ pub(super) fn apply_where_x_effect_expression(
     // clause DEFINED X and an unbound X survived the rewrite, report the gap. A control
     // with an escape hatch is not a control.
     //
+    if let Some(expression) = unbound_prevention_where_x {
+        *effect = Effect::unimplemented(
+            "prevent",
+            format!("prevent X of that damage, where X is {expression}"),
+        );
+        return;
+    }
+
     // The guard is keyed on the EXPRESSION, never on tree-presence of `Variable("X")`.
     // Some expressions legitimately bind TO the placeholder, and for those a surviving
     // `Variable("X")` is the CORRECT binding, not a fabrication:
