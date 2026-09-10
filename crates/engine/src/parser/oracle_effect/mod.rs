@@ -22520,7 +22520,7 @@ fn chain_has_prior_typed_referent(clauses: &[ClauseIr], skip_first_conditional: 
         if let Some(cond) = prev.condition.as_ref() {
             if skip_first_conditional && !skipped_conditional {
                 skipped_conditional = true;
-            } else if *cond != AbilityCondition::WhenYouDo {
+            } else if !cond.has_when_you_do_marker() {
                 return false;
             }
         }
@@ -22747,7 +22747,7 @@ fn chain_prior_referent_is_created_token(clauses: &[ClauseIr]) -> bool {
         if prev
             .condition
             .as_ref()
-            .is_some_and(|c| !c.is_affirmative_reflexive_gate())
+            .is_some_and(|c| !c.has_when_you_do_marker() && !c.is_affirmative_reflexive_gate())
         {
             return false;
         }
@@ -22849,7 +22849,7 @@ fn chain_source_becomes_attachment(clauses: &[ClauseIr]) -> bool {
         if prev
             .condition
             .as_ref()
-            .is_some_and(|c| !c.is_affirmative_reflexive_gate())
+            .is_some_and(|c| !c.has_when_you_do_marker() && !c.is_affirmative_reflexive_gate())
         {
             return false;
         }
@@ -35932,10 +35932,19 @@ pub(crate) fn parse_effect_chain_ir(
                 (Some(cond), Some(head)) => (difference_expr(cond), head.to_string()),
                 _ => (None, text),
             };
-        let (if_you_do, text) = if condition.is_none() {
-            strip_if_you_do_conditional(&text)
+        let (if_you_do, text, deferred_when_you_do_guard) = if condition.is_none() {
+            match strip_if_you_do_conditional_with_context(&text, ctx) {
+                conditions::ReflexiveConditionalStrip::Parsed {
+                    condition,
+                    remainder,
+                } => (condition, remainder, None),
+                conditions::ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
+                    condition,
+                    remainder,
+                } => (Some(condition.clone()), remainder, Some(condition)),
+            }
         } else {
-            (None, text)
+            (None, text, None)
         };
         // CR 603.4 + CR 608.2c: Counter threshold condition — runs unconditionally
         // on the text output from strip_if_you_do_conditional. For compound
@@ -35948,8 +35957,14 @@ pub(crate) fn parse_effect_chain_ir(
         // <property> among <filter>" (Wretched Banquet class).
         let (superlative_target_cond, text) = strip_superlative_target_conditional(&text);
         let (target_supertype_cond, text) = strip_target_supertype_conditional(&text);
+        // A deferred `When you do, if <guard>, ...` retains its reflexive
+        // marker in `if_you_do` while the ordered specialized parsers claim the
+        // guard. Ordinary reflexive connectors still block these parsers, as
+        // before; only the explicitly deferred path reopens the dispatch.
+        let specialized_guard_available =
+            if_you_do.is_none() || deferred_when_you_do_guard.is_some();
         let (cast_from_zone, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -35960,7 +35975,7 @@ pub(crate) fn parse_effect_chain_ir(
             (None, text)
         };
         let (card_type_cond, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -35972,7 +35987,7 @@ pub(crate) fn parse_effect_chain_ir(
             (None, text)
         };
         let (property_cond, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -35987,7 +36002,7 @@ pub(crate) fn parse_effect_chain_ir(
         // CR 608.2c: player-property superlative-comparison conditional —
         // "if that opponent's speed is greater than each other player's speed, ..."
         let (player_property_cond, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -36002,7 +36017,7 @@ pub(crate) fn parse_effect_chain_ir(
         };
         // CR 608.2c: "If it's your turn" / "If it's not your turn" — game-state condition
         let (turn_cond, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -36018,7 +36033,7 @@ pub(crate) fn parse_effect_chain_ir(
         };
         // CR 608.2c: "If that creature has [keyword], [effect] instead"
         let (keyword_instead_cond, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -36037,7 +36052,7 @@ pub(crate) fn parse_effect_chain_ir(
         // Runs only when no dedicated stripper matched; parse_condition_text is the safety net
         // (returns None for anything it can't parse).
         let (suffix_cond, text) = if condition.is_none()
-            && if_you_do.is_none()
+            && specialized_guard_available
             && counter_cond.is_none()
             && mv_cond.is_none()
             && superlative_target_cond.is_none()
@@ -36053,12 +36068,11 @@ pub(crate) fn parse_effect_chain_ir(
         } else {
             (None, text)
         };
-        let condition = condition
+        let guard_condition = condition
             .or(counter_cond)
             .or(mv_cond)
             .or(superlative_target_cond)
             .or(target_supertype_cond)
-            .or(if_you_do)
             .or(cast_from_zone)
             .or(card_type_cond)
             .or(property_cond)
@@ -36066,6 +36080,31 @@ pub(crate) fn parse_effect_chain_ir(
             .or(turn_cond)
             .or(keyword_instead_cond)
             .or(suffix_cond);
+        // CR 603.12 + CR 603.4 + CR 608.2a: A `When you do, if <guard>, ...` rider is
+        // not equivalent to a bare reflexive trigger. The shared leading
+        // conditional parser deferred this guard so the specialized guard
+        // parsers above could claim it. If none did, fail closed before the
+        // optional-clause fallback can erase the guard and lower an
+        // unconditional reflexive body.
+        if deferred_when_you_do_guard.is_some() && guard_condition.is_none() {
+            unimplemented_clause(
+                &mut builder,
+                "when_you_do_guard",
+                normalized_text,
+                chunk.boundary_after,
+            );
+            continue;
+        }
+        let condition = match (if_you_do, guard_condition) {
+            (Some(reflexive), Some(guard)) if reflexive.has_when_you_do_marker() => {
+                Some(reflexive.with_when_you_do_guard(guard))
+            }
+            // Preserve the established specialized-condition precedence for
+            // non-marker reflexive connectors (for example "if they don't").
+            (_, Some(guard)) => Some(guard),
+            (Some(reflexive), None) => Some(reflexive),
+            (None, None) => None,
+        };
         // CR 608.2c + CR 608.2d: When NO typed condition matched any pass above,
         // fall back to a structural-only strip that removes an unrepresentable
         // `If <X>, ` head ONLY when the body begins with `"you may "`. This
