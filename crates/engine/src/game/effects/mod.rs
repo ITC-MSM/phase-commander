@@ -2457,9 +2457,7 @@ fn try_begin_deferred_else_branch_target_selection(
 /// Every OTHER chain condition — `EffectOutcome`, `QuantityCheck`, intervening
 /// `if` gates — is left intact and is still re-checked at resolution (CR 603.4).
 fn consume_reflexive_creation_gate(ability: &mut ResolvedAbility) {
-    if ability.condition == Some(AbilityCondition::WhenYouDo) {
-        ability.condition = None;
-    }
+    AbilityCondition::take_when_you_do_marker(&mut ability.condition);
     if let Some(sub) = ability.sub_ability.as_deref_mut() {
         consume_reflexive_creation_gate(sub);
     }
@@ -2484,10 +2482,10 @@ fn build_reflexive_pending_trigger(
     // consume below strips only `WhenYouDo`, so a `QuantityCheck` survives onto
     // the stack object and is re-checked at resolution per CR 603.4.
     debug_assert!(
-        matches!(
-            ability.condition,
-            Some(AbilityCondition::WhenYouDo) | Some(AbilityCondition::QuantityCheck { .. })
-        ),
+        ability.condition.as_ref().is_some_and(|condition| {
+            condition.has_when_you_do_marker()
+                || matches!(condition, AbilityCondition::QuantityCheck { .. })
+        }),
         "build_reflexive_pending_trigger requires a WhenYouDo or QuantityCheck gate"
     );
     consume_reflexive_creation_gate(&mut ability);
@@ -2560,7 +2558,10 @@ fn try_materialize_reflexive_trigger_inner(
     events: &mut Vec<GameEvent>,
     depth: u32,
 ) -> Result<bool, EffectError> {
-    let creates_reflexive_trigger = reflexive.condition == Some(AbilityCondition::WhenYouDo);
+    let creates_reflexive_trigger = reflexive
+        .condition
+        .as_ref()
+        .is_some_and(AbilityCondition::has_when_you_do_marker);
     if !creates_reflexive_trigger && !reflexive.targets.is_empty() {
         return Ok(false);
     }
@@ -4052,7 +4053,7 @@ fn condition_depends_on_result_object(condition: &AbilityCondition) -> bool {
 /// (`IfYouDo` / composite `Or{[IfYouDo,…]}`). Predicate helper, not rule code.
 fn sub_ability_is_reflexive(sub: &ResolvedAbility) -> bool {
     match &sub.condition {
-        Some(AbilityCondition::WhenYouDo) => true,
+        Some(condition) if condition.has_when_you_do_marker() => true,
         Some(condition) => condition_depends_on_effect_performed(condition),
         None => false,
     }
@@ -4060,7 +4061,7 @@ fn sub_ability_is_reflexive(sub: &ResolvedAbility) -> bool {
 
 fn sub_ability_target_belongs_to_reflexive_context(sub: &ResolvedAbility) -> bool {
     match &sub.condition {
-        Some(AbilityCondition::WhenYouDo) => true,
+        Some(condition) if condition.has_when_you_do_marker() => true,
         Some(condition) => {
             condition_depends_on_effect_performed(condition)
                 || condition_depends_on_zone_change_this_way(condition)
@@ -6944,7 +6945,7 @@ fn when_you_do_mandatory_parent_did_nothing(
     parent: &ResolvedAbility,
     parent_events: &[GameEvent],
 ) -> bool {
-    matches!(condition, AbilityCondition::WhenYouDo)
+    condition.has_when_you_do_marker()
         && !parent.optional
         && !parent.context.optional_effect_performed
         && !effect_manages_own_outcome_flag(&parent.effect)
@@ -7194,16 +7195,49 @@ pub(crate) fn publish_tracked_set(state: &mut GameState, affected_ids: Vec<Objec
     // between exile and hand-fallback must not wipe the exiled card).
     // Storm Herald mid-pause empty publishes are skipped at the EffectZoneChoice
     // site; CreateDelayedTrigger also prefers a nonempty chain id.
+    // Chain unification is a set UNION, not a concatenation. Deliberately
+    // carries no CR citation: set identity is an engine data-structure
+    // invariant, not a game rule. CR 608.2c governs the ORDER instructions are
+    // followed in during resolution and says nothing about membership identity,
+    // so citing it here would be a false verification signal (CLAUDE.md: a wrong
+    // CR number is worse than no CR number, and plumbing is not annotated).
+    // What the rules do supply is the anaphor this set serves — "those cards" /
+    // "<verb> this way" naming a population — and an object is in that
+    // population once or not at all. Two
+    // producers in one chain legitimately publish the SAME object when both
+    // name the same population — Gifts Ungiven's "search your library for up to
+    // four cards ... and reveal them" both finds and reveals the identical four
+    // cards, so each was appended twice and every downstream consumer saw eight
+    // members (issue #8135: the opponent's chooser rendered each revealed card
+    // twice, and `QuantityRef::TrackedSetSize` would likewise have double-counted
+    // them). A tracked set holds objects, and an object cannot be in it twice.
+    //
+    // Membership is deduplicated in FIRST-PUBLISH order rather than by sorting:
+    // consumers read this population positionally (the chooser prompt renders it
+    // in order), so the sibling publisher's `sort_unstable_by_key` + `dedup`
+    // shape is deliberately NOT used here — it would reorder every existing
+    // chain set. Retaining the earliest occurrence keeps the producer order each
+    // consumer already observes.
     if let Some(chain_id) = state.chain_tracked_set_id {
-        state
-            .tracked_object_sets
-            .entry(chain_id)
-            .or_default()
-            .extend(affected_ids);
+        let members = state.tracked_object_sets.entry(chain_id).or_default();
+        for id in affected_ids {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
     } else {
         let set_id = TrackedSetId(state.next_tracked_set_id);
         state.next_tracked_set_id += 1;
-        state.tracked_object_sets.insert(set_id, affected_ids);
+        // A single publish can also repeat an id (a producer that reports the
+        // same object under two events); the invariant is the set's, not the
+        // caller's, so it is enforced on this path too.
+        let mut members: Vec<ObjectId> = Vec::with_capacity(affected_ids.len());
+        for id in affected_ids {
+            if !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        state.tracked_object_sets.insert(set_id, members);
         state.chain_tracked_set_id = Some(set_id);
     }
 }
@@ -8553,10 +8587,11 @@ pub(crate) fn is_repeated_optional_payment(ability: &ResolvedAbility) -> bool {
     ability.optional
         && is_synchronous_mana_pay_cost(&ability.effect)
         && matches!(ability.repeat_for, Some(QuantityExpr::Fixed { .. }))
-        && ability
-            .sub_ability
-            .as_ref()
-            .is_some_and(|sub| sub.condition == Some(AbilityCondition::WhenYouDo))
+        && ability.sub_ability.as_ref().is_some_and(|sub| {
+            sub.condition
+                .as_ref()
+                .is_some_and(AbilityCondition::has_when_you_do_marker)
+        })
 }
 
 /// CR 118.1: A `PayCost` whose cost is a pure, fully-static mana cost — the only
@@ -12686,10 +12721,9 @@ fn resolve_chain_body(
         // interactive `DiscardChoice`) carries its gate on `ability.condition`
         // itself, not as a parent's `sub_ability`. Mirror the reflexive target
         // selection path used for inline sub-chains.
-        if matches!(
-            condition,
-            AbilityCondition::WhenYouDo | AbilityCondition::QuantityCheck { .. }
-        ) && try_materialize_reflexive_trigger(state, ability, None, None, events, depth)?
+        if (condition.has_when_you_do_marker()
+            || matches!(condition, AbilityCondition::QuantityCheck { .. }))
+            && try_materialize_reflexive_trigger(state, ability, None, None, events, depth)?
         {
             return Ok(());
         }
@@ -14410,7 +14444,7 @@ fn resolve_chain_body(
                     || (matches!(ability.effect, Effect::Discard { .. } | Effect::DiscardCard { .. })
                         && condition_depends_on_graveyard_size(condition))
                     || condition_depends_on_last_created(condition)
-                    || matches!(condition, AbilityCondition::WhenYouDo)
+                    || condition.has_when_you_do_marker()
                     || (matches!(state.waiting_for, WaitingFor::SearchChoice { .. })
                         && condition_depends_on_result_object(condition))
                     || condition_awaits_resolution_only_referent(condition, state, ability))
@@ -14605,17 +14639,17 @@ fn resolve_chain_body(
             }
 
             // CR 603.12: Deferred reflexive target selection for inline sub-chains.
-            if matches!(
-                condition,
-                AbilityCondition::WhenYouDo | AbilityCondition::QuantityCheck { .. }
-            ) && try_materialize_reflexive_trigger(
-                state,
-                sub,
-                Some(ability),
-                effect_context_object.as_ref(),
-                events,
-                depth,
-            )? {
+            if (condition.has_when_you_do_marker()
+                || matches!(condition, AbilityCondition::QuantityCheck { .. }))
+                && try_materialize_reflexive_trigger(
+                    state,
+                    sub,
+                    Some(ability),
+                    effect_context_object.as_ref(),
+                    events,
+                    depth,
+                )?
+            {
                 return Ok(());
             }
         }
@@ -15464,21 +15498,46 @@ fn controller_sacrificed_matching_this_way(
     })
 }
 
+/// CR 603.4 + CR 608.2i + CR 701.20a: Resolve the specific object introduced by
+/// a reveal/move instruction for a later card-type condition. The
+/// resolution-local ledgers are authoritative for immediate chained
+/// conditions. A reflexive trigger resolves as a new top-level ability, which
+/// clears those ledgers, so its parent-captured `effect_context_object` carries
+/// the event-time fact across the separate resolution. A "revealed this way"
+/// predicate then reads the snapshot even if the live card's characteristics
+/// changed, as required for a look-back condition by CR 608.2i.
+fn revealed_card_type_condition_subject<'a>(
+    state: &'a GameState,
+    ability: &'a ResolvedAbility,
+) -> Option<(ObjectId, Option<&'a crate::types::game_state::LKISnapshot>)> {
+    state
+        .last_revealed_ids
+        .first()
+        .or_else(|| state.last_zone_changed_ids.first())
+        .copied()
+        .map(|id| (id, None))
+        .or_else(|| {
+            ability
+                .effect_context_object
+                .as_ref()
+                .map(|snapshot| (snapshot.object_id, Some(&snapshot.lki)))
+        })
+}
+
 /// CR 608.2c + CR 700.1: `RevealedHasCardType` riders (including `Not` for
 /// nonland branches) must not evaluate when no card was revealed or moved this
 /// way — negating a failed land match must not become true (issue #2871).
 fn subject_dependent_type_condition_has_no_subject(
     condition: &AbilityCondition,
     state: &GameState,
+    ability: &ResolvedAbility,
 ) -> bool {
     match condition {
-        AbilityCondition::RevealedHasCardType { .. } => state
-            .last_revealed_ids
-            .first()
-            .or_else(|| state.last_zone_changed_ids.first())
-            .is_none(),
+        AbilityCondition::RevealedHasCardType { .. } => {
+            revealed_card_type_condition_subject(state, ability).is_none()
+        }
         AbilityCondition::Not { condition } => {
-            subject_dependent_type_condition_has_no_subject(condition, state)
+            subject_dependent_type_condition_has_no_subject(condition, state, ability)
         }
         _ => false,
     }
@@ -15711,18 +15770,19 @@ pub(crate) fn evaluate_condition(
             additional_filter,
             subtype_filter,
         } => {
-            let subject_id = state
-                .last_revealed_ids
-                .first()
-                .or_else(|| state.last_zone_changed_ids.first())
-                .copied();
-            let type_matches = subject_id
-                .map(|id| {
+            let subject = revealed_card_type_condition_subject(state, ability);
+            let type_matches = subject
+                .as_ref()
+                .map(|(id, lki)| {
                     if card_types.is_empty() {
                         additional_filter.is_some() || subtype_filter.is_some()
+                    } else if let Some(lki) = lki {
+                        card_types
+                            .iter()
+                            .any(|card_type| lki.card_types.contains(card_type))
                     } else {
                         card_types.iter().any(|card_type| {
-                            super::printed_cards::object_has_core_type(state, id, *card_type)
+                            super::printed_cards::object_has_core_type(state, *id, *card_type)
                         })
                     }
                 })
@@ -15730,13 +15790,20 @@ pub(crate) fn evaluate_condition(
             // CR 205.3m: Match the revealed card's subtype against the subtype filter.
             let subtype_matches = match subtype_filter.as_ref() {
                 None => true,
-                Some(filter) => subject_id.is_some_and(|id| {
-                    crate::game::filter::matches_target_filter(
+                Some(filter) => subject.as_ref().is_some_and(|(id, lki)| match lki {
+                    Some(lki) => crate::game::filter::matches_target_filter_on_lki_snapshot(
                         state,
-                        id,
+                        *id,
+                        lki,
                         filter.as_ref(),
                         &crate::game::filter::FilterContext::from_ability(ability),
-                    )
+                    ),
+                    None => crate::game::filter::matches_target_filter(
+                        state,
+                        *id,
+                        filter.as_ref(),
+                        &crate::game::filter::FilterContext::from_ability(ability),
+                    ),
                 }),
             };
             let filter_matches = match additional_filter {
@@ -15744,35 +15811,48 @@ pub(crate) fn evaluate_condition(
                 // against the source permanent's chosen creature type.
                 Some(FilterProp::IsChosenCreatureType) => {
                     let source = state.objects.get(&ability.source_id);
-                    let subject = subject_id.and_then(|id| state.objects.get(&id));
-                    match (source, subject) {
-                        (Some(src), Some(obj)) => {
-                            src.chosen_creature_type().is_some_and(|chosen_type| {
-                                obj.card_types
-                                    .subtypes
-                                    .iter()
-                                    .any(|s| s.eq_ignore_ascii_case(chosen_type))
-                            })
-                        }
-                        _ => false,
-                    }
+                    let subject_subtypes = subject.as_ref().and_then(|(id, lki)| match lki {
+                        Some(lki) => Some(lki.subtypes.as_slice()),
+                        None => state
+                            .objects
+                            .get(id)
+                            .map(|object| object.card_types.subtypes.as_slice()),
+                    });
+                    source
+                        .and_then(|src| src.chosen_creature_type())
+                        .zip(subject_subtypes)
+                        .is_some_and(|(chosen_type, subtypes)| {
+                            subtypes
+                                .iter()
+                                .any(|subtype| subtype.eq_ignore_ascii_case(chosen_type))
+                        })
                 }
                 // CR 202.3 + CR 700.1: Generic property gates on the revealed card
                 // (e.g. Kellan, Daring Traveler's "creature card with mana value 3
                 // or less" → `FilterProp::Cmc`). Evaluate the property against the
                 // revealed subject through the shared filter evaluator, exactly as
                 // `subtype_filter` does above.
-                Some(prop) => subject_id.is_some_and(|id| {
-                    crate::game::filter::matches_target_filter(
-                        state,
-                        id,
-                        &TargetFilter::Typed(crate::types::ability::TypedFilter {
-                            type_filters: vec![],
-                            controller: None,
-                            properties: vec![prop.clone()],
-                        }),
-                        &crate::game::filter::FilterContext::from_ability(ability),
-                    )
+                Some(prop) => subject.as_ref().is_some_and(|(id, lki)| {
+                    let filter = TargetFilter::Typed(crate::types::ability::TypedFilter {
+                        type_filters: vec![],
+                        controller: None,
+                        properties: vec![prop.clone()],
+                    });
+                    match lki {
+                        Some(lki) => crate::game::filter::matches_target_filter_on_lki_snapshot(
+                            state,
+                            *id,
+                            lki,
+                            &filter,
+                            &crate::game::filter::FilterContext::from_ability(ability),
+                        ),
+                        None => crate::game::filter::matches_target_filter(
+                            state,
+                            *id,
+                            &filter,
+                            &crate::game::filter::FilterContext::from_ability(ability),
+                        ),
+                    }
                 }),
                 None => true,
             };
@@ -16306,7 +16386,7 @@ pub(crate) fn evaluate_condition(
             .any(|c| evaluate_condition(c, state, ability)),
         // CR 608.2c: Logical negation — true when the inner condition is false.
         AbilityCondition::Not { condition } => {
-            if subject_dependent_type_condition_has_no_subject(condition, state) {
+            if subject_dependent_type_condition_has_no_subject(condition, state, ability) {
                 return false;
             }
             !evaluate_condition(condition, state, ability)
@@ -30931,6 +31011,88 @@ mod tests {
             evaluate_condition(&land_cond, &state, &ability),
             "reveal must take precedence over the zone-change fallback",
         );
+    }
+
+    /// CR 603.4 + CR 608.2i + CR 701.20a: A reflexive trigger's captured
+    /// revealed-card referent keeps its reveal-time characteristics both while
+    /// the live object changes and after it changes zones into a new
+    /// incarnation. This is a look-back predicate and therefore the explicit
+    /// exception to CR 608.2h's ordinary current-characteristics rule.
+    #[test]
+    fn revealed_has_card_type_context_uses_event_snapshot_across_incarnations() {
+        let mut state = GameState::new_two_player(42);
+        let revealed = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Revealed Card".to_string(),
+            Zone::Library,
+        );
+        {
+            let object = state.objects.get_mut(&revealed).unwrap();
+            object.card_types.core_types = vec![CoreType::Creature];
+            object.base_card_types = object.card_types.clone();
+        }
+        let snapshot = CostPaidObjectSnapshot::capture(
+            &state.objects[&revealed],
+            state.objects[&revealed].snapshot_public_characteristics(),
+        );
+        let captured_incarnation = snapshot.incarnation;
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        ability.effect_context_object = Some(snapshot);
+        let creature = AbilityCondition::RevealedHasCardType {
+            card_types: vec![CoreType::Creature],
+            additional_filter: None,
+            subtype_filter: None,
+        };
+        let artifact = AbilityCondition::RevealedHasCardType {
+            card_types: vec![CoreType::Artifact],
+            additional_filter: None,
+            subtype_filter: None,
+        };
+
+        // The card remains the captured incarnation, but a later type change
+        // cannot rewrite whether it was a creature when revealed.
+        assert!(state.last_revealed_ids.is_empty());
+        assert!(state.last_zone_changed_ids.is_empty());
+        state
+            .objects
+            .get_mut(&revealed)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Artifact];
+        assert!(evaluate_condition(&creature, &state, &ability));
+        assert!(!evaluate_condition(&artifact, &state, &ability));
+
+        // Use the production zone-change pipeline to create a new incarnation
+        // at the same storage id. Give that new object the opposite current
+        // type; the same frozen reveal-time snapshot remains authoritative.
+        let mut events = Vec::new();
+        let _ = crate::game::zone_pipeline::move_object(
+            &mut state,
+            crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                revealed,
+                Zone::Graveyard,
+                ObjectId(1),
+            ),
+            &mut events,
+        );
+        let moved = state.objects.get_mut(&revealed).unwrap();
+        moved.card_types.core_types = vec![CoreType::Artifact];
+        assert_eq!(moved.zone, Zone::Graveyard);
+        assert_ne!(moved.incarnation, captured_incarnation);
+        state.last_zone_changed_ids.clear();
+        state.last_revealed_ids.clear();
+        assert!(evaluate_condition(&creature, &state, &ability));
+        assert!(!evaluate_condition(&artifact, &state, &ability));
     }
 
     #[test]

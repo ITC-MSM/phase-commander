@@ -23320,7 +23320,9 @@ pub enum ActivationRestriction {
     /// Read from `GameObject::harnessed`. Sibling of `IsSolved` (CR 719.3c) — a
     /// per-object designation activation gate, not a parameterization of it.
     SourceIsHarnessed,
-    /// CR 716.4: Level N+1 ability can only activate when the source Class is at exactly this level.
+    /// CR 716.2a: "[Cost]: Level N" activates only while the source Class is at
+    /// exactly this level (N-1). CR 716.4 is the disjoint leveler-card rule and
+    /// explicitly does not interact with Class levels.
     ClassLevelIs {
         level: u8,
     },
@@ -25015,6 +25017,138 @@ impl AbilityCondition {
 
     pub fn is_effect_outcome(&self) -> bool {
         matches!(self, AbilityCondition::EffectOutcome { .. })
+    }
+
+    /// CR 603.12 + CR 603.4 + CR 608.2a: Builds the flat root condition for a
+    /// reflexive trigger with an intervening-if guard. The `WhenYouDo` member
+    /// marks the separate triggered ability; `guard` is checked when that
+    /// trigger would be created and again when it resolves.
+    pub fn when_you_do_with_guard(guard: AbilityCondition) -> Self {
+        AbilityCondition::WhenYouDo.with_when_you_do_guard(guard)
+    }
+
+    /// Appends an ordinary guard to a root `WhenYouDo` marker, flattening only
+    /// root-level `And` members. Deliberately does not descend through `Or`,
+    /// `Not`, or nested `And`: those are distinct condition expressions, not
+    /// reflexive-body membership markers.
+    pub fn with_when_you_do_guard(self, guard: AbilityCondition) -> Self {
+        debug_assert!(self.has_when_you_do_marker());
+
+        let mut conditions = match self {
+            AbilityCondition::And { conditions } => conditions,
+            condition => vec![condition],
+        };
+        match guard {
+            AbilityCondition::And { conditions: guards } => conditions.extend(guards),
+            guard => conditions.push(guard),
+        }
+        AbilityCondition::And { conditions }
+    }
+
+    /// Whether this condition carries the CR 603.12 creation marker at its
+    /// root. A marker inside `Or`, `Not`, or a nested `And` is intentionally
+    /// not a reflexive-body marker.
+    ///
+    /// Exhaustive, with no wildcard: this is the single classifier used by
+    /// `take_when_you_do_marker`, so a new variant requires a deliberate
+    /// compiler-guided decision before either helper can accept it.
+    pub fn has_when_you_do_marker(&self) -> bool {
+        match self {
+            AbilityCondition::WhenYouDo => true,
+            AbilityCondition::And { conditions } => conditions
+                .iter()
+                .any(|condition| matches!(condition, AbilityCondition::WhenYouDo)),
+            AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+            | AbilityCondition::AdditionalCostPaidInstead
+            | AbilityCondition::AlternativeManaCostPaid
+            | AbilityCondition::EffectOutcome { .. }
+            | AbilityCondition::EventOutcomeWon
+            | AbilityCondition::SourceEnteredThisTurn
+            | AbilityCondition::HasMaxSpeed
+            | AbilityCondition::IsMonarch
+            | AbilityCondition::IsInitiative
+            | AbilityCondition::HasCityBlessing
+            | AbilityCondition::HasEnduringStory
+            | AbilityCondition::ControlsCommander { .. }
+            | AbilityCondition::DiscardedCardMatchesFilter { .. }
+            | AbilityCondition::IsRingBearer
+            | AbilityCondition::HasObjectTarget
+            | AbilityCondition::IsYourTurn
+            | AbilityCondition::FirstCombatPhaseOfTurn
+            | AbilityCondition::FirstEndStepOfTurn
+            | AbilityCondition::SourceIsTapped
+            | AbilityCondition::SourceAttachedToCreature
+            | AbilityCondition::DayNightIsNeither
+            | AbilityCondition::AdditionalCostPaid { .. }
+            | AbilityCondition::CoinFlipOutcome { .. }
+            | AbilityCondition::WasCast { .. }
+            | AbilityCondition::CastDuringPhase { .. }
+            | AbilityCondition::CurrentPhaseIs { .. }
+            | AbilityCondition::CastTimingPermission { .. }
+            | AbilityCondition::ManaColorSpent { .. }
+            | AbilityCondition::RevealedHasCardType { .. }
+            | AbilityCondition::ObjectsShareQuality { .. }
+            | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
+            | AbilityCondition::CastVariantPaid { .. }
+            | AbilityCondition::CastVariantPaidInstead { .. }
+            | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::PreviousEffectAmount { .. }
+            | AbilityCondition::CompletedDungeon { .. }
+            | AbilityCondition::TargetHasKeywordInstead { .. }
+            | AbilityCondition::TargetMatchesFilter { .. }
+            | AbilityCondition::TriggeringSpellTargetsFilter { .. }
+            | AbilityCondition::SourceMatchesFilter { .. }
+            | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
+            | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+            | AbilityCondition::ControllerControlsMatching { .. }
+            | AbilityCondition::ControllerControlledMatchingAsCast { .. }
+            | AbilityCondition::WasStartingPlayer { .. }
+            | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+            | AbilityCondition::ZoneChangedThisWay { .. }
+            | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+            | AbilityCondition::ConditionInstead { .. }
+            | AbilityCondition::Or { .. }
+            | AbilityCondition::Not { .. }
+            | AbilityCondition::DayNightIs { .. }
+            | AbilityCondition::AbilityUseCountThisTurn { .. }
+            | AbilityCondition::SourceLacksKeyword { .. }
+            | AbilityCondition::ScopedPlayerMatches { .. } => false,
+        }
+    }
+
+    /// Removes only root-level CR 603.12 creation markers from `condition`.
+    /// The residual ordinary guard is preserved for the separately-created
+    /// trigger, and the root collapses from zero/one/many members to
+    /// `None`/the member/`And`, respectively.
+    ///
+    /// This intentionally does not recurse through `Or`, `Not`, or nested
+    /// `And`; those shapes do not designate a reflexive-body boundary.
+    pub fn take_when_you_do_marker(condition: &mut Option<AbilityCondition>) -> bool {
+        let Some(condition_value) = condition.take() else {
+            return false;
+        };
+
+        // `has_when_you_do_marker` is the single exhaustive classifier. Any
+        // future `AbilityCondition` variant must be classified there before it
+        // can reach this consuming transformation.
+        if !condition_value.has_when_you_do_marker() {
+            *condition = Some(condition_value);
+            return false;
+        }
+        if matches!(&condition_value, AbilityCondition::WhenYouDo) {
+            return true;
+        }
+
+        let AbilityCondition::And { mut conditions } = condition_value else {
+            unreachable!("the exhaustive marker classifier only accepts WhenYouDo or root And")
+        };
+        conditions.retain(|member| !matches!(member, AbilityCondition::WhenYouDo));
+        *condition = match conditions.len() {
+            0 => None,
+            1 => conditions.pop(),
+            _ => Some(AbilityCondition::And { conditions }),
+        };
+        true
     }
 
     /// CR 603.12 + CR 608.2c: True for the AFFIRMATIVE reflexive-conditional
@@ -31569,6 +31703,69 @@ mod tests {
                 .expect("deserializes");
         assert_eq!(round_tripped, stamped);
         assert!(round_tripped.is_resolution_installed());
+    }
+
+    #[test]
+    fn when_you_do_marker_with_guard_is_a_flat_root_and() {
+        let condition = AbilityCondition::when_you_do_with_guard(AbilityCondition::And {
+            conditions: vec![AbilityCondition::IsYourTurn, AbilityCondition::IsMonarch],
+        });
+
+        assert_eq!(
+            condition,
+            AbilityCondition::And {
+                conditions: vec![
+                    AbilityCondition::WhenYouDo,
+                    AbilityCondition::IsYourTurn,
+                    AbilityCondition::IsMonarch,
+                ],
+            }
+        );
+        assert!(condition.has_when_you_do_marker());
+        assert!(
+            !AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::WhenYouDo),
+            }
+            .has_when_you_do_marker(),
+            "only bare/root-flat markers designate a reflexive body"
+        );
+        assert!(
+            !AbilityCondition::And {
+                conditions: vec![AbilityCondition::And {
+                    conditions: vec![AbilityCondition::WhenYouDo],
+                }],
+            }
+            .has_when_you_do_marker(),
+            "nested conjunctions are ordinary expressions, not reflexive markers"
+        );
+    }
+
+    #[test]
+    fn take_when_you_do_marker_preserves_and_collapses_root_guard() {
+        let mut bare = Some(AbilityCondition::WhenYouDo);
+        assert!(AbilityCondition::take_when_you_do_marker(&mut bare));
+        assert_eq!(bare, None);
+
+        let mut one_guard = Some(AbilityCondition::And {
+            conditions: vec![AbilityCondition::WhenYouDo, AbilityCondition::IsYourTurn],
+        });
+        assert!(AbilityCondition::take_when_you_do_marker(&mut one_guard));
+        assert_eq!(one_guard, Some(AbilityCondition::IsYourTurn));
+
+        let mut many_guards = Some(AbilityCondition::And {
+            conditions: vec![
+                AbilityCondition::WhenYouDo,
+                AbilityCondition::IsYourTurn,
+                AbilityCondition::IsMonarch,
+            ],
+        });
+        assert!(AbilityCondition::take_when_you_do_marker(&mut many_guards));
+        assert_eq!(
+            many_guards,
+            Some(AbilityCondition::And {
+                conditions: vec![AbilityCondition::IsYourTurn, AbilityCondition::IsMonarch],
+            })
+        );
     }
 
     #[test]
