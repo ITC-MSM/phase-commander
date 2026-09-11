@@ -1406,6 +1406,7 @@ mod issue_7816_call_of_the_ring;
 mod issue_7821_bare_plural_enters_with_counters;
 mod issue_7822_manifested_planeswalker_loyalty;
 mod kang_dynasty_until_next_turn_rider;
+mod karona_false_god;
 mod karplusan_yeti_fight_back;
 mod kav_landseeker_delayed_sacrifice;
 mod kellan_daring_traveler_mana_value_gate;
