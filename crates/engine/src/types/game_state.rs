@@ -8557,20 +8557,31 @@ pub enum OutsideGameChoiceSource {
     /// CR 400.11 + CR 400.11b: A card in a booster pack `Effect::OpenBoosterPack`
     /// just opened. The pack's cards are outside the game and in no zone, so —
     /// like `Sideboard` — the entry carries the full `CardFace` the taken card
-    /// is built from, plus the set the pack came from for display. `pack_slot`
+    /// is built from, plus where the pack came from for display. `pack_slot`
     /// is the card's position in the opened pack and its only stable identity.
     BoosterPack {
         pack_slot: usize,
-        set_code: String,
+        origin: PackOrigin,
         /// Boxed, unlike `Sideboard`'s inline face: `WaitingFor` is stored
         /// inline in `GameState`, which `phase-server` moves BY VALUE through
         /// the action + AI path, so this enum's largest variant is multiplied by
         /// every live `GameState` on a frame chain (see `types/game_state_size.rs`
         /// and the `game_state_stack_budget` regression). `Sideboard` already
-        /// sets that ceiling; adding a set code beside a second inline face
+        /// sets that ceiling; adding a pack origin beside a second inline face
         /// would raise it.
         card: Box<crate::types::card::CardFace>,
     },
+}
+
+/// Where an opened booster pack came from, for display. Every card in one pack
+/// shares its origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum PackOrigin {
+    /// A sealed product of one set, named by its MTGJSON set code.
+    Set(String),
+    /// The game's original Cube source (`GameState::booster_pack_pool`).
+    Cube,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8595,17 +8606,34 @@ fn default_one_u32() -> u32 {
 /// and each `Effect::OpenBoosterPack` resolution opens a freshly collated pack
 /// from one of them — so the number of packs a game can open is unbounded while
 /// the resident cost stays proportional to the shelf, not to the corpus.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BoosterShelf {
-    /// Products in deterministic order. Empty when no card in the game opens
-    /// booster packs, or when the loaded card database carries no set that can
-    /// fill a pack.
-    pub products: Vec<BoosterProduct>,
+///
+/// A game opens packs from exactly one kind of source, so the shelf is one or
+/// the other and never both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoosterShelf {
+    /// Sealed products in deterministic order. Empty when no card in the game
+    /// opens booster packs, or when the loaded card database carries no set
+    /// that can fill a pack.
+    Products(Vec<BoosterProduct>),
+    /// The hydrated original Cube source (`GameState::booster_pack_pool`),
+    /// copies included. Empty when that source is unavailable: a legacy
+    /// snapshot that lost it, or an entry the card database cannot resolve.
+    Cube(Vec<CardFace>),
+}
+
+impl Default for BoosterShelf {
+    /// An unstocked shelf: no products until rehydrate stocks it.
+    fn default() -> Self {
+        Self::Products(Vec::new())
+    }
 }
 
 impl BoosterShelf {
     pub fn is_empty(&self) -> bool {
-        self.products.is_empty()
+        match self {
+            Self::Products(products) => products.is_empty(),
+            Self::Cube(cards) => cards.is_empty(),
+        }
     }
 }
 
@@ -19214,6 +19242,11 @@ declare_game_state! {
     #[serde(skip)]
     pub booster_shelf: Arc<BoosterShelf>,
 
+    /// Original source entries for in-game packs. Shared across search clones,
+    /// persisted as names, and hydrated independently of the game RNG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub booster_pack_pool: Option<Arc<Vec<String>>>,
+
     /// Display names for log resolution. Set by server; WASM leaves empty (defaults to "Player N").
     /// Skipped in serialization — runtime context only.
     #[serde(skip)]
@@ -21180,11 +21213,74 @@ pub enum PhaseTransitionDrainState {
     AwaitingPostReplacementContinuation,
 }
 
+/// Why an empty-pool event is costing a player life. Two independent causes
+/// can apply to the SAME event, and they are not interchangeable: one is the
+/// format's rules being older, the other is a card doing something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmptyPoolLifeLossCause {
+    /// The pre-M10 mana-burn rule, per `LegacyRuleSet.mana_burn`. Emits
+    /// `GameEvent::ManaBurn` once the loss actually completes.
+    ManaBurn,
+    /// A Yurlok-class static ability that makes unspent mana cost life.
+    UnspentManaStatic,
+}
+
+/// A life loss an empty-pool event still owes, carried across a replacement
+/// deferral.
+///
+/// CR 616.1 life-loss replacement can pause mid-event, and the player was
+/// already popped from the APNAP queue by then — so without this the rest of
+/// that player's operation would be silently skipped when the transition
+/// resumes, and the next player would be processed instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEmptyPoolLifeLoss {
+    pub player_id: PlayerId,
+    pub amount: u32,
+    pub cause: EmptyPoolLifeLossCause,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseTransitionProgress {
     pub remaining_players: VecDeque<PlayerId>,
     pub next_phase: Phase,
-    pub in_combat: bool,
+    /// Life losses this transition still owes, in the order they must apply.
+    /// Non-empty only between a deferral and its resume; the drain discharges
+    /// it before advancing to the next player.
+    #[serde(default)]
+    pub owed_life_loss: VecDeque<PendingEmptyPoolLifeLoss>,
+    /// The empty-pool life loss currently IN FLIGHT through a CR 616.1 ordering
+    /// choice, kept only to name its cause when it lands.
+    ///
+    /// Distinct from `owed_life_loss`, which holds losses not yet ATTEMPTED:
+    /// this one has entered the pipeline and will complete elsewhere
+    /// (`apply_life_loss_after_replacement`), so re-queuing it would double it.
+    /// Without this the loss still resolves correctly, but nothing records WHY
+    /// — a deferred mana burn would silently lose its `ManaBurn` event and the
+    /// player would see life vanish with no stated reason.
+    ///
+    /// Set ONLY for `ReplacementDeferred::ReplacementChoice`, where the amount
+    /// is still unknown. A `SubstitutionContinuation` deferral has already
+    /// applied the root loss and carries the figure back to the drain, which
+    /// narrates it on the spot — parking that case would strand the record,
+    /// since the resume that finishes a substitute is not the one that applied
+    /// the root.
+    ///
+    /// Every terminal outcome of that choice must consume this, `Prevented`
+    /// included; see `turns::note_empty_pool_life_loss_resolved`.
+    #[serde(default)]
+    pub in_flight_life_loss: Option<PendingEmptyPoolLifeLoss>,
+    /// The phase the turn is leaving, paired with `next_phase` to identify the
+    /// boundary being crossed. Replaces a derived `in_combat: bool`, which
+    /// carried strictly less information than the phase it was computed from
+    /// and could contradict `next_phase` if either were ever set separately —
+    /// CR 500.1's phase-group crossing cannot be recovered from the
+    /// destination alone.
+    ///
+    /// `#[serde(default)]` `None` for a `GameState` saved before this field
+    /// existed; see `ManaPool::clear_expired_retention_markers` for why that
+    /// resolves conservatively rather than guessing a crossing.
+    #[serde(default)]
+    pub previous_phase: Option<Phase>,
     pub entering_cleanup: bool,
     #[serde(default)]
     pub drain_state: PhaseTransitionDrainState,
@@ -21251,7 +21347,9 @@ mod phase_transition_progress_serde_tests {
         let progress = PhaseTransitionProgress {
             remaining_players: VecDeque::from([PlayerId(1)]),
             next_phase: Phase::Upkeep,
-            in_combat: false,
+            previous_phase: Some(Phase::Untap),
+            owed_life_loss: VecDeque::new(),
+            in_flight_life_loss: None,
             entering_cleanup: false,
             drain_state: PhaseTransitionDrainState::AwaitingPostReplacementContinuation,
         };
@@ -24352,6 +24450,7 @@ impl GameState {
             meld_pair_registry: Arc::new(HashMap::new()),
             card_db: None,
             booster_shelf: Arc::new(BoosterShelf::default()),
+            booster_pack_pool: None,
             log_player_names: Vec::new(),
             last_created_token_ids: Vec::new(),
             last_revealed_ids: Vec::new(),
@@ -26485,6 +26584,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         meld_pair_registry: _,
         card_db: _,
         booster_shelf: _,
+        booster_pack_pool: _,
         log_player_names: _,
         last_created_token_ids: _,
         last_revealed_ids: _,
@@ -26730,6 +26830,7 @@ impl PartialEq for GameState {
             && self.current_starting_player == other.current_starting_player
             && self.next_game_chooser == other.next_game_chooser
             && self.deck_pools == other.deck_pools
+            && self.booster_pack_pool == other.booster_pack_pool
             && self.outside_game_cards_brought_in == other.outside_game_cards_brought_in
             && self.sideboard_submitted == other.sideboard_submitted
             && self.triggers_fired_this_turn == other.triggers_fired_this_turn
