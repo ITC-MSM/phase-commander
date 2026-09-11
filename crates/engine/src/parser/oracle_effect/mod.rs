@@ -31252,16 +31252,24 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
         def.player_scope,
         Some(PlayerFilter::OwnersOfCardsExiledBySource)
     ) {
-        let target_slot = match &mut *def.effect {
-            Effect::PutAtLibraryPosition { target, .. } | Effect::ChangeZoneAll { target, .. } => {
-                Some(target)
-            }
-            _ => None,
-        };
-        if let Some(target) = target_slot {
-            if matches!(target, TargetFilter::ParentTarget) {
+        match &mut *def.effect {
+            Effect::PutAtLibraryPosition { target, .. } | Effect::ChangeZoneAll { target, .. }
+                if matches!(target, TargetFilter::ParentTarget) =>
+            {
                 *target = TargetFilter::ExiledBySource;
             }
+            // CR 607.2a + CR 108.3 + CR 608.2g: "the exiled card's owner may cast
+            // that card without paying its mana cost" (Spell Queller). Each owner
+            // iteration casts only the linked card that owner owns: the
+            // `Owned { You }` leg rebinds to the iterating owner once the fan-out
+            // makes them the ability's controller, so one owner can never cast
+            // another owner's exiled card. The cast itself stays the
+            // during-resolution driver the body parsed to, so declining leaves no
+            // standing permission.
+            Effect::CastFromZone { target, .. } if matches!(target, TargetFilter::ParentTarget) => {
+                *target = nom_quantity::linked_exile_owned_filter();
+            }
+            _ => {}
         }
     }
     if let Some(condition) = def.condition.as_mut() {
@@ -34655,6 +34663,15 @@ pub(crate) fn parse_effect_chain_ir(
         lower::strip_each_copy_targets_distinct_member_suffix(text);
     let text = text.as_str();
     let chunks = split_clause_sequence(text);
+    let chunks = if ctx.in_trigger
+        && matches!(
+            ctx.relative_player_scope.as_ref(),
+            Some(ControllerRef::ScopedPlayer)
+        ) {
+        sequence::split_subject_elided_control_continuations(chunks)
+    } else {
+        chunks
+    };
     // CR 611.2a + CR 608.2c: expand any chunk whose leading duration governs conjuncts the
     // single-clause parse discarded. The expanded conjuncts become ORDINARY chunks of THIS
     // chain, which is the only construction under which chain-level anaphor state
@@ -34753,6 +34770,9 @@ pub(crate) fn parse_effect_chain_ir(
     // targeted player subject so the bare conjugated continuations inherit the
     // same player target rather than falling back to the ability controller.
     let mut carried_targeted_player_subject: Option<SubjectApplication> = None;
+    // CR 608.2c: a scoped phase subject applies only to its immediate
+    // same-sentence conjugated continuation.
+    let mut carried_scoped_player_subject: Option<SubjectApplication> = None;
     // CR 608.2c + CR 109.4: Chain-spanning "its controller" antecedent. Armed
     // when a chunk's leading subject is "its/their controller may <act>"
     // (SubjectApplication { affected: ParentTargetController, is_optional: true });
@@ -36976,6 +36996,15 @@ pub(crate) fn parse_effect_chain_ir(
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;
+        // Consume before every dispatch path so a non-continuation (including a
+        // special clause that exits early) cannot leak the subject farther down
+        // the sentence.
+        let consumed_scoped_player_subject = carried_scoped_player_subject.take();
+        let scoped_player_trigger_context = ctx.in_trigger
+            && matches!(
+                ctx.relative_player_scope.as_ref(),
+                Some(ControllerRef::ScopedPlayer)
+            );
         // CR 608.2c + CR 109.4 (issue #1670): Path-independent consumption-clear
         // of the single-shot "its controller" antecedent. The chunk consumed the
         // seeded scope above when `chunk_ctx.relative_player_scope` cloned
@@ -37012,6 +37041,23 @@ pub(crate) fn parse_effect_chain_ir(
             && player_scope.is_none()
             && !sequence::starts_clause_text(&text)
             && sequence::starts_clause_text_or_conjugated(&text);
+        let inherits_carried_scoped_player_subject = consumed_scoped_player_subject.filter(|_| {
+            leading_subject_application.is_none()
+                && player_scope.is_none()
+                && !sequence::starts_clause_text(&text)
+                && sequence::starts_clause_text_or_conjugated(&text)
+        });
+        // CR 608.2c: when a scoped phase player continues an immediately
+        // preceding self-targeted instruction, its bare object pronoun refers to
+        // that source rather than to an absent parent target.
+        if inherits_carried_scoped_player_subject.is_some()
+            && builder
+                .clauses()
+                .last()
+                .is_some_and(|previous| effect_targets_self_ref(&deepest_clause_effect(previous)))
+        {
+            ctx.object_pronoun_ref = Some(TargetFilter::SelfRef);
+        }
 
         // CR 603.7a: Check for temporal prefix before suffix. When present, parse the
         // inner effect through the full pipeline and wrap in CreateDelayedTrigger.
@@ -37628,6 +37674,18 @@ pub(crate) fn parse_effect_chain_ir(
                     target: Some(TargetFilter::ParentTarget),
                     multi_target: None,
                     inherits_parent: true,
+                    is_optional: subject.is_optional,
+                };
+                inject_subject_target(&mut clause.effect, &subject);
+            }
+        }
+        if let Some(subject) = inherits_carried_scoped_player_subject.as_ref() {
+            if matches!(clause.effect, Effect::GainControl { .. }) {
+                let subject = SubjectPhraseAst {
+                    affected: Some(subject.affected.clone()),
+                    target: None,
+                    multi_target: None,
+                    inherits_parent: subject.inherits_parent,
                     is_optional: subject.is_optional,
                 };
                 inject_subject_target(&mut clause.effect, &subject);
@@ -38591,6 +38649,20 @@ pub(crate) fn parse_effect_chain_ir(
         if chunk.boundary_after == Some(ClauseBoundary::Sentence) {
             decline_consequence_active = false;
         }
+        carried_scoped_player_subject = if scoped_player_trigger_context
+            && chunk.boundary_after != Some(ClauseBoundary::Sentence)
+            && chunks.get(chunk_idx + 1).is_some()
+        {
+            leading_subject_application
+                .as_ref()
+                .filter(|application| {
+                    application.affected == TargetFilter::ScopedPlayer
+                        && application.target.is_none()
+                })
+                .cloned()
+        } else {
+            None
+        };
         if chunk.boundary_after == Some(ClauseBoundary::Sentence) {
             carried_targeted_player_subject = None;
         } else if let Some(application) = leading_subject_application {

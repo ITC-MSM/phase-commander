@@ -26,6 +26,72 @@ use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit}
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::{CastFrequency, StaticMode};
 
+/// CR 608.2c: Karona's scoped upkeep player is the grammatical subject of the
+/// immediately following conjugated control clause, so it receives control of
+/// the named source rather than the ability controller taking it.
+#[test]
+fn karona_false_god_upkeep_scoped_subject_gives_control() {
+    let trigger = parse_trigger_line(
+        "At the beginning of each player's upkeep, that player untaps Karona and gains control of it.",
+        "Karona, False God",
+    );
+
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.phase, Some(Phase::Upkeep));
+    let untap = trigger.execute.as_deref().expect("Karona upkeep effect");
+    assert!(matches!(
+        untap.effect.as_ref(),
+        Effect::SetTapState {
+            target: TargetFilter::SelfRef,
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+        }
+    ));
+    let control = untap
+        .sub_ability
+        .as_deref()
+        .expect("immediate gains-control continuation");
+    assert_eq!(
+        control.effect.as_ref(),
+        &Effect::GiveControl {
+            target: TargetFilter::SelfRef,
+            recipient: TargetFilter::ScopedPlayer,
+        }
+    );
+    assert_no_unimplemented(untap);
+}
+
+/// The scoped carry is restricted to the `each player's upkeep` context; a
+/// controller-scoped upkeep instruction must not fabricate a ScopedPlayer
+/// recipient merely because it also has a control clause.
+#[test]
+fn controller_upkeep_subject_does_not_become_scoped_player_recipient() {
+    let trigger = parse_trigger_line(
+        "At the beginning of your upkeep, you untap Karona and gain control of it.",
+        "Karona, False God",
+    );
+    let untap = trigger.execute.as_deref().expect("upkeep effect");
+    assert!(matches!(
+        untap.effect.as_ref(),
+        Effect::SetTapState {
+            target: TargetFilter::SelfRef,
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+        }
+    ));
+    let control = untap
+        .sub_ability
+        .as_deref()
+        .expect("control continuation must be reached");
+    assert!(matches!(
+        control.effect.as_ref(),
+        Effect::GainControl {
+            target: TargetFilter::ParentTarget,
+        }
+    ));
+    assert_no_unimplemented(untap);
+}
+
 /// CR 603.4 + CR 601.2f: Liberator's intervening "if" survives the whole
 /// pipeline. Its printed wording predates the Increment keyword (CR 702.191a)
 /// and spells the same sentence out; before the mana-spent subject was widened
