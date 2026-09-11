@@ -13,10 +13,11 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationManaPaymentRestriction, ActivationRestriction, AdditionalCost, CastTimingPermission,
     CastingRestriction, ChoiceType, ChosenSubtypeKind, ContinuousModification, ControllerRef,
-    CostReduction, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
-    ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition,
-    TapStateChange, TargetFilter, TriggerCondition, TriggerDefinition, TypedFilter,
+    CostReduction, DamageRedirectTarget, DelayedTriggerCondition, Duration, Effect, EffectScope,
+    FilterProp, ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr,
+    QuantityRef, ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition,
+    StaticDefinition, TapStateChange, TargetFilter, TriggerCondition, TriggerDefinition,
+    TypedFilter,
 };
 use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::card::DraftEffect;
@@ -103,8 +104,9 @@ use super::oracle_modal::{
 use super::oracle_replacement::{
     find_copy_verb_present, lower_as_enters_becomes_choice_modal,
     lower_as_enters_or_face_up_counters, lower_replacement_ir,
-    parse_bidirectional_damage_prevention, parse_replacement_line, parse_replacement_line_ir,
-    parse_whenever_you_cast_enters_with_outcome, CastEntersWithOutcome,
+    parse_bidirectional_damage_prevention, parse_oneshot_damage_replacement,
+    parse_replacement_line, parse_replacement_line_ir, parse_whenever_you_cast_enters_with_outcome,
+    CastEntersWithOutcome,
 };
 use super::oracle_saga::{is_saga_chapter, parse_saga_chapters};
 use super::oracle_spacecraft::parse_spacecraft_threshold_lines;
@@ -4695,6 +4697,24 @@ pub(crate) fn parse_oracle_ir(
     )
 }
 
+/// The generic replacement priority cannot reconstruct the target ownership of
+/// these two one-shot spell forms. Every other one-shot effect must fall
+/// through to that priority, which preserves its established chains and
+/// replacement lowering.
+fn oneshot_damage_replacement_requires_direct_spell_route(effect: &Effect) -> bool {
+    match effect {
+        Effect::CreateDamageReplacement {
+            redirect_to: Some(DamageRedirectTarget::DamageSourceController),
+            ..
+        } => true,
+        Effect::PreventDamage {
+            damage_source_filter: Some(filter),
+            ..
+        } => crate::types::ability::is_oneshot_target_source_prevent_shape(filter),
+        _ => false,
+    }
+}
+
 fn parse_normalized_oracle_ir(
     original_oracle_text: &str,
     normalized_oracle_text: &str,
@@ -6564,10 +6584,14 @@ fn parse_normalized_oracle_ir(
         let prevention_effect_text = strip_ability_word_with_name(&line)
             .map(|(_, effect)| effect)
             .unwrap_or_else(|| line.clone());
+        let oneshot_damage_replacement = is_spell
+            .then(|| parse_oneshot_damage_replacement(&lower, &ctx))
+            .flatten();
         if is_spell
             && scan_contains(&lower, "prevent")
             && scan_contains(&lower, "damage")
             && !is_instead_replacement_line(&prevention_effect_text)
+            && oneshot_damage_replacement.is_none()
         {
             ctx.subject = None;
             ctx.actor = None;
@@ -6594,6 +6618,20 @@ fn parse_normalized_oracle_ir(
                 i += 1;
                 continue;
             }
+        }
+
+        // The generic replacement priority below can lower the ordinary
+        // one-shot forms (such as Carom). Keep this direct spell route limited
+        // to the forms whose target hosting it cannot reconstruct.
+        if let Some(effect) = oneshot_damage_replacement
+            .filter(oneshot_damage_replacement_requires_direct_spell_route)
+        {
+            emitter.ability_at(
+                item_line,
+                AbilityDefinition::new(AbilityKind::Spell, effect).description(line.clone()),
+            );
+            i += 1;
+            continue;
         }
 
         // Priority 8: Replacement patterns
