@@ -1151,6 +1151,7 @@ mod spear_of_bashenga_attacks_monarch_5249;
 mod special_action_x_runtime;
 mod specialize_runtime;
 mod spell_controller_is_derived;
+mod spell_queller_ltb_owner_cast;
 mod spell_resolution_child_boundary;
 mod spellstutter_sprite_counter_with_x;
 mod spelunking_shockland_order;

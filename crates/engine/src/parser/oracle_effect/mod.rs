@@ -31253,16 +31253,24 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
         def.player_scope,
         Some(PlayerFilter::OwnersOfCardsExiledBySource)
     ) {
-        let target_slot = match &mut *def.effect {
-            Effect::PutAtLibraryPosition { target, .. } | Effect::ChangeZoneAll { target, .. } => {
-                Some(target)
-            }
-            _ => None,
-        };
-        if let Some(target) = target_slot {
-            if matches!(target, TargetFilter::ParentTarget) {
+        match &mut *def.effect {
+            Effect::PutAtLibraryPosition { target, .. } | Effect::ChangeZoneAll { target, .. }
+                if matches!(target, TargetFilter::ParentTarget) =>
+            {
                 *target = TargetFilter::ExiledBySource;
             }
+            // CR 607.2a + CR 108.3 + CR 608.2g: "the exiled card's owner may cast
+            // that card without paying its mana cost" (Spell Queller). Each owner
+            // iteration casts only the linked card that owner owns: the
+            // `Owned { You }` leg rebinds to the iterating owner once the fan-out
+            // makes them the ability's controller, so one owner can never cast
+            // another owner's exiled card. The cast itself stays the
+            // during-resolution driver the body parsed to, so declining leaves no
+            // standing permission.
+            Effect::CastFromZone { target, .. } if matches!(target, TargetFilter::ParentTarget) => {
+                *target = nom_quantity::linked_exile_owned_filter();
+            }
+            _ => {}
         }
     }
     if let Some(condition) = def.condition.as_mut() {
