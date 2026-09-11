@@ -5015,6 +5015,7 @@ fn counters_on_source_provably_excludes_class(
         recipient: None,
         scoped_player: None,
         damage_source: None,
+        event_amount: None,
     };
     crate::game::quantity::object_id_for_scope(state, ObjectScope::Source, ctx, &[])
         .is_some_and(|read_id| read_id != class_member)
@@ -21462,6 +21463,7 @@ mod tests {
             let drawn_event = crate::types::proposed_event::ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 1,
+                stage: crate::types::proposed_event::DrawEventStage::Individual,
                 applied: Default::default(),
             };
             let candidates = crate::game::replacement::find_applicable_replacements(
@@ -26531,6 +26533,7 @@ mod tests {
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         };
         assert_eq!(
             crate::game::quantity::object_id_for_scope(
@@ -26556,6 +26559,7 @@ mod tests {
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         };
         assert_eq!(
             crate::game::quantity::object_id_for_scope(

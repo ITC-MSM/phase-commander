@@ -28399,10 +28399,11 @@ pub enum CombatDamageScope {
 /// corpus by `scripts/draw_replacement_census.py`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrawReplacementScope {
-    /// Modifies the draw *instruction*'s count before any individual draw happens
-    /// (CR 121.2a). Quantum Riddler — "if you would draw one or more cards, you
-    /// draw that many cards plus one instead" — is the only card in the pool that
-    /// does this.
+    /// Applies to the draw *instruction* before any individual draw happens
+    /// (CR 121.2a): it modifies the instruction's count (Quantum Riddler — "if you
+    /// would draw one or more cards, you draw that many cards plus one instead") or,
+    /// behind a count-form threshold, replaces it (Alms Collector — "If an opponent
+    /// would draw two or more cards, instead you and that player each draw a card").
     InstructionCount,
     /// Replaces or prevents a single individual card draw (CR 121.6b). Dredge,
     /// Notion Thief, Hullbreacher, and the runtime "you can't draw" shields.
