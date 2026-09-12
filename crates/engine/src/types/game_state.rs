@@ -4224,6 +4224,109 @@ pub struct PendingEachPlayerCopyChosen {
     pub trigger_event: Option<crate::types::events::GameEvent>,
 }
 
+/// CR 607.2a + CR 608.2c: one row of the exiled-"this way" population that
+/// `RepeatContinuation::UntilStopConditions`'s stop predicates read.
+///
+/// One field per input the predicates actually consult, so the set is exactly
+/// what `should_stop_repeat_until` reads and nothing more:
+///  - `zone` — `stop_on_put_to_hand` asks where an exiled card is NOW
+///    (`obj.zone == Zone::Hand`);
+///  - `controller` — the same predicate's second conjunct is
+///    `obj.controller == ability.controller`. Note what this field is NOT for:
+///    `Zone` is player-agnostic (`types/zones.rs` declares a bare `Hand`), so a
+///    card reaching ANY player's hand already changes `zone` and needs no help
+///    here. What `zone` cannot see is a CONTROL CHANGE with the zone held
+///    constant — that flips exactly this conjunct while `zone` and `name` stay
+///    byte-identical, and only a witness carrying `controller` observes it;
+///  - `name` — `stop_on_duplicate_exiled_names` compares names.
+///
+/// Two witnesses therefore compare equal exactly when every input both
+/// predicates read is unchanged.
+///
+/// NOTE (safe asymmetry, do NOT "fix"): `duplicate_name_among_exiled_by_source`
+/// compares names with `eq_ignore_ascii_case`, while this type's derived `Eq`
+/// is case-sensitive — so the witness is strictly FINER than the predicate. A
+/// finer witness can only ever fail to stop (one extra iteration), never stop
+/// early; that is the safe direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExiledStopInput {
+    pub object_id: ObjectId,
+    pub zone: Zone,
+    pub controller: PlayerId,
+    pub name: String,
+}
+
+/// CR 104.4b + CR 608.2c: a snapshot of every input the `UntilStopConditions`
+/// stop predicates consult, taken immediately before one iteration of the
+/// repeat.
+///
+/// TERMINATION CONTRACT: both stop predicates are pure functions of this
+/// witness. An iteration that leaves it unchanged changed nothing either
+/// predicate can observe, so no further iteration of the same body can reach a
+/// stop condition. `effects::repeat_until_verdict` turns that into the CR 104.4b
+/// outcome: a draw when the stalled iteration contained only mandatory actions
+/// and moved no object, otherwise the end of the process. Without this, an
+/// `UntilStopConditions` repeat whose producer is starved (empty library, a
+/// `Moved` redirect away from Exile) never terminates.
+///
+/// COUPLING, recorded: the `Some(RepeatContinuation::UntilStopConditions {
+/// stop_on_put_to_hand, stop_on_duplicate_exiled_names })` patterns in
+/// `game/effects/mod.rs` bind every field WITHOUT `..`. Keep it that way: a
+/// future third stop predicate must fail to compile there so it is classified
+/// here too. A `..` would silently make this witness unsound for it.
+///
+/// LATENT TRUNCATION HAZARD (not live in today's card pool — measured n = 1,
+/// Tainted Pact, which is unaffected): these ledgers are only populated when
+/// `exile_links::should_track_exiled_by_source` is true, i.e. the ability
+/// carries a linked-exile consumer. The grammar makes the same-name stop
+/// clause OPTIONAL, so a future body reading only "…repeat this process until
+/// you put a card into your hand" would track nothing, hold this witness
+/// byte-identical every iteration WHILE ACTUALLY EXILING CARDS, and be judged
+/// stalled after one iteration rather than hung. That iteration moved a card,
+/// so `repeat_until_verdict` ends the process there (TRUNCATED) instead of
+/// declaring a draw. A `Moved` redirect that
+/// sends the card anywhere but Exile has the same shape. If such a card
+/// appears, the repair is to make the witness key on something that body
+/// actually mutates (the producer's own output — moved-card count, library
+/// size, the iteration's published zone-change ids), NOT to loosen this
+/// type's equality. Note the no-`..` tripwire above does NOT fire for a body
+/// that merely omits a clause — this comment is the only warning for that
+/// case.
+///
+/// Every field added here WEAKENS the guard: this is a no-change detector, not
+/// a no-progress-toward-stop detector, so each field is one more way for a
+/// stalled loop to look like it advanced. `zone`, `controller` and `name` earn
+/// their place because `should_stop_repeat_until` reads all three. Add a fourth
+/// only when a stop predicate reads it.
+///
+/// THE ONE EXCEPTION, which STRENGTHENS the guard: keeping the two ledgers in
+/// SEPARATE rows (below) rather than deduping their union. The two stop
+/// predicates read the ledgers separately — the put-to-hand half reads
+/// `cards_exiled_with_source_this_turn`, `duplicate_name_among_exiled_by_source`
+/// reads `exile_links` — so a row added to one ledger for an object the OTHER
+/// ledger already holds genuinely moves a predicate's input. A union deduped by
+/// `ObjectId` would hold byte-identical across exactly that change and stop (or
+/// draw) a repeat that had in fact advanced — the unsafe direction — so
+/// the rows are keyed by `(ledger, object_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatUntilStopWitness {
+    /// Rows drawn from `GameState::cards_exiled_with_source_this_turn`, the
+    /// ledger `should_stop_repeat_until`'s put-to-hand half reads.
+    ///
+    /// Sorted and deduped by `object_id` so equality is order-independent —
+    /// the ledger this is built from is insertion-ordered, not stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exiled_this_turn: Vec<ExiledStopInput>,
+    /// Rows drawn from `GameState::exile_links` for this source, the ledger
+    /// `duplicate_name_among_exiled_by_source` reads. Kept separate from
+    /// `exiled_this_turn` rather than unioned with it, for the reason recorded
+    /// in this type's doc comment.
+    ///
+    /// Sorted and deduped by `object_id`, same as above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked: Vec<ExiledStopInput>,
+}
+
 /// CR 608.2c + CR 107.1c: Resume state for a "repeat this process" loop
 /// (`RepeatContinuation`) paused when an iteration's process entered an
 /// interactive `WaitingFor` state.
@@ -4235,9 +4338,21 @@ pub struct PendingEachPlayerCopyChosen {
 ///
 /// - `ability` — the loop ability, retaining `repeat_until` so the drain knows
 ///   which continuation mode to apply.
+/// - `stop_progress` — CR 104.4b: the `UntilStopConditions` stop-predicate
+///   inputs as they stood BEFORE the paused iteration began, so the drain can
+///   tell a stalled repeat from a progressing one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRepeatUntil {
     pub ability: Box<crate::types::ability::ResolvedAbility>,
+    /// CR 104.4b: the stop-predicate inputs as they stood BEFORE the paused
+    /// iteration began. `None` means no baseline was recorded (a legacy
+    /// payload, or a continuation mode that carries no progress guard:
+    /// `ControllerChoice` re-prompts the player every iteration, and
+    /// `WhileCondition` is bounded by its own `max_iterations`). `None` can
+    /// never cause a stop — it costs at most one extra iteration, which is the
+    /// safe direction to fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_progress: Option<RepeatUntilStopWitness>,
 }
 
 /// CR 701.55d: Remaining players queued to face the same resolution-time
@@ -17415,6 +17530,13 @@ pub struct LoopDetectSample {
     pub live: GameState,
 }
 
+/// CR 104.1: the result of a game that has ended. `winner: None` is a draw (CR 104.4).
+/// Written only by `elimination::end_game`; see [`GameState::game_end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameEnd {
+    pub winner: Option<PlayerId>,
+}
+
 /// Declares the runtime state and its private serde-only raw mirror from one
 /// field list. Keeping the field declaration single-sourced makes persistence
 /// ingress exhaustive whenever `GameState` evolves.
@@ -17575,6 +17697,24 @@ declare_game_state! {
 
     // Game flow
     pub waiting_for: WaitingFor,
+    /// CR 104.1: the recorded result once the game has ended, written only by
+    /// `elimination::end_game`. `waiting_for` is not a durable home for it: a game can end
+    /// mid-resolution (the CR 104.4b mandatory-loop draw), and a later step of the SAME
+    /// action can still overwrite `waiting_for` before the action boundary. The CR 104.1
+    /// guard in `run_post_action_pipeline` stops triggers from reaching a finished game's
+    /// stack at the source. This record covers the writers that remain, such as a CR 616.1
+    /// replacement-order prompt raised in `resolve_top` on the resolving spell's own zone
+    /// move. `elimination::ensure_game_over_if_terminal`
+    /// re-establishes `WaitingFor::GameOver` from this record, without a second
+    /// `GameEvent::GameOver`.
+    ///
+    /// `#[serde(skip)]`: consumed within the apply that set it. Every action boundary runs
+    /// `reconcile_terminal_result`, after which `waiting_for` carries the result on the
+    /// wire, and nothing serializes a `GameState` between the write and that boundary (the
+    /// only runtime serializers are the persistence and client-wire boundaries). A clone
+    /// keeps it. A new game is a fresh `GameState::new`, so it cannot leak into game 2.
+    #[serde(skip)]
+    pub game_end: Option<GameEnd>,
     /// Persisted allocation source for Resolve All consent epochs. Starts at
     /// one for legacy saves and is minted only by `BeginResolveAll`.
     #[serde(default = "initial_resolve_all_consent_epoch")]
@@ -19264,9 +19404,10 @@ declare_game_state! {
     pub last_revealed_ids: Vec<ObjectId>,
 
     /// CR 401.5 + CR 608.2c + CR 609.3 + issue #4950: Set when the most
-    /// recently resolved `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice
-    /// came up with nothing (empty library, no eligible card, or an empty
-    /// reveal-choice set respectively) — distinct from "none of those has run
+    /// recently resolved `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice/
+    /// `ExileTop` came up with nothing (empty library, no eligible card, an
+    /// empty reveal-choice set, or no card exiled respectively; `ExileTop`
+    /// since issue #8798) — distinct from "none of those has run
     /// in this chain link," which is `None`. This is a brief, transient
     /// relay: `effects::apply_parent_chain_context` reads and immediately
     /// clears it at the very next parent->child hand-off (whatever that
@@ -24257,6 +24398,7 @@ impl GameState {
             waiting_for: WaitingFor::Priority {
                 player: starting_player,
             },
+            game_end: None,
             next_resolve_all_consent_epoch: initial_resolve_all_consent_epoch(),
             viewer_projection: None,
             resolve_all_consent_run: None,
@@ -26411,6 +26553,16 @@ fn _gamestate_partition_is_total(s: &GameState) {
         rng: _,
         combat: _,
         waiting_for: _,
+        // `game_end` (CR 104.1 terminal record): EXCLUDED from `impl PartialEq for
+        // GameState`, and that is the SAFE direction. It is written once, when the game
+        // ends, and never cleared or grown, so it cannot be a per-cycle accumulator; and the
+        // write is followed, at the same action boundary, by a `reconcile_terminal_result`
+        // that leaves the game on `GameOver` (or past it, in the match flow), so
+        // no CR 732 loop verdict is reached from a state that carries it. After the action
+        // boundary it is redundant with the COMPARED `waiting_for` (`GameOver { winner }`)
+        // and `match_phase`. Comparing it would make a finished game unequal to its own
+        // serde round trip, since it is `#[serde(skip)]`.
+        game_end: _,
         next_resolve_all_consent_epoch: _,
         // `viewer_projection`: COMPARED (fail-safe). It is `None` on every authoritative
         // state, so every loop-detection sample compares `None == None` and COMPARING it
