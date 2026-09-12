@@ -71,6 +71,13 @@ pub struct QuantityContext {
     /// (`resolve_quantity_with_targets_and_damage_source`); `None` in every
     /// non-batch context (a null read → 0, fail-closed).
     pub damage_source: Option<ObjectId>,
+    /// CR 121.2a + CR 614.1a: The amount carried by the proposed event a
+    /// replacement condition is being evaluated against — the draw count a
+    /// count-form antecedent ("would draw two or more cards") compares. Set
+    /// only by the replacement pipeline's condition context; `None` in every
+    /// other context, where `EventContextAmount` keeps its trigger/effect
+    /// cascade.
+    pub event_amount: Option<i32>,
 }
 
 impl QuantityContext {
@@ -558,6 +565,7 @@ pub(crate) fn source_defending_player_for_context_for_test(
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         },
     )
 }
@@ -600,6 +608,7 @@ pub fn resolve_quantity(
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         },
     )
 }
@@ -1506,6 +1515,7 @@ pub fn resolve_quantity_with_recipient(
             recipient: Some(recipient_id),
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         },
     )
 }
@@ -1858,6 +1868,7 @@ pub(crate) fn quantity_expr_missing_resolution_only_referent(
             recipient: None,
             scoped_player: ability.scoped_player,
             damage_source: None,
+            event_amount: None,
         };
         !resolution_only_scope_referent_present(state, scope, ctx, &ability.targets, ability)
     }
@@ -3120,6 +3131,7 @@ pub(crate) fn resolve_quantity_for_trigger_check(
         recipient: None,
         scoped_player,
         damage_source: None,
+        event_amount: None,
     };
 
     // Fast path: when current_trigger_event is already set (resolution-time
@@ -3218,6 +3230,7 @@ pub(crate) fn resolve_player_scope_for_trigger_check(
         recipient: None,
         scoped_player,
         damage_source: None,
+        event_amount: None,
     };
 
     match event {
@@ -3522,6 +3535,7 @@ pub fn resolve_quantity_with_targets(
                 recipient: None,
                 scoped_player: ability.scoped_player,
                 damage_source: None,
+                event_amount: None,
             },
             &ability.targets,
             ability.chosen_x,
@@ -3575,6 +3589,7 @@ pub(crate) fn resolve_quantity_with_targets_and_recipient(
                 recipient: Some(recipient_id),
                 scoped_player: ability.scoped_player,
                 damage_source: None,
+                event_amount: None,
             },
             &ability.targets,
             ability.chosen_x,
@@ -3612,6 +3627,7 @@ pub(crate) fn resolve_quantity_with_targets_and_damage_source(
                 recipient: None,
                 scoped_player: ability.scoped_player,
                 damage_source: Some(damage_source),
+                event_amount: None,
             },
             &ability.targets,
             ability.chosen_x,
@@ -3648,6 +3664,7 @@ pub fn resolve_quantity_with_targets_slice(
                 recipient: None,
                 scoped_player: None,
                 damage_source: None,
+                event_amount: None,
             },
             targets,
             None,
@@ -3730,6 +3747,7 @@ pub(crate) fn resolve_quantity_scoped_with_targets(
                 recipient: None,
                 scoped_player: Some(scope_player),
                 damage_source: None,
+                event_amount: None,
             },
             targets,
             None,
@@ -5290,12 +5308,20 @@ fn resolve_ref(
         // continuation fallbacks (e.g. "discard up to N, then draw that
         // many"; "dealt excess damage this way, add that much {R}").
         //   6. `0` — undefined.
-        QuantityRef::EventContextAmount => state
-            // CR 614.1a: Moonlit-scoped "that many" copy count — highest priority,
-            // un-shadowable. `Some` only while a `CopyTokenOf` substitution
-            // continuation resolves (Moonlit Meditation); `None` otherwise, so it
-            // falls straight through to the existing trigger/effect cascade.
-            .post_replacement_token_substitution_count
+        QuantityRef::EventContextAmount => ctx
+            // CR 121.2a + CR 614.1a: a replacement condition evaluated against a
+            // proposed event reads that event's own amount ("would draw two or
+            // more cards" compares the pending draw's count). `Some` only in the
+            // replacement-condition context, so every other caller falls through
+            // to the cascade below unchanged.
+            .event_amount
+            // CR 614.1a: Moonlit-scoped "that many" copy count — highest priority
+            // after the proposed event's own amount, which is never set while a
+            // substitution continuation resolves. `Some` only while a
+            // `CopyTokenOf` substitution continuation resolves (Moonlit
+            // Meditation); `None` otherwise, so it falls straight through to the
+            // existing trigger/effect cascade.
+            .or(state.post_replacement_token_substitution_count)
             .or_else(|| enclosing_trigger_match_count(state))
             // CR 706.4: Die results recorded earlier in THIS resolution
             // outrank the triggering event's own amount, so "roll one or more
@@ -8177,6 +8203,7 @@ pub(crate) fn defending_player_for_quantity_context_for_test(
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         },
     )
 }
@@ -10906,6 +10933,7 @@ mod tests {
                     recipient: None,
                     scoped_player: None,
                     damage_source: None,
+                    event_amount: None,
                 },
             ),
             1
@@ -17462,6 +17490,7 @@ mod tests {
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         };
         assert_eq!(
             resolve_ref(
@@ -17565,6 +17594,7 @@ mod tests {
                     recipient: None,
                     scoped_player: None,
                     damage_source: None,
+                    event_amount: None,
                 },
                 &[],
                 None,
@@ -17929,6 +17959,7 @@ mod tests {
                     recipient: None,
                     scoped_player: Some(scoped_player),
                     damage_source: None,
+                    event_amount: None,
                 },
             ),
             9,
@@ -20684,6 +20715,7 @@ mod tests {
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         };
         let got =
             resolve_object_mana_value(&state, ObjectScope::AmassedArmy, ctx, &[], Some(&ability));
@@ -20751,6 +20783,7 @@ mod tests {
             recipient: None,
             scoped_player: None,
             damage_source: None,
+            event_amount: None,
         };
         let got =
             resolve_object_mana_value(&state, ObjectScope::AmassedArmy, ctx, &[], Some(&ability));
