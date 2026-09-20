@@ -1214,6 +1214,8 @@ pub(crate) fn is_blocked_by_cant_play_lands(
                         trigger_source: None,
                         recipient_id: None,
                         scoped_iteration_player: None,
+                        // CR 603.4: not a zone-change intervening-`if`.
+                        triggering_object: None,
                     },
                 ),
                 None => true,
@@ -19876,6 +19878,22 @@ pub fn can_pay_ability_mana_cost_after_auto_tap_excluding(
     )
 }
 
+/// CR 605.3b + CR 616.1: how an affordability probe treats an auto-tapped mana
+/// ability whose own cost pauses for a replacement choice mid-payment.
+///
+/// Whether that pause is "still payable" depends on the live payment the probe
+/// previews, not on the mana: a payment made with a resumable root surfaces the
+/// choice and continues, while one made without a root cannot suspend at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PausedManaPayment {
+    /// The live payment carries a resumable root and will surface the choice.
+    Resumable,
+    /// The live payment cannot suspend (`pay_unless_cost`, which combat taxes
+    /// and resolution-time "pay {X}" amounts pay through), so a pause means the
+    /// payment cannot complete.
+    Unresumable,
+}
+
 /// Returns true if the player can pay a resolution-time mana cost after
 /// auto-tapping mana sources. This is distinct from spell-casting and
 /// activated-ability payments: CR 106.6 restrictions that name those categories
@@ -19886,6 +19904,7 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
     player: PlayerId,
     source_id: ObjectId,
     cost: &crate::types::mana::ManaCost,
+    paused: PausedManaPayment,
 ) -> bool {
     let mut simulated = state.clone();
     super::layers::flush_layers(&mut simulated);
@@ -19901,10 +19920,14 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
         Some(&effect_ctx),
     );
     // CR 118.12 + CR 605.3b + CR 616.1: A replacement choice during an
-    // auto-tapped mana ability is an in-progress payment, not an affordability
-    // failure. The live payment will surface that exact choice before spending.
+    // auto-tapped mana ability is an in-progress payment when the live payment
+    // can surface that exact choice before spending, and a dead end when it
+    // cannot suspend.
     if mana_ability_cost_payment_is_paused(&simulated) {
-        return true;
+        return match paused {
+            PausedManaPayment::Resumable => true,
+            PausedManaPayment::Unresumable => false,
+        };
     }
     // CR 605.4a: Resolve coupled `TapsForMana` triggered mana abilities inline
     // so the bonus mana is in the simulated pool — same authority the real
@@ -21213,6 +21236,8 @@ fn apply_mana_spell_grants(
                 trigger_source: None,
                 recipient_id: None,
                 scoped_iteration_player: None,
+                // CR 603.4: not a zone-change intervening-`if`.
+                triggering_object: None,
             };
             if !crate::game::filter::matches_target_filter(state, spell_id, filter, &filter_ctx) {
                 continue;
