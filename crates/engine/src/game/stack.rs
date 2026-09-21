@@ -1,8 +1,8 @@
 use crate::types::ability::{
-    AbilityKind, ContinuousModification, CopyCountStatus, DetachedRemainder, Duration, Effect,
-    EffectKind, KeywordAction, PlayerFilter, QuantityExpr, ResolvedAbility, SiblingCondition,
-    SpellContext, SubAbilityLink, TargetChoiceTiming, TargetFilter, TargetRef, TargetSelectionMode,
-    TriggerCondition,
+    cost_paid_object_snapshot_ids_eq, AbilityKind, ContinuousModification, CopyCountStatus,
+    DetachedRemainder, Duration, Effect, EffectKind, KeywordAction, PlayerFilter, QuantityExpr,
+    ResolvedAbility, SiblingCondition, SpellContext, SubAbilityLink, TargetChoiceTiming,
+    TargetFilter, TargetRef, TargetSelectionMode, TriggerCondition,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -4826,7 +4826,15 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         && a_chosen_x == b_chosen_x
         && a_cost_paid_object == b_cost_paid_object
         && a_noted_mana_payment == b_noted_mana_payment
-        && a_cost_paid_objects == b_cost_paid_objects
+        // CR 601.2h + CR 400.7: compare the plural cost-paid authority by its
+        // OBJECT-ID SEQUENCE only, never by vector equality. This field used to
+        // be a raw `Vec<ObjectId>`, and run identity must not silently narrow
+        // just because each entry now also carries `lki` and `incarnation`:
+        // two runs whose costs consumed the same objects in the same order ARE
+        // the same run, even if one side's pins were refreshed. Routed through
+        // the shared helper so this comparator and `ResolvedAbility`'s manual
+        // `PartialEq` cannot drift apart.
+        && cost_paid_object_snapshot_ids_eq(a_cost_paid_objects, b_cost_paid_objects)
         && a_effect_context_object == b_effect_context_object
         && a_amassed_army_object == b_amassed_army_object
         && a_target_selection_mode == b_target_selection_mode
