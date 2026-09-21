@@ -6154,7 +6154,8 @@ fn collect_sub_chain_slot_specs(
 /// for a different zone, so they are correctly left untouched by this gate.
 ///
 /// Issue #4948 — Samwise Gamgee: checks EVERY object the cost
-/// consumed (`ability.cost_paid_objects`), not just the single referent in
+/// consumed (`ability.cost_paid_objects`, projected to
+/// `CostPaidObjectRecord::object_id`), not just the single referent in
 /// `ability.cost_paid_object`. A multi-object non-self cost (e.g. "Sacrifice
 /// three Foods") can move several objects into the same zone this ability's
 /// own target searches at once; excluding only the first left the rest
@@ -6165,20 +6166,17 @@ fn collect_sub_chain_slot_specs(
 /// singular referent without also calling
 /// `add_cost_paid_objects_recursive`.
 ///
-/// CR 400.7: this consumer deliberately compares STORAGE identity only and is
-/// NOT gated on `CostPaidObjectSnapshot::is_current`. The rule being enforced
-/// is "this object left the battlefield to pay this ability's own cost, so it
-/// was never a legal target under the real target-before-cost order" — that is
-/// true of the storage slot regardless of which incarnation now occupies it.
-/// Only consumers that act on the referent as a LIVE object (e.g.
-/// `ZoneChoiceCandidateSource::CostPaidObjects`) need the incarnation gate.
-///
-/// Because storage identity is all this filter needs, it reads
-/// `CostPaidObjectRecord::object_id` and so treats a
-/// `CostPaidObjectRecord::LegacyMembership` entry — a historical save whose
-/// record was a bare id — exactly like a full snapshot. That is what keeps a
-/// restored pre-migration game excluding EVERY object its multi-object cost
-/// paid rather than only the one the singular `cost_paid_object` names.
+/// CR 400.7: this reader is MEMBERSHIP-only and order-independent, so
+/// projecting each record's `object_id` is exact — an object the cost moved
+/// must be excluded whether or not the record still names a current
+/// incarnation, and whether the entry is a payment-time
+/// `CostPaidObjectRecord::Captured` snapshot or a `MembershipOnly` id (a
+/// persisted-save migration, or CR 701.9c's hidden-destination payment).
+/// Only CAPTURED entries carry
+/// live/LKI provenance; this filter deliberately needs none of it.
+/// Deliberately NOT `live_object_id`: a cost-moved object that has since
+/// changed zones AGAIN is still an object this cost moved, and a
+/// membership-only record resolves live to nothing by construction.
 fn exclude_cost_paid_object_that_left_battlefield(
     state: &GameState,
     ability: &ResolvedAbility,

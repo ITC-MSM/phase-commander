@@ -4178,7 +4178,7 @@ fn walk_ability(
         chosen_x: _,
         cost_paid_object: _,
         noted_mana_payment: _, // concrete captured payment snapshot, no read/write effect
-        cost_paid_objects: _,
+        cost_paid_objects: _,  // concrete cost-paid membership records
         effect_context_object: _,
         amassed_army_object: _,
         ability_index: _,
@@ -7562,14 +7562,6 @@ mod tests {
             (
                 "legacy tracked fallback",
                 zone_choice_for_rw(ZoneChoiceCandidateSource::Legacy, None),
-            ),
-            (
-                // CR 400.7j + CR 601.2h: the cost-payment record is a per-source
-                // binding this ability carries, so it belongs in this
-                // enumeration explicitly rather than riding along with the
-                // tracked sources in the profile's match arm.
-                "cost-paid provenance",
-                zone_choice_for_rw(ZoneChoiceCandidateSource::CostPaidObjects, None),
             ),
             (
                 "reciprocal consumer",
