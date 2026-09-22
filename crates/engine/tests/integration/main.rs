@@ -287,6 +287,7 @@ mod elspeth_resplendent_conjoined_counter_choice;
 mod elusive_otter_repro;
 mod embiggen_typeline_pump;
 mod emissary_green;
+mod empower_jace;
 mod emptiness_mana_spent_evoke_5943;
 mod emrakul_control_turn_crash;
 #[cfg(feature = "proptest")]
@@ -1693,4 +1694,5 @@ mod exchange_control_of_a_spell;
 mod exploit_ceased_exploiter_lki;
 mod extra_turn_quantity;
 mod optional_chain_link_prompt_description;
+mod planeswalker_token;
 mod ripple_reveal_choice_interaction;
