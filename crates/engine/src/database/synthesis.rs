@@ -10,9 +10,9 @@ use crate::parser::oracle_util::{apply_bracket_mode, strip_reminder_text, Bracke
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationRestriction, AdditionalCost, AdditionalCostOrigin, AdditionalCostPaymentSource,
-    AggregateFunction, AttachCardinality, AttachSelection, AttackScope, AttackSubject,
-    CardPlayMode, CastFromZoneDriver, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
-    ChoiceType, Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission,
+    AggregateFunction, AttachCardinality, AttachSelection, AttackSubject, CardPlayMode,
+    CastFromZoneDriver, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid, ChoiceType,
+    CombatHistoryScope, Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission,
     CounterTriggerFilter, DamageChannel, DamageKindFilter, DamageModification,
     DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp, KickerVariant,
     ManaContribution, ManaProduction, ModalSelectionCondition, ModalSelectionConstraint,
@@ -5720,7 +5720,7 @@ fn melee_attacked_opponents_expr() -> QuantityExpr {
         qty: QuantityRef::PlayerCount {
             filter: PlayerFilter::OpponentAttacked {
                 subject: AttackSubject::You,
-                scope: AttackScope::ThisCombat,
+                scope: CombatHistoryScope::ThisCombat,
             },
         },
     }
@@ -15228,7 +15228,7 @@ mod melee_synthesis_tests {
                 qty: QuantityRef::PlayerCount {
                     filter: PlayerFilter::OpponentAttacked {
                         subject: AttackSubject::You,
-                        scope: AttackScope::ThisCombat,
+                        scope: CombatHistoryScope::ThisCombat,
                     },
                 },
             }

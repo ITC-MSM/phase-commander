@@ -30902,7 +30902,7 @@ fn strip_each_player_subject_attacked_this_turn_clause() {
                 scope,
                 Some(PlayerFilter::OpponentAttacked {
                     subject: AttackSubject::Source,
-                    scope: AttackScope::ThisTurn,
+                    scope: CombatHistoryScope::ThisTurn,
                 }),
                 "scope must narrow to OpponentAttacked{{Source, ThisTurn}} for {text:?}",
             );
@@ -30917,7 +30917,7 @@ fn strip_each_player_subject_attacked_this_turn_clause() {
         scope,
         Some(PlayerFilter::OpponentAttacked {
             subject: AttackSubject::Source,
-            scope: AttackScope::ThisTurn,
+            scope: CombatHistoryScope::ThisTurn,
         })
     );
     assert_eq!(result, "lose 2 life");
