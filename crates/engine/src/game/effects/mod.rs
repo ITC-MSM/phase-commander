@@ -20415,6 +20415,7 @@ mod tests {
             Effect::Attach {
                 attachment: TargetFilter::Any,
                 target: TargetFilter::Any,
+                selection: crate::types::ability::AttachSelection::Targeted,
             },
             Vec::new(),
             ObjectId(100),
@@ -25158,6 +25159,7 @@ mod tests {
             Effect::Attach {
                 attachment: TargetFilter::SelfRef,
                 target: TargetFilter::ParentTarget,
+                selection: crate::types::ability::AttachSelection::Targeted,
             },
             vec![],
             source,
@@ -25437,6 +25439,7 @@ mod tests {
             Effect::Attach {
                 attachment: TargetFilter::SelfRef,
                 target: TargetFilter::LastCreated,
+                selection: crate::types::ability::AttachSelection::Targeted,
             },
             vec![],
             source,
