@@ -2,7 +2,7 @@
 // crate's own unit-test censuses use. `#[path]` rather than a copy: `src/source_census.rs` is
 // `#![cfg(test)]`, and `cfg(test)` HOLDS in this venue too (an integration target is built with
 // `--test`), so one implementation serves both without shipping guard code in a release build.
-// MEASURED, not assumed — the alternative already in this tree is `test_support.rs` / `support.rs`,
+// MEASURED, not assumed â€” the alternative already in this tree is `test_support.rs` / `support.rs`,
 // twin files kept equal by a comment asking a human to remember.
 #[path = "../../src/source_census.rs"]
 mod source_census;
@@ -925,6 +925,7 @@ mod issue_8760_airbend_any_number;
 mod issue_8773_class_copy_enters_at_level_one;
 mod issue_879_obsessive_pursuit;
 mod issue_8807_void_mirror_colored_mana;
+mod issue_9143_mad_wizards_lair_pipeline;
 mod issue_9180_force_block_named_attacker_not_attacking;
 mod issue_924_offspring;
 mod issue_927_tireless_provisioner;
@@ -1381,7 +1382,7 @@ mod yenna_aura_token_copy;
 mod yuriko_combat_damage;
 
 // Folded in from former top-level tests/*.rs files (each was its own ~130MB
-// test binary linking the full engine — see no_top_level_test_binaries).
+// test binary linking the full engine â€” see no_top_level_test_binaries).
 mod a_killer_among_us;
 mod a_sigil_of_myrkul;
 mod aang_journey_partial_fail_to_find_2722;
