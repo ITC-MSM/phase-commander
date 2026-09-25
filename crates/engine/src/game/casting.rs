@@ -1415,6 +1415,16 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
         &player_data.graveyard,
     ));
 
+    // CR 601.2a: the same object-tagged `PlayFromExile` grant, on a card in
+    // SOMEONE ELSE'S graveyard. Kept as its own pass rather than folded into the
+    // walk above, which is owner-scoped for everything else it discovers; see
+    // `non_owner_graveyard_play_from_exile_grants`.
+    objects.extend(
+        non_owner_graveyard_play_from_exile_grants(state, player, CardPlayMode::Cast)
+            .into_iter()
+            .map(|(obj_id, _source)| obj_id),
+    );
+
     // CR 601.2a + CR 113.6b + CR 118.9: Cards in exile castable via a
     // `StaticMode::ExileCastPermission` static from a battlefield permanent
     // (Maralen, Fae Ascendant). Restricted to cards exiled "with" the source
@@ -1461,6 +1471,63 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
             })
         })
         .collect()
+}
+
+/// CR 601.2a + CR 116.2a: object-tagged `PlayFromExile` grants on cards sitting in
+/// ANOTHER player's graveyard. Serves both surfaces: CR 601.2a for the cast half
+/// (a spell is moved "from where it is" to the stack) and CR 116.2a for the land
+/// half (a land is put onto the battlefield "from the zone it was in").
+///
+/// A `PlayFromExile` permission names the player it was granted to
+/// (`granted_to`), and nothing in CR 601.2a ties that player to the card's owner
+/// or to which graveyard the card is in — "you may cast a spell from among those
+/// cards" covers every member of the batch, including cards milled from an
+/// opponent's library (Locke, Treasure Hunter: "each player mills a card").
+///
+/// This exists because the owner-scoped walk in
+/// `graveyard_spell_objects_available_to_cast` is correct for everything ELSE it
+/// discovers — flashback, escape, retrace, and the battlefield-static permission
+/// sources are all properties of the caster's own graveyard — so widening that
+/// walk would change all of them. A separate, permission-gated pass mirrors what
+/// the exile surface already does one screen up in
+/// `spell_objects_available_to_cast`, where an owner-scoped block is followed by
+/// a second block gated on `obj.owner != player` admitting only objects whose
+/// permission authorizes this player.
+///
+/// The admission gate (`castable_from_current_zone`) already had no owner test on
+/// this disjunct, so before this pass existed the two halves disagreed: the
+/// engine would have accepted the cast it never offered.
+fn non_owner_graveyard_play_from_exile_grants(
+    state: &GameState,
+    player: PlayerId,
+    mode: CardPlayMode,
+) -> Vec<(ObjectId, ObjectId)> {
+    let mut results = Vec::new();
+    for other in state.players.iter().filter(|p| p.id != player) {
+        for &obj_id in &other.graveyard {
+            let Some(obj) = state.objects.get(&obj_id) else {
+                continue;
+            };
+            // CR 305.1: a land is played and a spell is cast; the caller's `mode`
+            // decides which surface this is, and the object has to match it.
+            let admitted = match mode {
+                CardPlayMode::Cast => play_from_exile_object_in_cast_path(obj),
+                CardPlayMode::Play => obj
+                    .card_types
+                    .core_types
+                    .contains(&crate::types::card_type::CoreType::Land),
+            };
+            if !admitted {
+                continue;
+            }
+            if let Some((source, _)) =
+                play_from_exile_permission_source(state, obj, player, state.turn_number, Some(mode))
+            {
+                results.push((obj_id, source));
+            }
+        }
+    }
+    results
 }
 
 fn graveyard_spell_objects_available_to_cast(
@@ -4468,12 +4535,37 @@ pub(crate) fn single_use_play_from_exile_group(
 /// CR 601.2a + CR 611.2a: Spend a single-use `PlayFromExile` grant. Records the
 /// `group` in `exile_play_single_use_consumed` and strips the now-void
 /// `PlayFromExile { single_use_group == group, single_use: true }` permission
-/// from every object still in exile, so the remaining cards in that tracked set
-/// are no longer castable (Chandra, Hope's Beacon +1 grants one cast total
+/// from every object still carrying it, so the remaining cards in that tracked
+/// set are no longer castable (Chandra, Hope's Beacon +1 grants one cast total
 /// across its until-end-of-next-turn window).
+///
+/// THE SWEEP IS ZONE-BLIND, and that is the fix rather than a detail. It used to
+/// iterate `state.exile` alone, which silently did nothing for a grant whose pool
+/// is any other zone: Locke, Treasure Hunter's batch is MILLED, so its siblings
+/// sit in graveyards and kept a permission this call had just declared spent.
+/// Membership in the set is what the permission is scoped by — `single_use_group`
+/// is a `TrackedSetId`, not a zone — so the tracked set is the authority here.
+/// The exile zone is still swept as well, because a grant whose set is absent
+/// from `tracked_object_sets` (a deserialized state, a legacy grant) would
+/// otherwise lose the sweep it has today; the union can only strip permissions
+/// carrying this exact group, so the extra leg cannot over-reach.
+///
+/// `exile_play_single_use_consumed` is the belt to this sweep's braces — the
+/// eligibility gate in `play_from_exile_permission_source_at_index` consults it
+/// independently and is itself zone-agnostic. Both are kept because a stale
+/// permission is visible to anything reading `casting_permissions` directly,
+/// including the AI's legal-action surface.
 pub(crate) fn consume_single_use_play_from_exile(state: &mut GameState, group: TrackedSetId) {
     state.exile_play_single_use_consumed.insert(group);
-    for obj_id in state.exile.clone() {
+    let scoped: Vec<ObjectId> = state
+        .tracked_object_sets
+        .get(&group)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(state.exile.iter().cloned())
+        .collect();
+    for obj_id in scoped {
         if let Some(obj) = state.objects.get_mut(&obj_id) {
             obj.casting_permissions.retain(|p| {
                 !matches!(
@@ -5896,6 +5988,18 @@ pub fn graveyard_lands_playable_by_permission(
         }
     }
 
+    // CR 116.2a + CR 305.1: the land companion of the cross-owner cast pass. Same
+    // grant, same reason — a `mode: Play` `PlayFromExile` naming this player
+    // authorizes the land wherever it sits, and scanning only this player's own
+    // graveyard hid it. Measured as the same shape as the cast surface rather
+    // than assumed symmetric: the loop above is the identical object-tagged
+    // branch, restricted the identical way.
+    results.extend(non_owner_graveyard_play_from_exile_grants(
+        state,
+        player,
+        CardPlayMode::Play,
+    ));
+
     let sources = graveyard_permission_sources(state, player, Some(CardPlayMode::Play));
     for source in &sources {
         let ctx =
@@ -5942,6 +6046,15 @@ pub(super) enum ExileLandPlayAuthorization {
         source: ObjectId,
         frequency: CastFrequency,
         casting_permission_index: CastingPermissionIndex,
+        /// CR 116.2a + CR 611.2a: the tracked-set budget this grant shares with
+        /// its siblings, captured pre-move so `record_exile_play_permission` can
+        /// spend it. `None` when the elected grant is not `single_use`.
+        ///
+        /// Carried here rather than re-derived at the completion seam because the
+        /// land has left its origin zone by then, and the grant travels with the
+        /// object: re-reading it after the move would find nothing and silently
+        /// leave the budget unspent, which is the defect this field closes.
+        single_use_group: Option<TrackedSetId>,
     },
     Static {
         source: ObjectId,
@@ -6007,9 +6120,14 @@ fn exile_land_playable_by_static_permission(
     })
 }
 
-/// CR 305.1 + CR 601.2a + CR 113.6b: Elect the exact exile-play authority for
-/// `land_id` before the land changes zones. Object-attached permissions take
-/// precedence over a static fallback, matching the public legal-actions surface.
+/// CR 116.2a + CR 305.1: Elect the exact play authority for
+/// `land_id` before the land changes zones. CR 116.2a puts the land onto the
+/// battlefield "from the zone it was in", so this is deliberately not
+/// exile-only: an object-attached `PlayFromExile { mode: Play }` grant is
+/// consultable from the graveyard on the same terms (a milled land — CR 701.17a
+/// puts each milled card into its owner's graveyard). Object-attached
+/// permissions take precedence over a static fallback, matching the public
+/// legal-actions surface.
 pub(super) fn exile_land_play_authorization(
     state: &GameState,
     player: PlayerId,
@@ -6036,7 +6154,39 @@ pub(super) fn exile_land_play_authorization(
             source,
             frequency,
             casting_permission_index,
+            // CR 611.2a: read while the land is still in its origin zone; see the
+            // field's own note on why this cannot be recovered afterwards.
+            single_use_group: single_use_play_from_exile_group(
+                state,
+                obj,
+                player,
+                casting_permission_index,
+            ),
         });
+    }
+    // The STATIC fallback is exile-only, and that has to be stated here rather
+    // than inherited. The object-attached branch above is zone-agnostic on
+    // purpose — a milled land carries its `PlayFromExile` grant into the
+    // graveyard. A static `ExileCastPermission` source is different: its printed
+    // scope is cards EXILED with it. Its this-turn pool
+    // (`cards_exiled_with_source_this_turn`) is keyed by `ObjectId`, which is
+    // stable across zone changes and is cleared only at turn end, never on zone
+    // exit — so a land exiled with such a source and then moved to a graveyard in
+    // the same turn is STILL in that pool. When the play-land capture was widened
+    // to graveyards, that land became playable from the graveyard through a
+    // permission that only covers exile, and CR 116.2a would then put it onto the
+    // battlefield "from the zone it was in" under an `Exile` origin it no longer
+    // occupies. Discovery never offered it; the action gate accepted it.
+    //
+    // Reachable only through a this-turn pool with a `SourceController` grantee:
+    // a persistent pool reads `exile_links`, which zone exit prunes, and an
+    // `EachPlayerOwnExiles` pool (Uba Mask) filters on `exiled_by`, which zone
+    // exit clears. No printed card has the reachable shape today (measured over
+    // the card-data export); the parser does support it, so this is a latent
+    // path, closed because the widening that opened it was this change's.
+    // `a_static_exile_permission_does_not_reach_a_land_that_left_exile` pins it.
+    if obj.zone != Zone::Exile {
+        return None;
     }
     let (source, frequency) = exile_land_playable_by_static_permission(state, player, land_id)?;
     Some(ExileLandPlayAuthorization::Static { source, frequency })
