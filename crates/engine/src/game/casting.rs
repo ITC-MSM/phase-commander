@@ -22542,7 +22542,13 @@ fn activation_cost_passes_early_affordability_gate(
     cost: &AbilityCost,
     ability_index: usize,
 ) -> bool {
-    if find_one_of_cost(cost).is_some() {
+    if let Some(locked) =
+        super::costs::lock_half_life_activation_cost(state, player, source_id, cost)
+    {
+        // CR 601.2f + CR 602.2b: Refuse an unaffordable locked cost before
+        // target prompts or mana abilities can mutate the activation state.
+        can_pay_ability_cost_now(state, player, source_id, &locked, Some(ability_index))
+    } else if find_one_of_cost(cost).is_some() {
         can_pay_ability_cost_now(state, player, source_id, cost, Some(ability_index))
     } else {
         // CR 106.6: the tag reaches the payability gate for the same reason it
@@ -24581,6 +24587,20 @@ fn activate_with_cost_carrier(
         // here — it must fall through to the general target-first path below
         // (CR 601.2c: targets are chosen before costs are paid), where the
         // mana-first `Composite` ordering keeps the post-target payment atomic.
+        // CR 601.2f + CR 602.2b: Announcement choices above are complete.
+        // Lock the no-target half-life cost before any mana or payment detour;
+        // the borrowed cost flows through those paths, while the local ability
+        // definition supplies the same fixed cost to final payment.
+        let locked_cost = if !has_effect_targets && find_one_of_cost(cost).is_none() {
+            super::costs::lock_half_life_activation_cost(state, player, source_id, cost)
+        } else {
+            None
+        };
+        let cost = locked_cost.as_ref().unwrap_or(cost);
+        if let Some(locked) = locked_cost.as_ref() {
+            ability_def.cost = Some(locked.clone());
+        }
+
         let loyalty_no_targets =
             crate::types::ability::is_loyalty_ability_cost(cost) && !has_effect_targets;
         if !has_effect_targets
@@ -27252,6 +27272,55 @@ fn is_blocked_by_per_turn_cast_limit_for(
 #[cfg(test)]
 #[path = "casting_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod half_life_activation_verdict_tests {
+    use super::{activation_verdict, restrictions, ActivationQuery, ActivationVerdict};
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::types::phase::Phase;
+
+    #[test]
+    fn block_reason_requires_a_legal_target_before_reporting_unpayable_half_life() {
+        for has_target in [true, false] {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain).with_life(P0, 3);
+            let source = scenario
+                .add_enchantment_from_oracle(
+                    P0,
+                    "Murderous Betrayal",
+                    "{B}{B}, Pay half your life, rounded up: Destroy target nonblack creature. It can't be regenerated.",
+                )
+                .id();
+            for _ in 0..2 {
+                scenario.add_land_from_oracle(
+                    P0,
+                    "Mana Confluence",
+                    "{T}, Pay 1 life: Add one mana of any color.",
+                );
+            }
+            if has_target {
+                scenario.add_creature(P1, "Grizzly Bears", 2, 2);
+            }
+            let runner = scenario.build();
+            let gates = restrictions::ActivationRestrictionStaticGates::compute(runner.state());
+            assert_eq!(
+                activation_verdict(
+                    runner.state(),
+                    P0,
+                    source,
+                    0,
+                    &gates,
+                    ActivationQuery::BlockReason,
+                ),
+                if has_target {
+                    ActivationVerdict::CostNotPayableNow
+                } else {
+                    ActivationVerdict::Illegal
+                }
+            );
+        }
+    }
+}
 
 /// CR 601.2a + CR 406.3b: the two admission predicates the visibility projection reads.
 ///
