@@ -3392,7 +3392,11 @@ fn introduces_chosen_object_target(effect: &Effect) -> bool {
     // in downstream ChangeZone sub-abilities.
     if matches!(
         effect,
-        Effect::RevealTop { .. } | Effect::Dig { .. } | Effect::RevealUntil { .. } | Effect::Clash
+        Effect::RevealTop { .. }
+            | Effect::Dig { .. }
+            | Effect::RevealUntil { .. }
+            | Effect::Clash
+            | Effect::TurnFaceUp { .. }
     ) {
         return true;
     }
