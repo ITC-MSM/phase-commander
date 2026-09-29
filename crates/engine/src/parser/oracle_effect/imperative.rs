@@ -45,16 +45,16 @@ use crate::parser::oracle_static::{
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AttachCardinality,
     AttachSelection, BounceSelection, CardSelectionMode, CategoryChooserScope, ChoiceType, Chooser,
-    ContinuousModification, ControlWindow, ControllerRef, CopyRetargetPermission,
-    CounterAdjustment, CounterKindChooser, CounterKindDomain, DigSource, DoorLockOp, Duration,
-    Effect, EffectScope, ExtraPhaseAnchor, FaceDownProfile, FilterProp, ForceBlockAttackerRef,
-    GrantedAbilityScope, LibraryPosition, MassLibraryShuffleMode, MultiTargetSpec,
-    ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope,
-    PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount, PreventionScope,
-    PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode, SearchSelectionConstraint,
-    StaticDefinition, StickerTicketCostPayment, TapStateChange, TargetChoiceTiming, TargetFilter,
-    TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter, ZoneChoiceCandidateSource,
-    ZoneOwner,
+    ContinuousModification, ControlWindow, ControllerRef, CopyRetargetPermission, CountBinding,
+    CountScope, CounterAdjustment, CounterKindChooser, CounterKindDomain, DigSource, DoorLockOp,
+    Duration, Effect, EffectScope, ExtraPhaseAnchor, FaceDownProfile, FilterProp,
+    ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition, MassLibraryShuffleMode,
+    MultiTargetSpec, ObjectSelectionCardinality, ObjectSelectionEligibility, OutsideGameSourcePool,
+    PerPlayerScope, PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount,
+    PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef, ReassembleControlMode,
+    SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment, TapStateChange,
+    TargetChoiceTiming, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ZoneChoiceCandidateSource, ZoneOwner, ZoneRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::{Phase, PhaseGroup};
@@ -9824,7 +9824,7 @@ fn parse_exile_count_prefix<'a>(text: &'a str, lower: &str) -> Option<(QuantityE
     })
 }
 
-fn terminal_punctuation_only(input: &str) -> bool {
+pub(super) fn terminal_punctuation_only(input: &str) -> bool {
     all_consuming(value(
         (),
         (space0::<_, OracleError<'_>>, opt(one_of(".;")), space0),
@@ -10009,11 +10009,120 @@ fn parse_exile_that_many_from_library_edge(
     Ok((input, (position, player)))
 }
 
+/// CR 401.2 + CR 701.13a: "exile all but the bottom/top N cards of <player>'s library [face down]"
+/// (Doomsday Excruciator, Jace Reality Sculptor, Nicol Bolas the Arisen).
+/// Exiles (library.len() - N) cards from the opposite edge (e.g. from the top down when leaving
+/// N cards at the bottom).
+pub(super) fn try_parse_exile_all_but_edge<'a>(
+    input: &'a str,
+    ctx: &ParseContext,
+) -> Option<(&'a str, ZoneCounterImperativeAst)> {
+    let (after_verb, is_third_person) = alt((
+        value(false, tag::<_, _, OracleError<'_>>("exile all but the ")),
+        value(true, tag::<_, _, OracleError<'_>>("exiles all but the ")),
+    ))
+    .parse(input)
+    .ok()?;
+
+    let (after_edge, position) = alt((
+        value(
+            LibraryPosition::Top,
+            tag::<_, _, OracleError<'_>>("bottom "),
+        ),
+        value(
+            LibraryPosition::Bottom,
+            tag::<_, _, OracleError<'_>>("top "),
+        ),
+    ))
+    .parse(after_verb)
+    .ok()?;
+
+    let (after_num, n) = if let Ok((rem, num)) = nom_primitives::parse_number.parse(after_edge) {
+        (rem.trim_start(), num as i32)
+    } else if let Ok((rem, _)) = alt((
+        tag::<_, _, OracleError<'_>>("a card"),
+        tag::<_, _, OracleError<'_>>("one card"),
+        tag::<_, _, OracleError<'_>>("card"),
+    ))
+    .parse(after_edge)
+    {
+        (rem.trim_start(), 1)
+    } else {
+        return None;
+    };
+
+    let (after_of, _) = alt((
+        tag::<_, _, OracleError<'_>>("cards of "),
+        tag::<_, _, OracleError<'_>>("card of "),
+        tag::<_, _, OracleError<'_>>("of "),
+    ))
+    .parse(after_num)
+    .ok()?;
+
+    let (after_owner, player) = parse_library_owner_or_opponent_scope(after_of, ctx)?;
+    let (tail, face_down) = strip_exile_top_face_down(after_owner);
+
+    let qty = match &player {
+        TargetFilter::Player | TargetFilter::Typed(_) => QuantityRef::TargetZoneCardCount {
+            zone: ZoneRef::Library,
+            scope: if matches!(player, TargetFilter::Typed(_)) {
+                ControllerRef::TargetOpponent
+            } else {
+                ControllerRef::TargetPlayer
+            },
+            binding: CountBinding::Anaphoric,
+        },
+        TargetFilter::Controller => QuantityRef::ZoneCardCount {
+            zone: ZoneRef::Library,
+            card_types: vec![],
+            filter: None,
+            scope: CountScope::Controller,
+        },
+        TargetFilter::ScopedPlayer | TargetFilter::Opponent => QuantityRef::ZoneCardCount {
+            zone: ZoneRef::Library,
+            card_types: vec![],
+            filter: None,
+            scope: CountScope::ScopedPlayer,
+        },
+        // These anaphoric players can differ from the current scoped player.
+        // CountScope has no corresponding owner, so decline the parse rather
+        // than count one library and exile cards from another.
+        _ => return None,
+    };
+
+    let count = QuantityExpr::Offset {
+        inner: Box::new(QuantityExpr::Ref { qty }),
+        offset: -n,
+    };
+
+    let actor = if is_third_person {
+        crate::types::ability::LibraryInstructionActor::LibraryPlayer
+    } else {
+        crate::types::ability::LibraryInstructionActor::Controller
+    };
+
+    Some((
+        tail,
+        ZoneCounterImperativeAst::ExileTop {
+            player,
+            count,
+            position,
+            face_down,
+            actor,
+        },
+    ))
+}
+
 pub(super) fn parse_exile_ast(
     text: &str,
     lower: &str,
     ctx: &mut ParseContext,
 ) -> Option<ZoneCounterImperativeAst> {
+    if let Some((tail, ast)) = try_parse_exile_all_but_edge(lower, ctx) {
+        if terminal_punctuation_only(tail) {
+            return Some(ast);
+        }
+    }
     // CR 701.13a + CR 401.2: A completed-scry trigger provides the only
     // supported provenance for this "that many" library-edge form. Do not
     // borrow generic EventContextAmount here: a textually similar clause in an
@@ -10034,6 +10143,7 @@ pub(super) fn parse_exile_ast(
                 },
                 position,
                 face_down: false,
+                actor: crate::types::ability::LibraryInstructionActor::Controller,
             });
         }
         // Preserve the pre-existing dynamic top-of-library path below, which
@@ -10089,6 +10199,7 @@ pub(super) fn parse_exile_ast(
                 count,
                 position: LibraryPosition::Top,
                 face_down,
+                actor: crate::types::ability::LibraryInstructionActor::Controller,
             });
         }
 
@@ -10137,6 +10248,7 @@ pub(super) fn parse_exile_ast(
                     count,
                     position: LibraryPosition::Top,
                     face_down,
+                    actor: crate::types::ability::LibraryInstructionActor::Controller,
                 });
             }
         }
@@ -10242,6 +10354,7 @@ pub(super) fn parse_exile_ast(
             count,
             position: LibraryPosition::Top,
             face_down,
+            actor: crate::types::ability::LibraryInstructionActor::Controller,
         });
     }
 
@@ -10271,6 +10384,7 @@ pub(super) fn parse_exile_ast(
             count,
             position: LibraryPosition::Top,
             face_down,
+            actor: crate::types::ability::LibraryInstructionActor::Controller,
         });
     }
 
@@ -15661,12 +15775,13 @@ pub(super) fn lower_zone_counter_ast(ast: ZoneCounterImperativeAst) -> Effect {
             count,
             position,
             face_down,
+            actor,
         } => Effect::ExileTop {
             player,
             count,
             position,
             face_down,
-            actor: crate::types::ability::LibraryInstructionActor::Controller,
+            actor,
         },
         ZoneCounterImperativeAst::Counter {
             target,
@@ -24845,6 +24960,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     position: LibraryPosition::Top,
                     face_down: false,
+                    actor: crate::types::ability::LibraryInstructionActor::Controller,
                 }
             ),
             "expected ExileTop(Controller, 1), got {singular:?}"
@@ -24864,6 +24980,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 2 },
                     position: LibraryPosition::Top,
                     face_down: false,
+                    actor: crate::types::ability::LibraryInstructionActor::Controller,
                 }
             ),
             "expected ExileTop(Controller, 2), got {plural:?}"
@@ -24879,6 +24996,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     position: LibraryPosition::Top,
                     face_down: false,
+                    actor: crate::types::ability::LibraryInstructionActor::Controller,
                 }
             ),
             "expected ExileTop(Controller, 1) at EOF, got {eof:?}"
@@ -24910,6 +25028,7 @@ mod tests {
                 },
                 position: LibraryPosition::Bottom,
                 face_down: false,
+                actor: crate::types::ability::LibraryInstructionActor::Controller,
             }
         ));
 
