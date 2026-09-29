@@ -1756,6 +1756,7 @@ mod wrens_run_vanquisher_reveal_cost;
 mod x_mana_sacrifice_residual;
 mod xantid_swarm_defending_player_cant_cast;
 mod you_have_been_caught_stealing_any_damage;
+mod yunas_whistle;
 mod yurlok_of_scorch_thrash;
 mod zenos_yae_galvus_chosen_object;
 mod zero_life_mid_cast_payment;
