@@ -40,6 +40,7 @@ mod angels_grace_2hg;
 mod announce_locked_x_runtime;
 mod announced_counter_recipient_set;
 mod announced_target_set_placement;
+mod announced_x_discard_cost;
 mod announced_x_effect_counts;
 mod another_round_repeat;
 mod anya_merciless_angel_5920;
