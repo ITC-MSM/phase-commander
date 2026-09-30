@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 96 — QuantityRef.NameStickerLetterCount adds a tagged name-sticker statistic
+ *      to GameState ability definitions. A v95 peer cannot decode the new tag;
+ *      full-game peers and P2P move in lockstep (wire 78). Lobby messages are
+ *      unchanged.
  * 95 — FilterProp.Unblocked is reshaped to FilterProp.BlockStatus { status:
  *      AttackerBlockStatus } (Blocked | Unblocked), so "blocked creature"
  *      filters (CR 509.1h: an attacking creature stays blocked for the rest of
@@ -640,7 +644,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 95;
+export const PROTOCOL_VERSION = 96;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

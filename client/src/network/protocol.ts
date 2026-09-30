@@ -495,7 +495,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 77 as const;
+export const WIRE_PROTOCOL_VERSION = 78 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

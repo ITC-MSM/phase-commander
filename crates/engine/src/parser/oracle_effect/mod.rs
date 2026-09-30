@@ -119,8 +119,8 @@ use crate::types::ability::{
     DieResultBranch, DigRestOrder, Duration, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
     GameRestriction, GuardReading, GuessSubject, IntensityScope, IterationKindBinding,
     KeeperConstraint, KeeperCounterMark, LibraryPosition, ManaProduction, ManaSpendPermission,
-    ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec, NumberDistinctness, ObjectProperty,
-    ObjectScope, OriginConstraint, PerPlayerScope, PerpetualModification,
+    ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec, NameStickerSet, NumberDistinctness,
+    ObjectProperty, ObjectScope, OriginConstraint, PerPlayerScope, PerpetualModification,
     PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter, PlayerRelation,
     PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PropertyAggregate, PtValue,
     QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole, ReplacementCondition,
@@ -13703,6 +13703,10 @@ fn quantity_ref_reads_chain_local_result(reference: &QuantityRef) -> bool {
         | QuantityRef::ZoneCardCount { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::ExiledFromHandThisResolution
+        // CR 608.2c: "that sticker" is the record the preceding PutSticker
+        // instruction set, not a chain-local effect result; the object-scoped
+        // form reads the object's stickers.
+        | QuantityRef::NameStickerLetterCount { .. }
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::PartySize { .. }
         | QuantityRef::UnspentMana { .. }
@@ -23939,6 +23943,10 @@ fn amount_reads_the_antecedent(amount: &QuantityExpr) -> bool {
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
         | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. }
         | QuantityRef::CountersOn { scope, .. } => scope,
@@ -24042,6 +24050,10 @@ fn rebind_object_scope_ref(
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
         | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. }
         | QuantityRef::CountersOn { scope, .. } => scope,
@@ -26465,6 +26477,10 @@ pub(super) fn rebind_target_subject_object_scope(expr: &mut QuantityExpr) {
                 | QuantityRef::ObjectManaValue { scope }
                 | QuantityRef::ObjectColorCount { scope }
                 | QuantityRef::ObjectNameWordCount { scope }
+                | QuantityRef::NameStickerLetterCount {
+                    stickers: NameStickerSet::OnObject { scope },
+                    letters: _,
+                }
                 | QuantityRef::ObjectTypelineComponentCount { scope }
                 | QuantityRef::ManaSymbolsInManaCost { scope, .. }
                 | QuantityRef::CountersOn { scope, .. } => scope,
@@ -26507,6 +26523,10 @@ fn rebind_anaphoric_ref(qty: &mut QuantityRef, target: ObjectScope) {
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
         | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::NameStickerLetterCount {
+            stickers: NameStickerSet::OnObject { scope },
+            letters: _,
+        }
         | QuantityRef::ObjectTypelineComponentCount { scope }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. }
         | QuantityRef::CountersOn { scope, .. } => scope,
