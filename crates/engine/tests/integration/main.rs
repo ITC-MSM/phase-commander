@@ -1153,6 +1153,8 @@ mod owner_relative_each_other_player;
 mod owner_scoped_graveyard_activation_8506;
 mod oxford_type_list_boundary_7451;
 mod ozolith_leaves_battlefield_counters;
+mod p1_9354_draw_accounting_35;
+mod p1_9354_oracle_owner_contract_30;
 mod padeem_consul_of_innovation;
 mod pain_magnification_single_source_damage;
 mod painters_servant_multi_zone_additive_color;
