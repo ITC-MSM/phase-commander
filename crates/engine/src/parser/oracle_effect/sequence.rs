@@ -3310,11 +3310,15 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
         // "gets"/"has" are continuous modification predicates. Safe to split because
         // a bare pronoun followed by a conjugated verb cannot be part of a noun phrase.
         value((), tag::<_, _, OracleError<'_>>("it doesn't ")),
+        value((), tag("it doesn\u{2019}t ")),
         value((), tag("it can't ")),
+        value((), tag("it can\u{2019}t ")),
         value((), tag("it cannot ")),
         value((), tag("~ can't ")),
+        value((), tag("~ can\u{2019}t ")),
         value((), tag("~ cannot ")),
         value((), tag("this creature can't ")),
+        value((), tag("this creature can\u{2019}t ")),
         value((), tag("this creature cannot ")),
         value((), tag("it gains ")),
         value((), tag("it gets ")),
@@ -3383,7 +3387,10 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
             tag::<_, _, OracleError<'_>>("players "),
             tag("your opponents "),
         )),
-        value((), alt((tag("can't "), tag("cannot ")))),
+        value(
+            (),
+            alt((tag("can't "), tag("can\u{2019}t "), tag("cannot "))),
+        ),
     ))
     // CR 109.3 + CR 201.4b + CR 608.2k: gendered pronouns ("he"/"she") used as an
     // Oracle-text subject refer to the card itself (Machine Man, Model X-51:
@@ -3411,7 +3418,9 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
                 tag("has "),
                 tag("loses "),
                 tag("doesn't "),
+                tag("doesn\u{2019}t "),
                 tag("can't "),
+                tag("can\u{2019}t "),
                 tag("cannot "),
             )),
         ),
@@ -8659,6 +8668,7 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         Effect::Destroy { .. } | Effect::DestroyAll { .. } | Effect::CreateDelayedTrigger { .. }
             if effect_wraps_destroy_like(previous_effect)
                 && (nom_primitives::scan_contains(&lower, "can't be regenerated")
+                    || nom_primitives::scan_contains(&lower, "can\u{2019}t be regenerated")
                     || nom_primitives::scan_contains(&lower, "cannot be regenerated")) =>
         {
             Some(ContinuationAst::CantRegenerate {
@@ -8915,6 +8925,10 @@ pub(super) fn parse_followup_continuation_ast_with_search_destination(
         // this phrase doesn't shadow the catch-all guard. The Destroy/DestroyAll
         // target is found by `apply_clause_continuation` walking backward.
         _ if nom_primitives::scan_contains(&lower, "destroyed this way can't be regenerated")
+            || nom_primitives::scan_contains(
+                &lower,
+                "destroyed this way can\u{2019}t be regenerated",
+            )
             || nom_primitives::scan_contains(
                 &lower,
                 "destroyed this way cannot be regenerated",
