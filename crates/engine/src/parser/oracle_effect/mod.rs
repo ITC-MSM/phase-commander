@@ -34862,6 +34862,9 @@ pub(crate) fn trigger_condition_references_controller_life_gained(
         TriggerCondition::Not { condition } => {
             trigger_condition_references_controller_life_gained(condition)
         }
+        TriggerCondition::EventTime { condition } => {
+            trigger_condition_references_controller_life_gained(condition)
+        }
         _ => false,
     }
 }
