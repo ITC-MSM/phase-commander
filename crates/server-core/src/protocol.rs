@@ -3318,6 +3318,11 @@ mod tests {
         }
     }
 
+    /// `SpellContext.creation_lookback_event` and `TriggerSourceContext.mana_cost`
+    /// are new in serialized full-game state (CR 603.7 + CR 603.10a + CR 608.2h,
+    /// CR 707.2); a v93 peer would drop both and resolve a phase-delayed
+    /// departure look-back differently, so it must be refused before it
+    /// receives v94 state.
     /// `ReductionProvenance` gains `SacrificedForCost`, the reduction an Emerge
     /// or Offering sacrifice earns before a deferred target declaration; v92
     /// state cannot decode a v93 provenance, so it must be refused before
@@ -3351,8 +3356,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_93_for_sacrifice_cost_reduction_provenance() {
-        assert_eq!(PROTOCOL_VERSION, 93);
+    fn protocol_version_is_94_for_delayed_departure_lookback() {
+        assert_eq!(PROTOCOL_VERSION, 94);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3363,7 +3368,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_93_for_sacrifice_cost_reduction_provenance` stays
+    /// `protocol_version_is_94_for_delayed_departure_lookback` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

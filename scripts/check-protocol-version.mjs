@@ -56,7 +56,9 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +21: the v92 serialized ParentTargetMissingReason carrier and its
 // RevealUntil reveal-until whiff verdict.
 // +22: the v93 SacrificedForCost reduction provenance.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 22;
+// +23: the v94 phase-delayed departure look-back carrier
+// (SpellContext.creation_lookback_event) and TriggerSourceContext.mana_cost.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 23;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -101,7 +103,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +19: wire 73 moves with full-game v91 for the counter-count retype.
 // +20: wire 74 moves with full-game v92 for the serialized reveal-until verdict.
 // +21: wire 75 moves with full-game v93 for the SacrificedForCost provenance.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 21;
+// +22: wire 76 moves with full-game v94 for the departure look-back carrier.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 22;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
