@@ -18871,7 +18871,9 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         on_exile: Option<ExiledSpellRider>,
     },
-    /// CR 615: Prevent damage to a target.
+    /// CR 615: Prevent damage to a declared recipient (a chosen target, or a
+    /// context reference) or to an untargeted population, per
+    /// `recipient_scope`.
     PreventDamage {
         amount: PreventionAmount,
         /// CR 615.11 + CR 107.3i: When present, overrides `amount` at effect
@@ -18883,6 +18885,12 @@ pub enum Effect {
         amount_dynamic: Option<QuantityExpr>,
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
+        /// CR 115.1a + CR 115.10a: `Single` = a declared target, or a
+        /// context reference that mints no slot (`TargetFilter::is_context_ref`);
+        /// `All` = an untargeted descriptor, singular ones such as "enchanted
+        /// creature" included, matched as each damage event happens (CR 615.1, CR 611.2c).
+        #[serde(default = "default_effect_scope_single")]
+        recipient_scope: EffectScope,
         #[serde(default)]
         scope: PreventionScope,
         /// CR 615 + CR 614.1a: Optional filter restricting which damage *sources* are
@@ -21920,7 +21928,6 @@ impl Effect {
             | Effect::BecomeUnprepared { target, .. }
             | Effect::BecomeSaddled { target, .. }
             | Effect::CastFromZone { target, .. }
-            | Effect::PreventDamage { target, .. }
             | Effect::Exploit { target, .. }
             | Effect::GivePlayerCounter { target, .. }
             | Effect::LoseAllPlayerCounters { target, .. }
@@ -22140,6 +22147,21 @@ impl Effect {
             } => Some(target),
             Effect::Transform {
                 scope: EffectScope::All,
+                ..
+            } => None,
+
+            // CR 115.1a + CR 115.10a: `PreventDamage` exposes its recipient only
+            // when it is declared ("prevent all damage that would be dealt to
+            // target creature"). An `All` recipient ("...to creatures this turn")
+            // is an untargeted population matched as each damage event happens
+            // (CR 615.1), so no target slot or prompt is built.
+            Effect::PreventDamage {
+                recipient_scope: EffectScope::Single,
+                target,
+                ..
+            } => Some(target),
+            Effect::PreventDamage {
+                recipient_scope: EffectScope::All,
                 ..
             } => None,
 
@@ -28926,6 +28948,11 @@ pub enum TriggerCondition {
     /// `if` beside it stays rechecked. Pugnacious Hammerskull's 2023-11-10
     /// ruling: a Dinosaur that enters after the attack declaration does not stop
     /// the stun counter.
+    /// The same event-time reading carries a count qualifier that is part of the
+    /// trigger event itself when no player anchors it — an unscoped subject-led
+    /// "Whenever two or more <subject> attack" (Argent Dais) compares the number
+    /// of attacking objects of the subject class when attackers are declared
+    /// (CR 508.1a + CR 603.2); there is no intervening "if" to recheck.
     EventTime { condition: Box<TriggerCondition> },
 }
 
