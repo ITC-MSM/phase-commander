@@ -106,6 +106,9 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  84 — full-game protocol 102 adds the SharedCardTypes quantity tag in
+ *       serialized ability definitions. Keep the existing P2P handshake in
+ *       lockstep with full-game protocol 102.
  *  83 — game_setup and state_update carry GameState, whose events now include
  *       mana-ability activations (AbilityActivated kind "Mana") and a
  *       departed-source LKI. A v82 peer would not recognize the kind; first
@@ -524,7 +527,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 83 as const;
+export const WIRE_PROTOCOL_VERSION = 84 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

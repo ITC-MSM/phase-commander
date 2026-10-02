@@ -12708,8 +12708,16 @@ fn collect_battlefield_cost_modifiers(
                 let qty_expr = crate::types::ability::QuantityExpr::Ref {
                     qty: qty_ref.clone(),
                 };
-                super::quantity::resolve_quantity(state, &qty_expr, source_controller, bf_id).max(0)
-                    as u32
+                // CR 205.2a + CR 607.2a: thread the spell as the `SharedCardTypes`
+                // intersection subject while `bf_id` remains the exile-link anchor.
+                super::quantity::resolve_quantity_with_spell(
+                    state,
+                    &qty_expr,
+                    source_controller,
+                    bf_id,
+                    spell_id,
+                )
+                .max(0) as u32
             } else {
                 1
             };
@@ -28384,6 +28392,7 @@ fn quantity_ref_reads_target_object(qty: &QuantityRef, read: TargetRead) -> bool
             card_type_set_source_reads_chosen_target(aggregate.source(), read)
         }
         QuantityRef::DistinctCardTypes { source }
+        | QuantityRef::SharedCardTypes { source }
         | QuantityRef::DistinctSubtypes { source, .. }
         | QuantityRef::DistinctColorsAmong { source } => {
             card_type_set_source_reads_chosen_target(source, read)
