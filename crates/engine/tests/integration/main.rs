@@ -1830,3 +1830,5 @@ mod untap_upkeep_draw_created_steps;
 
 #[cfg(feature = "test-support")]
 mod owned_you_target_authority;
+
+mod exile_origin_target_acquisition;
