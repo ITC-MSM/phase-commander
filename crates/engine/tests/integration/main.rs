@@ -1769,6 +1769,7 @@ mod trigger_index_stale_entry_panics;
 mod triple_triad_owned_plus_lesser_mv_impulse;
 mod triumphant_chomp;
 mod tromokratis;
+mod twinned_vision_cast_origin;
 mod umbra_stalker_graveyard_chroma_4066;
 mod undying_malice_edict_sacrifice_5942;
 mod unless_pay_routes_through_authority;
