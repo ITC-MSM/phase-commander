@@ -1829,6 +1829,7 @@ mod siphon_insight_mana_rider;
 mod uba_mask_draw_to_exile_play;
 mod ultimate_magic_meteor_per_opponent_destroy;
 mod untap_upkeep_draw_created_steps;
+mod welcome_the_dead;
 
 #[cfg(feature = "test-support")]
 mod owned_you_target_authority;
