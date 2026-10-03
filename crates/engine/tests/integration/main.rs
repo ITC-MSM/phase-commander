@@ -1215,6 +1215,7 @@ mod promise_of_loyalty;
 mod pugnacious_hammerskull_another_dinosaur;
 mod pulse_of_the_forge;
 mod punishing_punch_twice_subject_power;
+mod puppet_crafting_enchant_negation;
 mod purged_source_attachment_count_lki;
 mod purged_source_attacked_this_turn_lki;
 mod purged_source_intervening_if_lki;
