@@ -22410,6 +22410,72 @@ fn harsh_mentor_ability_activation_trigger_accepts_oxford_type_list() {
     );
 }
 
+// SHAPE: actor scope is independent of loyalty kind and source-object scope.
+#[test]
+fn loyalty_ability_trigger_actor_scopes_shape() {
+    let opponent = TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
+    for (line, expected) in [
+        ("Whenever an opponent activates a loyalty ability, Gideon deals 1 damage to that player.", opponent),
+        ("Whenever you activate a loyalty ability, draw a card.", TargetFilter::Controller),
+        ("When a player activates a loyalty ability, draw a card.", TargetFilter::Player),
+    ] {
+        let def = parse_trigger_line(line, "Gideon the Oathless");
+        assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+        assert_eq!(def.valid_target, Some(expected));
+        assert_eq!(def.valid_card, None);
+        assert_no_unimplemented(def.execute.as_deref().expect("recognized effect"));
+    }
+    // The positives above guard these strict grammar refusals.
+    for line in [
+        "Whenever you activates a loyalty ability, draw a card.",
+        "Whenever an opponent activate a loyalty ability, draw a card.",
+        "Whenever a player activates a loyalty ability with an unsupported rider, draw a card.",
+    ] {
+        assert_ne!(
+            parse_trigger_line(line, "Synthetic loyalty grammar").mode,
+            TriggerMode::LoyaltyAbilityActivated
+        );
+    }
+}
+
+// SHAPE: full verbatim Oracle must retain both printed triggers and Ward.
+#[test]
+fn gideon_the_oathless_full_oracle_shape() {
+    let oracle = "Ward—Discard a card.\nWhenever a creature an opponent controls enters, Gideon deals 1 damage to that player.\nWhenever an opponent activates a loyalty ability, Gideon deals 1 damage to that player.";
+    let parsed = parse_oracle_text(
+        oracle,
+        "Gideon the Oathless",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Mercenary".to_string()],
+    );
+    assert_eq!(parsed.triggers.len(), 2);
+    assert_eq!(parsed.triggers[0].mode, TriggerMode::ChangesZone);
+    let loyalty = &parsed.triggers[1];
+    assert_eq!(loyalty.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(
+        loyalty.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        ))
+    );
+    for trigger in &parsed.triggers {
+        assert_no_unimplemented(
+            trigger
+                .execute
+                .as_deref()
+                .expect("recognized printed effect"),
+        );
+    }
+    for ability in &parsed.abilities {
+        assert_no_unimplemented(ability);
+    }
+    assert!(parsed.extracted_keywords.iter().any(|kw| matches!(
+        kw,
+        Keyword::Ward(crate::types::keywords::WardCost::DiscardCard)
+    )));
+}
+
 // --- CR 606.2: "Whenever you activate a loyalty ability of [pw]" ---
 
 /// CR 606.2: Ajani Unrelenting's unqualified form accepts every loyalty
@@ -22421,6 +22487,7 @@ fn loyalty_ability_trigger_without_planeswalker_qualifier() {
         "Ajani Unrelenting",
     );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(def.valid_card, None);
     let execute = def.execute.as_ref().expect("execute ability present");
     assert!(
@@ -22441,6 +22508,7 @@ fn loyalty_ability_trigger_chandra_subtype_regulator() {
             "Chandra's Regulator",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(
         def.valid_card,
         Some(TargetFilter::Typed(
@@ -22464,6 +22532,7 @@ fn loyalty_ability_trigger_chandra_subtype_keral_keep() {
             "Keral Keep Disciples",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(
         def.valid_card,
         Some(TargetFilter::Typed(
@@ -22487,6 +22556,7 @@ fn loyalty_ability_trigger_enchanted_elspeth() {
             "Elspeth's Talent",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(def.valid_card, Some(TargetFilter::AttachedTo));
     let execute = def.execute.as_ref().expect("execute ability present");
     assert!(
@@ -22505,6 +22575,7 @@ fn loyalty_ability_trigger_enchanted_rowan() {
             "Rowan's Talent",
         );
     assert_eq!(def.mode, TriggerMode::LoyaltyAbilityActivated);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     assert_eq!(def.valid_card, Some(TargetFilter::AttachedTo));
     let execute = def.execute.as_ref().expect("execute ability present");
     assert!(

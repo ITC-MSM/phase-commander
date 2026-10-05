@@ -1583,6 +1583,7 @@ mod frantic_inventory_graveyard_count;
 mod furious_spinesplitter_any_damage;
 mod ghyrson_starn;
 mod gideon_blackblade_turn_conditional_creature_1155;
+mod gideon_the_oathless;
 mod god_pharaohs_gift_second_instance_2350;
 mod gonti_lord_of_luxury_exiles_dug_card;
 mod grab_the_prize_discarded_nonland;
