@@ -1757,6 +1757,7 @@ mod std_longtail_b_parse;
 mod std_longtail_d_batch;
 mod std_longtail_e;
 mod std_small_parser_a_batch;
+mod steward_of_the_harvest;
 mod stolen_goodies_zero_targets;
 mod sulfuric_vortex_no_lifegain_743;
 mod super_adaptoid_keyword_counters;
