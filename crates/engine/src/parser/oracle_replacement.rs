@@ -33,7 +33,7 @@ use super::oracle_nom::prevention::{
 };
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::quantity as nom_quantity;
-use super::oracle_nom::target::parse_type_filter_word;
+use super::oracle_nom::target::{parse_type_filter_word, parse_type_phrase};
 use super::oracle_quantity::capitalize_first;
 use super::oracle_target::{
     parse_declared_damage_source_target, parse_target, parse_type_phrase_folding,
@@ -105,6 +105,12 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     let lower = text.to_lowercase();
     let normalized = replace_self_refs(&text, card_name);
     let norm_lower = normalized.to_lowercase();
+
+    // Own the whole threshold production before any broad event scanner can
+    // mistake an unsupported rider for a different replacement event.
+    if parse_fixed_damage_threshold_antecedent(&norm_lower).is_ok() {
+        return parse_fixed_damage_threshold_replacement(&norm_lower, &text);
+    }
 
     if let Some(definition) = parse_search_found_replacement(&text, &lower) {
         return Some(definition);
@@ -506,7 +512,7 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         // CR 121.2a: the single composition step for a count-form antecedent's
         // threshold, applied to every draw-replacement form parsed above.
         return match threshold {
-            Some(n) => with_draw_count_threshold(def, n),
+            Some(n) => with_event_amount_threshold(def, n),
             None => Some(def),
         };
     }
@@ -7152,6 +7158,73 @@ fn parse_graveyard_redirect_replacement(
     Some(def)
 }
 
+/// Recognize the threshold antecedent's grammatical slots before interpreting
+/// its source or amount. Keeping those slots raw also claims unsupported source
+/// qualifiers and variable amounts, so they cannot fall through to a bare stub.
+fn parse_fixed_damage_threshold_antecedent(
+    input: &str,
+) -> OracleResult<'_, (&str, &str, Option<CombatDamageScope>)> {
+    let (rest, _) = tag("if ").parse(input)?;
+    let (rest, source) = terminated(take_until(" would deal "), tag(" would deal ")).parse(rest)?;
+    let (rest, threshold) = terminated(take_until(" or more "), tag(" or more ")).parse(rest)?;
+    let (rest, combat_scope) = opt(alt((
+        value(CombatDamageScope::NoncombatOnly, tag("noncombat ")),
+        value(CombatDamageScope::CombatOnly, tag("combat ")),
+    )))
+    .parse(rest)?;
+    let (rest, _) = tag("damage ").parse(rest)?;
+    Ok((rest, (source, threshold, combat_scope)))
+}
+
+/// CR 614.1a: A fixed-output threshold replaces this same source's damage to
+/// this same recipient. Only the complete, duration-free production is claimed.
+fn parse_fixed_damage_threshold_replacement(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    fn parse_clause(input: &str) -> OracleResult<'_, ReplacementDefinition> {
+        let (rest, (source, threshold, combat_scope)) =
+            parse_fixed_damage_threshold_antecedent(input)?;
+        if combat_scope.is_some() {
+            return Err(oracle_err(input));
+        }
+        let (_, source_filter) = all_consuming(preceded(
+            nom_primitives::parse_article,
+            alt((
+                value(None, tag("source")),
+                terminated(parse_type_phrase, tag(" source")).map(Some),
+            )),
+        ))
+        .parse(source)?;
+        let (_, threshold) = all_consuming(nom_primitives::parse_number).parse(threshold)?;
+        let (rest, recipient) = parse_damage_target_phrase(rest)?;
+        let (rest, _) = tag(", ").parse(rest)?;
+        let (rest, _) = alt((tag("it deals "), tag("that source deals "))).parse(rest)?;
+        let (rest, output) = nom_primitives::parse_number(rest)?;
+        let (rest, _) = tag(" damage ").parse(rest)?;
+        // A matching domain alone is insufficient: the result must refer back
+        // to the original recipient, rather than introduce a different one.
+        let (rest, _) = peek(alt((tag("to you"), tag("to that ")))).parse(rest)?;
+        let (rest, result_recipient) = parse_damage_target_phrase(rest)?;
+        if recipient != result_recipient {
+            return Err(oracle_err(input));
+        }
+        let (rest, _) = (tag(" instead"), opt(char('.')), multispace0).parse(rest)?;
+        let mut definition = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .damage_modification(DamageModification::SetTo { value: output })
+            .damage_target_filter(recipient);
+        if let Some(source_filter) = source_filter {
+            definition = definition.damage_source_filter(source_filter);
+        }
+        let definition =
+            with_event_amount_threshold(definition, threshold).ok_or_else(|| oracle_err(input))?;
+        Ok((rest, definition))
+    }
+
+    let (_, definition) = all_consuming(parse_clause).parse(norm_lower).ok()?;
+    Some(definition.description(original_text.to_string()))
+}
+
 /// CR 614.1a: Parse damage boost/reduction replacement effects.
 /// Extracts modification formula, source filter, target filter, and combat scope.
 fn parse_damage_modification_replacement(
@@ -9568,12 +9641,11 @@ fn parse_draw_replacement(
     Some(def)
 }
 
-/// CR 121.2a: Gate a count-form draw replacement ("would draw N or more
-/// cards", N >= 2) on the proposed draw instruction drawing at least N cards —
-/// an `OnlyIfQuantity` over the event's own count (`EventContextAmount`),
+/// CR 121.2a + CR 120.4b: Gate a draw-count or damage-amount replacement on
+/// the proposed event's own amount being at least N (`EventContextAmount`),
 /// composed with any gate the definition already carries so neither is lost.
 /// Fails closed on a threshold the typed quantity cannot represent.
-fn with_draw_count_threshold(
+fn with_event_amount_threshold(
     mut def: ReplacementDefinition,
     n: u32,
 ) -> Option<ReplacementDefinition> {
@@ -14389,6 +14461,42 @@ mod tests {
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
+
+    #[test]
+    fn shape_fixed_damage_threshold_parameterizes_both_numbers() {
+        let text = "if an instant or sorcery source would deal 7 or more damage to you, it deals 5 damage to you instead.";
+        let definition = parse_fixed_damage_threshold_replacement(text, text).unwrap();
+        assert_eq!(
+            definition.damage_modification,
+            Some(DamageModification::SetTo { value: 5 })
+        );
+        assert!(matches!(
+            definition.condition,
+            Some(ReplacementCondition::OnlyIfQuantity {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 7 },
+                active_player_req: None,
+            })
+        ));
+        assert_eq!(
+            definition.damage_target_filter,
+            Some(damage_target_controller())
+        );
+        let Some(TargetFilter::Typed(filter)) = definition.damage_source_filter else {
+            panic!("the source type disjunction must be preserved");
+        };
+        assert_eq!(filter.controller, None);
+        assert_eq!(
+            filter.type_filters,
+            vec![TypeFilter::AnyOf(vec![
+                TypeFilter::Instant,
+                TypeFilter::Sorcery
+            ])]
+        );
+    }
 
     /// V13 — building block: `parse_type_phrase_folding`'s leading-article strip and its
     /// `other than <self-ref>` suffix (CR 201.5) compose MID-STREAM, leaving the

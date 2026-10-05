@@ -381,6 +381,7 @@ mod fire_lord_ozai_each_opponent_library_top;
 mod fire_prophecy;
 mod fireball_x_cost_surcharge_timing;
 mod first_family_union_color_count;
+mod fixed_damage_amount_thresholds;
 mod fixture_deck_size_conformance;
 mod flamewar_mtmte_export;
 mod flare_of_faith_parent_target;
