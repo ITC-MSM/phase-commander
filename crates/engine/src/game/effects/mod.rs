@@ -14779,23 +14779,19 @@ fn is_bound_attach_remainder_for(pending: &PendingContinuation, ability: &Resolv
 /// - `CreateDelayedTrigger` — Helmut Zemo, driven in
 ///   `cast_this_way_gate_8721::zemo_pays_out_the_counter_once_the_granted_spell_is_actually_cast`.
 ///
-/// Absent on purpose: `PutAtLibraryPosition` (Invasion of Alara) and `CopySpell`
-/// (Finale of Promise). Both are single-link tails, so the rule above would
-/// admit them — and for both, admitting them is measurably WRONG, not merely
-/// unmeasured. That is the first reason and it is stated first, because "no
-/// runtime evidence" alone would be the excuse rule L3 rejects:
+/// Absent on purpose: `PutAtLibraryPosition` and `CopySpell` (Finale of
+/// Promise). Both are single-link tails, so the rule above would admit them:
 ///
-/// - Invasion of Alara's tail is `PutAtLibraryPosition { target: ExiledBySource,
-///   count: Ref(CardsExiledBySource) }` — it names EVERY card the source exiled,
-///   not "the other cards", so running it would also bottom the card the player
-///   may still cast under the permission it just granted.
+/// - `PutAtLibraryPosition`: no card reaches this branch with it. Invasion of
+///   Alara, the one that did, casts from a window over the cards its exile loop
+///   found and bottoms the rest itself (issue #8750), so there is no card to
+///   drive this family with.
 /// - Finale of Promise's tail targets `TrackedSetFiltered { id: 0 }`, the
 ///   parser's sentinel, whose documented fallback in
 ///   `targeting::resolve_tracked_set_id` is the latest non-empty published set —
-///   so it can copy an unrelated set from earlier in the same resolution.
+///   so it can copy an unrelated set from earlier in the same resolution, and
+///   it could not be driven to its tail in a `GameScenario` (issue #8750).
 ///
-/// The second reason is that neither could be driven to its tail in a
-/// `GameScenario`, so neither repair can be measured here either (issue #8750).
 /// Adding a variant to this list without a test that fails when the branch is
 /// reverted is the mistake it was introduced to prevent.
 /// CR 603.7 + CR 608.2g: after a `CastFromZone` head's tail ran inline behind
@@ -21804,9 +21800,9 @@ mod tests {
         let helmut_zemo = effect(
             r#"{"type":"CreateDelayedTrigger","condition":{"type":"WhenNextEvent","trigger":{"mode":"SpellCast","valid_card":{"type":"ParentTarget"},"valid_target":{"type":"Controller"}},"or_trigger":null},"effect":{"kind":"Spell","effect":{"type":"PutCounter","counter_type":"P1P1","count":{"type":"Fixed","value":1},"target":{"type":"SelfRef"}}},"uses_tracked_set":false}"#,
         );
-        // Invasion of Alara — reaches the branch, but could not be driven to its
-        // tail in a `GameScenario`, so its behaviour must stay as it is on main.
-        let invasion_of_alara = effect(
+        // A bottom-of-library tail: no card reaches the branch with one since
+        // Invasion of Alara's cast became a window (issue #8750).
+        let bottom_of_library = effect(
             r#"{"type":"PutAtLibraryPosition","target":{"type":"ExiledBySource"},"count":{"type":"Ref","qty":{"type":"CardsExiledBySource"}},"position":{"type":"Bottom"}}"#,
         );
         // Finale of Promise — likewise, and its `TrackedSetFiltered` target reads
@@ -21824,9 +21820,8 @@ mod tests {
             "CreateDelayedTrigger is driven end to end and must stay in the allowlist"
         );
         assert!(
-            !tail_family_has_runtime_evidence(&invasion_of_alara),
-            "PutAtLibraryPosition has no test that fails when the branch is reverted — \
-             admitting it would change Invasion of Alara on an unmeasured path (issue #8750)"
+            !tail_family_has_runtime_evidence(&bottom_of_library),
+            "PutAtLibraryPosition has no test that fails when the branch is reverted"
         );
         assert!(
             !tail_family_has_runtime_evidence(&finale_of_promise),
@@ -34080,6 +34075,7 @@ mod tests {
             Effect::ExileFromTopUntil {
                 player: TargetFilter::Controller,
                 until: UntilCondition::NextMatches {
+                    count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
                     filter: TargetFilter::Any,
                 },
             },
@@ -41612,9 +41608,12 @@ mod tests {
     /// resolver (`resolve_ability_chain`) with the crewing creature as the chosen
     /// target.
     ///
-    /// Helper returns the crewing creature's final +1/+1 counter total after the
-    /// chain resolves. `subtype` selects whether the conditional doubling fires.
-    fn run_turtle_van_chain(subtype: &str, starting_counters: u32) -> u32 {
+    /// The placement head is an explicit parser gap (no filter expresses "that
+    /// crewed it this turn"), so this resolves the parsed conditional-doubling
+    /// sentence on its own. `counters_after_placement` is the crewer's +1/+1
+    /// count once the head's counter is on it. Returns the final +1/+1 total;
+    /// `subtype` selects whether the conditional doubling fires.
+    fn run_turtle_van_chain(subtype: &str, counters_after_placement: u32) -> u32 {
         use crate::parser::oracle::parse_oracle_text;
 
         let mut state = GameState::new_two_player(11);
@@ -41632,9 +41631,9 @@ mod tests {
             obj.card_types.subtypes.push(subtype.to_string());
             obj.power = Some(2);
             obj.toughness = Some(2);
-            if starting_counters > 0 {
+            if counters_after_placement > 0 {
                 obj.counters
-                    .insert(CounterType::Plus1Plus1, starting_counters);
+                    .insert(CounterType::Plus1Plus1, counters_after_placement);
             }
         }
         // The Vehicle is the ability source.
@@ -41664,13 +41663,16 @@ mod tests {
             .triggers
             .first()
             .expect("Turtle Van must parse an attack trigger");
-        let execute = trigger
+        let doubling = trigger
             .execute
             .as_deref()
-            .expect("attack trigger must carry an execute ability");
+            .expect("attack trigger must carry an execute ability")
+            .sub_ability
+            .as_deref()
+            .expect("the doubling sentence chains after the placement head");
 
         let ability = crate::game::ability_utils::build_resolved_from_def_with_targets(
-            execute,
+            doubling,
             vehicle,
             PlayerId(0),
             vec![TargetRef::Object(crewer)],
@@ -41688,36 +41690,32 @@ mod tests {
 
     #[test]
     fn turtle_van_doubles_counters_on_matching_crewer() {
-        // Turtle crewer starting with 2 counters: PutCounter → 3, then double → 6.
-        // 6 is distinct from the no-double result (3) AND a no-op (2), so reverting
-        // either the condition wiring or the MultiplyCounter→ParentTarget rewrite
-        // flips this assertion.
+        // Turtle crewer with 3 counters after placement: doubled → 6. 6 is
+        // distinct from the no-double result (3), so reverting either the
+        // condition wiring or the MultiplyCounter→ParentTarget rewrite flips
+        // this assertion.
         assert_eq!(
-            run_turtle_van_chain("Turtle", 2),
+            run_turtle_van_chain("Turtle", 3),
             6,
-            "Turtle crewer: 2 + 1 = 3, doubled to 6"
+            "Turtle crewer: 3 doubled to 6"
         );
         // Ninja and Mutant must match the same subtype disjunction.
+        assert_eq!(run_turtle_van_chain("Ninja", 1), 2, "Ninja: 1 doubled to 2");
         assert_eq!(
-            run_turtle_van_chain("Ninja", 0),
-            2,
-            "Ninja: 0 + 1 = 1, doubled to 2"
-        );
-        assert_eq!(
-            run_turtle_van_chain("Mutant", 1),
+            run_turtle_van_chain("Mutant", 2),
             4,
-            "Mutant: 1 + 1 = 2, doubled to 4"
+            "Mutant: 2 doubled to 4"
         );
     }
 
     #[test]
     fn turtle_van_does_not_double_counters_on_nonmatching_crewer() {
         // A Wizard is none of Mutant/Ninja/Turtle: the conditional doubling must
-        // NOT fire. Only the PutCounter applies: 2 + 1 = 3 (no double to 6).
+        // NOT fire, so the 3 counters stay 3 (no double to 6).
         assert_eq!(
-            run_turtle_van_chain("Wizard", 2),
+            run_turtle_van_chain("Wizard", 3),
             3,
-            "non-matching crewer: only the +1/+1 counter is added, no doubling"
+            "non-matching crewer: no doubling"
         );
     }
 

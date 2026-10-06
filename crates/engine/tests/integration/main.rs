@@ -7,6 +7,7 @@
 #[path = "../../src/source_census.rs"]
 mod source_census;
 
+mod aang_compound_tail;
 mod abigale_integration;
 mod ability_block_display_clone_gate;
 mod ability_cost_block_readout;
@@ -497,6 +498,7 @@ mod integration_adventure;
 mod integration_bending;
 mod integration_landfall;
 mod interaction_contract;
+mod invasion_of_alara_8750;
 mod invoke_calamity_free_cast;
 mod ir_spell_node_readers;
 mod ironsoul_enforcer_commander_attacks_alone;
@@ -1304,6 +1306,7 @@ mod serras_emissary_chosen_card_type_protection;
 mod shorten_efficacy;
 mod shuffle_them_into_libraries;
 mod shuri_wakandan_inventor_copy_recipient;
+mod siege_behemoth_unblocked_grant;
 mod sift_through_sands;
 mod sigarda_tajuru_tamiyo_forced_action_protection;
 mod sin_spiras_punishment_repeat;
