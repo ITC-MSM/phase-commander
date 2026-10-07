@@ -1789,6 +1789,7 @@ mod tergrid_mirrormade_copy_on_effect_entry;
 mod the_mind_stone_harness_infinity;
 mod there_are_no_permanents_state_trigger;
 mod they_gain_keyword_anaphor;
+mod thranduil_graveyard_granted_abilities;
 mod three_blind_mice;
 mod token_storm_scaling_gate;
 mod token_zone_change_index;
