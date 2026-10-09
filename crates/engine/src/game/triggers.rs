@@ -18420,11 +18420,13 @@ pub mod tests {
                 player_id: PlayerId(1),
                 source_amounts: vec![(hero, 2), (other, 3)],
                 total_damage: 5,
+                source_incarnations: vec![],
             },
             GameEvent::CombatDamageDealtToPlayer {
                 player_id: PlayerId(0),
                 source_amounts: vec![(hero, 1)],
                 total_damage: 1,
+                source_incarnations: vec![],
             },
         ];
 
@@ -18454,6 +18456,7 @@ pub mod tests {
                 player_id: PlayerId(1),
                 source_amounts: vec![(hero, 2)],
                 total_damage: 2,
+                source_incarnations: vec![],
             }],
             "the normalized context must retain only matching sources and their total"
         );
@@ -18463,6 +18466,7 @@ pub mod tests {
                 player_id: PlayerId(0),
                 source_amounts: vec![(hero, 1)],
                 total_damage: 1,
+                source_incarnations: vec![],
             }]
         );
     }
@@ -18529,6 +18533,7 @@ pub mod tests {
             amount: 1,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         };
         let event_batch = vec![
             player_one_hit.clone(),
@@ -18539,6 +18544,7 @@ pub mod tests {
                 amount: 2,
                 is_combat: false,
                 excess: 0,
+                source_incarnation: None,
             },
             GameEvent::DamageDealt {
                 source_id: other,
@@ -18546,6 +18552,7 @@ pub mod tests {
                 amount: 3,
                 is_combat: false,
                 excess: 0,
+                source_incarnation: None,
             },
             GameEvent::DamageDealt {
                 source_id: hero,
@@ -18553,6 +18560,7 @@ pub mod tests {
                 amount: 4,
                 is_combat: false,
                 excess: 0,
+                source_incarnation: None,
             },
         ];
 
@@ -18585,6 +18593,7 @@ pub mod tests {
                 amount: 2,
                 is_combat: false,
                 excess: 0,
+                source_incarnation: None,
             }],
             "a matching noncombat player hit must remain a positive group"
         );
@@ -19978,6 +19987,7 @@ pub mod tests {
                 amount: 2,
                 is_combat,
                 excess: 0,
+                source_incarnation: None,
             };
             collect_pending_triggers(&mut state, &[event])
                 .into_iter()
@@ -27017,6 +27027,7 @@ pub mod tests {
             player_id: defender,
             source_amounts: vec![(attacker_a, 2), (attacker_b, 3)],
             total_damage: 5,
+            source_incarnations: vec![],
         }];
 
         let DelayedTriggerMatch {
@@ -27106,6 +27117,7 @@ pub mod tests {
             amount: 2,
             is_combat: false,
             excess: 0,
+            source_incarnation: None,
         };
         let events = vec![hit(own_a), hit(theirs), hit(own_b)];
         let DelayedTriggerMatch {
@@ -27162,6 +27174,7 @@ pub mod tests {
                 player_id: defender,
                 source_amounts: vec![(attacker_a, 2), (attacker_b, 2)],
                 total_damage: 4,
+                source_incarnations: vec![],
             },
         )
     }
@@ -28731,6 +28744,7 @@ pub mod tests {
                 amount: 2,
                 is_combat: true,
                 excess: 0,
+                source_incarnation: None,
             }],
         );
 
@@ -31095,6 +31109,7 @@ pub mod tests {
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         };
         assert!(check_trigger_condition(
             &state,
@@ -31111,6 +31126,7 @@ pub mod tests {
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -31127,6 +31143,7 @@ pub mod tests {
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -31184,6 +31201,7 @@ pub mod tests {
                 player_id: PlayerId(0),
                 source_amounts: vec![(source, 4)],
                 total_damage: 4,
+                source_incarnations: vec![],
             }];
             let pending = collect_pending_triggers(&mut state, &events);
             assert_eq!(
@@ -31212,6 +31230,7 @@ pub mod tests {
                 player_id: PlayerId(0),
                 source_amounts: vec![(source, 4)],
                 total_damage: 4,
+                source_incarnations: vec![],
             }];
             let pending = collect_pending_triggers(&mut state, &events);
             assert_eq!(
@@ -31509,6 +31528,7 @@ pub mod tests {
             amount: 2,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         };
 
         // BUG REGRESSION: must be FALSE — creature A took no excess damage even
@@ -31556,6 +31576,7 @@ pub mod tests {
             amount: 5,
             is_combat: true,
             excess: 3,
+            source_incarnation: None,
         };
         assert!(
             check_trigger_condition(

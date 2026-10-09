@@ -210,6 +210,11 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 122 — PermissionGrantee gains TriggeringSourceController (a cast grant bound to the
+ *      controller of the object that caused the trigger, CR 603.2 + CR 109.4),
+ *      serialized in the ability definitions of GameState; damage events carry
+ *      the source incarnation. A v121 peer cannot deserialize the tag. Wire 104
+ *      moves with it; no lobby frame names it.
  * 121 — GameState's triggered-ability mana ledger records the actual
  *       receiving player alongside the exact trigger definition. A v120 peer
  *       cannot decode a nonempty pair ledger; the exact-match handshake
@@ -755,7 +760,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 121;
+export const PROTOCOL_VERSION = 122;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

@@ -3346,6 +3346,10 @@ mod tests {
         }
     }
 
+    /// `PermissionGrantee` gains `TriggeringSourceController` (a cast grant bound to
+    /// the triggering object's controller, CR 603.2 + CR 109.4), and damage events
+    /// carry the source incarnation (CR 400.7); a v121 peer cannot deserialize
+    /// the tag, so it must be refused before it receives v122 state.
     /// The successful-mana-history ledger now stores the actual receiving
     /// player with each trigger definition. A v120 peer cannot decode a
     /// nonempty pair ledger, so it must be refused before v121 state.
@@ -3468,8 +3472,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_121_for_player_relative_mana_history() {
-        assert_eq!(PROTOCOL_VERSION, 121);
+    fn protocol_version_is_122_for_triggering_source_grantee() {
+        assert_eq!(PROTOCOL_VERSION, 122);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3480,7 +3484,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_121_for_player_relative_mana_history` stays
+    /// `protocol_version_is_122_for_triggering_source_grantee` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

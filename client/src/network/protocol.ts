@@ -106,6 +106,11 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  104 — game_setup and state_update carry GameState, whose cast grants can now
+ *       name the TriggeringSourceController grantee (and whose damage events
+ *       carry the source incarnation). A v103 peer cannot deserialize the
+ *       tag, so first contact rejects the skew. Bumped with full-game
+ *       protocol 122.
  *  103 — game_setup and state_update carry GameState's successful-mana-history
  *       ledger as (trigger definition, receiving player) pairs. A v102 peer
  *       cannot decode a nonempty pair ledger. Bumped with full-game 121.
@@ -599,7 +604,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 103 as const;
+export const WIRE_PROTOCOL_VERSION = 104 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
