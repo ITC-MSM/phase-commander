@@ -1305,6 +1305,21 @@ pub struct SpellCastRecord {
     /// for records built by Default / legacy deserialization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spell_object_id: Option<ObjectId>,
+    /// CR 722.3d: the prepared permanent this spell was cast as a prepare spell
+    /// from (the `GameObject::prepared_copy_source` marker at cast time; CR 722.3c
+    /// and CR 601.2i). `Some` is the cast-time answer to `FilterProp::PrepareSpell`,
+    /// so a negated history query (`FilterProp::Not` / `TargetFilter::Not`) inverts
+    /// the real designation rather than an unknown. `None` for every other spell,
+    /// including Paradigm and cast-a-copy-of-a-card casts (CR 707.12), and for
+    /// legacy payloads. A copy of a prepare spell is a prepare spell (CR 722.3d)
+    /// but is not cast (CR 707.10), so a copy made by a spell never reaches this
+    /// ledger; a copy that is itself cast (the `CopySpell` + `CastFromZone` route)
+    /// keeps the marker, which is correct per CR 722.3d. A live
+    /// candidate projection of the linked copy still waiting in exile also carries
+    /// the marker: that object can only be cast as a prepare spell (CR 722.3c), so
+    /// pre-cast probes and the recorded cast agree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_copy_source: Option<ObjectId>,
 }
 
 /// Snapshot of a land play's cast-capable origin for per-turn history queries.
@@ -1339,6 +1354,7 @@ impl Default for SpellCastRecord {
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
             spell_object_id: None,
+            prepared_copy_source: None,
         }
     }
 }
@@ -1877,6 +1893,12 @@ pub struct ZoneChangeCombatStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttackDeclarationRecord {
     pub object_id: ObjectId,
+    /// CR 400.7: the incarnation that was declared as an attacker. An attack
+    /// trigger that resolves after the attacker left and returned (a blink)
+    /// names this object, not the new one at the same `ObjectId`. `None` on
+    /// legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<u64>,
     pub lki: LKISnapshot,
     /// CR 111.1: Token identity at declaration time.
     #[serde(default)]
@@ -39988,6 +40010,7 @@ mod tests {
             replacement_definitions: std::sync::Arc::default(),
             static_definitions: std::sync::Arc::default(),
             room_halves: None,
+            prepare_face: None,
             name_origin: Default::default(),
         })
     }
@@ -44800,6 +44823,38 @@ mod tests {
         assert!(!none_json.contains("spell_object_id"));
     }
 
+    /// CR 722.3d: the cast-time prepare-spell designation survives a serde round
+    /// trip when present, is omitted when `None` (so every non-prepare record
+    /// serializes byte-identically to the pre-field shape), and a legacy payload
+    /// without the field reads `None`.
+    #[test]
+    fn spell_cast_record_prepared_copy_source_round_trips() {
+        let prepared = SpellCastRecord {
+            spell_object_id: Some(ObjectId(7)),
+            prepared_copy_source: Some(ObjectId(42)),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&prepared).unwrap();
+        assert_eq!(json["prepared_copy_source"], serde_json::json!(42));
+        let round_tripped: SpellCastRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, prepared);
+
+        // `None` is omitted from an ordinary (non-prepare) record's JSON.
+        let ordinary = SpellCastRecord {
+            spell_object_id: Some(ObjectId(7)),
+            ..Default::default()
+        };
+        let ordinary_json = serde_json::to_value(&ordinary).unwrap();
+        assert!(ordinary_json.get("prepared_copy_source").is_none());
+
+        // Legacy payload (field absent) deserializes to `None`.
+        let legacy: SpellCastRecord = serde_json::from_str(
+            r#"{"core_types":["Instant"],"supertypes":[],"subtypes":[],"keywords":[],"colors":[],"mana_value":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.prepared_copy_source, None);
+    }
+
     #[test]
     fn legacy_stack_object_and_resolved_ability_default_cast_occurrence_to_none() {
         let object = crate::game::game_object::GameObject::new(
@@ -44872,6 +44927,7 @@ mod tests {
             cast_variant: CastingVariant::Normal,
             was_kicked: false,
             spell_object_id: None,
+            prepared_copy_source: None,
         };
         let json = serde_json::to_string(&original).unwrap();
         let round_tripped: SpellCastRecord = serde_json::from_str(&json).unwrap();

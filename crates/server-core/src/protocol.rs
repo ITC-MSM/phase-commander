@@ -3346,6 +3346,13 @@ mod tests {
         }
     }
 
+    /// `FilterProp::PrepareSpell` (CR 722.3d), the `scope` field on
+    /// `Effect::BecomePrepared` / `BecomeUnprepared` (CR 722.3a + CR 115.10a),
+    /// `SpellCastRecord::prepared_copy_source`, `CopiableValues::prepare_face`
+    /// and `GameObject::copied_prepare_face` are new in serialized full-game
+    /// state; a v122 peer cannot parse the new `FilterProp` tag and would read a
+    /// mass prepare as a single-target one, so it must be refused before it
+    /// receives v123 state.
     /// `PermissionGrantee` gains `TriggeringSourceController` (a cast grant bound to
     /// the triggering object's controller, CR 603.2 + CR 109.4), and damage events
     /// carry the source incarnation (CR 400.7); a v121 peer cannot deserialize
@@ -3472,8 +3479,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_122_for_triggering_source_grantee() {
-        assert_eq!(PROTOCOL_VERSION, 122);
+    fn protocol_version_is_123_for_prepared_spell_and_mass_prepare() {
+        assert_eq!(PROTOCOL_VERSION, 123);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3484,7 +3491,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_122_for_triggering_source_grantee` stays
+    /// `protocol_version_is_123_for_prepared_spell_and_mass_prepare` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

@@ -11382,6 +11382,18 @@ fn apply_non_priority_pass_action(
             {
                 return Err(EngineError::NotYourPriority);
             }
+            // CR 722.3c + CR 601.2i: the linked prepare-spell copy is cast only
+            // through `CastPreparedCopy`, which unprepares its permanent as the
+            // spell becomes cast; a generic cast of it would skip that.
+            if state
+                .objects
+                .get(&object_id)
+                .is_some_and(effects::prepare::is_linked_prepared_copy)
+            {
+                return Err(EngineError::InvalidAction(
+                    "A prepared copy is cast only through its prepared permanent".to_string(),
+                ));
+            }
             casting::handle_cast_spell_with_payment_mode(
                 state,
                 *player,
@@ -14557,6 +14569,14 @@ fn apply_non_priority_pass_action(
             if obj.back_face.is_none() {
                 return Err(EngineError::InvalidAction(
                     "Card has no back face".to_string(),
+                ));
+            }
+            // CR 701.27c + CR 701.27d: reject what the preflight never offers —
+            // the shared `can_transform` authority — rather than accepting an
+            // action whose transform would do nothing.
+            if !super::transform::can_transform(state, object_id) {
+                return Err(EngineError::InvalidAction(
+                    "This permanent can't transform".to_string(),
                 ));
             }
             super::transform::transform_permanent(state, object_id, &mut events)?;
