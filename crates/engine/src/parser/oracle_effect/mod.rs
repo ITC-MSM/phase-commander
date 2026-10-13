@@ -15,6 +15,7 @@ pub(crate) mod sequence;
 pub(crate) mod subject;
 mod text_change;
 pub(crate) mod token;
+mod zone_change_reflexive;
 
 pub(crate) use search::parse_search_name_reference_suffix;
 
@@ -84,7 +85,7 @@ use nom::combinator::{
     all_consuming, eof, map, map_opt, not, opt, peek, recognize, rest, value, verify,
 };
 use nom::multi::{many0, many1, many_till, separated_list1};
-use nom::sequence::{pair, preceded, terminated};
+use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use super::oracle_nom::bridge::nom_on_lower;
@@ -95,7 +96,7 @@ use super::oracle_nom::filter as nom_filter;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::quantity as nom_quantity;
 use super::oracle_nom::target as nom_target;
-use super::oracle_nom::target::ControllerSubject;
+use super::oracle_nom::target::{controller_phrase_among, ControllerPhrase, ControllerSubject};
 use super::oracle_quantity::{
     parse_event_context_quantity, parse_for_each_clause, parse_for_each_clause_expr_with_context,
     parse_for_each_object_filter_clause_with_context,
@@ -116,21 +117,22 @@ use crate::parser::oracle_effect::subject::parse_subject_application;
 use crate::parser::oracle_ir::diagnostic::{ClauseGapKind, OracleDiagnostic};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AggregateFunction,
-    AttachCardinality, AttachSelection, BounceSelection, CardPlayMode, CardTypeSetSource,
-    CastFromZoneDriver, CastMechanism, CastPermissionConstraint, CastingPermission, ChoiceType,
-    ChooseFromZoneConstraint, Chooser, ChosenGroupId, CombatDamageScope, Comparator, ConjureCard,
-    ConjureSource, ContinuousModification, ControlWindow, ControllerRef, CopyChooseScope,
-    CopyRetargetPermission, CopyScale, DamageModification, DamageSource, DelayedTriggerCondition,
-    DelayedTriggerLifetime, DieResultBranch, DigRestOrder, Duration, Effect, EffectOutcomeSignal,
-    EffectScope, ExtraPhaseRecipient, FilterProp, GameRestriction, GuardReading, GuessSubject,
-    IntensityScope, IterationKindBinding, KeeperConstraint, KeeperCounterMark, LibraryPosition,
-    ManaProduction, ManaSpendPermission, ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec,
-    NameStickerSet, NumberDistinctness, ObjectProperty, ObjectScope, OriginConstraint,
-    PerPlayerScope, PerpetualModification, PlayPermissionInvalidation, PlayerChoiceDistinctness,
-    PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount, PreventionScope,
-    ProhibitedActivity, PropertyAggregate, PtValue, QuantityExpr, QuantityRef,
-    ReciprocalZoneChoiceRole, ReplacementCondition, ReplacementDefinition, ResolutionCastWindow,
-    RestrictionExpiry, RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
+    AttachCardinality, AttachSelection, AttackSubject, BounceSelection, CardPlayMode,
+    CardTypeSetSource, CastFromZoneDriver, CastMechanism, CastPermissionConstraint,
+    CastingPermission, ChoiceType, ChooseFromZoneConstraint, Chooser, ChosenGroupId,
+    CombatDamageScope, CombatHistoryScope, Comparator, ConjureCard, ConjureSource,
+    ContinuousModification, ControlWindow, ControllerRef, CopyChooseScope, CopyRetargetPermission,
+    CopyScale, DamageModification, DamageSource, DelayedTriggerCondition, DelayedTriggerLifetime,
+    DieResultBranch, DigRestOrder, Duration, Effect, EffectOutcomeSignal, EffectScope,
+    ExtraPhaseRecipient, FilterProp, GameRestriction, GuardReading, GuessSubject, IntensityScope,
+    IterationKindBinding, KeeperConstraint, KeeperCounterMark, LibraryPosition, ManaProduction,
+    ManaSpendPermission, ManaTargetRole, MassLibraryShuffleMode, MultiTargetSpec, NameStickerSet,
+    NumberDistinctness, ObjectProperty, ObjectScope, OriginConstraint, PerPlayerScope,
+    PerpetualModification, PlayPermissionInvalidation, PlayerChoiceDistinctness, PlayerFilter,
+    PlayerRelation, PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity,
+    PropertyAggregate, PtValue, QuantityExpr, QuantityRef, ReciprocalZoneChoiceRole,
+    ReplacementCondition, ReplacementDefinition, ResolutionCastWindow, RestrictionExpiry,
+    RestrictionPlayerScope, RevealUntilDisposition, RoundingMode, SharedQuality,
     SharedQualityRelation, SiblingCondition, SkipScope, SpellStackToGraveyardReplacement,
     StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
     TargetFilter, TargetReadOrigin, TargetSelectionMode, ThisWayCause, TrackedAnaphorSource,
@@ -142,7 +144,7 @@ use crate::types::ability::{
 // discriminator moved to `Effect::is_counter_multiplication()`; the child
 // `tests` module still names it through `use super::*`.
 #[cfg(test)]
-use crate::types::ability::{AttackSubject, CombatHistoryScope, DoubleTarget};
+use crate::types::ability::DoubleTarget;
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
 use crate::types::game_state::{NextSpellModifier, RetargetScope};
@@ -3548,10 +3550,10 @@ fn parse_that_player_or_their_permanent(input: &str) -> Option<&str> {
     let (rest, _) = tag::<_, _, OracleError<'_>>("a permanent ")
         .parse(rest)
         .ok()?;
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("that player controls"),
-        tag("controlled by that player"),
-    ))
+    let (rest, _) = controller_phrase_among(&[
+        ControllerPhrase::THAT_PLAYER_CONTROLS,
+        ControllerPhrase::CONTROLLED_BY_THAT_PLAYER,
+    ])
     .parse(rest)
     .ok()?;
     Some(rest)
@@ -5821,7 +5823,12 @@ fn try_parse_that_player_cant_attack_prohibition(tp: TextPair<'_>) -> Option<Par
     // turn" duration are required discriminators. Do not let an incomplete
     // prefix become a broad blanket attack ban.
     if let Some((defended, remaining)) = nom_on_lower(tp.original, tp.lower, |input| {
-        let (input, _) = tag("creatures that player controls ").parse(input)?;
+        let (input, _) = (
+            tag("creatures "),
+            controller_phrase_among(&[ControllerPhrase::THAT_PLAYER_CONTROLS]),
+            tag(" "),
+        )
+            .parse(input)?;
         let (input, _) =
             preceded(alt((tag("can't"), tag("cannot"))), tag(" attack")).parse(input)?;
         let (input, defended) = parse_cant_attack_defended_scope_nom(input)?;
@@ -11729,6 +11736,15 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return parsed_clause(effect);
     }
 
+    // Digital-only Alchemy: "<subject> perpetually gains your choice of A, B, or
+    // C" (Smogbelcher Chariot). No arm models a resolution-time choice among
+    // PERPETUAL keyword grants; without this gap the subject-predicate path
+    // reads "perpetually" as part of the subject and lowers the choice to an
+    // until-end-of-turn grant. Fail closed.
+    if let Some(effect) = perpetual_gain_choice_gap(tp) {
+        return parsed_clause(effect);
+    }
+
     // Digital-only Alchemy: "draft a card from [X]'s spellbook [+ destination]".
     if let Some(effect) = try_parse_spellbook_draft(tp) {
         return parsed_clause(effect);
@@ -12268,6 +12284,31 @@ fn parse_zone_list_tail(input: &str) -> OracleResult<'_, ()> {
 /// filter as a stack target slot, so the resolver would edit the one chosen card
 /// instead of every matching card. They stay honest-red until the effect can
 /// express an untargeted population.
+/// A "<subject> perpetually gain(s) your choice of …" clause: a resolution-time
+/// choice among perpetual keyword grants, which no arm models. Recorded as a gap
+/// so the clause is never lowered to an until-end-of-turn keyword choice.
+fn perpetual_gain_choice_gap(tp: TextPair) -> Option<Effect> {
+    let (rest, subject) = take_until::<_, _, OracleError<'_>>(" perpetually gain")
+        .parse(tp.lower)
+        .ok()?;
+    // A quote in the subject means the verb sits inside a quoted (granted)
+    // ability, whose own parse owns it.
+    let (unquoted, _) = take_till::<_, _, OracleError<'_>>(|c| c == '"')
+        .parse(subject)
+        .ok()?;
+    if !unquoted.is_empty() {
+        return None;
+    }
+    (
+        tag::<_, _, OracleError<'_>>(" perpetually gain"),
+        alt((tag("s "), tag(" "))),
+        tag("your choice of "),
+    )
+        .parse(rest)
+        .ok()?;
+    Some(Effect::unimplemented("perpetual_gain_choice", tp.original))
+}
+
 fn perpetual_modify_pt_gap(tp: TextPair) -> Option<Effect> {
     let (subject, rest) = split_perpetual_get_clause(tp.lower)?;
     // Chain-splitter / subject-binder shapes keep their own handling.
@@ -17041,7 +17082,12 @@ fn balance_filter_scoped_player(filter: &TargetFilter) -> TargetFilter {
 fn parse_balance_arm_b(input: &str) -> OracleResult<'_, (EqualizeVerb, TargetFilter)> {
     let (input, _) = tag("each player chooses a number of ").parse(input)?;
     let (input, filter) = super::oracle_nom::target::parse_type_phrase(input)?;
-    let (input, _) = tag(" they control equal to ").parse(input)?;
+    let (input, _) = delimited(
+        tag(" "),
+        controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+        tag(" equal to "),
+    )
+    .parse(input)?;
     // CR 107.1b: the min-quantity phrase MUST parse to the equalization shape
     // (`ControlledByEachPlayer { aggregate: Min, .. }` — "the number of [type]
     // controlled by the player who controls the fewest"). The parsed ref is
@@ -17263,24 +17309,32 @@ fn parse_keeper_dispose_head(input: &str) -> OracleResult<'_, KeeperDisposeHead>
 
     let (rest, filter) = nom_target::parse_type_phrase(rest)?;
 
-    // Recognized for its POSITION, not for a payload — which is why this
-    // production is a bare `alt` and carries no typed value. Nothing downstream
-    // could read one: both lowerings leave the emitted keeper filter's
-    // `controller` unset and carry the seat on the clause's player scope
-    // instead, and the per-seat eligibility is enforced at resolution by
+    // Recognized for its POSITION, not for a payload — which is why this reads
+    // the controller-phrase grammar (`nom_target::parse_controller_phrase`)
+    // through its recognize-only projection, `controller_phrase_among`, which
+    // carries no typed value. Nothing downstream could read one: both lowerings
+    // leave the emitted keeper filter's `controller` unset and carry the seat on
+    // the clause's player scope instead, and the per-seat eligibility is
+    // enforced at resolution by
     // `choose_and_sacrifice_rest.rs::compute_eligible_creatures`, whose
     // `obj.controller == player` test scopes each seat's choice to its own
-    // permanents whether or not the line prints this clause. The spellings are
-    // deliberately NOT routed through `nom_target::parse_controller_suffix` —
-    // that is the authority for `ControllerRef`-valued suffixes and accepts
-    // neither of them, and binding one here would bind the domain to the
+    // permanents whether or not the line prints this clause. The binding
+    // projection `nom_target::parse_controller_suffix` is the wrong reader: it
+    // declines both anaphors, and binding one here would bind the domain to the
     // SPELL's controller rather than to each nominating seat.
     //
     // What this production does contribute is the ADJACENCY the disposal tail
     // must follow: `keeper_dispose_head_recognizes_the_control_clause_positionally`
     // pins that both spellings and their absence parse, and that an unmodelled
     // possessive between the domain and the connector declines.
-    let (rest, _) = opt(alt((tag(" they control"), tag(" that player controls")))).parse(rest)?;
+    let (rest, _) = opt(preceded(
+        tag(" "),
+        controller_phrase_among(&[
+            ControllerPhrase::THEY_CONTROL,
+            ControllerPhrase::THAT_PLAYER_CONTROLS,
+        ]),
+    ))
+    .parse(rest)?;
     let keeper_end = offset(rest);
 
     let (rest, connector) = alt((
@@ -17967,12 +18021,22 @@ fn parse_threshold_land_balance_ir(
             let (input, sacrifice_threshold) = nom_primitives::parse_number.parse(input)?;
             let (input, _) = tag(" or more lands chooses ").parse(input)?;
             let (input, keep_count) = nom_primitives::parse_number.parse(input)?;
-            let (input, _) = tag(" lands they control and sacrifices the rest. ").parse(input)?;
+            let (input, _) = (
+                tag(" lands "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+                tag(" and sacrifices the rest. "),
+            )
+                .parse(input)?;
             let (input, _) = tag("each player who controls ").parse(input)?;
             let (input, search_threshold) = nom_primitives::parse_number.parse(input)?;
             let (input, _) = tag(" or fewer lands may search their library for up to x basic land cards and put them onto the battlefield, where x is ").parse(input)?;
             let (input, x_base) = nom_primitives::parse_number.parse(input)?;
-            let (input, _) = tag(" minus the number of lands they control. then each player who searched their library this way shuffles").parse(input)?;
+            let (input, _) = (
+                tag(" minus the number of lands "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+                tag(". then each player who searched their library this way shuffles"),
+            )
+                .parse(input)?;
             let (input, _) = opt(tag(".")).parse(input)?;
             let (input, _) = eof.parse(input)?;
             Ok((
@@ -21733,9 +21797,10 @@ enum PossessiveRelation {
 /// Strip a trailing ANAPHORIC possessive from a compound damage subject's object
 /// conjunct, returning the bare object phrase and the relation it binds.
 ///
-/// Suffix-anchored rather than scanned (the `strip_trailing_duration` idiom): the
-/// possessive closes the phrase, so `take_until` locating it is a position
-/// computation, not a substring dispatch. One `alt` per axis — the relation — and
+/// Suffix-anchored (the `strip_trailing_duration` idiom): the possessive closes the
+/// phrase, so locating it — `take_until`, or a word-bounded `many_till` scan of the
+/// controller-phrase projection for "they control" — is a position computation, not
+/// a substring dispatch. One `alt` per axis — the relation — and
 /// the whole suffix must close the phrase, which is what makes this a gate rather
 /// than a probe.
 ///
@@ -21745,8 +21810,20 @@ enum PossessiveRelation {
 fn parse_anaphoric_possessive_suffix(phrase: &str) -> Option<(&str, PossessiveRelation)> {
     let mut suffix = alt((
         pair(
-            take_until::<_, _, OracleError<'_>>(" they control"),
-            value(PossessiveRelation::Controls, tag(" they control")),
+            recognize(many_till(
+                anychar,
+                peek(preceded(
+                    tag(" "),
+                    controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+                )),
+            )),
+            value(
+                PossessiveRelation::Controls,
+                preceded(
+                    tag(" "),
+                    controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+                ),
+            ),
         ),
         pair(
             take_until(" those players control"),
@@ -23549,7 +23626,9 @@ struct CompoundSubjectPrefix {
 /// CR 109.5 + CR 115.1: Second-subject axis of a static compound-subject prefix —
 /// the recipient named after "you and " / "~ and " and before " each ". Shared with
 /// the clause chunker (`remainder_trimmed_starts_with_compound_subject_each`) so
-/// its no-split guard and this distributor recognize the same forms.
+/// its no-split guard and this distributor recognize the same forms: "that
+/// player", "that opponent", "target opponent", "the attacking player", "target
+/// player", "that creature", "[the] defending player" and "those players".
 fn parse_static_compound_second_subject(lower: &str) -> OracleResult<'_, TargetFilter> {
     alt((
         value(
@@ -23560,6 +23639,15 @@ fn parse_static_compound_second_subject(lower: &str) -> OracleResult<'_, TargetF
             TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
             tag("target opponent each "),
         ),
+        // CR 608.2c: "that opponent" is the same anaphor as "that player",
+        // narrowed by its noun.
+        value(TargetFilter::ScopedPlayer, tag("that opponent each ")),
+        // CR 508.1 + CR 603.2: "the attacking player" is the player of the
+        // triggering attack event (Karazikar, the Eye Tyrant).
+        value(
+            TargetFilter::TriggeringPlayer,
+            tag("the attacking player each "),
+        ),
         value(TargetFilter::Player, tag("target player each ")),
         value(TargetFilter::ParentTarget, tag("that creature each ")),
         // CR 508.5: the defending player of the source's attack (Cait, Cage
@@ -23567,6 +23655,18 @@ fn parse_static_compound_second_subject(lower: &str) -> OracleResult<'_, TargetF
         value(
             TargetFilter::DefendingPlayer,
             (opt(tag("the ")), tag("defending player each ")),
+        ),
+        // CR 508.6: "those players" of an attack head — the players the event's
+        // matching attackers attacked (Zurzoth, Chaos Rider). Bound only by the
+        // coordinated channel under the head's `DefendingPlayer` antecedent.
+        value(
+            TargetFilter::PlayerMatching {
+                player: Box::new(PlayerFilter::OpponentAttacked {
+                    subject: AttackSubject::EventAttackers,
+                    scope: CombatHistoryScope::ThisCombat,
+                }),
+            },
+            tag("those players each "),
         ),
     ))
     .parse(lower)
@@ -23704,6 +23804,18 @@ fn try_parse_shared_equal_to_quantity_compound(
     })
 }
 
+/// CR 109.5 + CR 608.2c + CR 608.2e: "<A> and <B> each <body>". Two paths:
+///
+/// - **The coordinated player set.** When A is "you" and
+///   `coordinated_player_member` names B, the body is parsed once and every link
+///   is scoped to `AnyOf[Controller, member]` (`bind_coordinated_player_set`).
+/// - **The halves fallback.** Every other prefix keeps the two-halves shape (the
+///   body cloned per conjunct with its recipient rewritten): members no
+///   `PlayerFilter` names (a vote-body "that player", `EnchantedPlayer`), a
+///   targeted conjunct after an earlier player-capable slot, a body that already
+///   carries its own `player_scope`, and the object axis ("~ and", "it and"). A
+///   set conjunct ("those players") never takes it: when the channel declines
+///   it, the clause stays the `unbound_subject` gap.
 fn try_parse_compound_subject_each(
     text: &str,
     ctx: &mut ParseContext,
@@ -23718,6 +23830,73 @@ fn try_parse_compound_subject_each(
         second: second_filter,
         declares_target,
     } = parse_compound_subject_prefix(lower.as_str())?;
+
+    // CR 109.5 + CR 608.2c: "you and <player> each <body>" names a coordinated
+    // player set when the mapper names the second conjunct. Computed from the
+    // conjunct as parsed, before the #6381 shadowing below (fallback only).
+    let member = (first_filter == TargetFilter::OriginalController)
+        .then(|| coordinated_player_member(&second_filter, ctx))
+        .flatten();
+    // CR 608.2c: "the other" inside the body names the other member of the pair,
+    // which no set member can express. Fail closed rather than let the body
+    // widen (Twist Allegiance's "the other controls").
+    if member.is_some()
+        && nom_primitives::scan_at_word_boundaries(lower[consumed_prefix..].trim(), |i| {
+            terminated(
+                tag::<_, _, OracleError<'_>>("the other"),
+                not(satisfy(|c: char| c.is_alphanumeric())),
+            )
+            .parse(i)
+        })
+        .is_some()
+    {
+        return Some(parsed_clause(Effect::unimplemented(
+            "coordinated_other_player",
+            text,
+        )));
+    }
+
+    // Slice the original-case body text using the consumed offset.
+    let body_text = text[consumed_prefix..].trim();
+    if body_text.is_empty() {
+        return None;
+    }
+
+    // Parse the body once. Re-using `parse_effect_chain_with_context`
+    // composes the existing body parser surface (Token, Draw, etc.).
+    // Throwaway (`ChosenColorQualifierScope` rule 1) — the parsed body is
+    // kept, `body_ctx` is dropped.
+    let mut body_ctx = ctx.clone_throwaway();
+    let parsed_body = parse_effect_chain_with_context(body_text, AbilityKind::Spell, &mut body_ctx);
+
+    // A body that already carries its own iteration scope is refused by the
+    // channel, so the set never overwrites that scope; it takes the halves path.
+    if let Some(member) = member.filter(|_| {
+        std::iter::successors(Some(&parsed_body), |link| link.sub_ability.as_deref())
+            .all(|link| link.player_scope.is_none())
+    }) {
+        // CR 115.1 + CR 601.2c: a targeted conjunct announces its player target
+        // through a `TargetOnly` head; a possessive actor announces its object.
+        let head = declares_target
+            .or_else(|| is_targeted_player_conjunct(&second_filter).then(|| second_filter.clone()));
+        return Some(bind_coordinated_player_set(
+            parsed_body,
+            member,
+            head,
+            text,
+            ctx,
+        ));
+    }
+
+    // CR 508.6: "those players" names a player SET; only the coordinated channel
+    // carries it. A conjunct the channel declined stays the unbound gap and never
+    // reaches the halves rewrite, which would bind the set as one recipient.
+    if matches!(second_filter, TargetFilter::PlayerMatching { .. }) {
+        return Some(parsed_clause(Effect::unimplemented(
+            subject::UNBOUND_SUBJECT_GAP,
+            text,
+        )));
+    }
 
     // CR 109.4 + CR 608.2c (issue #6381): "that player" in "you and that
     // player each ..." is ambiguous prose with two distinct antecedents. The
@@ -23742,19 +23921,6 @@ fn try_parse_compound_subject_each(
         }
         _ => second_filter,
     };
-
-    // Slice the original-case body text using the consumed offset.
-    let body_text = text[consumed_prefix..].trim();
-    if body_text.is_empty() {
-        return None;
-    }
-
-    // Parse the body once. Re-using `parse_effect_chain_with_context`
-    // composes the existing body parser surface (Token, Draw, etc.).
-    // Throwaway (`ChosenColorQualifierScope` rule 1) — the parsed body is
-    // kept, `body_ctx` is dropped.
-    let mut body_ctx = ctx.clone_throwaway();
-    let parsed_body = parse_effect_chain_with_context(body_text, AbilityKind::Spell, &mut body_ctx);
 
     // Reject Unimplemented bodies — distribution is meaningless when the body
     // didn't parse, and the caller's fallback (Unimplemented + diagnostic)
@@ -23824,6 +23990,74 @@ fn try_parse_compound_subject_each(
         optional: false,
         unless_pay: None,
     })
+}
+
+/// CR 608.2c + CR 608.2e: Bind a parsed coordinated body to the player set
+/// `AnyOf[Controller, member]`; each seat performs the body for itself.
+///
+/// - A body gap surfaces the body's own gap name over the whole clause: the
+///   subject is bound, the verb is the gap.
+/// - A body whose per-seat processing is observable fails closed
+///   (`seat_order_is_unobservable`).
+/// - Every link's implicit recipient becomes the seat
+///   (`rebind_subject_only_body_recipient`) and every link carries the set.
+/// - CR 115.1 + CR 601.2c: with a `head`, the clause is a `TargetOnly` head over
+///   the scoped body. CR 608.2b: the existing fizzle check owns an illegal sole
+///   target. Without a head, the clause root's scope rides
+///   `ctx.pending_player_scope` to the chunk fold; an earlier different value on
+///   entry declines to the unbound gap, and an equal one is this chunk's own
+///   earlier parse.
+fn bind_coordinated_player_set(
+    mut body: AbilityDefinition,
+    member: PlayerFilter,
+    head: Option<TargetFilter>,
+    clause_text: &str,
+    ctx: &mut ParseContext,
+) -> ParsedEffectClause {
+    if let Effect::Unimplemented { name, .. } = &*body.effect {
+        return parsed_clause(Effect::unimplemented(name.clone(), clause_text));
+    }
+    if !seat_order_is_unobservable(&body) {
+        return parsed_clause(Effect::unimplemented(
+            subject::UNBOUND_SUBJECT_GAP,
+            clause_text,
+        ));
+    }
+    let set = PlayerFilter::AnyOf {
+        filters: vec![PlayerFilter::Controller, member],
+    };
+    if head.is_none()
+        && ctx
+            .pending_player_scope
+            .as_ref()
+            .is_some_and(|pending| *pending != set)
+    {
+        return parsed_clause(Effect::unimplemented(
+            subject::UNBOUND_SUBJECT_GAP,
+            clause_text,
+        ));
+    }
+    let mut cursor = Some(&mut body);
+    while let Some(link) = cursor {
+        rebind_subject_only_body_recipient(&mut link.effect);
+        link.player_scope = Some(set.clone());
+        cursor = link.sub_ability.as_deref_mut();
+    }
+    match head {
+        Some(target) => ParsedEffectClause {
+            sub_ability: Some(Box::new(body)),
+            ..parsed_clause(Effect::TargetOnly { target })
+        },
+        None => {
+            ctx.pending_player_scope = Some(set);
+            ParsedEffectClause {
+                duration: body.duration,
+                sub_ability: body.sub_ability,
+                condition: body.condition,
+                ..parsed_clause(*body.effect)
+            }
+        }
+    }
 }
 
 /// CR 109.5 + CR 115.1: Rewrite the recipient slot on EVERY link of an
@@ -27463,6 +27697,125 @@ fn player_scope_from_parent_target_subject(affected: &TargetFilter) -> Option<Pl
         TargetFilter::ParentTargetOwner => Some(PlayerFilter::ParentObjectTargetOwner),
         _ => None,
     }
+}
+
+/// CR 109.5 + CR 115.1 + CR 608.2c: The single authority mapping the second
+/// conjunct of "you and <conjunct> each <body>" to the `PlayerFilter` member of
+/// the coordinated set `AnyOf[Controller, member]` ("you" is the `Controller`
+/// member, CR 109.5). `None` means no `PlayerFilter` names that player in this
+/// context, and the caller keeps the halves fallback's verdict.
+fn coordinated_player_member(second: &TargetFilter, ctx: &ParseContext) -> Option<PlayerFilter> {
+    match second {
+        targeted if is_targeted_player_conjunct(targeted) => {
+            // CR 608.2b + CR 115.1: the member must name the head's own declared
+            // player, and the positional read cannot tell that slot from an
+            // earlier player slot of the chain once the head's slot is illegal.
+            // Decline whenever the chain may hold such a slot: an earlier slot
+            // that does not provably name battlefield objects, an indeterminate
+            // registry, or a player the chain already declared.
+            let earlier_slots_name_only_objects = matches!(
+                &ctx.chain_declared_slots,
+                DeclaredSlotRegistry::Known(entries)
+                    if entries.iter().all(|entry| entry.filter.denotes_battlefield_objects())
+            );
+            (earlier_slots_name_only_objects && ctx.declared_player_scope.is_none())
+                .then_some(PlayerFilter::TargetPlayer)
+        }
+        TargetFilter::ScopedPlayer => {
+            // CR 608.2c: once the chain has declared a player, that player is the
+            // nearer antecedent of the subject "that player" (the analogous
+            // "that player controls" precedence in `oracle_target.rs` reads
+            // `declared_player_scope` before `relative_player_scope`). The set
+            // cannot name it, so decline rather than bind the relative antecedent.
+            if ctx.declared_player_scope.is_some() {
+                return None;
+            }
+            match ctx.relative_player_scope.as_ref()? {
+                ControllerRef::TriggeringPlayer => Some(PlayerFilter::TriggeringPlayer),
+                ControllerRef::ChosenPlayer { index } => {
+                    Some(PlayerFilter::ChosenPlayer { index: *index })
+                }
+                ControllerRef::DefendingPlayer => Some(PlayerFilter::DefendingPlayer),
+                ControllerRef::TargetPlayer => Some(PlayerFilter::TargetPlayer),
+                ControllerRef::ParentTargetController => {
+                    Some(PlayerFilter::ParentObjectTargetController)
+                }
+                ControllerRef::You
+                | ControllerRef::Opponent
+                | ControllerRef::ScopedPlayer
+                | ControllerRef::TargetOpponent
+                | ControllerRef::EventTargetController
+                | ControllerRef::ParentTargetOwner
+                | ControllerRef::SourceChosenPlayer
+                | ControllerRef::EnchantedPlayer
+                | ControllerRef::ActivePlayer
+                | ControllerRef::SpecificPlayer { .. }
+                | ControllerRef::DeclaredPlayer { .. } => None,
+            }
+        }
+        TargetFilter::TriggeringPlayer => Some(PlayerFilter::TriggeringPlayer),
+        TargetFilter::DefendingPlayer => Some(PlayerFilter::DefendingPlayer),
+        // CR 508.6: "those players" names the attacked players only inside an
+        // attack trigger — the head's `DefendingPlayer` antecedent.
+        TargetFilter::PlayerMatching { player } => matches!(
+            ctx.relative_player_scope,
+            Some(ControllerRef::DefendingPlayer)
+        )
+        .then(|| player.as_ref().clone()),
+        possessive => player_scope_from_parent_target_subject(possessive),
+    }
+}
+
+/// CR 115.1: True for the two conjuncts that declare their own player target
+/// ("target player", "target opponent" — the grammar's exact values). Shared by
+/// the member mapping and the `TargetOnly` head rule so both read one decision.
+fn is_targeted_player_conjunct(second: &TargetFilter) -> bool {
+    match second {
+        TargetFilter::Player => true,
+        TargetFilter::Typed(filter) => {
+            *filter == TypedFilter::default().controller(ControllerRef::Opponent)
+        }
+        _ => false,
+    }
+}
+
+/// CR 101.4 + CR 101.4a + CR 101.4b + CR 608.2e: True when a coordinated body may
+/// run seat by seat without the deviation being observable. When several players
+/// make choices for one instruction, each chooses in APNAP order and then the
+/// actions happen simultaneously; the `player_scope` driver instead resolves the
+/// whole body for one seat before prompting the next, so a body that pairs a
+/// choice with any other link is observable: one seat's choice lands before
+/// another seat's earlier link has run, or after another seat's later link has
+/// run. Fail-closed allowlist: any link kind not shown unobservable returns
+/// `false`.
+fn seat_order_is_unobservable(body: &AbilityDefinition) -> bool {
+    let lone_link = body.sub_ability.is_none();
+    std::iter::successors(Some(body), |link| link.sub_ability.as_deref()).all(|link| {
+        match &*link.effect {
+            // Links that ask their seat no choice. CR 701.17a: mill; CR 705.1:
+            // a coin flip.
+            Effect::Draw { .. }
+            | Effect::GainLife { .. }
+            | Effect::LoseLife { .. }
+            | Effect::Token { .. }
+            | Effect::Mill { .. }
+            | Effect::FlipCoin { .. }
+            | Effect::RevealTop { .. } => true,
+            // CR 701.9b: a random discard asks no choice.
+            Effect::Discard { selection, .. } => selection.is_random(),
+            // CR 101.4 + CR 608.2e: a lone choice is the seat's whole action, so
+            // recording it seat by seat is the APNAP choice sequence; a secret
+            // number stays private until revealed. Any other link in the body
+            // would run for one seat between another seat's choice and its own
+            // (before or after it).
+            Effect::Choose { .. } => lone_link,
+            // CR 101.4 + CR 701.21a: a lone scoped sacrifice takes the driver's
+            // coordinator, which announces every seat's choice in APNAP order
+            // before any permanent is sacrificed.
+            Effect::Sacrifice { .. } => lone_link,
+            _ => false,
+        }
+    })
 }
 
 /// CR 608.2c + CR 108.3: When an immediately preceding owner-subject clause
@@ -38402,7 +38755,13 @@ pub(crate) fn parse_each_player_copy_chosen_ir(
     // the shared type-phrase parser so any object class (not just "creature") is
     // supported.
     let (i, noun) = alt((
-        take_until::<_, _, OracleError<'_>>(" they control"),
+        recognize(many_till(
+            anychar,
+            peek(preceded(
+                tag::<_, _, OracleError<'_>>(" "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+            )),
+        )),
         take_until::<_, _, OracleError<'_>>(" controlled by "),
     ))
     .parse(i)
@@ -38416,7 +38775,10 @@ pub(crate) fn parse_each_player_copy_chosen_ir(
     let (i, choose_scope) = alt((
         value(
             CopyChooseScope::Chooser,
-            tag::<_, _, OracleError<'_>>(" they control"),
+            preceded(
+                tag::<_, _, OracleError<'_>>(" "),
+                controller_phrase_among(&[ControllerPhrase::THEY_CONTROL]),
+            ),
         ),
         map(
             preceded(
@@ -41937,7 +42299,7 @@ fn parse_effect_chain_ir_body(
         } else {
             None
         };
-        let (if_you_do, text, deferred_when_you_do_guard, reflexive_guard_route) =
+        let (if_you_do, text, deferred_when_you_do_guard, reflexive_guard_route, zone_change_head) =
             if let Some(remainder) = reveal_gate {
                 // CR 603.12 + CR 701.20a: the reflexive's trigger event is the
                 // reveal-until's until-condition, so its creation gate carries the
@@ -41951,21 +42313,30 @@ fn parse_effect_chain_ir_body(
                     remainder,
                     None,
                     None,
+                    None,
                 )
             } else if condition.is_none() {
                 match strip_if_you_do_conditional_with_context(&text, ctx) {
                     conditions::ReflexiveConditionalStrip::Parsed {
                         condition,
                         guard_route,
+                        zone_change_head,
                         remainder,
-                    } => (condition, remainder, None, guard_route),
+                    } => (condition, remainder, None, guard_route, zone_change_head),
                     conditions::ReflexiveConditionalStrip::DeferredWhenYouDoGuard {
                         condition,
+                        zone_change_head,
                         remainder,
-                    } => (Some(condition.clone()), remainder, Some(condition), None),
+                    } => (
+                        Some(condition.clone()),
+                        remainder,
+                        Some(condition),
+                        None,
+                        zone_change_head,
+                    ),
                 }
             } else {
-                (None, text, None, None)
+                (None, text, None, None, None)
             };
         // CR 603.12 + CR 608.2c: a `When you do, if <guard>, <body>` guard is
         // stamped on the reflexive body exactly as a leading general conditional
@@ -42179,6 +42550,23 @@ fn parse_effect_chain_ir_body(
         // optional-clause fallback can erase the guard and lower an
         // unconditional reflexive body.
         if deferred_when_you_do_guard.is_some() && guard_condition.is_none() {
+            unimplemented_clause(
+                &mut builder,
+                "when_you_do_guard",
+                normalized_text,
+                chunk.boundary_after,
+            );
+            continue;
+        }
+        // CR 603.12 + CR 603.4: a zone-change guard cannot be a reflexive's
+        // intervening "if" (see `AbilityCondition::zone_changed_this_way_head`).
+        if if_you_do
+            .as_ref()
+            .is_some_and(AbilityCondition::has_when_you_do_marker)
+            && guard_condition
+                .as_ref()
+                .is_some_and(AbilityCondition::has_root_zone_changed_this_way)
+        {
             unimplemented_clause(
                 &mut builder,
                 "when_you_do_guard",
@@ -43813,12 +44201,13 @@ fn parse_effect_chain_ir_body(
             }
         }
         lift_distributive_exile_top_scope(&mut clause.effect, &mut player_scope);
-        // CR 608.2c + CR 109.4: Fold a pending player-scope lifted from a
-        // fieldless subject-predicate (`Effect::Investigate` — "That player
-        // investigates", Declaration in Stone) into this chunk's `player_scope`.
-        // `lower_subject_predicate_ast` stamps `ctx.pending_player_scope` because
-        // the effect has no player field for the subject; here it becomes the
-        // chunk's `AbilityDefinition.player_scope`. Take() so it is consumed
+        // CR 608.2c + CR 109.4: Fold a pending player-scope lifted from a subject
+        // the clause cannot carry into this chunk's `player_scope`: a fieldless
+        // subject-predicate (`Effect::Investigate` — "That player investigates",
+        // Declaration in Stone, stamped by `lower_subject_predicate_ast`) or the
+        // coordinated player set's root ("you and that player each …", stamped by
+        // `bind_coordinated_player_set`). Here it becomes the chunk's
+        // `AbilityDefinition.player_scope`. Take() so it is consumed
         // within this chunk and cannot leak to a later one; a pre-existing scope
         // (e.g. a leading "each opponent") wins.
         if let Some(scope) = ctx.pending_player_scope.take() {
@@ -45040,9 +45429,28 @@ fn parse_effect_chain_ir_body(
         // was rebound to `Power{Source}` (the spell, power 0). Restore it to
         // `Anaphoric` so the runtime reads the entering creature's power via the
         // trigger-event-source slot. Gated to `ZoneChangedThisWay` so a true
-        // self-reference clause is untouched.
-        if matches!(condition, Some(AbilityCondition::ZoneChangedThisWay { .. })) {
+        // self-reference clause is untouched. A "When … this way" head reaches
+        // here as the reflexive creation gate carrying that zone change.
+        if condition
+            .as_ref()
+            .and_then(AbilityCondition::zone_changed_this_way_head)
+            .is_some()
+        {
             restore_this_way_trigger_anaphor(&mut clause.effect);
+        }
+        // CR 603.12 + CR 608.2c: a "When <zone change> this way" reflexive is
+        // supported only when its gate reads the instruction that performed the
+        // zone change and its body's object reference reaches the stack object.
+        if let Some(gap) = zone_change_reflexive::unsupported_zone_change_reflexive(
+            condition.as_ref(),
+            zone_change_head,
+            &clause.effect,
+            &text_lower,
+            player_scope.as_ref(),
+            builder.clauses(),
+        ) {
+            unimplemented_clause(&mut builder, gap, normalized_text, chunk.boundary_after);
+            continue;
         }
 
         // CR 614.1a + CR 614.6: LAST RESORT for an "instead" override whose
@@ -49969,6 +50377,217 @@ mod exile_graveyard_origin_shape {
                 (scalar, original, original_rem),
                 "{operand}"
             );
+        }
+    }
+}
+
+/// Structural-marker sites recognize a controller phrase without binding it: the
+/// enclosing construct fixes whose objects are meant. Each test pins the site's
+/// admitted phrase set: every admitted phrase is accepted in its construct, and
+/// every other controller phrase at the same position keeps the result the
+/// literal alternatives gave.
+#[cfg(test)]
+mod structural_marker_tests {
+    use super::*;
+
+    #[test]
+    fn that_player_or_their_permanent_marker() {
+        let tail = ", ~ deals double that damage instead";
+        for admitted in ["that player controls", "controlled by that player"] {
+            assert_eq!(
+                parse_that_player_or_their_permanent(&format!(
+                    "that player or a permanent {admitted}{tail}"
+                )),
+                Some(tail),
+                "{admitted:?}"
+            );
+        }
+        for declined in ["they control", "you control", "the chosen player controls"] {
+            assert_eq!(
+                parse_that_player_or_their_permanent(&format!(
+                    "that player or a permanent {declined}{tail}"
+                )),
+                None,
+                "{declined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cant_attack_bounded_subject_marker() {
+        let parse = |subject: &str| {
+            let text = format!("creatures {subject} can't attack you until your next turn");
+            let lower = text.to_lowercase();
+            try_parse_that_player_cant_attack_prohibition(TextPair::new(&text, &lower))
+        };
+        let clause = parse("that player controls").expect("bounded form");
+        assert!(matches!(
+            clause.effect,
+            Effect::AddRestriction {
+                restriction: GameRestriction::ProhibitActivity {
+                    affected_players: RestrictionPlayerScope::ScopedPlayer,
+                    ..
+                },
+            }
+        ));
+        for declined in [
+            "they control",
+            "you control",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(parse(declined).is_none(), "{declined:?}");
+        }
+    }
+
+    #[test]
+    fn balance_arm_b_marker() {
+        let parse = |controller: &str| {
+            parse_balance_arm_b(&format!(
+                "each player chooses a number of lands {controller} equal to the number of \
+                 lands controlled by the player who controls the fewest, then sacrifices the rest"
+            ))
+            .ok()
+            .map(|(rest, (verb, _))| (rest.to_string(), verb))
+        };
+        assert_eq!(
+            parse("they control"),
+            Some((String::new(), EqualizeVerb::Sacrifice))
+        );
+        for declined in [
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(parse(declined).is_none(), "{declined:?}");
+        }
+        // "you control" never reaches the marker: `parse_type_phrase` consumes it
+        // as the type phrase's own controller suffix, and the marker then sees
+        // " equal to". Pinned, not counted as the marker declining it.
+        assert!(parse("you control").is_none());
+    }
+
+    #[test]
+    fn keeper_dispose_head_marker() {
+        let parse = |controller: &str| {
+            parse_keeper_dispose_head(&format!(
+                "each player chooses three permanents {controller}, then sacrifices the rest."
+            ))
+            .ok()
+            .map(|(_, head)| head)
+        };
+        for admitted in ["they control", "that player controls"] {
+            let head = parse(admitted).expect("keeper head");
+            assert_eq!(
+                head.keeper_end,
+                format!("each player chooses three permanents {admitted}").len(),
+                "{admitted:?}"
+            );
+            let TargetFilter::Typed(filter) = &head.filter else {
+                panic!("typed keeper filter: {:?}", head.filter)
+            };
+            assert_eq!(filter.controller, None, "{admitted:?}");
+        }
+        for declined in ["controlled by that player", "the chosen player controls"] {
+            assert!(parse(declined).is_none(), "{declined:?}");
+        }
+        // "you control" never reaches the marker: `parse_type_phrase` consumes it
+        // as the type phrase's own controller suffix. Pinned, not counted as the
+        // marker declining it.
+        let head = parse("you control").expect("type phrase takes the suffix");
+        let TargetFilter::Typed(filter) = &head.filter else {
+            panic!("typed keeper filter: {:?}", head.filter)
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::You));
+        assert_eq!(
+            head.keeper_end,
+            "each player chooses three permanents you control".len()
+        );
+    }
+
+    #[test]
+    fn threshold_land_balance_marker() {
+        let parse = |keep: &str, count: &str| {
+            parse_threshold_land_balance_ir(
+                &format!(
+                    "Each player who controls 7 or more lands chooses 4 lands {keep} and \
+                     sacrifices the rest. Each player who controls 3 or fewer lands may search \
+                     their library for up to X basic land cards and put them onto the \
+                     battlefield, where X is 6 minus the number of lands {count}. Then each \
+                     player who searched their library this way shuffles."
+                ),
+                AbilityKind::Spell,
+                &ParseContext::default(),
+            )
+        };
+        assert!(parse("they control", "they control").is_some());
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(
+                parse(declined, "they control").is_none(),
+                "keeper {declined:?}"
+            );
+            assert!(
+                parse("they control", declined).is_none(),
+                "count {declined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anaphoric_possessive_suffix_marker() {
+        assert_eq!(
+            parse_anaphoric_possessive_suffix("each creature and planeswalker they control"),
+            Some((
+                "each creature and planeswalker",
+                PossessiveRelation::Controls
+            ))
+        );
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert_eq!(
+                parse_anaphoric_possessive_suffix(&format!("each creature {declined}")),
+                None,
+                "{declined:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_chosen_scope_marker() {
+        let parse = |controller: &str| {
+            parse_each_player_copy_chosen_ir(
+                &format!(
+                    "Each player chooses a creature {controller}. Each player creates a token \
+                     that's a copy of the creature they chose."
+                ),
+                AbilityKind::Spell,
+                &ParseContext::default(),
+            )
+        };
+        let ir = parse("they control").expect("copy-chosen chain");
+        assert!(matches!(
+            ir.clauses[0].parsed.effect,
+            Effect::EachPlayerCopyChosen {
+                choose_scope: CopyChooseScope::Chooser,
+                ..
+            }
+        ));
+        for declined in [
+            "you control",
+            "that player controls",
+            "controlled by that player",
+            "the chosen player controls",
+        ] {
+            assert!(parse(declined).is_none(), "{declined:?}");
         }
     }
 }
