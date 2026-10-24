@@ -23824,6 +23824,200 @@ fn put_counter_each_of_them_is_parent_target_not_put_counter_all() {
     );
 }
 
+/// The effect of the first sub-ability after a leading `Token` head.
+fn sub_after_token_head(def: &AbilityDefinition) -> &AbilityDefinition {
+    assert!(
+        matches!(def.effect.as_ref(), Effect::Token { .. }),
+        "chain must start with the token clause, got {:?}",
+        def.effect
+    );
+    def.sub_ability
+        .as_deref()
+        .expect("a clause must follow the token clause")
+}
+
+/// SHAPE — CR 608.2c + CR 111.1: "each of them" right after a token clause is
+/// the just-created tokens (`LastCreated`), routed to `PutCounter` (the bounded
+/// anaphor), never to the battlefield-scanning `PutCounterAll`.
+/// REVERT-PROBE: drop `LastCreated` from `counter_target_is_bounded_anaphor`
+/// and the head mis-promotes to `PutCounterAll { LastCreated }`.
+#[test]
+fn put_counter_each_of_them_after_token_clause_is_last_created_put_counter() {
+    let def = parse_effect_chain(
+        "Create two 0/0 green and blue Fractal creature tokens. Put a +1/+1 counter on each of them.",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let put = sub_after_token_head(&def);
+    assert_eq!(
+        put.effect.as_ref(),
+        &Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::LastCreated,
+        }
+    );
+}
+
+/// SHAPE — the compound Snarl Song shape ("... on each of them and you gain 2
+/// life") routes through the same site and keeps the life-gain conjunct.
+#[test]
+fn put_counter_each_of_them_compound_after_token_clause_is_last_created_put_counter() {
+    let def = parse_effect_chain(
+        "Create two 0/0 green and blue Fractal creature tokens. Put a +1/+1 counter on each of them and you gain 2 life.",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let put = sub_after_token_head(&def);
+    assert_eq!(
+        put.effect.as_ref(),
+        &Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::LastCreated,
+        }
+    );
+    let gain = put
+        .sub_ability
+        .as_deref()
+        .expect("life-gain conjunct must follow");
+    assert!(
+        matches!(gain.effect.as_ref(), Effect::GainLife { .. }),
+        "compound tail must be reached, got {:?}",
+        gain.effect
+    );
+}
+
+/// SHAPE — the for-each twin goes through the "put a counter on <target> for
+/// each X" dispatch, which consults `counter_anaphor_created_token_binding`
+/// directly. Paired control: with no token clause the anaphor stays
+/// `ParentTarget`.
+#[test]
+fn put_counter_each_of_them_for_each_after_token_clause_is_last_created() {
+    let def = parse_effect_chain(
+        "Create two 0/0 green and blue Fractal creature tokens. Put a +1/+1 counter on each of them for each card in your graveyard.",
+        AbilityKind::Spell,
+    );
+    assert_attachment_chain_has_no_unimplemented(&def);
+    let put = sub_after_token_head(&def);
+    let Effect::PutCounter { target, .. } = put.effect.as_ref() else {
+        panic!("expected PutCounter, got {:?}", put.effect);
+    };
+    assert_eq!(target, &TargetFilter::LastCreated);
+
+    let control = parse_effect_chain(
+        "Put a +1/+1 counter on each of them for each card in your graveyard.",
+        AbilityKind::Spell,
+    );
+    let Effect::PutCounter { target, .. } = control.effect.as_ref() else {
+        panic!("expected PutCounter control, got {:?}", control.effect);
+    };
+    assert_eq!(target, &TargetFilter::ParentTarget);
+}
+
+/// SHAPE — CR 608.2c + CR 111.1: the move-counters consumer binds "on each of
+/// them" exactly like its "on them" sibling after a token clause. Paired
+/// control: with no token clause it stays `ParentTarget`.
+#[test]
+fn move_counters_on_each_of_them_after_token_clause_matches_on_them() {
+    fn move_target(text: &str) -> TargetFilter {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let mut current = Some(&def);
+        while let Some(ability) = current {
+            if let Effect::MoveCounters { target, .. } = ability.effect.as_ref() {
+                return target.clone();
+            }
+            current = ability.sub_ability.as_deref();
+        }
+        panic!("no MoveCounters in chain for {text:?}: {def:#?}");
+    }
+    let each = move_target(
+        "Create two 0/0 green and blue Fractal creature tokens. Put its counters on each of them.",
+    );
+    let plain = move_target(
+        "Create two 0/0 green and blue Fractal creature tokens. Put its counters on them.",
+    );
+    assert_eq!(each, TargetFilter::LastCreated);
+    assert_eq!(each, plain);
+    assert_eq!(
+        move_target("Put its counters on each of them."),
+        TargetFilter::ParentTarget
+    );
+}
+
+/// SHAPE — Recursive Recruitment, verbatim Oracle text. The counter clause is
+/// gated on a graveyard cast and places floor(graveyard / 3) +1/+1 counters on
+/// each created Cadet; nothing in the chain stays unimplemented.
+#[test]
+fn recursive_recruitment_full_card_shape() {
+    let parsed = parse_oracle_text(
+        "Create two 2/2 colorless Wizard Soldier creature tokens named Cadet. If this spell was cast from a graveyard, put a +1/+1 counter on each of them for every three cards in your graveyard.\nFlashback {6}{U}{B}",
+        "Recursive Recruitment",
+        &["Flashback".to_string()],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    let spell = parsed
+        .abilities
+        .iter()
+        .find(|a| matches!(a.effect.as_ref(), Effect::Token { .. }))
+        .expect("spell ability must start with the Cadet token clause");
+    assert_attachment_chain_has_no_unimplemented(spell);
+    let Effect::Token { name, count, .. } = spell.effect.as_ref() else {
+        unreachable!()
+    };
+    assert_eq!(name, "Cadet");
+    assert_eq!(count, &QuantityExpr::Fixed { value: 2 });
+    let put = spell
+        .sub_ability
+        .as_deref()
+        .expect("counter clause must follow the token clause");
+    let Effect::PutCounter {
+        counter_type,
+        count,
+        target,
+    } = put.effect.as_ref()
+    else {
+        panic!("expected PutCounter, got {:?}", put.effect);
+    };
+    assert_eq!(counter_type, &CounterType::Plus1Plus1);
+    assert!(
+        matches!(
+            count,
+            QuantityExpr::DivideRounded {
+                divisor: 3,
+                rounding: RoundingMode::Down,
+                ..
+            }
+        ),
+        "count must be floor(graveyard / 3), got {count:?}"
+    );
+    assert_eq!(target, &TargetFilter::LastCreated);
+    assert_eq!(
+        put.condition,
+        Some(AbilityCondition::WasCast {
+            zone: Some(Zone::Graveyard)
+        })
+    );
+}
+
+/// Coverage honesty: a "for every K" tail whose noun does not parse is NOT
+/// accepted — the clause stays `Unimplemented`, while the token clause before
+/// it is reached and lowered (positive guard).
+#[test]
+fn put_counter_for_every_unparsable_noun_stays_unimplemented() {
+    let def = parse_effect_chain(
+        "Create two 2/2 colorless Wizard Soldier creature tokens named Cadet. Put a +1/+1 counter on each of them for every three frobnications.",
+        AbilityKind::Spell,
+    );
+    let tail = sub_after_token_head(&def);
+    assert!(
+        matches!(tail.effect.as_ref(), Effect::Unimplemented { .. }),
+        "nonsense for-every tail must stay unimplemented, got {:?}",
+        tail.effect
+    );
+}
+
 /// Issue #588 (Summon: Good King Mog XII, chapter IV): the mass counter
 /// placement must stay scoped to other Moogles you control — not every
 /// other permanent. Regression when "Moogle" was absent from SUBTYPES.

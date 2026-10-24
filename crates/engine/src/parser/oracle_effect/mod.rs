@@ -13322,7 +13322,8 @@ fn try_parse_perpetual_modify_pt_single(tp: TextPair, ctx: &ParseContext) -> Opt
 ///   immediately preceding clause in the same effect chain created one — e.g.
 ///   Agent of Raffine's "Conjure a duplicate ... into your hand. It
 ///   perpetually gains ..." (`ctx.token_created_in_chain`, via
-///   `counter::counter_anaphor_created_token_binding`) — and otherwise falls
+///   `counter::counter_anaphor_created_token_binding`, which also binds the
+///   distributive plural "each of them") — and otherwise falls
 ///   back to the parent target, mirroring the demonstrative form (a bare "it"
 ///   with no created referent back-references a prior chosen/tracked object,
 ///   e.g. the self-spell cost grant's "Choose a nonland card ... It
@@ -13374,7 +13375,9 @@ fn parse_perpetual_self_subject<'a>(
         // nearest first:
         //
         //  1. The chain's most-recently CREATED object (Agent of Raffine's
-        //     conjured duplicate) -- `counter::counter_anaphor_created_token_binding`.
+        //     conjured duplicate) -- `counter::counter_anaphor_created_token_binding`
+        //     (called with the literal "it"; its plural "each of them" class
+        //     is not reachable from here).
         //  2. An earlier SAME-CHAIN typed/chosen referent -- a prior "choose a
         //     card in your hand" clause (`ctx.parent_target_available`) or an
         //     immediately preceding `Effect::ChooseFromZone`
@@ -13434,8 +13437,9 @@ fn parse_perpetual_self_subject<'a>(
         //     Lightning Bolts) -- `ctx.token_created_in_chain`, the same
         //     predicate the "it" arm reaches through
         //     `counter::counter_anaphor_created_token_binding` (whose
-        //     recipient-pronoun set has no subject-plural member, so the
-        //     equivalent flag read is inline here). `LastCreated` fans out to
+        //     recipient-pronoun set and object-plural "each of them" class have
+        //     no subject-plural member, so the equivalent flag read is inline
+        //     here). `LastCreated` fans out to
         //     every object the conjure published.
         //  2. An earlier SAME-CHAIN typed/chosen referent (Racketeer Boss's
         //     "choose up to two ... cards in your hand") --
@@ -19650,7 +19654,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
             after_counter_on
         };
         // CR 608.2c + CR 111.10: a same-chain counter anaphor ("it"/"that token"/
-        // "the token"/…) placed after a token-creating clause binds to the
+        // "the token"/"each of them"/…) placed after a token-creating clause binds to the
         // just-created token (`LastCreated`). The for-each counter dispatch
         // intercepts these clauses before the shared put-counter path, so it must
         // consult the SAME binding helper as `resolve_counter_placement_target`,
@@ -22093,12 +22097,14 @@ fn try_parse_verb_and_target<'a>(
             // UTF-8 char boundary and `text[..text.len() - rem.len()]` is sound.
             let primary_clause = &text[..text.len() - rem.len()];
             let primary_clause_lower = primary_clause.to_ascii_lowercase();
-            // CR 608.2c: A `ParentTarget` placement subject ("each of them") is
-            // an anaphor to a bounded set of chosen objects, not a battlefield-
-            // wide type scan — mirror imperative.rs mass-classification authority.
+            // CR 608.2c: A bounded-anaphor placement subject ("each of them" →
+            // `ParentTarget` / `LastCreated`) is not a battlefield-wide type
+            // scan. The rule is shared with `parse_zone_counter_ast` through
+            // `imperative::counter_target_is_bounded_anaphor`, so the two
+            // mass-vs-single routing sites cannot drift.
             let ast = if imperative::counter_placement_is_mass(&primary_clause_lower)
                 && multi_target.is_none()
-                && !matches!(target, TargetFilter::ParentTarget)
+                && !imperative::counter_target_is_bounded_anaphor(&target)
             {
                 ZoneCounterImperativeAst::PutCounterAll {
                     counter_type,
