@@ -38029,7 +38029,7 @@ mod remove_counter_cost {
             selection: CounterCostSelection::SingleObject,
         };
         assert!(
-            !cost.is_payable(&state, PlayerId(0), source),
+            !cost.is_payable_for_spell(&state, PlayerId(0), source),
             "cost must be unpayable when the source has no +1/+1 counters"
         );
         assert!(
@@ -38056,7 +38056,7 @@ mod remove_counter_cost {
             selection: CounterCostSelection::SingleObject,
         };
         assert!(
-            !cost.is_payable(&state, PlayerId(0), source),
+            !cost.is_payable_for_spell(&state, PlayerId(0), source),
             "cost must be unpayable when the source has fewer than N counters"
         );
     }
@@ -39545,7 +39545,7 @@ mod unattach_cost {
         let (equipment, creature) = attached_equipment(&mut state);
         let cost = AbilityCost::Unattach;
 
-        assert!(cost.is_payable(&state, PlayerId(0), equipment));
+        assert!(cost.is_payable_for_spell(&state, PlayerId(0), equipment));
         pay_ability_cost_for_activation(
             &mut state,
             PlayerId(0),
@@ -39569,7 +39569,7 @@ mod unattach_cost {
         crate::game::effects::attach::unattach(&mut state, equipment);
 
         assert!(
-            !AbilityCost::Unattach.is_payable(&state, PlayerId(0), equipment),
+            !AbilityCost::Unattach.is_payable_for_spell(&state, PlayerId(0), equipment),
             "unattach cost requires an attached source permanent"
         );
     }
@@ -39589,7 +39589,7 @@ mod unattach_cost {
         assert!(state.objects[&equipment].attached_to.is_some());
         assert!(state.objects[&creature].attachments.contains(&equipment));
         assert!(
-            !AbilityCost::Unattach.is_payable(&state, PlayerId(0), equipment),
+            !AbilityCost::Unattach.is_payable_for_spell(&state, PlayerId(0), equipment),
             "unattach cost is Equipment-only"
         );
     }
@@ -59324,7 +59324,7 @@ fn resolve_discard_requirement_fixed_one_empty_hand_is_unpayable_err() {
         Err(EngineError::ActionNotAllowed(_))
     ));
     // CR 601.2h: the payability gate excludes it too.
-    assert!(!cost.is_payable(&state, PlayerId(0), source));
+    assert!(!cost.is_payable_for_spell(&state, PlayerId(0), source));
 
     // Positive reach-guard: with one eligible card the helper resolves the real
     // interactive requirement (not a vacuous early return).
@@ -59348,7 +59348,7 @@ fn resolve_discard_requirement_fixed_one_empty_hand_is_unpayable_err() {
         }
         other => panic!("expected Ok(Some((1, [card]))), got {other:?}"),
     }
-    assert!(cost.is_payable(&state, PlayerId(0), source));
+    assert!(cost.is_payable_for_spell(&state, PlayerId(0), source));
 }
 
 /// Issue #6494 (no over-fire, casting path): a `Discard { Fixed(2) }` with THREE
@@ -62728,4 +62728,38 @@ fn echo_upper_bound_defers_to_spend_any_color_permission() {
         ),
         "without the concession the green unit cannot cover the black pips"
     );
+}
+
+#[test]
+fn split_source_tap_cost_legs_takes_every_tap_and_untap_leg_in_order() {
+    let life = |amount| AbilityCost::PayLife {
+        amount: QuantityExpr::Fixed { value: amount },
+    };
+    let lands = AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 1));
+    let cost = AbilityCost::Composite {
+        costs: vec![
+            life(1),
+            AbilityCost::Untap,
+            AbilityCost::Composite {
+                costs: vec![lands.clone(), AbilityCost::Tap],
+            },
+            life(2),
+        ],
+    };
+    assert_eq!(
+        split_source_tap_cost_legs(cost),
+        (
+            Some(AbilityCost::Composite {
+                costs: vec![AbilityCost::Untap, AbilityCost::Tap],
+            }),
+            Some(AbilityCost::Composite {
+                costs: vec![life(1), lands, life(2)],
+            }),
+        )
+    );
+    assert_eq!(
+        split_source_tap_cost_legs(AbilityCost::Tap),
+        (Some(AbilityCost::Tap), None)
+    );
+    assert_eq!(split_source_tap_cost_legs(life(3)), (None, Some(life(3))));
 }
