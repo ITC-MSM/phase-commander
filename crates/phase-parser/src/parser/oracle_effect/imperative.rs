@@ -2780,12 +2780,16 @@ pub(super) fn parse_targeted_action_ast(
             .parse(input)
         })
         .is_some();
-        // CR 115.1d + CR 601.2c: Preserve the "up to N target" count instead of discarding
-        // it. `strip_optional_target_prefix` already parses the quantifier; the
-        // spec was previously dropped here, so "gain control of up to two target
-        // creatures" collapsed to a single optional slot and only one creature
-        // could be chosen (issue #6205).
-        let (target_text, multi_target) = super::strip_optional_target_prefix(rest);
+        // CR 115.1d + CR 601.2c: Preserve the target count instead of discarding
+        // it. Exact counts ("X target", "two target") must be tried before the
+        // optional prefixes, because an exact count makes every slot mandatory:
+        // "gain control of X target creatures" collapsed to a single target slot
+        // when the exact prefix was dropped (issue #7862). "up to N target" and
+        // "any number of target" keep their count through the optional prefix
+        // (issue #6205).
+        let (target_text, multi_target) = super::strip_exact_target_prefix(rest)
+            .map(|(count, rest)| (rest, Some(MultiTargetSpec::exact(count))))
+            .unwrap_or_else(|| super::strip_optional_target_prefix(rest));
         // CR 608.2k: A singular bare object pronoun ("gains control of it") in a subject-bearing
         // clause is an anaphor, not a parent-target chain. Route it through
         // `resolve_it_pronoun` — identical to the tap/sacrifice/counter clauses — so
@@ -23190,6 +23194,57 @@ mod tests {
         let _ = (text, lower);
     }
 
+    /// CR 115.1d + CR 601.2c: Mass Manipulation's printed text carries an
+    /// uppercase `X` ("Gain control of X target creatures and/or
+    /// planeswalkers."). The gain-control branch dispatches through
+    /// `nom_on_lower`, which returns original-case text, so the exact-count
+    /// prefix must match case-insensitively — otherwise the count is dropped
+    /// and the engine offers one target slot instead of X (issue #7862).
+    #[test]
+    fn parse_gain_control_of_x_target_creatures_from_printed_case() {
+        use crate::types::ability::{MultiTargetSpec, QuantityExpr, QuantityRef, TypeFilter};
+        let text = "Gain control of X target creatures and/or planeswalkers";
+        let lower = text.to_lowercase();
+        let ast = parse_targeted_action_ast(text, &lower, &mut ParseContext::default())
+            .expect("Mass Manipulation's printed text should parse");
+        match ast {
+            TargetedImperativeAst::GainControl {
+                multi_target,
+                target,
+                ..
+            } => {
+                assert_eq!(
+                    multi_target,
+                    Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string()
+                        }
+                    })),
+                    "printed uppercase X must still yield an exact(X) count"
+                );
+                let TargetFilter::Or { filters } = target else {
+                    panic!("expected Or filter for and/or, got {target:?}");
+                };
+                assert_eq!(filters.len(), 2);
+                assert!(
+                    filters.iter().any(|filter| matches!(
+                        filter,
+                        TargetFilter::Typed(tf) if tf.type_filters.contains(&TypeFilter::Creature)
+                    )),
+                    "filter must include Creature"
+                );
+                assert!(
+                    filters.iter().any(|filter| matches!(
+                        filter,
+                        TargetFilter::Typed(tf) if tf.type_filters.contains(&TypeFilter::Planeswalker)
+                    )),
+                    "filter must include Planeswalker"
+                );
+            }
+            other => panic!("Expected GainControl AST, got {other:?}"),
+        }
+    }
+
     /// CR 613.1b: Hellkite Tyrant — "gain control of all artifacts that player
     /// controls" is the untargeted MASS form, lowered to `GainControlAll`
     /// (mirrors "destroy all" → `DestroyAll`). The "target" single form must
@@ -31357,6 +31412,135 @@ mod tests {
             Some(MultiTargetSpec::exact(QuantityExpr::Fixed { value: 3 }))
         );
         assert_eq!(execute.target_choice_timing, TargetChoiceTiming::Resolution);
+    }
+
+    /// SHAPE — CR 510.1a: "… and this creature assigns no combat damage this
+    /// turn" after a bare " and " is its own subject-predicate clause. Covers the
+    /// printed members of the class (Goblin Vandal after a Destroy, Rysorian
+    /// Badger after a GainLife). Before the clause splitter recognised the
+    /// conjunct, it stayed glued to the leading imperative: the trailing "this
+    /// turn" was stripped onto that imperative and the rider fell to an
+    /// `Unimplemented` sub-ability.
+    #[test]
+    fn self_assigns_no_combat_damage_conjunct_splits_off_the_leading_imperative() {
+        let cases = [
+            (
+                "Goblin Vandal",
+                "Whenever this creature attacks and isn't blocked, you may pay {R}. If you do, destroy target artifact defending player controls and this creature assigns no combat damage this turn.",
+                vec!["Goblin".to_string(), "Rogue".to_string()],
+            ),
+            (
+                "Rysorian Badger",
+                "Whenever this creature attacks and isn't blocked, you may exile up to two target creature cards from defending player's graveyard. If you do, you gain 1 life for each card exiled this way and this creature assigns no combat damage this turn.",
+                vec!["Badger".to_string()],
+            ),
+        ];
+        for (name, oracle, subtypes) in cases {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                oracle,
+                name,
+                &[],
+                &["Creature".to_string()],
+                &subtypes,
+            );
+            let execute = parsed
+                .triggers
+                .first()
+                .and_then(|trigger| trigger.execute.as_ref())
+                .unwrap_or_else(|| panic!("{name} trigger execute"));
+            assert!(
+                !crate::parser::oracle::has_unimplemented(execute),
+                "{name} must parse fully: {execute:?}"
+            );
+            // Walk to the last link of the chain: the rider, immediately after
+            // the conditional ("If you do") leading imperative.
+            let mut chain: Vec<&AbilityDefinition> = vec![execute];
+            while let Some(next) = chain.last().and_then(|def| def.sub_ability.as_deref()) {
+                chain.push(next);
+            }
+            let [.., leading, rider] = chain.as_slice() else {
+                panic!("{name}: expected a leading imperative and a rider, got {chain:?}");
+            };
+            assert_eq!(
+                leading.duration, None,
+                "{name}: the rider's \"this turn\" must not leak onto the leading imperative"
+            );
+            let Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } = rider.effect.as_ref()
+            else {
+                panic!("{name}: expected the rider GenericEffect, got {rider:?}");
+            };
+            assert_eq!(duration, &Some(Duration::UntilEndOfTurn), "{name}");
+            let [rule] = static_abilities.as_slice() else {
+                panic!("{name}: expected one rule modification, got {static_abilities:?}");
+            };
+            assert_eq!(rule.mode, StaticMode::AssignNoCombatDamage, "{name}");
+            assert_eq!(rule.affected, Some(TargetFilter::SelfRef), "{name}");
+        }
+    }
+
+    /// SHAPE — CR 508.5a + CR 108.3: a target card "from defending player's
+    /// graveyard" is owned by that one defending player, not by any player.
+    /// Covers the attack-trigger class across the exile (Rysorian Badger,
+    /// Graven Abomination) and reanimate (Rakshasa Debaser) verbs.
+    #[test]
+    fn defending_player_graveyard_target_binds_the_defending_owner() {
+        let cases = [
+            (
+                "Rysorian Badger",
+                "Whenever this creature attacks and isn't blocked, you may exile up to two target creature cards from defending player's graveyard. If you do, you gain 1 life for each card exiled this way and this creature assigns no combat damage this turn.",
+            ),
+            (
+                "Graven Abomination",
+                "Whenever this creature attacks, exile target card from defending player's graveyard.",
+            ),
+            (
+                "Rakshasa Debaser",
+                "Whenever this creature attacks, put target creature card from defending player's graveyard onto the battlefield under your control.",
+            ),
+        ];
+        for (name, oracle) in cases {
+            let parsed = crate::parser::oracle::parse_oracle_text(
+                oracle,
+                name,
+                &[],
+                &["Creature".to_string()],
+                &[],
+            );
+            let execute = parsed
+                .triggers
+                .first()
+                .and_then(|trigger| trigger.execute.as_ref())
+                .unwrap_or_else(|| panic!("{name} trigger execute"));
+            // Reach guard: the owner binding below comes from a complete parse.
+            assert!(
+                !crate::parser::oracle::has_unimplemented(execute),
+                "{name} must parse fully: {execute:?}"
+            );
+            let Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                target: TargetFilter::Typed(target),
+                ..
+            } = execute.effect.as_ref()
+            else {
+                panic!("{name}: expected a graveyard-origin ChangeZone, got {execute:?}");
+            };
+            assert!(
+                target.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::DefendingPlayer,
+                }),
+                "{name}: target must be owned by the defending player: {target:?}"
+            );
+            assert!(
+                target.properties.contains(&FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                }),
+                "{name}: target must be in a graveyard: {target:?}"
+            );
+        }
     }
 
     #[test]
