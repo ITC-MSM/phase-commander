@@ -10808,8 +10808,9 @@ fn drain_pending_deferred_life_cost_resume(
                     }
                 }
                 if pending.prepaid_actual_mana_spent.is_some() {
-                    state.pending_cast = Some(pending);
-                    super::casting_costs::finalize_automatic_mana_payment(state, player, events)
+                    super::casting_costs::resume_cast_after_deferred_life_cost(
+                        state, player, *pending, events,
+                    )
                 } else {
                     super::casting_costs::finish_pending_cost_or_cast(
                         state, player, *pending, events,
@@ -16183,12 +16184,13 @@ fn apply_non_priority_pass_action(
             }
             casting_costs::begin_deferred_target_selection(state, caster, pending, &mut events)?
         }
-        // CR 702.174a: Caster chose which opponent receives the promised Gift.
+        // CR 601.2 + CR 115.10a: caster chose the opponent for the prompt's purpose.
         (
             WaitingFor::ChooseGiftRecipient {
                 player,
                 candidates,
                 pending_cast,
+                purpose,
                 ..
             },
             GameAction::ChooseGiftRecipient { opponent },
@@ -16200,6 +16202,7 @@ fn apply_non_priority_pass_action(
                 (**pending_cast).clone(),
                 opponent,
                 candidates,
+                purpose,
                 &mut events,
             )?
         }
@@ -17096,18 +17099,13 @@ fn apply_non_priority_pass_action(
                 } => (enchant_filter.clone(), grants.clone()),
                 _ => {
                     // CR 303.4f + CR 701.3b: attach through the entering-Aura
-                    // authority, so the CR 701.3a gate judges the same entrant
-                    // the host list was offered for. Seams that park none get
-                    // the stored object, i.e. their prior behaviour exactly.
-                    let old_target = super::zone_pipeline::attach_chosen_entering_aura_host(
-                        state, returned, &chosen,
+                    // authority, recording canonical Unattached and Attached events.
+                    super::zone_pipeline::attach_chosen_entering_aura_host(
+                        state,
+                        returned,
+                        &chosen,
+                        &mut events,
                     );
-                    if let Some(old_target) = old_target {
-                        events.push(crate::types::events::GameEvent::Unattached {
-                            attachment_id: returned,
-                            old_target,
-                        });
-                    }
                     let resumes_change_zone_iteration = state
                         .active_change_zone_frame()
                         .is_some_and(|frame| frame.pending.is_some());

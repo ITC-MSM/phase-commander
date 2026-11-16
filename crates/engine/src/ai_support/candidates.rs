@@ -9018,6 +9018,7 @@ mod tests {
         names.extend((0..10_000).map(|i| format!("Bulk Card {i}")));
         state.all_card_names = names.into();
         state.waiting_for = WaitingFor::NamedChoice {
+            decision_subject_id: None,
             free_entry: None,
             player: PlayerId(0),
             choice_type: ChoiceType::card_name(),
@@ -9041,6 +9042,7 @@ mod tests {
     fn card_name_prompt(mut state: GameState, names: Vec<String>) -> GameState {
         state.all_card_names = names.into();
         state.waiting_for = WaitingFor::NamedChoice {
+            decision_subject_id: None,
             free_entry: None,
             player: PlayerId(0),
             choice_type: ChoiceType::card_name(),
@@ -9528,7 +9530,11 @@ mod tests {
                 .activation_restrictions(vec![ActivationRestriction::OnlyOnceEachTurn]),
             );
         }
-        state.activated_abilities_this_turn.insert((source, 0), 1);
+        // CR 602.5c: the used-budget entry is keyed by the resolved
+        // acquisition, not the index.
+        let usage = crate::game::restrictions::ability_usage_key(&state, source, 0)
+            .expect("the printed ability resolves");
+        state.activated_abilities_this_turn.insert(usage, 1);
 
         let actions = candidate_actions(&state);
         assert!(!actions.iter().any(|candidate| {
