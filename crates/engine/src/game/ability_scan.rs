@@ -6033,6 +6033,9 @@ fn scan_delayed_trigger_condition(c: &DelayedTriggerCondition, mode: ScanMode) -
         // The same coordinate plus the identity of one added phase
         // (`ExtraPhaseId`). Neither reaches a filter or a quantity.
         DelayedTriggerCondition::AtBeginningOfAddedPhase { phase: _, entry: _ } => Axes::NONE,
+        // The same coordinate plus the identity of one granted extra turn
+        // (`ExtraTurnId`). Neither reaches a filter or a quantity.
+        DelayedTriggerCondition::AtBeginningOfGrantedTurn { phase: _, turn: _ } => Axes::NONE,
         // CR 603.7c: a delayed triggered ability that refers to a particular object.
         // `object_id` is already resolved, so there is no filter to walk and no
         // population whose size a growing class could move.
@@ -6943,6 +6946,10 @@ fn scan_replacement_condition(x: &ReplacementCondition, mode: ScanMode) -> Axes<
             acc
         }
         ReplacementCondition::EffectCausedDiscard => Axes::NONE,
+        // CR 614.16: reads only the event's own `CounterCause` (carried on the
+        // placement) — event-scoped like `EffectCausedDiscard`'s flag, no board
+        // census and no projected player resource.
+        ReplacementCondition::EffectCausedPlacement => Axes::NONE,
         ReplacementCondition::OnlyExtraTurn => Axes::NONE,
         ReplacementCondition::TokenSubtypeMatches { subtypes: _ } => Axes::NONE,
         ReplacementCondition::TokenCoreTypeMatches { core_types: _ } => Axes::NONE,
@@ -14448,6 +14455,7 @@ mod tests {
             DelayedTriggerCondition::AtNextPhase { .. }
             | DelayedTriggerCondition::AtNextPhaseForPlayer { .. }
             | DelayedTriggerCondition::AtBeginningOfAddedPhase { .. }
+            | DelayedTriggerCondition::AtBeginningOfGrantedTurn { .. }
             | DelayedTriggerCondition::WhenLeavesPlay { .. } => (false, false, false),
             DelayedTriggerCondition::WhenDies { .. }
             | DelayedTriggerCondition::WhenLeavesPlayFiltered { .. }

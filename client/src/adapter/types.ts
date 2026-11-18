@@ -2594,6 +2594,9 @@ export interface PendingCast {
   activation_ability_index?: number;
   target_constraints?: Array<{ type: string }>;
   deferred_sacrificed_permanents?: DeferredSpellSacrifice[];
+  // CR 601.2b + CR 601.2h: creatures selected before targets for a spell tap
+  // cost, tapped at the payment commit. Absent when none.
+  deferred_tapped_permanents?: { object_ids: ObjectId[]; cost: SerializedAbilityCost }[];
   // CR 118.3a: pip ids the caster pinned to direct payment. `#[serde(default,
   // skip_serializing_if = "Vec::is_empty")]` — absent when no pin is recorded.
   pinned_pool_units?: number[];
@@ -4022,6 +4025,19 @@ export type GameEvent =
   | { type: "PermanentUntapped"; data: { object_id: ObjectId } }
   | { type: "LandPlayed"; data: { object_id: ObjectId; player_id: PlayerId; from_zone: Zone } }
   | { type: "StackPushed"; data: { object_id: ObjectId } }
+  // CR 603.2: a triggered ability triggered (pushed, or `stack_entry: null`
+  // when removed during placement). Bookkeeping for observer triggers; the
+  // engine never sends `causes` on the event stream, but state carriers hold it.
+  | {
+      type: "AbilityTriggered";
+      data: {
+        stack_entry: ObjectId | null;
+        source_id: ObjectId;
+        controller: PlayerId;
+        origin: "SourceAbility" | "Delayed";
+        causes: GameEvent[];
+      };
+    }
   | { type: "StackResolved"; data: { object_id: ObjectId } }
   // CR 714.2: a Saga's chapter ability finished resolving. Bookkeeping the
   // engine publishes for meta-triggers (Narci, Fable Singer); non-visual, since
@@ -4111,7 +4127,7 @@ export type GameEvent =
   // the engine's authoritative roll (1..=sides after modifiers). `result` is
   // `null` for the symbolic planar die (CR 901.9d / CR 706.7), which has no
   // numeric face value to animate.
-  | { type: "DieRolled"; data: { player_id: PlayerId; sides: number; result: number | null } }
+  | { type: "DieRolled"; data: { player_id: PlayerId; sides: number; result: number | null; pre_entry_source?: ObjectId } }
   // CR 706.6: a die roll ignored by a replacement, shown so players see what
   // the lowest roll was. Display mirror only — never a rules roll: triggers,
   // results tables, aggregates, and AI must not read it. `result` is always
