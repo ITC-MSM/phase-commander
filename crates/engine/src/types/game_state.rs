@@ -285,13 +285,16 @@ impl<'de, K: Ord + Deserialize<'de>, V: Deserialize<'de>> Deserialize<'de> for L
     }
 }
 
-/// [`LazyBoxedMap`]'s list counterpart, for action-scoped working memory that
-/// is empty at every action boundary: `None` while empty, collapsed back to
-/// `None` whenever it empties, so it costs one pointer on `GameState`'s stack
-/// frame and an empty clone allocates nothing.
-// The box is the point (the `game_state_size` budget).
+/// A rarely-populated `Vec` stored behind one pointer and allocated only while it holds an
+/// element: `None` when empty, and collapsed back to `None` whenever it empties, so a type
+/// carrying it widens by 8 B instead of 24 and an empty clone allocates nothing. Serializes
+/// exactly as the `Vec` it holds. Used for action-scoped working memory on `GameState` (empty at
+/// every action boundary) and for `ResolvedAbility` context lists (deep resolution chains keep
+/// many on the stack).
+// The box is the point: one pointer instead of a `Vec`'s three words (the `game_state_size`
+// budget).
 #[allow(clippy::box_collection)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LazyBoxedVec<T>(Option<Box<Vec<T>>>);
 
 impl<T> Default for LazyBoxedVec<T> {
@@ -352,6 +355,24 @@ impl<T> LazyBoxedVec<T> {
     /// Empties the list, returning what it held.
     pub fn take(&mut self) -> Vec<T> {
         self.0.take().map_or_else(Vec::new, |list| *list)
+    }
+}
+
+impl<T> From<Vec<T>> for LazyBoxedVec<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self((!items.is_empty()).then(|| Box::new(items)))
+    }
+}
+
+impl<T: Serialize> Serialize for LazyBoxedVec<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for LazyBoxedVec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Vec::<T>::deserialize(deserializer).map(Self::from)
     }
 }
 
@@ -4105,6 +4126,17 @@ pub struct PendingContinuation {
     /// owned the payment cannot be identified from the old payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) x_announcement: Option<ContinuationXAnnouncement>,
+    /// CR 614.6 + CR 615.5 + CR 608.2c: `Some` when this is work a replacement's own action left
+    /// for a later `apply()` (a step after a child prompt), and that action owns an amount. The
+    /// drain re-enters the action's scope, so its "that many" is still that amount, not the die
+    /// result or trigger event of the resolution around it. Captured at stash time from the
+    /// running scope (`quantity::current_replacement_action`), like `trigger_context`. A chain of
+    /// another owner never merges into this frame (`effects::append_to_pending_continuation`,
+    /// `prepend_to_pending_continuation_with_producer`). An action that owns no amount (an
+    /// entering object's as-enters choices) leaves its work ordinary. Serde-defaulted: a save
+    /// taken mid-prompt before this field existed resumes as ordinary work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) replacement_action: Option<ReplacementActionScope>,
 
     /// CR 118.12: how this chain's head `Effect::PayCost` enters the payment
     /// authority. `LatchedSuffix` only for the unpaid remainder that
@@ -4119,6 +4151,15 @@ pub struct PendingContinuation {
         skip_serializing_if = "ResolutionPaymentOrigin::is_fresh_choice"
     )]
     pub(crate) head_payment_origin: ResolutionPaymentOrigin,
+}
+
+/// CR 614.6 + CR 615.5: the replacement action a paused continuation belongs to
+/// ([`PendingContinuation::replacement_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplacementActionScope {
+    /// The amount of the event the replacement replaced or prevented, bound when the
+    /// replacement applied.
+    pub amount: i32,
 }
 
 /// CR 118.12 + CR 614.17b: how a resolution-time payment enters the single
@@ -4207,6 +4248,7 @@ impl PendingContinuation {
             player_scope_tail: state.resolving_player_scope_tail.clone(),
             player_scope_queue_end: false,
             x_announcement: None,
+            replacement_action: crate::game::quantity::current_replacement_action(),
             head_payment_origin: ResolutionPaymentOrigin::FreshChoice,
         }
     }
@@ -4233,6 +4275,7 @@ impl PendingContinuation {
             player_scope_tail: state.resolving_player_scope_tail.clone(),
             player_scope_queue_end: false,
             x_announcement: None,
+            replacement_action: crate::game::quantity::current_replacement_action(),
             head_payment_origin: ResolutionPaymentOrigin::FreshChoice,
         }
     }
@@ -10546,6 +10589,14 @@ pub struct PendingCast {
     /// How this spell was cast — threads through the casting pipeline to finalize_cast.
     #[serde(default)]
     pub casting_variant: CastingVariant,
+    /// CR 113.2c + CR 601.2b + CR 601.2f: the keyword instance whose
+    /// alternative cost this cast announced, when the card has more than one
+    /// distinct instance of `casting_variant`'s keyword. Bound once, at
+    /// preparation; every later read of the alternative cost resolves this
+    /// payload instead of re-electing one. `None` for every cast whose variant
+    /// elects no instance, and for a cast whose card has a single instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternative_cost_keyword: Option<Keyword>,
     /// CR 601.2a: Object-attached permission elected for this cast. Keeping the
     /// exact index prevents payment concessions from leaking between competing
     /// `PlayFromExile` / `ExileWithAltCost` grants on the same object.
@@ -11693,6 +11744,7 @@ impl PendingCast {
             target_constraints: Vec::new(),
             crime_candidate: false,
             casting_variant: CastingVariant::Normal,
+            alternative_cost_keyword: None,
             casting_permission_index: None,
             cast_timing_permission: None,
             distribute: None,
@@ -14542,6 +14594,14 @@ pub struct CastingVariantChoiceOption {
     /// Blitz, Bestow); `None` for every other option.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority: Option<CastAuthorityChoice>,
+    /// CR 113.2c + CR 601.2b + CR 118.9a: the keyword instance whose
+    /// alternative cost this option pays, for a card with more than one
+    /// distinct instance of the same graveyard-cast keyword (Deep Analysis'
+    /// printed flashback and Lier's granted one). `Some` exactly when
+    /// `keywords::instance_elected_kind(variant)` names the instance's kind;
+    /// `None` for every other option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alternative_cost_keyword: Option<Keyword>,
 }
 
 /// CR 601.2a: which graveyard-cast permission grant authorizes a cast: the
@@ -23034,6 +23094,12 @@ pub struct PendingCombatDamageReplacement {
     /// existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub one_shot_applications: Vec<(AppliedReplacementKey, ObjectId)>,
+    /// CR 608.2f + CR 700.1: what the printed "while" guards read when the batch opened. Every
+    /// portion of the batch meets that one reading, including the portions proposed after the
+    /// pause (Undergrowth Champion ruling: "its prevention effect will apply once to all that
+    /// damage"). Absent from saves written before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settled_guards: Vec<crate::types::ability::SettledDamageGuard>,
 }
 
 /// CR 616.1 + CR 616.1g + CR 101.4: where one proposed damage leg of a parked
@@ -26392,11 +26458,20 @@ impl AbilityOnsetRecord {
 pub const ABILITY_ONSET_RECORD_FIELD: &str = "ability_onset_record";
 
 /// Test support: declares a committed game-state capture written before onsets were recorded
-/// (CR 611.2e) as onset-recorded, for a test whose subject does not depend on onsets. The capture
-/// then decodes exactly as it did before `admit_entry_onset_record` existed: every unrecorded node
-/// keeps the `WhenFollowed` default. Never call it on a payload whose onsets the test observes, and
-/// never outside tests; production admission refuses the same bytes
-/// (`a_frozen_v78_mode_choice_keeps_its_announcement_fold`).
+/// (CR 611.2e) as onset-recorded, and drops its legacy table-wide `spells_cast_last_turn` total,
+/// for a test whose subject depends on neither. The capture then decodes exactly as it did before
+/// `admit_entry_onset_record` existed: every unrecorded node keeps the `WhenFollowed` default.
+/// Never call it on a payload whose onsets the test observes, and never outside tests; production
+/// admission refuses the same bytes (`a_frozen_v78_mode_choice_keeps_its_announcement_fold`).
+///
+/// CR 117.1 + CR 603.4: a capture from a build before the per-player
+/// `Player.spells_cast_last_turn` snapshot persisted one table-wide total of the previous turn,
+/// which production restore refuses when nonzero (`LEGACY_SPELLS_CAST_LAST_TURN_ERROR`: it cannot
+/// say which player cast the spells). The committed captures stay byte-for-byte as recorded and
+/// `committed_dump_walk` pins each nonzero one as an expected refusal through
+/// [`record_captured_onsets_keeping_legacy_snapshot`]; a test whose subject does not read last
+/// turn's casts declares the total absent here, the state a save taken after a turn without casts
+/// has.
 ///
 /// Marks each game-state root of the document, by the committed capture shapes:
 /// - a debug export `{gameState, turnCheckpoints?, …}`: `gameState` and every `turnCheckpoints`
@@ -26408,28 +26483,53 @@ pub const ABILITY_ONSET_RECORD_FIELD: &str = "ability_onset_record";
 /// Any other document (a card export, a CR 733 census map) is left unchanged.
 #[cfg(any(test, feature = "test-support"))]
 pub fn record_captured_onsets(document: &mut serde_json::Value) {
-    fn mark(root: &mut serde_json::Value) {
-        let recorded = serde_json::to_value(AbilityOnsetRecord::Recorded)
-            .expect("AbilityOnsetRecord serializes");
-        root.as_object_mut()
-            .expect("a committed capture's game-state root is a JSON object")
-            .insert(ABILITY_ONSET_RECORD_FIELD.to_string(), recorded);
-    }
+    for_each_captured_root(document, |root| {
+        mark_onsets_recorded(root);
+        root.remove("spells_cast_last_turn");
+    });
+}
+
+/// [`record_captured_onsets`] that keeps the capture's legacy table-wide `spells_cast_last_turn`
+/// total as recorded, so a restore sees (and refuses, when nonzero) exactly what the build that
+/// wrote the capture persisted.
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_captured_onsets_keeping_legacy_snapshot(document: &mut serde_json::Value) {
+    for_each_captured_root(document, mark_onsets_recorded);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn mark_onsets_recorded(root: &mut serde_json::Map<String, serde_json::Value>) {
+    let recorded =
+        serde_json::to_value(AbilityOnsetRecord::Recorded).expect("AbilityOnsetRecord serializes");
+    root.insert(ABILITY_ONSET_RECORD_FIELD.to_string(), recorded);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn for_each_captured_root(
+    document: &mut serde_json::Value,
+    mut visit: impl FnMut(&mut serde_json::Map<String, serde_json::Value>),
+) {
+    let mut visit_root = |root: &mut serde_json::Value| {
+        visit(
+            root.as_object_mut()
+                .expect("a committed capture's game-state root is a JSON object"),
+        );
+    };
     let Some(object) = document.as_object_mut() else {
         return;
     };
     if let Some(game_state) = object.get_mut("gameState") {
-        mark(game_state);
+        visit_root(game_state);
         if let Some(checkpoints) = object
             .get_mut("turnCheckpoints")
             .and_then(serde_json::Value::as_array_mut)
         {
-            checkpoints.iter_mut().for_each(mark);
+            checkpoints.iter_mut().for_each(visit_root);
         }
     } else if let Some(state) = object.get_mut("state") {
-        mark(state);
+        visit_root(state);
     } else if object.contains_key("objects") && object.contains_key("turn_number") {
-        mark(document);
+        visit_root(document);
     }
 }
 
@@ -26451,6 +26551,29 @@ pub fn record_captured_onsets_json(json: &str) -> String {
 pub struct TrackedMemberOrigin {
     pub departed_from: Zone,
     pub departure_incarnation: u64,
+}
+
+/// CR 614.6 + CR 615.5: when a damage batch's held rider runs, relative to the damage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum RiderTiming {
+    /// CR 614.6: a substitution's action is the modified event itself (Dralnu, Lich Lord's
+    /// sacrifice), so it happens with the batch's damage.
+    WithEvent,
+    /// CR 615.5: a prevention's additional effect "takes place immediately afterward" (Test of
+    /// Faith's counters), after the batch's damage.
+    AfterEvent,
+}
+
+/// CR 614.6 + CR 615.5 + CR 616.1: a damage batch's substitution action or prevention rider,
+/// held until every portion's original replacement choice in that batch is made, then run
+/// after the batch's damage is dealt. `authority` is the affected player once the event's
+/// redirects applied (the recipient, or its controller); held riders run in APNAP order of it,
+/// substitution actions first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldBatchRider {
+    pub authority: crate::types::player::PlayerId,
+    pub timing: RiderTiming,
+    pub drain: PostReplacementDrain,
 }
 
 // A pre-entry board keeps its objects and their derived indexes together. Every
@@ -27093,10 +27216,6 @@ declare_game_state! {
     pub day_night: Option<DayNight>,
     #[serde(default)]
     pub spells_cast_this_turn: u8,
-    /// CR 603.4: Snapshot of `spells_cast_this_turn` from the previous turn.
-    /// Used by werewolf "if no/two or more spells were cast last turn" conditions.
-    #[serde(default)]
-    pub spells_cast_last_turn: Option<u8>,
     /// CR 502.2 + CR 502.2a + CR 731.2: the most spells any one active player of the previous
     /// turn cast during it: the active player alone, or each member of the active team when the
     /// game uses shared team turns (CR 805.4a). CR 731.2a's "no player ... cast a spell" is a
@@ -29704,15 +29823,32 @@ declare_game_state! {
     /// is excluded from serialization and structural equality.
     #[serde(skip)]
     pub combat_prevention_tally: Option<HashMap<AppliedReplacementKey, i32>>,
-    /// CR 510.2 + CR 700.1 + CR 615.8: Successful one-shot applications to a
-    /// damage source's current simultaneous combat-damage instance. A consumed
-    /// replacement stays eligible only for that same source inside this batch.
-    /// Only this ledger is suspended during independent follow-ups, then restored
-    /// before the next portion; the prevention tally remains active.
-    /// Restored to its prior value before returning; excluded from serialization
-    /// and equality like the prevention tally.
+    /// CR 510.2 + CR 700.1 + CR 615.8 + CR 611.3a: what one simultaneous damage batch has
+    /// settled. Only this ledger is suspended during independent follow-ups, then restored
+    /// before the next portion; the prevention tally remains active. Restored to its prior
+    /// value before returning; excluded from serialization and equality like the
+    /// prevention tally. A batch that pauses hands its guards to `PendingReplacement` and
+    /// to its remaining portions (`SpellContext::settled_damage_guards`). Boxed: it is
+    /// populated only while a batch settles (`game_state_size.rs`).
     #[serde(skip)]
-    pub(crate) combat_one_shot_applications: Option<Vec<(AppliedReplacementKey, ObjectId)>>,
+    pub(crate) damage_batch_ledger: Option<Box<DamageBatchLedger>>,
+    /// CR 104.4a + CR 614.6 + CR 120.4: how an effect-stated win or loss settles while a
+    /// two-phase damage batch runs (`elimination::event_outcomes`): recorded with the batch's one
+    /// simultaneous event (its damage and substitution actions), or at once. `None` outside a
+    /// running batch, where a paused batch's continuation owns the answer. Execution-local and
+    /// restored before the batch returns, so excluded from serialization and equality like the
+    /// ledger.
+    #[serde(skip)]
+    pub(crate) damage_event_losses: Option<EventLosses>,
+}
+
+/// CR 104.4a + CR 614.6: whether an effect-stated win or loss during a running damage batch waits
+/// for the batch's simultaneous event to settle (`Recording` it) or happens at once (`Immediate`:
+/// replacement choices, prevention after-effects).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EventLosses {
+    Recording(crate::types::ability::EventOutcomes),
+    Immediate,
 }
 
 /// The map-backed history entries `copy` does not share with `original`, a nested causes map
@@ -29775,6 +29911,9 @@ pub(crate) struct GameStateDecode;
 
 const LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR: &str =
     "CreatureExploited snapshot lacks authoritative victim record; restore a save that contains the exploit departure record";
+
+const LEGACY_SPELLS_CAST_LAST_TURN_ERROR: &str =
+    "legacy spells_cast_last_turn snapshot cannot say which player cast the spells of the previous turn; restore a save taken after a turn in which no spell was cast";
 
 const LEGACY_DEFERRED_SPELL_DELIVERY_ERROR: &str =
     "legacy deferred_spell_delivery snapshot cannot prove which on-resolution hooks already ran; restore a save taken after the spell's free-cast window closed";
@@ -29881,6 +30020,29 @@ fn reject_legacy_deferred_spell_delivery(value: &serde_json::Value) -> Result<()
     match state.get("deferred_spell_delivery") {
         None | Some(serde_json::Value::Null) => Ok(()),
         Some(_) => Err(LEGACY_DEFERRED_SPELL_DELIVERY_ERROR.to_string()),
+    }
+}
+
+/// Rejects a snapshot that carries a nonzero table-wide `spells_cast_last_turn`.
+///
+/// CR 117.1 + CR 603.4: builds before the per-player window persisted one
+/// table-wide total (`GameState.spells_cast_last_turn: Option<u8>`) and cleared
+/// the per-player distribution of that turn at the boundary, with no turn stamp
+/// on any record. For a total of 1 or more the split between players cannot be
+/// recovered, and "a player cast two or more spells last turn" tells 2+0 from
+/// 1+1 (Gatstaf Howler), "no spells were cast last turn" needs the exact sum
+/// (Gatstaf Shepherd): any default distribution would be a fabricated one. The
+/// snapshot is therefore refused rather than guessed at (the same pattern as
+/// `deferred_spell_delivery`). Absent, `null` and `0` are exact: no completed
+/// turn, or a turn without a cast, has only one distribution (all zeros), which
+/// is also what the new per-player `Player.spells_cast_last_turn` defaults to.
+/// The key is the discriminator: a current build never writes it.
+fn reject_legacy_spells_cast_last_turn(value: &serde_json::Value) -> Result<(), String> {
+    let state = value.get("state").unwrap_or(value);
+    match state.get("spells_cast_last_turn") {
+        None | Some(serde_json::Value::Null) => Ok(()),
+        Some(serde_json::Value::Number(total)) if total.as_u64() == Some(0) => Ok(()),
+        Some(_) => Err(LEGACY_SPELLS_CAST_LAST_TURN_ERROR.to_string()),
     }
 }
 
@@ -31850,6 +32012,7 @@ impl GameStateDecode {
         reject_legacy_exploit_event_evidence(&value)?;
         reject_legacy_raw_prompt_authority(&value)?;
         reject_legacy_deferred_spell_delivery(&value)?;
+        reject_legacy_spells_cast_last_turn(&value)?;
         reject_legacy_deferred_random_discard_cost(&value)?;
         if !matches!(mode, GameStateDecodeMode::DirectCurrentRaw) {
             migrate_legacy_delayed_trigger_provenance(&mut value)?;
@@ -31913,6 +32076,7 @@ impl GameStateDecode {
         reject_legacy_exploit_event_evidence(value)?;
         reject_legacy_raw_prompt_authority(value)?;
         reject_legacy_deferred_spell_delivery(value)?;
+        reject_legacy_spells_cast_last_turn(value)?;
         reject_legacy_deferred_random_discard_cost(value)?;
         if matches!(
             mode,
@@ -32221,14 +32385,14 @@ pub struct PostReplacementDrain {
     /// `TargetFilter::PostReplacementDamageTarget`.
     pub event_target: Option<crate::types::ability::TargetRef>,
 
-    /// CR 614.1a + CR 614.6: the amount of the damage event a damage
-    /// SUBSTITUTION replaced (Soul-Scar Mage: "put that many -1/-1 counters on
-    /// that creature instead"; Szadek). Read by `QuantityRef::EventContextAmount`
-    /// ahead of the enclosing trigger's event while this drain is resident, so
-    /// "that many" names the replaced damage — not the amount of a trigger
-    /// whose resolution dealt it, and not a count a preceding link of the same
-    /// continuation produced. `None` on every other install path: prevention
-    /// riders keep their "damage prevented this way" stamp.
+    /// CR 614.6 + CR 615.5: the amount of the event this drain's replacement replaced or
+    /// prevented, latched when it applied (`replacement::replaced_event_amount`): a damage or
+    /// life substitution's replaced amount ("that many"), or the damage a prevention actually
+    /// prevented, zero included ("for each 1 damage prevented this way"). Dispatch binds it as
+    /// the action's own amount (`quantity::with_replacement_action_scope`), ahead of the die
+    /// result and the enclosing trigger's amounts; work the action leaves behind a prompt
+    /// carries it (`PendingContinuation::replacement_action`). `None` when the replacement owns
+    /// no amount.
     #[serde(default)]
     pub event_amount: Option<u32>,
 
@@ -32433,10 +32597,50 @@ impl PostReplacementDrainStack {
     /// and a nested check taken during that dispatch must not try to re-drain it.
     /// This is exactly what `post_replacement_continuation.is_some()` meant, since
     /// the old code took the continuation out of the slot before dispatching.
+    ///
+    /// Only the resident can run, so only the resident counts. A Ready entry beneath a paused
+    /// resident (`install_behind_paused_resident`) is work that waits for that resident to
+    /// retire; until then nothing may dispatch it, and a nested install must not collide with it.
     pub fn has_ready(&self) -> bool {
         self.drains
-            .iter()
-            .any(|drain| matches!(drain.status, DrainStatus::Ready(_)))
+            .last()
+            .is_some_and(|drain| matches!(drain.status, DrainStatus::Ready(_)))
+    }
+
+    /// CR 615.5 + CR 608.2c: whether work waits directly beneath the resident
+    /// (`install_behind_paused_resident`), to run once the resident retires.
+    pub fn has_ready_behind_resident(&self) -> bool {
+        self.drains
+            .len()
+            .checked_sub(2)
+            .and_then(|depth| self.drains.get(depth))
+            .is_some_and(|drain| matches!(drain.status, DrainStatus::Ready(_)))
+    }
+
+    /// CR 615.5 + CR 608.2c: queue `drain` beneath a paused resident, so it becomes the
+    /// resident, and runs, only once that paused work retires
+    /// (`finish_paused_dispatch`). Hands `drain` back, not installed, when the resident is not
+    /// paused.
+    ///
+    /// The queue is first in, first out: `drain` goes beneath the run of Ready entries already
+    /// queued directly under the resident, so work queued earlier runs earlier.
+    pub fn install_behind_paused_resident(
+        &mut self,
+        drain: PostReplacementDrain,
+    ) -> Option<PostReplacementDrain> {
+        match self.drains.last().map(|resident| &resident.status) {
+            Some(DrainStatus::Paused) => {
+                let resident = self.drains.len() - 1;
+                let queued = self.drains[..resident]
+                    .iter()
+                    .rev()
+                    .take_while(|queued| matches!(queued.status, DrainStatus::Ready(_)))
+                    .count();
+                self.drains.insert(resident - queued, drain);
+                None
+            }
+            Some(DrainStatus::Ready(_) | DrainStatus::Dispatching) | None => Some(drain),
+        }
     }
 
     /// The innermost drain, whatever its status. Event-context reads (CR 615.5)
@@ -33182,6 +33386,10 @@ fn validate_draw_dealer(frame: &DrawSequenceFrame, dealer: &DrawDealer) -> Resul
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingReplacement {
     pub proposed: ProposedEvent,
+    /// CR 608.2f + CR 700.1: the guards of the simultaneous damage batch this portion
+    /// belongs to, read again when the answer re-scans this portion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settled_damage_guards: Vec<crate::types::ability::SettledDamageGuard>,
     /// CR 701.21a + CR 614.1: An inner Battlefield→graveyard `ZoneChange`
     /// can pause for a `Moved` replacement after its enclosing sacrifice was
     /// already accepted. Preserve that action's subject and controller until
@@ -33274,6 +33482,34 @@ pub struct PendingReplacement {
         skip_serializing_if = "UnrepresentablePolicy::is_ignore_impossible"
     )]
     pub unrepresentable_life_change: UnrepresentablePolicy,
+}
+
+/// CR 510.2 + CR 700.1 + CR 615.8 + CR 611.3a: what one simultaneous damage batch has
+/// settled so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DamageBatchLedger {
+    /// A consumed one-shot stays eligible only for the same source's portions of a combat
+    /// batch.
+    pub(crate) applications: Vec<(AppliedReplacementKey, ObjectId)>,
+    /// A printed guard reads once for the whole batch (Undergrowth Champion ruling: "its
+    /// prevention effect will apply once to all that damage").
+    pub(crate) settled_guards: Vec<crate::types::ability::SettledDamageGuard>,
+    /// CR 615.5 + CR 608.2c: the frame of the first noncombat rider in this batch that left its
+    /// prompt standing. The batch's later riders queue behind it
+    /// (`replacement::damage_rider_placement`). In combat a settled leg's own continuation parks
+    /// the pass (`replacement::drain_combat_damage_continuation`), and only the in-leg
+    /// earlier-rider and aggregate drains settle their pauses (`drain_combat_damage_rider`), so
+    /// it is never set there.
+    pub(crate) paused_rider: Option<PostReplacementFrameId>,
+    /// CR 614.6 + CR 615.5 + CR 616.1: `Some` while a two-phase noncombat batch is settling its
+    /// original replacement choices. A damage replacement's action or rider is held here
+    /// (`replacement::hold_damage_rider`) instead of running between those choices; the batch
+    /// runs them after its damage. `None` everywhere else, where riders run at once.
+    pub(crate) held_riders: Option<Vec<HeldBatchRider>>,
+    /// CR 614.9 + CR 120.4b: portions a capped redirect split off while the batch settles its
+    /// original choices (`replacement::redirect_damage_event`), for the batch to replace with
+    /// its other portions.
+    pub(crate) split_portions: Vec<crate::types::ability::SplitDamagePortion>,
 }
 
 /// Who owns a player-resource change (life, player counter, energy) whose final
@@ -35735,6 +35971,18 @@ impl GameState {
         installed
     }
 
+    /// CR 615.5 + CR 608.2c: install `drain` behind the paused resident of the frame `owner`
+    /// names, found by identity. Hands `drain` back, not installed, when that frame is gone or
+    /// its resident is not paused.
+    pub(crate) fn install_post_replacement_drain_behind_paused(
+        &mut self,
+        owner: PostReplacementFrameId,
+        drain: PostReplacementDrain,
+    ) -> Option<PostReplacementDrain> {
+        self.resolution_stack
+            .install_post_replacement_drain_behind_paused(owner, drain)
+    }
+
     /// True when the exact active general drain has ready continuation work.
     pub fn has_active_post_replacement_drain(&self) -> bool {
         self.active_post_replacement_drains()
@@ -37940,7 +38188,6 @@ impl GameState {
             remote_type_layer_recipients: im::HashSet::new(),
             day_night: None,
             spells_cast_this_turn: 0,
-            spells_cast_last_turn: None,
             most_spells_cast_by_one_previous_active_player: None,
             pending_trigger: None,
             pending_trigger_firing: None,
@@ -38232,7 +38479,8 @@ impl GameState {
             baxter_set_aside: Vec::new(),
             initiative: None,
             combat_prevention_tally: None,
-            combat_one_shot_applications: None,
+            damage_batch_ledger: None,
+            damage_event_losses: None,
             cancelled_casts: Vec::new(),
             pending_activations: Vec::new(),
             commander_declined_zone_return: HashSet::new(),
@@ -39293,14 +39541,6 @@ impl GameState {
         self.active_post_replacement_drains()?
             .resident()
             .and_then(|drain| drain.event_target.as_ref())
-    }
-
-    /// CR 614.1a: the resident drain's replaced damage amount — set only by a
-    /// damage substitution (see [`PostReplacementDrain::event_amount`]).
-    pub fn post_replacement_event_amount(&self) -> Option<u32> {
-        self.active_post_replacement_drains()?
-            .resident()
-            .and_then(|drain| drain.event_amount)
     }
 
     /// Clear the resident drain's replacement source while leaving the
@@ -41879,7 +42119,6 @@ impl GameState {
             day_night: _,
             most_spells_cast_by_one_previous_active_player: _,
             spells_cast_this_turn: _,
-            spells_cast_last_turn: _,
             cancelled_casts: _,
             pending_activations: _,
             pending_trigger_entry: _,
@@ -42121,7 +42360,8 @@ impl GameState {
             baxter_set_aside: _,
             initiative: _,
             combat_prevention_tally: _,
-            combat_one_shot_applications: _,
+            damage_batch_ledger: _,
+            damage_event_losses: _,
             liminal_entries: _,
             pending_liminal_entry_resume: _,
             entering_aura_authority: _,
@@ -43104,7 +43344,7 @@ pub(crate) fn same_position(a: &GameState, b: &GameState) -> bool {
 /// entry unless the SAME simultaneous combat batch is still applying it
 /// (`if repl_def.is_consumed && !consumed_replacement_applies_in_combat_batch(state, event, rid) { continue; }`
 /// in `game::replacement`), and that re-admission ledger exists only inside
-/// `replace_combat_damage_batch` (`combat_one_shot_applications`), which grants no priority,
+/// `replace_combat_damage_batch` (`DamageBatchLedger::applications`), which grants no priority,
 /// so no loop sample ever observes a spent shield able to apply again. This is the same
 /// live-only reading `analysis::resource::replacement_def_is_live` gives the loop firewall
 /// (`last_known_records_grow_unread`), applied to both comparators here because they now share
@@ -43472,7 +43712,6 @@ fn _gamestate_partition_is_total(s: &GameState) {
         remote_type_layer_recipients: _,
         day_night: _,
         spells_cast_this_turn: _,
-        spells_cast_last_turn: _,
         most_spells_cast_by_one_previous_active_player: _,
         cancelled_casts: _,
         pending_activations: _,
@@ -43786,7 +44025,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         baxter_set_aside: _,
         initiative: _,
         combat_prevention_tally: _,
-        combat_one_shot_applications: _,
+        damage_batch_ledger: _,
+        damage_event_losses: _,
         // Post-rebase upstream additions (v0.21.x: #5515 discover + liminal mechanic).
         // Strict-compared by eq_except_growable's GameState PartialEq reuse (fail-safe:
         // a differing value is correctly not a fixed-point repeat); object-growth loops
@@ -44197,7 +44437,6 @@ impl PartialEq for GameState {
             && self.state_revision == other.state_revision
             && self.day_night == other.day_night
             && self.spells_cast_this_turn == other.spells_cast_this_turn
-            && self.spells_cast_last_turn == other.spells_cast_last_turn
             && self.most_spells_cast_by_one_previous_active_player
                 == other.most_spells_cast_by_one_previous_active_player
             && self.pending_trigger == other.pending_trigger
@@ -45308,6 +45547,65 @@ mod drain_stack_reentrancy_tests {
             "the nested post-effect must be visible as pending work — \
              draw_through_replacement gates its drain on exactly this predicate"
         );
+    }
+
+    /// CR 615.5 + CR 608.2c: work queued behind a paused resident is not pending work until
+    /// that resident retires, so a nested stash still installs above it; then it is the
+    /// resident, and runs next. Two queued drains run in the order they were queued.
+    #[test]
+    fn work_queued_behind_a_paused_resident_waits_for_it() {
+        let mut stack = PostReplacementDrainStack::default();
+        let queued = ready_drain("queued");
+        let second = ready_drain("second");
+        assert!(
+            stack
+                .install_behind_paused_resident(queued.clone())
+                .is_some(),
+            "an empty stack has no paused resident to wait behind"
+        );
+        assert!(stack.install(ready_drain("earlier"), ResidentDrainPolicy::KeepResident));
+        assert!(
+            stack
+                .install_behind_paused_resident(queued.clone())
+                .is_some(),
+            "a Ready resident is not paused work"
+        );
+        let (_, earlier) = stack
+            .begin_dispatch()
+            .expect("the earlier rider dispatches");
+        assert!(stack.pause_dispatch(earlier));
+
+        assert!(stack
+            .install_behind_paused_resident(queued.clone())
+            .is_none());
+        assert!(stack
+            .install_behind_paused_resident(second.clone())
+            .is_none());
+        assert!(!stack.has_ready(), "only the resident can run");
+        assert!(stack.has_ready_behind_resident());
+        assert!(
+            stack.install(ready_drain("nested"), ResidentDrainPolicy::KeepResident),
+            "a nested stash is not dropped by work waiting behind the paused resident"
+        );
+        let (_, nested) = stack.begin_dispatch().expect("the nested drain dispatches");
+        assert!(stack.finish_dispatch(nested).is_some());
+
+        assert!(stack.finish_paused_dispatch().is_some());
+        assert!(stack.has_ready(), "the queued work is now the resident");
+        assert_eq!(
+            stack.resident(),
+            Some(&queued),
+            "the work queued first runs first"
+        );
+        assert!(stack.has_ready_behind_resident());
+        let (_, first) = stack.begin_dispatch().expect("the first queued drain runs");
+        assert!(stack.finish_dispatch(first).is_some());
+        assert_eq!(
+            stack.resident(),
+            Some(&second),
+            "the work queued second runs next"
+        );
+        assert!(!stack.has_ready_behind_resident());
     }
 
     /// CR 615.5 + CR 616.1g: nested pausing replacement continuations own
@@ -47201,6 +47499,81 @@ mod tests {
             error.contains(LEGACY_DEFERRED_SPELL_DELIVERY_ERROR),
             "{error}"
         );
+    }
+
+    /// A current-build state serialized to JSON, with the legacy table-wide
+    /// `spells_cast_last_turn` key set to `legacy` (`None` leaves it absent, which is
+    /// what every current build writes).
+    fn state_with_legacy_spells_cast_last_turn(
+        legacy: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut value =
+            serde_json::to_value(GameState::new_two_player(7)).expect("a state serializes");
+        assert!(
+            value.get("spells_cast_last_turn").is_none(),
+            "a current build never writes the table-wide snapshot"
+        );
+        if let Some(legacy) = legacy {
+            value
+                .as_object_mut()
+                .expect("a state is an object")
+                .insert("spells_cast_last_turn".to_string(), legacy);
+        }
+        value
+    }
+
+    /// T1: the legacy table-wide snapshot cannot say which player cast the spells of the previous
+    /// turn (CR 117.1 + CR 603.4), so a nonzero total is refused at BOTH restore hosting points
+    /// (`GameState::deserialize` -> `GameStateDecode::decode`, and
+    /// `GameStateDecode::prepare_resolution_wire`) while an absent key, `null` and `0` (one
+    /// distribution only: all zeros) restore. Each row is its own assertion.
+    #[test]
+    fn legacy_spells_cast_last_turn_snapshot_is_refused_unless_it_is_exactly_zero() {
+        let restore = |legacy: Option<serde_json::Value>| {
+            serde_json::from_value::<GameState>(state_with_legacy_spells_cast_last_turn(legacy))
+                .map_err(|error| error.to_string())
+        };
+        let wire = |legacy: Option<serde_json::Value>| {
+            let mut value = state_with_legacy_spells_cast_last_turn(legacy);
+            GameStateDecode::prepare_resolution_wire(
+                &mut value,
+                GameStateDecodeMode::ResolutionWireV4,
+            )
+        };
+        // Reach: the same state restores with no legacy key, so every refusal below is the key's.
+        assert!(restore(None).is_ok(), "{:?}", restore(None).err());
+        assert!(wire(None).is_ok(), "{:?}", wire(None).err());
+        assert!(restore(Some(serde_json::Value::Null)).is_ok());
+        assert!(wire(Some(serde_json::Value::Null)).is_ok());
+        assert!(restore(Some(serde_json::json!(0))).is_ok());
+        assert!(wire(Some(serde_json::json!(0))).is_ok());
+        for total in [1, 2, 255] {
+            let error = restore(Some(serde_json::json!(total)))
+                .expect_err("a nonzero legacy total is refused by decode");
+            assert!(
+                error.contains(LEGACY_SPELLS_CAST_LAST_TURN_ERROR),
+                "{total}: {error}"
+            );
+            let error = wire(Some(serde_json::json!(total)))
+                .expect_err("a nonzero legacy total is refused by the wire preparation");
+            assert!(
+                error.contains(LEGACY_SPELLS_CAST_LAST_TURN_ERROR),
+                "{total}: {error}"
+            );
+        }
+    }
+
+    /// T3: the policy is by data, not by which card is on the battlefield: a total of 1 is refused
+    /// even though Gatstaf Shepherd's and Howler's answers would both be decidable from it, and
+    /// the trusted envelope nests the key under `state`.
+    #[test]
+    fn legacy_spells_cast_last_turn_refusal_reads_the_enveloped_state_too() {
+        let bare = serde_json::json!({ "spells_cast_last_turn": 1 });
+        assert!(reject_legacy_spells_cast_last_turn(&bare).is_err());
+        let envelope = serde_json::json!({ "state": bare });
+        assert!(reject_legacy_spells_cast_last_turn(&envelope).is_err());
+        let zero = serde_json::json!({ "state": { "spells_cast_last_turn": 0 } });
+        assert!(reject_legacy_spells_cast_last_turn(&zero).is_ok());
     }
 
     fn legacy_exploited_definition(marker: &str, actor_id: u64) -> serde_json::Value {
@@ -55470,6 +55843,30 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
             .is_none());
     }
 
+    /// `LazyBoxedVec` holds no allocation while empty, is one pointer wide, and serializes as
+    /// the plain `Vec` it holds.
+    #[test]
+    fn lazy_boxed_vec_is_one_pointer_and_unallocated_while_empty() {
+        assert_eq!(
+            std::mem::size_of::<LazyBoxedVec<u32>>(),
+            std::mem::size_of::<usize>()
+        );
+        let empty = LazyBoxedVec::<u32>::from(Vec::new());
+        assert!(empty.0.is_none() && empty.is_empty() && empty.as_slice().is_empty());
+        assert_eq!(empty, LazyBoxedVec::default());
+
+        let held = LazyBoxedVec::from(vec![1u32, 2]);
+        assert_eq!(held.as_slice(), [1, 2]);
+        assert_eq!(serde_json::to_string(&held).unwrap(), "[1,2]");
+        let decoded: LazyBoxedVec<u32> = serde_json::from_str("[1,2]").unwrap();
+        assert_eq!(decoded, held);
+        let decoded_empty: LazyBoxedVec<u32> = serde_json::from_str("[]").unwrap();
+        assert!(
+            decoded_empty.0.is_none(),
+            "an empty list decodes unallocated"
+        );
+    }
+
     /// CR 104.4b + CR 732.2a: repeated same-step zone cycles accumulate
     /// incarnation-versioned LKI, but snapshots no pending trigger can consume
     /// are history rather than a change to the recurring game state. A snapshot
@@ -59865,6 +60262,7 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
                 trigger_events,
                 trigger_match_count: None,
                 return_result_occurrence: None,
+                replacement_action: None,
             })
         }
 
@@ -63108,6 +63506,7 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
     fn waiting_for_variants_exist() {
         fn dummy_pending() -> Box<PendingCast> {
             Box::new(PendingCast {
+                alternative_cost_keyword: None,
                 object_id: ObjectId(1),
                 card_id: CardId(1),
                 ability: Box::new(ResolvedAbility::new(
@@ -63749,6 +64148,56 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
         assert_eq!(back, prompt);
     }
 
+    /// CR 113.2c + CR 601.2b: the elected keyword instance round-trips on a
+    /// casting option and on a pending cast; payloads without it load `None`.
+    #[test]
+    fn alternative_cost_keyword_round_trips_and_defaults_to_none() {
+        use crate::types::keywords::FlashbackCost;
+        let keyword = Keyword::Flashback(FlashbackCost::Mana(ManaCost::SelfManaCost));
+        let option = CastingVariantChoiceOption {
+            variant: CastingVariant::Flashback,
+            face: CastingVariantFace::Current,
+            mana_cost: ManaCost::SelfManaCost,
+            additional_cost: None,
+            authority: None,
+            alternative_cost_keyword: Some(keyword.clone()),
+        };
+        let mut json = serde_json::to_value(&option).expect("serialize option");
+        let back: CastingVariantChoiceOption =
+            serde_json::from_value(json.clone()).expect("deserialize option");
+        assert_eq!(back, option);
+        json.as_object_mut()
+            .expect("an object")
+            .remove("alternative_cost_keyword");
+        let legacy: CastingVariantChoiceOption =
+            serde_json::from_value(json).expect("deserialize legacy option");
+        assert_eq!(legacy.alternative_cost_keyword, None);
+
+        let mut pending = PendingCast::new(
+            ObjectId(1),
+            CardId(1),
+            ResolvedAbility::new(
+                crate::types::ability::Effect::Unimplemented {
+                    name: "Dummy".to_string(),
+                    description: None,
+                },
+                vec![],
+                ObjectId(1),
+                PlayerId(0),
+            ),
+            ManaCost::NoCost,
+        );
+        pending.alternative_cost_keyword = Some(keyword.clone());
+        let mut json = serde_json::to_value(&pending).expect("serialize pending");
+        let back: PendingCast = serde_json::from_value(json.clone()).expect("deserialize pending");
+        assert_eq!(back.alternative_cost_keyword, Some(keyword));
+        json.as_object_mut()
+            .expect("an object")
+            .remove("alternative_cost_keyword");
+        let legacy: PendingCast = serde_json::from_value(json).expect("deserialize legacy pending");
+        assert_eq!(legacy.alternative_cost_keyword, None);
+    }
+
     #[test]
     fn pending_cast_ref_is_single_source_of_truth_for_inline_variants() {
         // CR 601.2f: Every WaitingFor variant that carries `pending_cast: Box<PendingCast>`
@@ -63759,6 +64208,7 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
         // inline variants share the same match arm; the destructuring pattern
         // makes coverage compiler-visible.
         let pending = Box::new(PendingCast {
+            alternative_cost_keyword: None,
             object_id: ObjectId(1),
             card_id: CardId(1),
             ability: Box::new(ResolvedAbility::new(
@@ -68262,6 +68712,7 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
 
     fn pending_life_gain_replacement(policy: UnrepresentablePolicy) -> PendingReplacement {
         PendingReplacement {
+            settled_damage_guards: Vec::new(),
             proposed: ProposedEvent::LifeGain {
                 player_id: PlayerId(0),
                 amount: 1,
@@ -68316,6 +68767,53 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
             legacy.unrepresentable_life_change,
             UnrepresentablePolicy::IgnoreImpossible
         );
+    }
+
+    /// Wire shape of the settled damage-guard carrier (CR 608.2f + CR 700.1): omitted
+    /// when empty, absent in older payloads, and a non-empty value round-trips on both
+    /// `PendingReplacement` and `SpellContext`.
+    #[test]
+    fn settled_damage_guards_wire_shape() {
+        use crate::types::ability::{
+            DamageGuardReading, ReplacementCondition, SettledDamageGuard, SpellContext,
+            StaticCondition,
+        };
+        use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
+
+        let guard = SettledDamageGuard {
+            source: ObjectIncarnationRef::of(ObjectId(7), 2),
+            condition: ReplacementCondition::OnlyIfStatic {
+                condition: Box::new(StaticCondition::SourceIsEquipped),
+            },
+            reading: DamageGuardReading::Holds,
+        };
+
+        let empty = pending_life_gain_replacement(UnrepresentablePolicy::IgnoreImpossible);
+        let json = serde_json::to_value(&empty).expect("record must serialize");
+        assert!(json.get("settled_damage_guards").is_none(), "{json}");
+        let legacy: PendingReplacement =
+            serde_json::from_value(json).expect("legacy record must deserialize");
+        assert!(legacy.settled_damage_guards.is_empty());
+
+        let mut carried = empty;
+        carried.settled_damage_guards = vec![guard.clone()];
+        let json = serde_json::to_value(&carried).expect("record must serialize");
+        assert!(json.get("settled_damage_guards").is_some(), "{json}");
+        let round_trip: PendingReplacement =
+            serde_json::from_value(json).expect("record must deserialize");
+        assert_eq!(round_trip, carried);
+
+        let legacy_context: SpellContext =
+            serde_json::from_value(serde_json::json!({})).expect("legacy context");
+        assert!(legacy_context.settled_damage_guards.is_empty());
+        let context = SpellContext {
+            settled_damage_guards: vec![guard].into(),
+            ..SpellContext::default()
+        };
+        let round_trip: SpellContext =
+            serde_json::from_value(serde_json::to_value(&context).expect("context serializes"))
+                .expect("context deserializes");
+        assert_eq!(round_trip, context);
     }
 
     /// CR 616.1f: a re-parked record copies a `Reject` stamp from its
@@ -69025,6 +69523,7 @@ mod restored_exact_attack_authority_tests {
                             trigger_events: vec![],
                             trigger_match_count: None,
                             return_result_occurrence: None,
+                            replacement_action: None,
                         });
                     state
                         .resolution_stack
@@ -69267,6 +69766,7 @@ mod restored_exact_attack_authority_tests {
                 trigger_events: trigger_event.clone().into_iter().collect(),
                 trigger_match_count: None,
                 return_result_occurrence: None,
+                replacement_action: None,
             });
         state.waiting_for = WaitingFor::OptionalEffectChoice {
             player: P0,
@@ -69425,6 +69925,7 @@ mod restored_exact_attack_authority_tests {
                         trigger_events: vec![],
                         trigger_match_count: None,
                         return_result_occurrence: None,
+                        replacement_action: None,
                     });
                 state
                     .resolution_stack
@@ -70388,6 +70889,7 @@ mod restored_exact_attack_authority_tests {
                                     trigger_events: trigger_event.clone().into_iter().collect(),
                                     trigger_match_count: None,
                                     return_result_occurrence: None,
+                                    replacement_action: None,
                                 }),
                                 selected: vec![],
                             },

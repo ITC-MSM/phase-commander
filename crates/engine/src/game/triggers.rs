@@ -54,7 +54,7 @@ use super::conditions::{
     eval_is_initiative, eval_is_monarch, eval_no_monarch, eval_source_is_attacking,
 };
 use super::filter::{
-    matches_target_filter, matches_target_filter_on_damage_record_source,
+    damage_record_for_event, matches_target_filter, matches_target_filter_on_damage_record_source,
     matches_target_filter_on_lki_snapshot, spell_record_matches_filter, FilterContext,
 };
 use super::game_object::GameObject;
@@ -3656,7 +3656,7 @@ fn collect_matching_triggers_from_context(
     )
 }
 
-/// CR 303.4b + CR 603.10a + CR 603.10f: Collect an off-battlefield observer's
+/// CR 303.4b + CR 603.10a: Collect an off-battlefield observer's
 /// triggers with its last-known `attached_to` temporarily restored.
 ///
 /// `sever_battlefield_attachment_graph_on_exit` clears the live field when the
@@ -3733,8 +3733,8 @@ fn collect_observer_triggers_under_lki_attachment(
 /// per-turn departure ledger rather than from `state.objects` (which no longer
 /// holds it at all).
 ///
-/// WHY THE LEDGER AND NOT THE EVENT BATCH. The sibling CR 603.10a / CR 603.10f
-/// arms below search `events` because each is *keyed on* a `ZoneChanged` in the
+/// WHY THE LEDGER AND NOT THE EVENT BATCH. The sibling CR 603.10a
+/// co-departure arm below searches `events` because it is *keyed on* a `ZoneChanged` in the
 /// batch by construction. `CreatureExploited` is not: CR 702.110b emits it when
 /// the exploit ability RESOLVES, while the exploiter's own departure was
 /// recorded in an earlier action's batch by the CR 704.3 state-based-action
@@ -6800,6 +6800,12 @@ pub(crate) fn complete_logical_zone_trigger_collection_for(
 
     group.stamp_battlefield_departures()?;
     sync_logical_zone_change_simultaneity_stamps(group, final_events);
+    // CR 603.2c: bring the departure stamps into already-queued observer witnesses
+    // (such as Soulherder) captured by the owner's segment before later collectors
+    // compare them by whole-event equality, keeping the single joint event.
+    for context in &mut state.deferred_triggers {
+        sync_logical_zone_change_simultaneity_stamps(group, &mut context.trigger_events);
+    }
     let settlement = collect_logical_zone_trigger_settlement_for(state, group, collector)?;
     resolve_and_apply_trigger_collection(
         state,
@@ -8492,8 +8498,8 @@ fn collect_pending_triggers_with_collection(
                 // exist is still an observer. Its object is gone from
                 // `state.objects`, but its ZoneChangeRecord owns its identity and
                 // trigger entries (CR 608.2h), which is what
-                // `collect_observer_triggers_under_lki_attachment` reads below —
-                // exactly as the CR 603.10f arm does. Only an observer still ON the
+                // `collect_observer_triggers_under_lki_attachment` reads below.
+                // Only an observer still ON the
                 // battlefield is excluded here (the live scan covers it).
                 //
                 // CR 400.7f is the rule that ENTITLES this arm to find the
@@ -8589,8 +8595,7 @@ fn collect_pending_triggers_with_collection(
                         co_departed_observer_record(state, observer_id, *moved_id)
                             .and_then(|record| record.attached_to)
                     });
-                // The save/mutate/collect/restore discipline lives in one place
-                // and is shared with the CR 603.10f player-loss arm below.
+                // The save/mutate/collect/restore discipline lives in one place.
                 let matched_triggers = collect_observer_triggers_under_lki_attachment(
                     state,
                     observer_id,
@@ -8598,113 +8603,6 @@ fn collect_pending_triggers_with_collection(
                     event,
                     events,
                     &observer_source_context,
-                    &mut batched_this_pass,
-                    &mut registered_this_event,
-                    &active_suppress_triggers,
-                    collection,
-                    // CR 603.10a: an LKI observer existed on the battlefield before the event.
-                    TriggerSourceVisit::Observer {
-                        exists_from: TriggerObservationTime::ImmediatelyBefore,
-                    },
-                );
-                for matched in matched_triggers {
-                    if !session.record_match(state, &matched, event) {
-                        continue;
-                    }
-                    if matched.batched {
-                        batched_this_pass.insert((observer_id, matched.trig_idx));
-                    }
-                    registered_this_event.insert((observer_id, matched.trig_idx));
-                    pending.push(PendingTriggerContext::batched(
-                        matched.pending,
-                        matched.trigger_events,
-                        matched.causes,
-                    ));
-                }
-            }
-        }
-
-        // CR 603.10f: "Abilities that trigger when a player loses the game look
-        // back in time." CR 704.3 runs state-based actions in one pass, and
-        // within that pass CR 104.3b eliminates the player before the CR 704.5m
-        // sweep puts an Aura attached to that now-illegal player into its
-        // owner's graveyard — all before triggers are collected. Per CR 400.7
-        // the Aura is a new object with no memory of the battlefield, so the
-        // empty-`trigger_zones` battlefield gate would reject it. CR 603.10f is
-        // the rule that says it triggers anyway; the departure record
-        // (CR 608.2h last-known information) is the authority for what it was
-        // attached to.
-        //
-        // Admission is a POSITIVE IDENTITY match on `record.attached_to`, not an
-        // inference from simultaneity: the CR 704.5m sweep does not call
-        // `mark_simultaneous_departures`, so `record.co_departed` can be empty
-        // on this path, and when it is non-empty it names unrelated permanents
-        // that died in the same pass. Only the recorded attachment identifies
-        // the observer as having been attached to THIS losing player.
-        if let GameEvent::PlayerLost { player_id, .. } = event {
-            for observer_event in events {
-                let GameEvent::ZoneChanged {
-                    object_id: observer_id,
-                    record,
-                    ..
-                } = observer_event
-                else {
-                    continue;
-                };
-                // CR 303.4b: only a permanent attached to the player who just
-                // lost. CR 301.5 restricts Equipment hosts to creatures, so
-                // `AttachTarget::Player` excludes the CR 704.5n Equipment case
-                // by construction.
-                if record.attached_to
-                    != Some(crate::game::game_object::AttachTarget::Player(*player_id))
-                {
-                    continue;
-                }
-                // The live battlefield scan already covers observers still on
-                // the battlefield; this arm only admits objects it excluded, so
-                // skip ONLY an object that is both present AND still on the
-                // battlefield.
-                //
-                // CR 704.5d: an ABSENT object must fall through to admission. A
-                // token Aura is swept to its owner's graveyard by CR 704.5m and
-                // then ceases to exist in the SAME state-based-action pass,
-                // before triggers are collected — so `state.objects` no longer
-                // holds it at all. Treating absence as "off the battlefield" is
-                // what CR 603.10f requires: the departure record (CR 608.2h last
-                // known information) remains the authority for what the observer
-                // was attached to, and it outlives the object itself.
-                //
-                // That rationale now lives in `zones::battlefield_residency`, the
-                // shared authority this guard delegates to: `Remained` is exactly
-                // "present AND still on the battlefield", so `!has_departed()` is
-                // the same predicate this arm has always used.
-                if !super::zones::battlefield_residency(state, *observer_id).has_departed() {
-                    continue;
-                }
-                // CR 400.7 + CR 608.2h: the record's own source context — not a
-                // later same-id object — owns the source identity.
-                let source_context =
-                    match crate::types::game_state::battlefield_departure_trigger_source_context(
-                        observer_event,
-                    ) {
-                        crate::types::game_state::BattlefieldDepartureSourceContext::Present(
-                            context,
-                        ) => context,
-                        // Fail closed on absent/malformed provenance, exactly as
-                        // the co-departure arm does.
-                        crate::types::game_state::BattlefieldDepartureSourceContext::Absent
-                        | crate::types::game_state::BattlefieldDepartureSourceContext::Malformed => {
-                            continue
-                        }
-                    };
-                let observer_id = *observer_id;
-                let matched_triggers = collect_observer_triggers_under_lki_attachment(
-                    state,
-                    observer_id,
-                    record.attached_to,
-                    event,
-                    events,
-                    source_context,
                     &mut batched_this_pass,
                     &mut registered_this_event,
                     &active_suppress_triggers,
@@ -8874,8 +8772,8 @@ fn collect_pending_triggers_with_collection(
         // skipped before any context is resolved.
         //
         // Runs after every other per-object arm for this event, so the
-        // registrations they made (the CR 603.10f player-loss arm, the
-        // off-zone scan, look-back control-change watchers) are seen below
+        // registrations they made (the off-zone scan, look-back control-change
+        // watchers) are seen below
         // and the same printed trigger never fires twice for one event.
         for (ordinal, observer) in departure_window.iter().enumerate() {
             let departure = &observer.departure;
@@ -9033,10 +8931,10 @@ fn collect_pending_triggers_with_collection(
             // CR 611.2f + CR 702.85a: count Cascade from the cast-time keyword
             // snapshot (`obj.cast_spell_keywords`), NOT a fresh
             // `effective_spell_keywords` query. The latter re-evaluates the
-            // grant's `SpellsCastThisTurn == 0` gate AFTER the spell was recorded,
+            // grant's `SpellsCast == 0` gate AFTER the spell was recorded,
             // which would drop a first-qualifying-spell-each-turn Cascade grant on
             // its own spell (Maelstrom Nexus / Wild-Magic Sorcerer / Tardis Bay).
-            // Only `SpellsCastThisTurn`-gated `CastWithKeyword` grants require this
+            // Only `SpellsCast`-gated `CastWithKeyword` grants require this
             // snapshot; the Storm/Ripple/Casualty/Conspire/Replicate seams stay on
             // the live query because their gates are point-stable. For printed
             // Cascade and unconditional grants the snapshot is behavior-preserving:
@@ -9414,7 +9312,7 @@ fn collect_pending_triggers_with_collection(
             // Demonstrate copy ability definition. Gate on the cast-time keyword
             // snapshot (CR 611.2f) rather than a fresh `effective_spell_keywords`
             // query, so a first-qualifying-spell grant is not dropped by the
-            // post-record `SpellsCastThisTurn == 0` gate. Count only the granted
+            // post-record `SpellsCast == 0` gate. Count only the granted
             // delta: printed Demonstrate instances are handled by the face trigger,
             // while a printed-Demonstrate spell with an extra dynamic Demonstrate
             // still gets the extra CR 702.144a trigger.
@@ -12028,12 +11926,17 @@ impl ImmediatelyBeforeObservers {
 /// trigger look back on: an object leaving the game with its owner
 /// (CR 603.10a: leaves-the-battlefield abilities are the only ones that see it),
 /// an Aura or Equipment becoming unattached from it (CR 603.10c), and a
-/// permanent phasing out (CR 603.10b). Everything else, such as the monarch or
-/// the initiative changing hands, is checked immediately after it.
+/// permanent phasing out (CR 603.10b), and the player losing the game
+/// (CR 603.10f): a loss observer the loser owned triggers although it leaves
+/// the game with them (CR 800.4a), and one the loser controlled triggers under
+/// them (CR 603.3a) and is retired (CR 800.4d). Everything else, such as the
+/// monarch or the initiative changing hands, is checked immediately after it.
 fn departure_event_looks_back(event: &GameEvent) -> bool {
     match event {
         GameEvent::ZoneChanged { record, .. } => record.departure.left_game(),
-        GameEvent::Unattached { .. } | GameEvent::PermanentPhasedOut { .. } => true,
+        GameEvent::Unattached { .. }
+        | GameEvent::PermanentPhasedOut { .. }
+        | GameEvent::PlayerLost { .. } => true,
         _ => false,
     }
 }
@@ -12058,7 +11961,8 @@ fn simultaneous_event_looks_back(event: &GameEvent) -> bool {
 ///
 /// `looked_back` names the observers latched before `events[event_start..split]`
 /// happened; that prefix's look-back events (objects leaving the game and
-/// becoming unattached, CR 603.10a + CR 603.10c) are matched against them,
+/// becoming unattached, and players losing the game, CR 603.10a + CR 603.10c +
+/// CR 603.10f) are matched against them,
 /// every other event against the live game. `events[split..batch_end]` is the
 /// rest of the same simultaneous event (CR 704.3: the state-based actions
 /// performed with the departure): its leaves-the-battlefield events look back
@@ -17965,7 +17869,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::StartingLifeTotal { player }
         | QuantityRef::StartingDeckSize { player }
         | QuantityRef::GraveyardSize { player, .. }
-        | QuantityRef::LifeLostThisTurn { player }
+        | QuantityRef::LifeLost { player, .. }
         | QuantityRef::LifeGainedThisTurn { player }
         | QuantityRef::PartySize { player }
         | QuantityRef::Speed { player }
@@ -18004,7 +17908,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         // Same filter axis, optional: a `None` filter names no population to
         // re-scope, so only the `Some` arm can diverge.
         QuantityRef::ZoneCardCount { filter, .. }
-        | QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCast { filter, .. }
         | QuantityRef::SpellsCastThisGame { filter, .. }
         | QuantityRef::AttackedThisTurn { filter, .. } => {
             filter.as_ref().is_some_and(filter_binding_diverges)
@@ -18123,7 +18027,6 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::ChosenNumber
         | QuantityRef::NotedNumber
         | QuantityRef::DescendedThisTurn
-        | QuantityRef::SpellsCastLastTurn
         | QuantityRef::DungeonsCompleted
         | QuantityRef::CostXPaid
         | QuantityRef::KickerCount
@@ -21005,6 +20908,15 @@ fn trigger_subject_read<'event, 'state>(
         .or_else(|| live.map(TriggerSourceRead::ExactLive))
 }
 
+/// CR 601.2i + CR 800.4i: table-wide number of spells cast during the previous
+/// turn: the sum of every player's latched `spells_cast_last_turn`, departed
+/// players included (their actions can still be found).
+fn spells_cast_last_turn_total(state: &GameState) -> u32 {
+    state.players.iter().fold(0u32, |total, p| {
+        total.saturating_add(p.spells_cast_last_turn)
+    })
+}
+
 /// Check whether an intervening-if condition is satisfied.
 /// Used both at fire-time and resolution-time.
 ///
@@ -21620,10 +21532,14 @@ fn evaluate_trigger_condition_with_source(
         // dealt. Reuse the same DamageRecord snapshot matcher as
         // PlayerFilter::OpponentDealtDamage so later type changes or zone
         // moves do not change what "that damage was dealt by" refers to.
+        // CR 400.7: `damage_record_for_event` is the single locator of the
+        // record an event wrote — the same source incarnation, recipient,
+        // amount, and combat class — shared with the damage trigger matchers.
         TriggerCondition::EventDamageSourceMatchesFilter { filter } => trigger_event
             .and_then(|event| match event {
                 GameEvent::DamageDealt {
                     source_id: dmg_src,
+                    source_incarnation,
                     target,
                     amount,
                     is_combat,
@@ -21632,33 +21548,44 @@ fn evaluate_trigger_condition_with_source(
                     let ctx = source_context.map_or_else(FilterContext::neutral, |source| {
                         FilterContext::from_trigger_source_with_controller(source, controller)
                     });
-                    state.damage_dealt_this_turn.iter().rev().find(|record| {
-                        record.source_id == *dmg_src
-                            && record.target == *target
-                            && record.amount == *amount
-                            && record.is_combat == *is_combat
-                            && matches_target_filter_on_damage_record_source(
-                                state, record, filter, &ctx,
-                            )
+                    damage_record_for_event(
+                        state,
+                        *dmg_src,
+                        *source_incarnation,
+                        target,
+                        *amount,
+                        *is_combat,
+                    )
+                    .filter(|record| {
+                        matches_target_filter_on_damage_record_source(state, record, filter, &ctx)
                     })
                 }
                 GameEvent::CombatDamageDealtToPlayer {
                     player_id,
                     source_amounts,
+                    source_incarnations,
                     ..
                 } => {
                     let ctx = source_context.map_or_else(FilterContext::neutral, |source| {
                         FilterContext::from_trigger_source_with_controller(source, controller)
                     });
+                    let recipient = TargetRef::Player(*player_id);
                     source_amounts.iter().find_map(|(dmg_src, amount)| {
-                        state.damage_dealt_this_turn.iter().rev().find(|record| {
-                            record.source_id == *dmg_src
-                                && record.target == TargetRef::Player(*player_id)
-                                && record.amount == *amount
-                                && record.is_combat
-                                && matches_target_filter_on_damage_record_source(
-                                    state, record, filter, &ctx,
-                                )
+                        damage_record_for_event(
+                            state,
+                            *dmg_src,
+                            super::trigger_matchers::combat_source_incarnation(
+                                source_incarnations,
+                                *dmg_src,
+                            ),
+                            &recipient,
+                            *amount,
+                            true,
+                        )
+                        .filter(|record| {
+                            matches_target_filter_on_damage_record_source(
+                                state, record, filter, &ctx,
+                            )
                         })
                     })
                 }
@@ -21746,12 +21673,12 @@ fn evaluate_trigger_condition_with_source(
                 .iter()
                 .any(|id| matches_target_filter(state, *id, filter, &ctx))
         }
-        // CR 603.4: "if no spells were cast last turn" — check previous turn spell count.
-        TriggerCondition::NoSpellsCastLastTurn => state.spells_cast_last_turn.unwrap_or(0) == 0,
-        // CR 603.4: "if two or more spells were cast last turn"
-        TriggerCondition::TwoOrMoreSpellsCastLastTurn => {
-            state.spells_cast_last_turn.unwrap_or(0) >= 2
-        }
+        // CR 603.4: "if no spells were cast last turn" — the table-wide total of
+        // the per-player snapshots latched at the turn boundary. CR 800.4i: a
+        // departed player's casts still count.
+        TriggerCondition::NoSpellsCastLastTurn => spells_cast_last_turn_total(state) == 0,
+        // CR 603.4: "if two or more spells were cast last turn" (table-wide).
+        TriggerCondition::TwoOrMoreSpellsCastLastTurn => spells_cast_last_turn_total(state) >= 2,
         // CR 603.4 + CR 810.9a: "if you have N or more life" reads the
         // controller's TEAM total in a team format (own life off-team). Note:
         // `minimum == 0` would flip a missing-player false→true vs. the prior
@@ -23351,6 +23278,7 @@ pub mod tests {
         TargetSelectionMode, TriggerCondition, TriggerConstraint, TriggerDefinition,
         TriggerGrantInstanceRef, TypeFilter, TypedFilter,
     };
+    use crate::types::ability::{CountScope, TurnWindow};
     use crate::types::actions::GameAction;
     use crate::types::card::LayoutKind;
     use crate::types::card_type::CoreType;
@@ -31380,6 +31308,7 @@ pub mod tests {
                 trigger_events: Vec::new(),
                 trigger_match_count: None,
                 return_result_occurrence: None,
+                replacement_action: None,
             }
         }
 
@@ -38416,9 +38345,10 @@ pub mod tests {
             trigger.trigger_zones = vec![Zone::Stack];
             trigger.condition = Some(TriggerCondition::QuantityComparison {
                 lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::SpellsCastThisTurn {
+                    qty: QuantityRef::SpellsCast {
                         scope: crate::types::ability::CountScope::Controller,
                         filter: None,
+                        window: TurnWindow::ThisTurn,
                     },
                 },
                 comparator: Comparator::GE,
@@ -43547,14 +43477,19 @@ pub mod tests {
     }
 
     /// Gatstaf Shepherd's parsed upkeep trigger on a P0 creature, after a turn
-    /// in which `spells_cast` spells were cast; returns the stack length after
-    /// the next upkeep begins.
-    fn gatstaf_shepherd_upkeep_stack_len(spells_cast: u8) -> usize {
+    /// in which P0 cast `p0_casts` and P1 cast `p1_casts` spells (seeded into the
+    /// per-player cast journal the turn boundary latches from); returns the stack
+    /// length after the next upkeep begins.
+    fn gatstaf_shepherd_upkeep_stack_len(p0_casts: usize, p1_casts: usize) -> usize {
         let trigger = parsed_quantity_gated_trigger(
             "Gatstaf Shepherd",
             "At the beginning of each upkeep, if no spells were cast last turn, transform this creature.",
             &["Intimidate", "Transform"],
-            &QuantityRef::SpellsCastLastTurn,
+            &QuantityRef::SpellsCast {
+                scope: CountScope::All,
+                filter: None,
+                window: TurnWindow::LastTurn,
+            },
         );
         let mut state = setup();
         state.active_player = PlayerId(0);
@@ -43570,11 +43505,25 @@ pub mod tests {
             obj.card_types.core_types.push(CoreType::Creature);
             obj.trigger_definitions.push(trigger);
         }
-        state.spells_cast_this_turn = spells_cast;
+        for (player, casts) in [(PlayerId(0), p0_casts), (PlayerId(1), p1_casts)] {
+            state.spells_cast_this_turn_by_player.insert(
+                player,
+                (0..casts)
+                    .map(|_| crate::types::game_state::SpellCastRecord::default())
+                    .collect(),
+            );
+        }
         let mut events = Vec::new();
         crate::game::turns::start_next_turn(&mut state, &mut events);
-        // Reach: the production turn-boundary snapshot ran.
-        assert_eq!(state.spells_cast_last_turn, Some(spells_cast));
+        // Reach: the production turn-boundary latched each player's own count.
+        assert_eq!(
+            state
+                .players
+                .iter()
+                .map(|p| p.spells_cast_last_turn as usize)
+                .collect::<Vec<_>>(),
+            vec![p0_casts, p1_casts]
+        );
         state.phase = Phase::Upkeep;
         process_triggers(
             &mut state,
@@ -43586,22 +43535,22 @@ pub mod tests {
     }
 
     /// R1. CR 603.4 + CR 601.2i: "if no spells were cast last turn" reads the
-    /// table-wide count of spells cast during the previous turn, snapshotted by
-    /// `turns::start_next_turn`. Runtime evidence for coverage classifying
-    /// `QuantityRef::SpellsCastLastTurn` as `Handled`.
-    /// REVERT-PROBE: resolve the ref as a constant 0 → the n = 1 case fires.
+    /// table-wide total of the per-player counts of the previous turn, latched
+    /// by `turns::start_next_turn`. Runtime evidence for coverage classifying
+    /// `SpellsCast { window: LastTurn }` as `Handled`.
+    /// REVERT-PROBE: resolve the ref as a constant 0 → the (1, 0) case fires.
     #[test]
     fn spells_cast_last_turn_gates_parsed_werewolf_upkeep_trigger() {
         assert_eq!(
-            gatstaf_shepherd_upkeep_stack_len(0),
+            gatstaf_shepherd_upkeep_stack_len(0, 0),
             1,
             "no spells were cast last turn: the trigger must fire"
         );
-        for spells_cast in [1, 2] {
+        for (p0, p1) in [(1, 0), (0, 1), (1, 1), (2, 0)] {
             assert_eq!(
-                gatstaf_shepherd_upkeep_stack_len(spells_cast),
+                gatstaf_shepherd_upkeep_stack_len(p0, p1),
                 0,
-                "{spells_cast} spell(s) were cast last turn: the trigger must not fire"
+                "{p0} + {p1} spell(s) were cast last turn: the trigger must not fire"
             );
         }
     }
