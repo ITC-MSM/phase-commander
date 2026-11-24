@@ -1823,6 +1823,7 @@ pub fn static_definition_is_cast_stable_for_pre_cast(definition: &StaticDefiniti
         room_door: None,
         granting_object: None,
         bound_actor: None,
+        origin: _,
     } = definition
     else {
         // This is intentionally a positive proof over every direct static
@@ -8316,7 +8317,7 @@ fn battlefield_departure_counter_context(
 /// undetermined amount from a determined zero (a delayed trigger freezing its
 /// creation-time amount, CR 603.7a) use `determined_event_context_amount`.
 /// Resolution-precedence ordered, after the proposed event's own amount
-/// (`ctx.event_amount`) and the Moonlit copy count:
+/// (`ctx.event_amount`):
 ///
 ///   0. CR 614.6 + CR 615.5: the amount a replacement's own action owns
 ///      (`with_replacement_action_scope`) — the amount of the event it
@@ -8355,13 +8356,6 @@ fn event_context_amount(
         // replacement-condition context, so every other caller falls through
         // to the cascade below unchanged.
         .event_amount
-        // CR 614.1a: Moonlit-scoped "that many" copy count — highest priority
-        // after the proposed event's own amount, which is never set while a
-        // substitution continuation resolves. `Some` only while a
-        // `CopyTokenOf` substitution continuation resolves (Moonlit
-        // Meditation); `None` otherwise, so it falls straight through to the
-        // existing trigger/effect cascade.
-        .or(state.post_replacement_token_substitution_count)
         // CR 614.6 + CR 615.5: a replacement's own action reads the amount of the
         // event it replaced or prevented, ahead of the die result and the trigger
         // tiers of the resolution around it. Farideh's Fireball's "deals 2 damage to
@@ -11800,6 +11794,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
 
@@ -22346,6 +22341,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
         state
@@ -25502,6 +25498,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
         );
@@ -25570,6 +25567,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -25723,6 +25721,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -25807,6 +25806,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -25889,6 +25889,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -25957,6 +25958,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -26022,6 +26024,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -26080,6 +26083,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -26161,6 +26165,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: 0,
@@ -26872,6 +26877,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
         );
@@ -27702,6 +27708,7 @@ mod tests {
                     is_suspected: false,
                     was_prepared: false,
                     attachments: Vec::new(),
+                    produceable_mana_types: Vec::new(),
                     intensity: 0,
                 },
             );

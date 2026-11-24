@@ -10336,6 +10336,7 @@ impl<'a> SourceContext<'a> {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             trigger_source: None,
@@ -10573,6 +10574,7 @@ fn source_context_from_filter<'a>(
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             });
         (
@@ -12478,7 +12480,10 @@ pub(crate) fn object_has_no_abilities(obj: &GameObject) -> bool {
         && obj.abilities.is_empty()
         && obj.trigger_definitions.is_empty()
         && obj.replacement_definitions.is_empty()
-        && obj.static_definitions.is_empty()
+        // CR 109.3 + CR 611.2c: Installed rule effects do not count as abilities.
+        && obj.static_definitions.iter_all().all(
+            crate::types::ability::StaticDefinition::is_resolution_installed,
+        )
 }
 
 /// CR 201.2a: objects with a common name have the same name. The Oracle parser
@@ -13573,6 +13578,7 @@ fn source_context_from_spell_filter(context: SpellFilterContext<'_>) -> SourceCo
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         });
     SourceContext {
@@ -17865,6 +17871,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
         );
@@ -22518,6 +22525,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
             incarnation: departed.objects[&gone].incarnation,
@@ -26128,6 +26136,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
         let filter =
@@ -26178,6 +26187,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
         let entrant = ObjectId(700);
@@ -26318,6 +26328,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
         let filter =
@@ -26466,6 +26477,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
 
@@ -27463,6 +27475,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
         let land_lki = LKISnapshot {
@@ -27486,6 +27499,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
 
@@ -27604,6 +27618,7 @@ mod tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         };
         let filter = TargetFilter::Typed(
@@ -27749,6 +27764,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
         );
@@ -27822,6 +27838,7 @@ mod tests {
                 is_suspected: false,
                 was_prepared: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
         );
@@ -30617,6 +30634,7 @@ mod entry_projection_tests {
         let record = |proposed: ProposedEvent| PendingReplacement {
             settled_damage_guards: Vec::new(),
             proposed,
+            token_substitute: None,
             sacrifice_provenance: None,
             candidates: Vec::new(),
             search_found_candidates: Vec::new(),
@@ -31270,6 +31288,7 @@ mod attached_set_host_filter_tests {
             is_suspected: false,
             was_prepared: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
             intensity: 0,
         }
     }
@@ -31481,6 +31500,7 @@ mod attached_set_host_filter_tests {
                     controller: PlayerId(1),
                     kind: crate::types::ability::AttachmentKind::Aura,
                 }],
+                produceable_mana_types: Vec::new(),
                 intensity: 0,
             },
         );
