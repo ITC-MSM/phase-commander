@@ -15,14 +15,14 @@ use crate::game::game_object::ObjectIncarnationRefExt;
 use crate::game::keywords::HeldObject;
 use crate::game::quantity::{
     counter_count_from_map, quantity_expr_characteristic_reads_at, resolve_quantity,
-    resolve_quantity_with_ctx, resolve_quantity_with_targets, QuantityContext,
+    resolve_quantity_with_ctx, QuantityContext,
 };
 use crate::game::targeting::{DeclaredSlotBinding, SlotReferent};
 use crate::types::ability::{
     filter_contains, filter_grammar_any, filter_prop_grammar_any, player_filter_grammar_any,
     quantity_expr_grammar_any, quantity_ref_grammar_any, rewrite_filter_prop, rewrite_filter_props,
     rewrite_player_filter_props, rewrite_quantity_expr_filter_props, AbilityCondition,
-    AttachmentReferent, AttackerBlockStatus, BlockPairDirection, CardTypeSetSource,
+    AttachmentKind, AttachmentReferent, AttackerBlockStatus, BlockPairDirection, CardTypeSetSource,
     CastManaSpentMetric, ChoiceValue, ChosenAttribute, CombatRelation, CombatRelationSubject,
     ContinuousModification, ControllerRef, CountScope, CrewRelation, FilterGrammarNode, FilterProp,
     Parity, ParitySource, PlayerFilter, PtStat, PtValueScope, QuantityExpr, QuantityRef,
@@ -34,7 +34,8 @@ use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterMatch;
 use crate::types::events::EventObjectSnapshot;
 use crate::types::game_state::{
-    AttackDeclarationRecord, CounterAddedRecord, DamageEventKey, DamageRecord, GameState,
+    battlefield_departure_source_context_from_record, AttackDeclarationRecord,
+    BattlefieldDepartureSourceContext, CounterAddedRecord, DamageEventKey, DamageRecord, GameState,
     LKISnapshot, SpellCastRecord, StackEntryKind, TriggerSourceContext, ZoneChangeRecord,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TriggeringObjectRef};
@@ -1576,6 +1577,10 @@ pub struct FilterContext<'a> {
     /// source-relative filter fact must read through it rather than rebinding
     /// `source_id` to whichever object currently owns that storage slot.
     pub trigger_source: Option<&'a TriggerSourceContext>,
+    /// CR 603.2 + CR 400.7: selected stack-entry trigger provenance for a
+    /// retarget legality call. This is absent for ordinary callers, which keep
+    /// their existing ambient fallback.
+    pub stack_trigger_context: Option<crate::game::targeting::StackTriggerContext<'a>>,
     /// CR 613.4c: Per-recipient binding for dynamic P/T statics whose quantity
     /// is relative to the affected object ("attached to it", "other", "shares a
     /// type with it"). The pronoun "it" refers to the per-id recipient in
@@ -1589,12 +1594,13 @@ pub struct FilterContext<'a> {
     /// trigger whose intervening-`if` is being evaluated — the referent of
     /// "another" in a trigger-anaphoric filter ("another creature you control",
     /// where "another" means "other than the creature that just entered", not
-    /// "other than the ability source"). Bound only inside
-    /// `matches_zone_change_event_object_filter`, which is the one place holding
-    /// the `GameEvent::ZoneChanged` both CR 603.4 legs are handed; `None`
-    /// everywhere else, where `FilterProp::OtherThanTriggerObject` keeps its
-    /// transparent pass-through and the `ObjectCount` / `PropertyAggregate`
-    /// resolvers apply the exclusion at the set level instead.
+    /// "other than the ability source"). Bound inside
+    /// `matches_zone_change_event_object_filter` for trigger condition checks
+    /// and by triggered-ability target enumeration while the current event is
+    /// pushed; `None` everywhere else, where
+    /// `FilterProp::OtherThanTriggerObject` keeps its transparent pass-through
+    /// and the `ObjectCount` / `PropertyAggregate` resolvers apply the
+    /// exclusion at the set level instead.
     ///
     /// CR 400.7: carried as a `TriggeringObjectRef` (id + the incarnation the
     /// event proves) rather than a bare `ObjectId`, so a leave-and-re-enter at
@@ -1632,6 +1638,7 @@ impl<'a> FilterContext<'a> {
             source_controller: source.controller,
             ability: source.ability,
             trigger_source: source.trigger_source,
+            stack_trigger_context: source.stack_trigger_context,
             recipient_id: source.recipient_id,
             scoped_iteration_player: None,
             triggering_object: source.triggering_object,
@@ -1651,6 +1658,17 @@ impl<'a> FilterContext<'a> {
     ) -> FilterContext<'a> {
         FilterContext {
             declared_slot_view: Some(view),
+            ..*self
+        }
+    }
+
+    /// CR 603.2: bind the selected stack entry's event for one legality call.
+    pub(crate) fn with_stack_trigger_context(
+        &self,
+        context: crate::game::targeting::StackTriggerContext<'a>,
+    ) -> FilterContext<'a> {
+        FilterContext {
+            stack_trigger_context: Some(context),
             ..*self
         }
     }
@@ -1742,6 +1760,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             ability_targets: None,
             trigger_source: None,
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1765,6 +1784,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             ability_targets: None,
             trigger_source: None,
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1784,6 +1804,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             ability_targets: None,
             trigger_source: None,
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1803,6 +1824,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             ability_targets: None,
             trigger_source: Some(source),
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1825,6 +1847,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             ability_targets: None,
             trigger_source: Some(source),
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1849,6 +1872,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             ability_targets: None,
             trigger_source: None,
+            stack_trigger_context: None,
             recipient_id: Some(recipient_id),
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1868,6 +1892,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             ability_targets: None,
             trigger_source: ability.trigger_source.as_ref(),
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1889,6 +1914,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             ability_targets: None,
             trigger_source: ability.trigger_source.as_ref(),
+            stack_trigger_context: None,
             recipient_id: Some(recipient_id),
             scoped_iteration_player: None,
             triggering_object: None,
@@ -1913,6 +1939,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             ability_targets: None,
             trigger_source: ability.trigger_source.as_ref(),
+            stack_trigger_context: None,
             recipient_id: None,
             scoped_iteration_player: None,
             triggering_object: None,
@@ -4792,6 +4819,7 @@ pub(crate) fn matches_target_filter_on_entry_observation(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOrLki,
@@ -5082,6 +5110,7 @@ pub fn matches_target_filter_including_phased_out(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOnly,
@@ -5423,6 +5452,7 @@ pub fn matches_target_filter_in_owner_zone(
             ctx.recipient_id,
             ctx.scoped_iteration_player,
             ctx.triggering_object,
+            ctx.stack_trigger_context,
             ctx.declared_slot_view,
             ctx.granting_object,
             ControllerLookup::OwnerZone,
@@ -5445,6 +5475,7 @@ pub fn matches_target_filter_in_owner_zone(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::OwnerZone,
@@ -6498,6 +6529,7 @@ pub(crate) fn matches_target_filter_on_object(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOrLki,
@@ -6543,6 +6575,7 @@ fn entry_filter_matches_staged(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOrLki,
@@ -6668,6 +6701,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.recipient_id,
                     ctx.scoped_iteration_player,
                     ctx.triggering_object,
+                    ctx.stack_trigger_context,
                     ctx.declared_slot_view,
                     ctx.granting_object,
                     ControllerLookup::LiveOrLki,
@@ -6740,6 +6774,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.recipient_id,
                     ctx.scoped_iteration_player,
                     ctx.triggering_object,
+                    ctx.stack_trigger_context,
                     ctx.declared_slot_view,
                     ctx.granting_object,
                     ControllerLookup::LiveOrLki,
@@ -6767,6 +6802,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                 ctx.recipient_id,
                 ctx.scoped_iteration_player,
                 ctx.triggering_object,
+                ctx.stack_trigger_context,
                 ctx.declared_slot_view,
                 ctx.granting_object,
                 ControllerLookup::LiveOrLki,
@@ -6845,6 +6881,7 @@ pub fn matches_target_filter_on_counter_added_record(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOrLki,
@@ -6895,6 +6932,7 @@ pub fn matches_target_filter_on_attack_declaration_record(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOrLki,
@@ -6978,6 +7016,7 @@ pub fn matches_target_filter_on_damage_record_source(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOrLki,
@@ -7350,6 +7389,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         ControllerLookup::LiveOnly,
@@ -7535,6 +7575,7 @@ fn filter_inner_with_lookup(
         ctx.recipient_id,
         ctx.scoped_iteration_player,
         ctx.triggering_object,
+        ctx.stack_trigger_context,
         ctx.declared_slot_view,
         ctx.granting_object,
         controller_lookup,
@@ -7556,6 +7597,7 @@ fn filter_inner_for_object(
     recipient_id: Option<ObjectId>,
     scoped_iteration_player: Option<PlayerId>,
     triggering_object: Option<TriggeringObjectRef>,
+    stack_trigger_context: Option<crate::game::targeting::StackTriggerContext<'_>>,
     declared_slot_view: Option<&[Option<crate::game::targeting::DeclaredSlotBinding>]>,
     granting_object: Option<ObjectIncarnationRef>,
     controller_lookup: ControllerLookup,
@@ -7849,6 +7891,7 @@ fn filter_inner_for_object(
             );
             source_ctx.declared_slot_view = declared_slot_view;
             source_ctx.ability_targets = ability_targets;
+            source_ctx.stack_trigger_context = stack_trigger_context;
             properties.iter().all(|p| match p {
                 FilterProp::Owned { controller } => {
                     zone_axis_admits(state, licensed, obj.owner, |owner| {
@@ -7870,6 +7913,7 @@ fn filter_inner_for_object(
             recipient_id,
             scoped_iteration_player,
             triggering_object,
+            stack_trigger_context,
             declared_slot_view,
             granting_object,
             controller_lookup,
@@ -7889,6 +7933,7 @@ fn filter_inner_for_object(
                 recipient_id,
                 scoped_iteration_player,
                 triggering_object,
+                stack_trigger_context,
                 declared_slot_view,
                 granting_object,
                 controller_lookup,
@@ -7909,6 +7954,7 @@ fn filter_inner_for_object(
                 recipient_id,
                 scoped_iteration_player,
                 triggering_object,
+                stack_trigger_context,
                 declared_slot_view,
                 granting_object,
                 controller_lookup,
@@ -7932,6 +7978,7 @@ fn filter_inner_for_object(
                     recipient_id,
                     scoped_iteration_player,
                     triggering_object,
+                    stack_trigger_context,
                     declared_slot_view,
                     granting_object,
                     pre_entry_battlefield: None,
@@ -8156,6 +8203,7 @@ fn filter_inner_for_object(
                     recipient_id,
                     scoped_iteration_player,
                     triggering_object,
+                    stack_trigger_context,
                     declared_slot_view,
                     granting_object,
                     controller_lookup,
@@ -8346,6 +8394,7 @@ fn filter_inner_for_object(
                 recipient_id,
                 scoped_iteration_player,
                 triggering_object,
+                stack_trigger_context,
                 declared_slot_view,
                 granting_object,
                 pre_entry_battlefield: None,
@@ -10273,6 +10322,9 @@ pub(crate) struct SourceContext<'a> {
     /// projection so nested filter evaluation cannot rebind a recycled id.
     pub(crate) lki: LKISnapshot,
     pub(crate) trigger_source: Option<&'a TriggerSourceContext>,
+    /// CR 603.2 + CR 400.7: selected stack-entry trigger provenance carried
+    /// into dynamic quantity thresholds.
+    pub(crate) stack_trigger_context: Option<crate::game::targeting::StackTriggerContext<'a>>,
     /// CR 303.4 + CR 301.5: Resolved host of the source's attachment, if any.
     /// Widened to `AttachTarget` so attachment-aware filter properties
     /// (`EnchantedBy`, `EquippedBy`) can route on Object vs Player. The
@@ -10340,6 +10392,7 @@ impl<'a> SourceContext<'a> {
                 intensity: 0,
             },
             trigger_source: None,
+            stack_trigger_context: None,
             attached_to: None,
             source_is_aura: false,
             source_is_equipment: false,
@@ -10600,6 +10653,7 @@ fn source_context_from_filter<'a>(
         declared_slot_view: None,
         lki: lki.clone(),
         trigger_source,
+        stack_trigger_context: None,
         attached_to,
         source_is_aura,
         source_is_equipment,
@@ -11095,6 +11149,7 @@ fn aura_can_enchant_referenced_target(
                 triggering_object: source.triggering_object,
                 declared_slot_view: source.declared_slot_view,
                 granting_object: source.granting_object,
+                stack_trigger_context: source.stack_trigger_context,
                 pre_entry_battlefield: None,
             };
             filter_inner(state, *target_id, enchant_filter, &ctx)
@@ -11120,12 +11175,18 @@ fn resolve_filter_threshold(
     source: &SourceContext<'_>,
 ) -> i32 {
     match source.ability {
-        Some(ability) => resolve_quantity_with_targets(state, expr, ability),
+        Some(ability) => crate::game::quantity::resolve_quantity_with_targets_and_trigger_context(
+            state,
+            expr,
+            ability,
+            source.stack_trigger_context,
+        ),
         None => resolve_quantity_with_ctx(
             state,
             expr,
             source.controller.unwrap_or(PlayerId(0)),
             QuantityContext {
+                stack_trigger_context: source.stack_trigger_context,
                 granting_object: source.granting_object,
                 ..QuantityContext::new(source.id)
             },
@@ -12039,17 +12100,14 @@ fn matches_filter_prop(
         FilterProp::Modified => {
             let has_counter = obj.counters.values().any(|&n| n > 0);
             let has_qualifying_attachment = phased_in_attachments(state, obj).any(|att| {
-                let is_equipment = att.card_types.subtypes.iter().any(|s| s == "Equipment");
-                if is_equipment {
-                    // CR 301.5: Equipment attachment alone is sufficient — no
-                    // controller constraint (a creature equipped by anyone's
-                    // Equipment is modified).
-                    return true;
-                }
-                let is_aura = att.card_types.subtypes.iter().any(|s| s == "Aura");
-                // CR 303.4: Aura counts only if controlled by the permanent's
-                // controller.
-                is_aura && att.controller == obj.controller
+                let kind = if att.card_types.subtypes.iter().any(|s| s == "Equipment") {
+                    AttachmentKind::Equipment
+                } else if att.card_types.subtypes.iter().any(|s| s == "Aura") {
+                    AttachmentKind::Aura
+                } else {
+                    return false;
+                };
+                attachment_modifies_permanent(&kind, att.controller, obj.controller)
             });
             has_counter || has_qualifying_attachment
         }
@@ -12531,18 +12589,18 @@ pub(crate) fn spell_has_chosen_name(spell: &GameObject, fused: bool, chosen: &st
 
 /// CR 603.10: Evaluate a `FilterProp` against a zone-change event snapshot.
 ///
-/// Properties fall into four groups:
+/// Properties fall into five groups:
 /// 1. **Snapshot-derivable.** Read directly from the captured record — P/T, colors, CMC,
-///    keywords, supertypes, types, owner/controller, name.
+///    keywords, supertypes, types, owner/controller, name, and departure-time
+///    modification (`Modified`).
 /// 2. **Source/event relational.** Compare the record against the source object or its
 ///    chosen attributes — `Another`, `Owned`, `IsChosenCreatureType`, `Named`,
 ///    `SharesQuality` (`None` and direct-`ParentTarget` references only).
 /// 3. **Combat snapshot state.** Attacking/blocking/unblocked predicates read
 ///    `ZoneChangeRecord::combat_status`, because leaving a zone removes the
 ///    object from live combat.
-/// 4. **Dynamic battlefield state.** Inherently requires the live object (tapped,
-///    counters, attached-to). A zone-change subject has already left its public
-///    zone, so these are semantically not applicable and return `false`.
+/// 4. **Exit-time LKI cache.** `Counters`, `Tapped`, and `Untapped` read the
+///    cached state for the record's object ID.
 /// 5. **Not-yet-supported.** Could plausibly be snapshotted or cross-referenced but
 ///    are not currently required. Returning `false` is a known conservative gap.
 fn zone_change_record_matches_property(
@@ -12993,6 +13051,29 @@ fn zone_change_record_matches_property(
                     .contains(&record.object_id)
         }
 
+        // CR 700.9 + CR 603.10a: The attachment check reads `record.attachments`,
+        // which `zones::capture_attachment_snapshot` fills per moved object.
+        // Attachments that left earlier in the same batch are missing here,
+        // as they are for `EnchantedBy` and `EquippedBy`.
+        // An attachment that is both an Aura and an Equipment is recorded with one kind.
+        FilterProp::Modified => {
+            // The context authority also rejects records from zones other than the battlefield.
+            let has_counter = match battlefield_departure_source_context_from_record(record) {
+                BattlefieldDepartureSourceContext::Present(context) => {
+                    context.lki.counters.values().any(|&count| count > 0)
+                }
+                BattlefieldDepartureSourceContext::Absent => false,
+                BattlefieldDepartureSourceContext::Malformed => return false,
+            };
+            has_counter
+                || record.attachments.iter().any(|attachment| {
+                    attachment_modifies_permanent(
+                        &attachment.kind,
+                        attachment.controller,
+                        record.controller,
+                    )
+                })
+        }
         // CR 603.10a + CR 704.5n: the departure record captures the attachment
         // relation at the instant before the zone change, so an "equipped" /
         // "enchanted" look-back reads THAT snapshot — the live object has already
@@ -13086,9 +13167,6 @@ fn zone_change_record_matches_property(
         // CR 701.15b/c: goad is not snapshotted onto the zone-change record
         // (unlike Suspected's `record.is_suspected`). Fail closed.
         | FilterProp::Goaded
-        // CR 700.9: Modified is a live-battlefield predicate (counters +
-        // attachments) — a zone-change snapshot cannot represent it.
-        | FilterProp::Modified
         | FilterProp::DifferentNameFrom { .. }
         // CR 109.1: identity-exclusion is a live-battlefield predicate; a
         // zone-change snapshot cannot represent it. Fail closed.
@@ -13153,6 +13231,19 @@ pub(crate) fn phased_in_attachments<'a>(
         .iter()
         .filter_map(|id| state.objects.get(id))
         .filter(|att| !att.is_phased_out())
+}
+
+/// CR 700.9: Equipment qualifies under any controller (CR 301.5).
+/// An Aura qualifies only under the attached permanent's controller (CR 303.4).
+fn attachment_modifies_permanent(
+    kind: &AttachmentKind,
+    attachment_controller: PlayerId,
+    permanent_controller: PlayerId,
+) -> bool {
+    match kind {
+        AttachmentKind::Equipment => true,
+        AttachmentKind::Aura => attachment_controller == permanent_controller,
+    }
 }
 
 fn attachment_controller_matches(
@@ -13590,6 +13681,7 @@ fn source_context_from_spell_filter(context: SpellFilterContext<'_>) -> SourceCo
         triggering_object: None,
         declared_slot_view: None,
         trigger_source: None,
+        stack_trigger_context: None,
         attached_to: source_obj.and_then(|o| o.attached_to),
         source_is_aura: source_obj
             .is_some_and(|o| source_is_aura_or_bestow(&o.card_types.subtypes, &o.keywords)),
@@ -13784,6 +13876,7 @@ fn object_shares_quality_with_reference_filter(
         triggering_object: source.triggering_object,
         declared_slot_view: source.declared_slot_view,
         granting_object: source.granting_object,
+        stack_trigger_context: source.stack_trigger_context,
         pre_entry_battlefield: None,
     };
     // CR 109.2 + CR 205.3m: resolve a bare descriptive reference such as "a
@@ -26818,6 +26911,97 @@ mod tests {
             PlayerId(0),
             &[],
         ));
+    }
+
+    #[test]
+    fn modified_look_back_reads_the_departure_record() {
+        use crate::types::counter::CounterType;
+
+        let mut state = setup();
+        let id = add_creature(&mut state, PlayerId(0), "Grizzly Bears");
+        let equipment = AttachmentSnapshot {
+            object_id: ObjectId(100),
+            identity: None,
+            controller: PlayerId(1),
+            kind: AttachmentKind::Equipment,
+        };
+        let from_hand = ZoneChangeRecord {
+            attachments: vec![equipment.clone()],
+            ..ZoneChangeRecord::test_minimal(id, Some(Zone::Hand), Zone::Graveyard)
+        };
+        let absent = ZoneChangeRecord::test_minimal(id, Some(Zone::Battlefield), Zone::Graveyard);
+        let empty = ZoneChangeRecord {
+            trigger_source_context: state.objects[&id]
+                .snapshot_for_zone_change(id, Some(Zone::Battlefield), Zone::Graveyard)
+                .trigger_source_context,
+            ..absent.clone()
+        };
+        let mut counted = empty.clone();
+        counted
+            .trigger_source_context
+            .as_mut()
+            .unwrap()
+            .lki
+            .counters
+            .insert(CounterType::Plus1Plus1, 1);
+        let malformed = ZoneChangeRecord {
+            object_id: ObjectId(101),
+            ..counted.clone()
+        };
+        let malformed_equipped = ZoneChangeRecord {
+            object_id: malformed.object_id,
+            attachments: vec![equipment],
+            ..empty.clone()
+        };
+        let mut mismatches = Vec::new();
+        // CR 700.9 + CR 603.10a: Read the modification of the departing permanent
+        // from its own record, even if a later departure has overwritten the cache.
+        for (case, record, cached, expected) in [
+            ("a: from hand", &from_hand, &empty, false),
+            ("b: record has counters", &counted, &empty, true),
+            ("c: only cache has counters", &empty, &counted, false),
+            ("d: absent context", &absent, &counted, false),
+            (
+                "e: malformed context with counters",
+                &malformed,
+                &empty,
+                false,
+            ),
+            (
+                "f: malformed context with Equipment",
+                &malformed_equipped,
+                &empty,
+                false,
+            ),
+        ] {
+            state.lki_cache.insert(
+                record.object_id,
+                cached.trigger_source_context().unwrap().lki.clone(),
+            );
+            let source_ctx = source_context_from_filter(
+                &state,
+                id,
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let actual = zone_change_record_matches_property(
+                &FilterProp::Modified,
+                &state,
+                record,
+                &source_ctx,
+            );
+            if actual != expected {
+                mismatches.push(case);
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "mismatched Modified cases: {mismatches:?}"
+        );
     }
 
     /// CR 111.1: `FilterProp::Token` on a zone-change snapshot must read the

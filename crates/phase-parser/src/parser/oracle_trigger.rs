@@ -8746,12 +8746,35 @@ fn extract_if_condition_with_card_name(
     head_enters_battlefield: bool,
     attack_scope: Option<&AttackHeadScope>,
 ) -> IfExtraction {
+    use super::oracle_nom::condition::parse_ge_threshold;
+
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
     // Only a proven self-trigger may use the source-bound "it's on the
     // battlefield" shorthand. On a non-self zone-change trigger, "it" is
     // the event object, so the simple source-condition table must not steal it.
     let source_is_self = matches!(dying_subject, Some(TargetFilter::SelfRef));
+
+    // CR 606.4 + CR 603.4: bind the payment-specific threshold to the
+    // activation event. Reuse the shared grammar for both threshold forms;
+    // the clause itself is consumed completely before it is hoisted.
+    let leading_if_start = lower.len() - lower.trim_start().len();
+    let loyalty_threshold = map(
+        delimited(
+            tag("if you removed "),
+            verify(parse_ge_threshold, |minimum| *minimum > 0),
+            (tag("loyalty counters to activate it"), peek(tag(", "))),
+        ),
+        |minimum| TriggerCondition::LoyaltyCountersRemovedAtLeast { minimum },
+    )
+    .parse(&lower[leading_if_start..]);
+    if let Ok((rest, condition)) = loyalty_threshold {
+        let consumed = lower.len() - leading_if_start - rest.len();
+        return IfExtraction::hoisted(
+            strip_condition_clause(text, leading_if_start, consumed),
+            condition,
+        );
+    }
 
     // CR 603.4: Only a true intervening-if is hoisted to the trigger-level condition.
     // A trigger-level `if` is one that IMMEDIATELY follows the trigger condition
@@ -15061,6 +15084,19 @@ fn parse_object_head_noun(input: &str) -> OracleResult<'_, ()> {
     ))
     .parse(input)
 }
+
+/// CR 702.29c + CR 113.6k: the zones a "when you discard this card" trigger, and a "when you
+/// cycle this card" trigger (CR 702.29c: the same discard, made to pay a cycling cost),
+/// functions in. Neither can trigger from the battlefield, so each functions in the zones it
+/// can trigger from: its owner's graveyard, where a discard puts the card (CR 701.9a), or
+/// exile, where a replacement effect such as Leyline of the Void or Rest in Peace puts it
+/// instead (CR 614.6).
+///
+/// CR 400.2 + CR 603.2f: the hidden zones are not listed. Whether such a trigger fires from a
+/// library depends on the card having been visible to all players, and the trigger collector
+/// has no library or hand source, so a discard redirected to a library (Wheel of Sun and Moon)
+/// is not delivered.
+const DISCARDED_SELF_TRIGGER_ZONES: [Zone; 2] = [Zone::Graveyard, Zone::Exile];
 
 fn parse_self_cycle_trigger_head(input: &str) -> OracleResult<'_, ()> {
     value(
@@ -22869,12 +22905,15 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         return Some((TriggerMode::SpellCast, def));
     }
 
-    // CR 702.29c: use the existing graveyard self-cycle delivery route.
     if parse_self_cycle_trigger_head(lower).is_ok() {
         let mut def = make_base();
         def.mode = TriggerMode::Cycled;
         def.valid_card = Some(TargetFilter::SelfRef);
-        def.trigger_zones = vec![Zone::Graveyard];
+        // CR 702.29c: "When you cycle this card" means "When you discard this card to pay an
+        // activation cost of a cycling ability", and the ability triggers from whatever zone the
+        // card winds up in after it's cycled. Lowering still narrows a body that moves the card
+        // out of a named zone to that zone (Yidaro, Wandering Monster: "from your graveyard").
+        def.trigger_zones = DISCARDED_SELF_TRIGGER_ZONES.to_vec();
         return Some((TriggerMode::Cycled, def));
     }
 
@@ -25755,9 +25794,8 @@ fn try_parse_discard_trigger(
         // process_triggers scans the Discarded event, complete_discard_to_graveyard has
         // already moved the card hand->graveyard (CR 701.9a), so the trigger must
         // function from the graveyard it lands in (the same off-zone seam Necropotence-
-        // style self-discard triggers use). Exile keeps it live under a madness/RIP-class
-        // redirect (a redirected discard is still a discard).
-        def.trigger_zones = vec![Zone::Graveyard, Zone::Exile];
+        // style self-discard triggers use).
+        def.trigger_zones = DISCARDED_SELF_TRIGGER_ZONES.to_vec();
         return Some((TriggerMode::Discarded, def));
     }
 
@@ -25785,7 +25823,7 @@ fn try_parse_discard_trigger(
     if is_discarded_self_reference(after_verb) {
         def.mode = TriggerMode::Discarded;
         def.valid_card = Some(TargetFilter::SelfRef);
-        def.trigger_zones = vec![Zone::Graveyard, Zone::Exile];
+        def.trigger_zones = DISCARDED_SELF_TRIGGER_ZONES.to_vec();
         return Some((TriggerMode::Discarded, def));
     }
 

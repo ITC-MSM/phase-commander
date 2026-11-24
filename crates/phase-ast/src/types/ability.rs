@@ -12530,10 +12530,9 @@ pub enum ObjectScope {
     EventSource,
     /// CR 608.2k: The specific untargeted object previously referred to by
     /// this ability's cost OR trigger condition. Resolved (first match wins)
-    /// via `ResolvedAbility.cost_paid_object` → trigger-event source →
-    /// `effect_context_object`. Subsumes the former `EventContextSource*`
-    /// trio (CR 117.1 + CR 400.7j cost referent and CR 603.2 trigger
-    /// referent are the two enumerated members of CR 608.2k's single clause).
+    /// via `ResolvedAbility.cost_paid_object`, then the same-resolution effect
+    /// object, then the trigger-event source. Where-X references to a trigger's
+    /// object use `EventSource` directly.
     CostPaidObject,
     /// CR 608.2k: A deferred anaphoric **pronoun** ("it" / "its") whose object
     /// referent is bound at parse time. The parser rebinds this to a concrete
@@ -40978,6 +40977,9 @@ pub enum TriggerCondition {
     /// CR 605.1a + CR 603.4: Event qualifier for "that isn't a mana ability"
     /// on activated-ability trigger events.
     ActivatedAbilityIsNonMana,
+    /// CR 606.4 + CR 603.4: "if you removed N or more loyalty counters to activate it".
+    /// Reads the actual loyalty-only removal from that activation's event snapshot.
+    LoyaltyCountersRemovedAtLeast { minimum: u32 },
 
     /// CR 700.4 + CR 120.1: "a creature dealt damage by ~ this turn dies" — death trigger
     /// gated on the dying creature having been dealt damage by the trigger source this turn.
@@ -41396,21 +41398,15 @@ pub enum TriggerConditionAnchor<'a> {
     Player(&'a PlayerScope),
     /// CR 607.1c + CR 113.2c: the exact trigger occurrence the leaf is linked to.
     OwnTriggerDefinition,
+    /// CR 603.4: the exact loyalty activation event and its completed payment result.
+    LoyaltyActivationEvent,
 }
 
 impl TriggerCondition {
     /// CR 603.4: the anchor this leaf needs resolved before it is answerable,
     /// when it needs one at all.
     ///
-    /// Two anchor kinds exist. A designation leaf (CR 109.4) tests a player's
-    /// designation, so it needs its [`PlayerScope`] resolved. A self-linked leaf
-    /// (CR 607.1c) reads this triggered ability's own history, so it needs the
-    /// identity of the trigger occurrence it gates.
-    ///
-    /// Exhaustive by design — there is deliberately no wildcard arm. This is
-    /// the guard that makes the polarity boundary gate in `game::triggers`
-    /// total: adding a future anchored leaf of either kind is a COMPILE ERROR
-    /// here, not a latent fail-open under [`TriggerCondition::Not`].
+    /// Three anchor kinds exist: designation leaves (CR 109.4) require a resolved `PlayerScope`; self-linked leaves (CR 607.1c) require the trigger occurrence identity; loyalty-removal threshold leaves (CR 603.4) require the exact loyalty activation event and its completed payment result.
     ///
     /// Boolean combinators return `None`; the gate recurses them itself.
     /// `QuantityComparison` returns `None` BY DEFINITION — it tests a quantity,
@@ -41425,6 +41421,9 @@ impl TriggerCondition {
             TriggerCondition::IsPoisoned { player } => Some(TriggerConditionAnchor::Player(player)),
             TriggerCondition::AddedManaWithThisAbilityThisTurn => {
                 Some(TriggerConditionAnchor::OwnTriggerDefinition)
+            }
+            TriggerCondition::LoyaltyCountersRemovedAtLeast { .. } => {
+                Some(TriggerConditionAnchor::LoyaltyActivationEvent)
             }
             TriggerCondition::GainedLife { .. }
             | TriggerCondition::LostLife
