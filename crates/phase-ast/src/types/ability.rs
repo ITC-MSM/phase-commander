@@ -1088,10 +1088,14 @@ pub enum CategoryChooserScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum KeeperConstraint {
-    /// The chooser must protect exactly this many eligible permanents. If fewer
-    /// are eligible, the instruction does as much as possible and protects all
-    /// of them (CR 609.3).
-    ExactCount { count: QuantityExpr },
+    /// CR 101.4 + CR 701.21a: the chooser protects `count` eligible permanents.
+    /// A bare count is exact; if fewer are eligible, the chooser protects all of
+    /// them (CR 609.3). A `QuantityExpr::UpTo` count lets the chooser protect any
+    /// number from zero to its bound (Covetous Elegy: "Players may choose fewer
+    /// than two creatures even if they control two or more creatures.").
+    /// `exact_count` is the legacy serialized tag.
+    #[serde(alias = "exact_count")]
+    Count { count: QuantityExpr },
 }
 
 /// CR 122.1 + CR 608.2c: the counter a keeper-and-dispose instruction places to
@@ -26568,7 +26572,7 @@ pub enum Effect {
         /// unchosen permanents are sacrificed — the printed order. CR 614.1: replacement
         /// effects "apply continuously as events happen", so a would-be multiplier that
         /// is itself about to be sacrificed must still be on the battlefield when the
-        /// mark is placed. Only valid together with `KeeperConstraint::ExactCount`;
+        /// mark is placed. Only valid together with `KeeperConstraint::Count`;
         /// `choose_and_sacrifice_rest::resolve` refuses any other mode.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         keeper_counter: Option<KeeperCounterMark>,
@@ -34720,7 +34724,7 @@ macro_rules! define_effect_quantity_walk {
     /// (`ChangeZoneAll`/`PutAtLibraryPosition`/`Conjure`/`Counter`'s
     /// countered-spell destination), `UntilCondition::CumulativeThreshold`
     /// (`ExileFromTopUntil`), `GuessSubject::Proposition` (`OpponentGuess`),
-    /// `KeeperConstraint::ExactCount` and `KeeperCounterMark::count`
+    /// `KeeperConstraint::Count` and `KeeperCounterMark::count`
     /// (`ChooseAndSacrificeRest`), and each `ConjureCard::count`.
     ///
     /// Deliberately NOT walked: quantities inside deferred definition
@@ -35089,7 +35093,7 @@ macro_rules! define_effect_quantity_walk {
                 // live when the chooser prompt is built.
                 if let Some(constraint) = keeper_constraint {
                     match constraint {
-                        KeeperConstraint::ExactCount { count } => f(count),
+                        KeeperConstraint::Count { count } => f(count),
                     }
                 }
                 // CR 608.2c + CR 122.1: the printed keeper mark's count.
@@ -42168,8 +42172,29 @@ pub enum DieResultFilter {
     AtLeast(u8),
 }
 
+/// CR 603.2c: How a received-damage trigger counts occurrences.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DamageReceivedGrouping {
+    /// CR 603.2c: Each matching damage record is a separate occurrence.
+    #[default]
+    PerEvent,
+    /// CR 603.2c: A collective recipient ("one or more opponents") fires once
+    /// for the simultaneous batch.
+    WholeBatch,
+    /// CR 603.2c: A singular player recipient with a quantified source fires
+    /// once for each matching damaged player.
+    PerPlayerRecipient,
+}
+
+impl DamageReceivedGrouping {
+    fn is_per_event(&self) -> bool {
+        *self == Self::PerEvent
+    }
+}
+
 /// Trigger definition with typed fields. Zero params HashMap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct TriggerDefinition {
     pub mode: TriggerMode,
     #[serde(default)]
@@ -42281,8 +42306,16 @@ pub struct TriggerDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unless_pay: Option<UnlessPayModifier>,
     /// CR 603.2c: "One or more" triggers fire once per batch of simultaneous events.
+    /// `DamageReceived` uses `damage_received_grouping` instead.
     #[serde(default)]
     pub batched: bool,
+    /// CR 603.2c: Occurrence grouping for `DamageReceived`. Omission defaults to
+    /// `PerEvent`; deserialization first migrates any legacy `batched: true`.
+    #[serde(
+        skip_deserializing,
+        skip_serializing_if = "DamageReceivedGrouping::is_per_event"
+    )]
+    pub damage_received_grouping: DamageReceivedGrouping,
     /// CR 706.2: Optional sides filter for die-roll triggers such as
     /// "Whenever you roll a d20". `None` accepts any die.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43185,6 +43218,38 @@ impl Default for TriggerOccurrenceState {
     }
 }
 
+impl Serialize for TriggerDefinition {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        Self::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TriggerDefinition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            damage_received_grouping: Option<DamageReceivedGrouping>,
+            #[serde(flatten, with = "TriggerDefinition")]
+            definition: TriggerDefinition,
+        }
+
+        let Wire {
+            damage_received_grouping,
+            mut definition,
+        } = Wire::deserialize(deserializer)?;
+        let legacy_batched = definition.mode == TriggerMode::DamageReceived
+            && std::mem::take(&mut definition.batched);
+        definition.damage_received_grouping =
+            damage_received_grouping.unwrap_or(if legacy_batched {
+                DamageReceivedGrouping::WholeBatch
+            } else {
+                DamageReceivedGrouping::PerEvent
+            });
+        Ok(definition)
+    }
+}
+
 impl TriggerDefinition {
     /// CR 701.43d: The self-referential exert component grants an optional
     /// attack cost; an actor-filtered exert observer grants no such permission.
@@ -43228,6 +43293,7 @@ impl TriggerDefinition {
             saga_chapter: None,
             unless_pay: None,
             batched: false,
+            damage_received_grouping: DamageReceivedGrouping::default(),
             die_sides: None,
             gotcha_condition: None,
             expend_threshold: None,
@@ -48582,7 +48648,7 @@ mod tests {
     }
 
     /// V-QE: `ChooseAndSacrificeRest`'s TWO secondary quantity slots —
-    /// `keeper_constraint`'s `ExactCount { count }` and `keeper_counter`'s
+    /// `keeper_constraint`'s `Count { count }` and `keeper_counter`'s
     /// `KeeperCounterMark::count` — are both visited, and in that order. No
     /// pre-existing completeness test enumerated the CSR arm's slots (grepped
     /// this module for a `for_each_quantity_expr` walk keyed to
@@ -48598,7 +48664,7 @@ mod tests {
             choose_filter: TargetFilter::Typed(TypedFilter::creature()),
             sacrifice_filter: TargetFilter::Typed(TypedFilter::creature()),
             total_power_cap: None,
-            keeper_constraint: Some(KeeperConstraint::ExactCount {
+            keeper_constraint: Some(KeeperConstraint::Count {
                 count: keeper_count.clone(),
             }),
             keeper_counter: Some(KeeperCounterMark {
@@ -48610,7 +48676,7 @@ mod tests {
         effect.for_each_quantity_expr(&mut |quantity| visited.push(quantity.clone()));
         assert_eq!(visited, vec![keeper_count, mark_count]);
 
-        // A `keeper_counter: None` construction yields only the `ExactCount` expr.
+        // A `keeper_counter: None` construction yields only the `Count` expr.
         let Effect::ChooseAndSacrificeRest {
             keeper_counter: mark_slot,
             ..
@@ -48627,6 +48693,33 @@ mod tests {
         let mut visited_none = Vec::new();
         none_effect.for_each_quantity_expr(&mut |quantity| visited_none.push(quantity.clone()));
         assert_eq!(visited_none, vec![QuantityExpr::Fixed { value: 1 }]);
+    }
+
+    /// CR 101.4 + CR 701.21a: `KeeperConstraint::Count` still reads the legacy
+    /// `exact_count` tag (saved games, older card data), serializes the new
+    /// `count` tag, and round-trips an "up to" count (Covetous Elegy).
+    #[test]
+    fn keeper_constraint_count_reads_the_legacy_exact_count_tag() {
+        let legacy: KeeperConstraint =
+            serde_json::from_str(r#"{"type":"exact_count","count":{"type":"Fixed","value":5}}"#)
+                .expect("legacy exact_count tag must deserialize");
+        assert_eq!(
+            legacy,
+            KeeperConstraint::Count {
+                count: QuantityExpr::Fixed { value: 5 }
+            }
+        );
+        let written = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(written["type"], "count");
+
+        let up_to = KeeperConstraint::Count {
+            count: QuantityExpr::up_to(QuantityExpr::Fixed { value: 2 }),
+        };
+        let json = serde_json::to_string(&up_to).unwrap();
+        let back: KeeperConstraint = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, up_to);
+        let KeeperConstraint::Count { count } = &back;
+        assert!(count.is_up_to());
     }
 
     /// CR 109.1: `with_own_cast_exclusion` injects the `Another` marker and
@@ -50185,6 +50278,7 @@ mod tests {
             saga_chapter: None,
             unless_pay: None,
             batched: false,
+            damage_received_grouping: DamageReceivedGrouping::default(),
             die_sides: None,
             gotcha_condition: None,
             expend_threshold: None,
@@ -52751,6 +52845,56 @@ mod modal_ability_tests {
 
         assert!(def.modal.is_some());
         assert_eq!(def.mode_abilities.len(), 2);
+    }
+
+    #[test]
+    fn damage_received_grouping_migrates_legacy_batching() {
+        use serde_json::json;
+
+        use DamageReceivedGrouping::{PerEvent, PerPlayerRecipient, WholeBatch};
+
+        let omitted: TriggerDefinition =
+            serde_json::from_value(json!({ "mode": "DamageReceived" })).unwrap();
+        let canonical_default = serde_json::to_value(&omitted).unwrap();
+
+        for (legacy_batched, explicit_grouping, expected) in [
+            (Some(true), None, WholeBatch),
+            (Some(false), None, PerEvent),
+            (None, None, PerEvent),
+            (None, Some(PerEvent), PerEvent),
+            (Some(true), Some(PerEvent), PerEvent),
+            (Some(true), Some(PerPlayerRecipient), PerPlayerRecipient),
+        ] {
+            let mut input = json!({ "mode": "DamageReceived" });
+            if let Some(batched) = legacy_batched {
+                input["batched"] = json!(batched);
+            }
+            if let Some(grouping) = explicit_grouping {
+                input["damage_received_grouping"] = json!(grouping);
+            }
+            let definition: TriggerDefinition = serde_json::from_value(input).unwrap();
+            assert_eq!(definition.damage_received_grouping, expected);
+            assert!(!definition.batched);
+
+            let serialized = serde_json::to_value(&definition).unwrap();
+            assert_eq!(serialized["batched"], false);
+            if expected == PerEvent {
+                assert_eq!(definition, omitted);
+                assert_eq!(serialized, canonical_default);
+                assert!(serialized.get("damage_received_grouping").is_none());
+            } else {
+                assert_eq!(serialized["damage_received_grouping"], json!(expected));
+            }
+            assert_eq!(
+                serde_json::from_value::<TriggerDefinition>(serialized).unwrap(),
+                definition
+            );
+        }
+
+        let other: TriggerDefinition =
+            serde_json::from_value(json!({ "mode": "ChangesZone", "batched": true })).unwrap();
+        assert!(other.batched);
+        assert_eq!(other.damage_received_grouping, PerEvent);
     }
 
     /// V13 / H8 — CR 603.2 + CR 120.4b: `damage_amount` gained a scope axis, so

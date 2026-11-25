@@ -22941,7 +22941,11 @@ fn trigger_opponents_are_dealt_combat_damage_uses_valid_target() {
     );
     assert_eq!(def.mode, TriggerMode::DamageReceived);
     assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
-    assert!(def.batched);
+    assert!(!def.batched);
+    assert_eq!(
+        def.damage_received_grouping,
+        DamageReceivedGrouping::WholeBatch
+    );
     assert_eq!(def.valid_card, None);
     assert_eq!(
         def.valid_target,
@@ -40548,34 +40552,33 @@ fn dealt_damage_axes_amount_exactly_is_whole_event() {
 
 #[test]
 fn dealt_damage_axes_plural_noncombat() {
-    // The plural voice parses, and the consumer arm does NOT set `batched` —
-    // that is the caller's `"one or more "` scan, pinned by the sibling test.
     let def = parse_trigger_line(
         "Whenever creatures you control are dealt noncombat damage, draw a card.",
         "Some Card",
     );
     assert_eq!(def.mode, TriggerMode::DamageReceived);
     assert_eq!(def.damage_kind, DamageKindFilter::NoncombatOnly);
-    assert!(
-        !def.batched,
-        "no SimpleEvent arm may set `batched`; only the caller's \"one or more \" scan does"
+    assert!(!def.batched);
+    assert_eq!(
+        def.damage_received_grouping,
+        DamageReceivedGrouping::PerEvent
     );
 }
 
 #[test]
 fn dealt_damage_axes_plural_one_or_more_noncombat() {
-    // CR 603.2c: the caller stamps `batched` from the subject phrase. This shape
-    // is newly reachable via the parameterization, so its batching is pinned as
-    // known-and-accepted. It pins ONLY the flag — a `"that many"` resolution on a
-    // batched damage trigger would resolve to a subject headcount, which is a
-    // deferred, currently card-less hazard.
+    // CR 603.2c: The quantified recipient makes the batch one occurrence.
     let def = parse_trigger_line(
         "Whenever one or more creatures you control are dealt noncombat damage, draw a card.",
         "Some Card",
     );
     assert_eq!(def.mode, TriggerMode::DamageReceived);
     assert_eq!(def.damage_kind, DamageKindFilter::NoncombatOnly);
-    assert!(def.batched);
+    assert!(!def.batched);
+    assert_eq!(
+        def.damage_received_grouping,
+        DamageReceivedGrouping::WholeBatch
+    );
 }
 
 #[test]
@@ -40776,6 +40779,11 @@ fn dealt_damage_lolth_emblem_quantified_source_parses() {
         "Lolth, Spider Queen",
     );
     assert_eq!(def.mode, TriggerMode::DamageReceived);
+    assert!(!def.batched);
+    assert_eq!(
+        def.damage_received_grouping,
+        DamageReceivedGrouping::PerPlayerRecipient
+    );
     assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
     assert_eq!(
         def.valid_source,
@@ -40784,6 +40792,35 @@ fn dealt_damage_lolth_emblem_quantified_source_parses() {
         )),
         "the emblem's quantified source must not be dropped"
     );
+}
+
+// Synthetic shape: no printed card is known to combine a collective recipient
+// with a source qualifier. The nearest printed cards are Master of Barbs and
+// Fblthp, Impossibly Lost (collective recipients) and Lolth, Spider Queen's
+// emblem (quantified source). The test checks precedence between those two
+// existing grammar axes.
+#[test]
+fn dealt_damage_collective_recipients_stay_grouped_with_a_qualified_source() {
+    for source in ["a creature", "one or more creatures"] {
+        let def = parse_trigger_line(
+            &format!(
+                "Whenever one or more opponents are dealt combat damage by {source} you control, you gain 1 life."
+            ),
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageReceived);
+        assert!(!def.batched);
+        assert_eq!(
+            def.damage_received_grouping,
+            DamageReceivedGrouping::WholeBatch
+        );
+        assert_eq!(
+            def.valid_source,
+            Some(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Creature).controller(ControllerRef::You)
+            ))
+        );
+    }
 }
 
 #[test]
@@ -40890,15 +40927,8 @@ fn dealt_damage_single_source_tail_with_amount_is_per_source() {
 
 #[test]
 fn whole_event_trigger_is_not_subject_batched() {
-    // V14 / Guard 2 — CR 603.2c: whole-event damage aggregation must NOT set
-    // `batched`. That field additionally means "count subjects", and
-    // `subject_match_count` (a SUBJECT HEADCOUNT) outranks the triggering
-    // event's amount in the `EventContextAmount` cascade, so setting it here
-    // would fix the once-per-batch dedup and simultaneously corrupt "that much".
-    // Firing granularity is carried instead by `fires_once_per_batch` in
-    // `game/triggers.rs`, which reads the typed scope.
-    //
-    // Verbatim Oracle text (Innocent Bystander).
+    // CR 603.2c + CR 120.4b: The amount scope alone requests aggregation.
+    // This keeps the subject count empty so "that much" reads the summed damage.
     let def = parse_trigger_line(
         "Whenever this creature is dealt 3 or more damage, investigate.",
         "Innocent Bystander",
@@ -40907,20 +40937,19 @@ fn whole_event_trigger_is_not_subject_batched() {
         def.damage_amount.expect("threshold present").scope,
         DamageAmountScope::WholeEvent
     );
-    assert!(
-        !def.batched,
-        "whole-event damage aggregation must not set the subject-counting `batched` flag"
+    assert!(!def.batched);
+    assert_eq!(
+        def.damage_received_grouping,
+        DamageReceivedGrouping::PerEvent
     );
 
-    // Paired positive control: `batched` IS observable and CAN be true on this
-    // very grammar, so the negative above is not vacuous.
-    let batched = parse_trigger_line(
+    let quantified = parse_trigger_line(
         "Whenever one or more creatures you control are dealt noncombat damage, draw a card.",
         "Some Card",
     );
-    assert!(
-        batched.batched,
-        "control must prove `batched` is readable and reachable on this grammar"
+    assert_eq!(
+        quantified.damage_received_grouping,
+        DamageReceivedGrouping::WholeBatch
     );
 }
 
@@ -46968,8 +46997,10 @@ fn fblthp_full_oracle_keeps_the_damage_received_trigger() {
                 parsed.triggers, parsed.parse_warnings
             )
         });
-    assert!(
-        trigger.batched,
+    assert!(!trigger.batched);
+    assert_eq!(
+        trigger.damage_received_grouping,
+        DamageReceivedGrouping::WholeBatch,
         "CR 603.2c: one or more opponents is one batched trigger"
     );
     assert_eq!(trigger.damage_kind, DamageKindFilter::CombatOnly);
@@ -47036,9 +47067,10 @@ fn fblthp_impossibly_lost_head_is_batched_opponent_combat_damage_with_turn_windo
     assert_eq!(def.mode, TriggerMode::DamageReceived);
     assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
     assert_eq!(def.damage_amount, None);
-    assert!(
-        def.batched,
-        "CR 603.2c: \"one or more\" is one trigger event"
+    assert!(!def.batched);
+    assert_eq!(
+        def.damage_received_grouping,
+        DamageReceivedGrouping::WholeBatch
     );
     assert_eq!(
         def.valid_card, None,
@@ -47148,7 +47180,11 @@ fn received_damage_siblings_without_windows_keep_no_condition() {
     );
     assert_eq!(barbs.mode, TriggerMode::DamageReceived);
     assert_eq!(barbs.damage_kind, DamageKindFilter::NoncombatOnly);
-    assert!(barbs.batched);
+    assert!(!barbs.batched);
+    assert_eq!(
+        barbs.damage_received_grouping,
+        DamageReceivedGrouping::WholeBatch
+    );
     assert_eq!(barbs.condition, None);
 
     let galleon = parse_trigger_line(
@@ -48046,4 +48082,94 @@ fn trigger_verrak_pay_that_much_life_again_stays_unimplemented() {
             if name == "unparsed_verb_arguments"
                 && description.as_deref() == Some("pay that much life again")
     ));
+}
+
+/// Raggadragga, Goreguts Boss (issue #1184) — "Whenever a creature you
+/// control with a mana ability attacks, untap it." The "with a mana ability"
+/// subject qualifier (CR 605.1) is a declaration-time property of the
+/// attacker (CR 508.1), so it folds into the attack trigger's `valid_card`
+/// as `FilterProp::HasManaAbility` — the trigger must NOT strand as
+/// `Unknown` (the pre-fix fixture shape in `r.jsonl`).
+#[test]
+fn raggadragga_attack_trigger_subject_keeps_mana_ability() {
+    let def = parse_trigger_line(
+        "Whenever a creature you control with a mana ability attacks, untap it.",
+        "Raggadragga, Goreguts Boss",
+    );
+    assert_eq!(def.mode, TriggerMode::Attacks);
+    let typed = match def.valid_card.as_ref() {
+        Some(TargetFilter::Typed(tf)) => tf,
+        other => panic!("attack subject must be a typed filter, got {other:?}"),
+    };
+    assert!(
+        typed.type_filters.contains(&TypeFilter::Creature),
+        "subject must stay a creature filter, got {:?}",
+        typed.type_filters
+    );
+    assert_eq!(typed.controller, Some(ControllerRef::You));
+    assert!(
+        typed.properties.contains(&FilterProp::HasManaAbility),
+        "subject must carry HasManaAbility, got {:?}",
+        typed.properties
+    );
+    let execute = def.execute.as_deref().expect("trigger execute");
+    assert!(
+        matches!(
+            execute.effect.as_ref(),
+            Effect::SetTapState {
+                target: TargetFilter::TriggeringSource,
+                state: TapStateChange::Untap,
+                ..
+            }
+        ),
+        "expected untap-the-attacker, got {:?}",
+        execute.effect
+    );
+    assert_no_unimplemented(execute);
+}
+
+/// SHAPE pin for Raggadragga's third clause — "Whenever you cast a spell, if
+/// at least seven mana was spent to cast it, ...". The intervening-if
+/// (CR 603.4) reads the triggering spell's payment record (CR 601.2h).
+/// Reach-guard for the runtime tests: if this shape regresses, the runtime
+/// silence/pump tests would fail for a parse reason, not a rules reason.
+#[test]
+fn raggadragga_seven_mana_spell_trigger_shape() {
+    let def = parse_trigger_line(
+        "Whenever you cast a spell, if at least seven mana was spent to cast it, untap target creature. It gets +7/+7 and gains trample until end of turn.",
+        "Raggadragga, Goreguts Boss",
+    );
+    assert_eq!(def.mode, TriggerMode::SpellCast);
+    match def.condition.as_ref() {
+        Some(TriggerCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        }) => {
+            assert!(
+                matches!(
+                    lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ManaSpentToCast {
+                            scope: crate::types::ability::CastManaObjectScope::TriggeringSpell,
+                            metric: crate::types::ability::CastManaSpentMetric::Total,
+                        },
+                    }
+                ),
+                "lhs must read total mana spent on the triggering spell, got {lhs:?}"
+            );
+            assert_eq!(*comparator, Comparator::GE);
+            assert!(
+                matches!(rhs, QuantityExpr::Fixed { value: 7 }),
+                "threshold must be seven, got {rhs:?}"
+            );
+        }
+        other => panic!("expected the seven-mana intervening-if, got {other:?}"),
+    }
+    let execute = def.execute.as_deref().expect("trigger execute");
+    assert_no_unimplemented(execute);
+    assert!(
+        execute.sub_ability.is_some(),
+        "the +7/+7 trample continuation must be attached past the untap"
+    );
 }

@@ -16595,8 +16595,8 @@ pub(crate) struct TriggeredManaResume {
     pub stage: TriggeredManaStage,
 }
 
-/// CR 603.3b: One controller's group within an in-flight trigger ordering
-/// pass. `ordered = true` once the controller has submitted their permutation
+/// CR 603.3b: One ordering controller's group within one CR 603.3b placement stage
+/// of an in-flight trigger ordering pass. `ordered = true` once the controller has submitted their permutation
 /// (or once the group is single-trigger and trivially in final order, or once
 /// the controller has been eliminated per CR 800.4a).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16607,7 +16607,7 @@ pub struct TriggerOrderGroup {
 }
 
 /// CR 603.3b: Engine-internal scheduling state for the per-controller ordering
-/// pass. `groups` are kept in **placement order** (NAP-group first → AP-group
+/// pass of one placement stage. `groups` are kept in **placement order** (NAP-group first → AP-group
 /// last) — the order they will be concatenated into the dispatch queue once
 /// every group is `ordered`. Controllers are *prompted* in choice order
 /// (AP-first per CR 101.4), but each chosen permutation is applied only within
@@ -17701,6 +17701,114 @@ fn migrate_legacy_pending_cast_timing(value: &mut serde_json::Value) {
             "legacy_unrouted_pending_casts".into(),
             serde_json::Value::Array(ids),
         );
+    }
+}
+
+/// CR 603.3b: flags a save whose trigger queue (`deferred_triggers` and the
+/// `pending_trigger_order` groups) is non-empty while no queued context carries
+/// the placement-process key. The key is written on every context, so only a
+/// writer from before it existed leaves it off; restore then refuses the save
+/// if a placement may be under way (`triggers::refuse_legacy_unmarked_placement`).
+fn flag_legacy_unmarked_placement_queue(value: &mut serde_json::Value) {
+    let Some(state) = value.as_object_mut() else {
+        return;
+    };
+    let deferred = state
+        .get("deferred_triggers")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    let ordered = state
+        .get("pending_trigger_order")
+        .and_then(|order| order.get("groups"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|group| group.get("triggers").and_then(serde_json::Value::as_array))
+        .flatten();
+    let mut contexts = deferred.chain(ordered).peekable();
+    let non_empty = contexts.peek().is_some();
+    let marked = contexts.any(|context| {
+        context
+            .get(crate::game::triggers::PLACEMENT_PROCESS_FIELD)
+            .is_some()
+    });
+    if non_empty && !marked {
+        state.insert(
+            "legacy_unmarked_placement_queue".into(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_unmarked_placement_queue_tests {
+    use super::*;
+    use serde_json::json;
+
+    const KEY: &str = "legacy_unmarked_placement_queue";
+
+    fn flagged(mut value: serde_json::Value) -> bool {
+        flag_legacy_unmarked_placement_queue(&mut value);
+        value.get(KEY) == Some(&serde_json::Value::Bool(true))
+    }
+
+    fn unmarked() -> serde_json::Value {
+        json!({ "pending": {} })
+    }
+
+    fn marked() -> serde_json::Value {
+        json!({ "pending": {}, (crate::game::triggers::PLACEMENT_PROCESS_FIELD): "Fresh" })
+    }
+
+    fn order(contexts: Vec<serde_json::Value>) -> serde_json::Value {
+        json!({ "groups": [{ "triggers": contexts }] })
+    }
+
+    /// CR 603.3b: only a non-empty queue where no context carries the
+    /// placement-process key is flagged as written before the key existed.
+    #[test]
+    fn flags_only_a_non_empty_queue_with_no_marked_context() {
+        assert!(!flagged(json!({ "deferred_triggers": [] })), "empty queue");
+        assert!(!flagged(json!({})), "no queue");
+        assert!(
+            flagged(json!({ "deferred_triggers": [unmarked()] })),
+            "unmarked deferred context"
+        );
+        assert!(
+            flagged(json!({
+                "deferred_triggers": [],
+                "pending_trigger_order": order(vec![unmarked()]),
+            })),
+            "unmarked order-group context"
+        );
+        assert!(
+            flagged(json!({
+                "deferred_triggers": [unmarked()],
+                "pending_trigger_order": order(vec![unmarked()]),
+            })),
+            "unmarked contexts in both"
+        );
+        assert!(
+            !flagged(json!({ "deferred_triggers": [unmarked(), marked()] })),
+            "one marked deferred context"
+        );
+        assert!(
+            !flagged(json!({
+                "deferred_triggers": [unmarked()],
+                "pending_trigger_order": order(vec![marked()]),
+            })),
+            "a marked order-group context beside an unmarked deferred one"
+        );
+    }
+
+    /// The flag is decode-only: a state never writes it.
+    #[test]
+    fn the_flag_is_never_serialized() {
+        let mut state = GameState::new_two_player(7);
+        state.legacy_unmarked_placement_queue = true;
+        let value = serde_json::to_value(&state).expect("the state serializes");
+        assert!(value.get(KEY).is_none());
     }
 }
 
@@ -22022,6 +22130,12 @@ pub enum PersistedRestoreError {
     /// statics.
     #[error("persisted damage history of {object_id:?} is ambiguous: the save cannot prove whether it has dealt combat damage, and the game contains an ability that reads it")]
     AmbiguousLegacyDamageHistory { object_id: ObjectId },
+    /// CR 603.3b: a save written before queued triggered abilities recorded
+    /// their placement process holds a queue while a placement may be under
+    /// way. The remainder of that process cannot be told from what triggered
+    /// during it, so the order the rule requires cannot be rebuilt.
+    #[error("RESTORE_INCOMPATIBLE_TRIGGER_PLACEMENT: This saved game was paused while triggered abilities were being put on the stack, and it was made by an earlier version of the game that did not record which of them belong to that step. Their order cannot be rebuilt as the rules require, so it cannot be continued.")]
+    LegacyTriggerPlacementNotRestorable,
 }
 
 /// CR 118.12 + CR 400.7: the object-naming prompts a staged payment parks
@@ -22388,6 +22502,7 @@ impl PersistedGameState {
         }
         state.rehydrate_recovered_checkpoint_rng();
         crate::game::engine_casting::restore_legacy_cast_timing_routes(&mut state)?;
+        crate::game::triggers::refuse_legacy_unmarked_placement(&mut state)?;
         crate::game::engine_casting::restore_legacy_pitch_cost_resume(&mut state);
         crate::game::effects::choose_from_zone::migrate_legacy_per_player_frame_on_restore(
             &mut state,
@@ -25418,21 +25533,26 @@ pub enum WaitingFor {
         #[serde(default)]
         scoped_players: Vec<PlayerId>,
     },
-    /// CR 101.4 + CR 701.21a: The player protects exactly `count` of the
-    /// eligible permanents; every other in-scope permanent is sacrificed after
-    /// all scoped players have chosen. Used by the generic exact keeper
-    /// constraint, not a card-specific choice shape.
+    /// CR 101.4 + CR 701.21a: The player protects exactly, or up to,
+    /// `required_count` of the eligible permanents; every other in-scope
+    /// permanent is sacrificed after all scoped players have chosen. Used by
+    /// the generic keeper-count constraint, not a card-specific choice shape.
     KeepExactPermanentsChoice {
         player: PlayerId,
         target_player: PlayerId,
         eligible: Vec<ObjectId>,
-        /// Exact number of permanents the engine requires the player to keep,
-        /// already capped to this prompt's eligible pool under CR 609.3's
-        /// "do as much as possible" rule. Display clients render this value
-        /// directly; they must not derive a second legality rule from
-        /// `eligible.len()`.
+        /// The most permanents the player may keep: the printed keeper count,
+        /// deliberately NOT capped to `eligible.len()`, because the resume
+        /// hands it unchanged to the next seat. An exact prompt exists only
+        /// when `eligible.len()` exceeds it (CR 609.3 auto-keeps otherwise).
+        /// Display clients render this value directly; they must not derive
+        /// a second legality rule from `eligible.len()`.
         #[serde(alias = "count")]
         required_count: usize,
+        /// The fewest permanents the player may keep; `None` means exactly
+        /// `required_count`. `Some(0)` is an "up to" keeper (Covetous Elegy).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        minimum_count: Option<usize>,
         /// CR 608.2c + CR 122.1: the keeper mark the instruction owes, with its count
         /// already resolved (CR 608.2h). The `ResolvedAbility` is gone by the time
         /// `GameAction::ChooseKeptPermanents` resumes, so the mark rides here.
@@ -27870,13 +27990,20 @@ pub struct StackResolutionSession {
     #[serde(default)]
     pub cursor: usize,
     pub representatives: BTreeSet<PlayerId>,
-    /// AI representatives whose verified pass is a policy authorization for
+    /// AI semantic owners whose verified pass is a policy authorization for
     /// later priority windows in this exact fenced cohort. Absence is
-    /// conservative: that representative must receive an explicit decision
+    /// conservative: that owner must receive an explicit decision
     /// unless its standing pass covers the window
-    /// (`priority::standing_priority_pass`).
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub verified_pass_representatives: BTreeSet<PlayerId>,
+    /// (`priority::standing_priority_pass`). CR 805.5b: authorization is
+    /// per individual seat — one teammate's verified pass never authorizes
+    /// another member's window. The alias keeps pre-rename persisted
+    /// sessions (which stored representatives) deserializing.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeSet::is_empty",
+        alias = "verified_pass_representatives"
+    )]
+    pub verified_pass_owners: BTreeSet<PlayerId>,
     #[serde(default)]
     pub budget: StackResolutionBudget,
     #[serde(default)]
@@ -30289,7 +30416,9 @@ declare_game_state! {
     /// permanent (e.g., two Boggart Pranksters seeing "you attack") must each
     /// reach the stack. Drained in FIFO order by
     /// `triggers::drain_deferred_trigger_queue` after the active
-    /// `pending_trigger` is pushed to the stack.
+    /// `pending_trigger` is pushed to the stack. Abilities of the placement
+    /// process under way are placed before abilities that triggered during it
+    /// (CR 603.3b).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred_triggers: Vec<crate::game::triggers::DeferredTrigger>,
 
@@ -32738,6 +32867,13 @@ declare_game_state! {
     #[serde(default, skip_serializing)]
     pub(crate) legacy_unrouted_pending_casts: Vec<ObjectId>,
 
+    /// Decode-only carrier: the save's queue (`deferred_triggers`, `pending_trigger_order`
+    /// groups) is non-empty and no context carries a placement-process mark, so
+    /// it was written before the mark existed. Always false after
+    /// `PersistedGameState::prepare_for_restore`.
+    #[serde(default, skip_serializing)]
+    pub(crate) legacy_unmarked_placement_queue: bool,
+
     /// CR 601.2c + CR 601.2i: a spell announcement's trigger carrier, held here
     /// for the duration of ONE reducer action and returned to whichever
     /// [`PendingCastOwner`] holds the announcement when the action ends.
@@ -35122,6 +35258,7 @@ impl GameStateDecode {
         migrate_legacy_batched_zone_change_trigger_fired(&mut value)?;
         migrate_legacy_unrecognized_static_conditions(&mut value);
         migrate_legacy_pending_cast_timing(&mut value);
+        flag_legacy_unmarked_placement_queue(&mut value);
         migrate_legacy_as_though_flash_grants(&mut value);
         if let Some(config) = value.get_mut("format_config") {
             crate::types::format::FormatConfig::migrate_persisted(config);
@@ -41949,6 +42086,7 @@ impl GameState {
             pending_discard_for_cost: None,
             pending_cast: None,
             legacy_unrouted_pending_casts: Vec::new(),
+            legacy_unmarked_placement_queue: false,
             in_flight_spell_trigger_carrier: None,
             announcement_event_scope: AnnouncementEventScope::Unowned,
             ring_level: HashMap::new(),
@@ -45954,6 +46092,7 @@ impl GameState {
             pending_discard_for_cost: _,
             pending_cast: _,
             legacy_unrouted_pending_casts: _,
+            legacy_unmarked_placement_queue: _,
             in_flight_spell_trigger_carrier: _,
             announcement_event_scope: _,
             ring_level: _,
@@ -47647,6 +47786,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_discard_for_cost: _,
         pending_cast: _,
         legacy_unrouted_pending_casts: _,
+        legacy_unmarked_placement_queue: _,
         in_flight_spell_trigger_carrier: _,
         announcement_event_scope: _,
         ring_level: _,
@@ -64493,7 +64633,7 @@ Go for the Goal! — {3}, {T}: Until end of turn, target creature gains \"Whenev
                 entries: vec![StackResolutionEntryFence::capture(&entry)],
                 cursor: 0,
                 representatives: [PlayerId(0)].into_iter().collect(),
-                verified_pass_representatives: BTreeSet::new(),
+                verified_pass_owners: BTreeSet::new(),
                 budget: StackResolutionBudget::Unlimited,
                 policy: StackResolutionPolicy::Committed,
                 auto_pass_overlay: StackResolutionAutoPassOverlay {
