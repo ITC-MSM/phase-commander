@@ -3320,7 +3320,7 @@ enum UnwindowedWhenever {
 }
 
 fn try_parse_whenever_this_turn(tp: TextPair) -> Option<ParsedEffectClause> {
-    try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::Delayed)
+    try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::Delayed).map(|(clause, _)| clause)
 }
 
 /// CR 603.4 + CR 608.2c: does this delayed body's intervening-if test the
@@ -3403,10 +3403,131 @@ fn condition_reads_the_event_subject(condition: &AbilityCondition) -> bool {
     }
 }
 
-fn try_parse_whenever_this_turn_from(
-    tp: TextPair,
+enum DelayedPlayerDamageAdmission {
+    OutsideFamily,
+    Unsupported,
+    Admitted(Box<TriggerDefinition>),
+}
+
+fn delayed_player_damage_admission(head: &str) -> DelayedPlayerDamageAdmission {
+    use super::oracle_trigger::{parse_batched_damage_head, BatchedDamageRecipient};
+    use crate::types::ability::DamageKindFilter;
+    use DelayedPlayerDamageAdmission as Admission;
+
+    let Ok((rest, head)) = parse_batched_damage_head(head) else {
+        return Admission::OutsideFamily;
+    };
+    let TargetFilter::Typed(source) = &head.source else {
+        return Admission::OutsideFamily;
+    };
+    if source.type_filters != [TypeFilter::Creature]
+        || source.controller != Some(ControllerRef::You)
+        || head.damage_kind != DamageKindFilter::CombatOnly
+    {
+        return Admission::OutsideFamily;
+    }
+    let mode = match (&head.recipient, source.properties.as_slice()) {
+        (BatchedDamageRecipient::DefendingPlayer | BatchedDamageRecipient::Other(_), _) => {
+            return Admission::OutsideFamily;
+        }
+        // The whole-step matcher currently requires an unqualified creature filter.
+        (BatchedDamageRecipient::OneOrMorePlayers, []) => TriggerMode::DamageDoneOnce,
+        (
+            BatchedDamageRecipient::APlayer,
+            []
+            | [FilterProp::WithKeyword {
+                value: Keyword::Flying,
+            }],
+        ) => TriggerMode::DamageDone,
+        _ => return Admission::Unsupported,
+    };
+    if !rest.is_empty() || !head.source_remainder.trim().is_empty() || head.threshold.is_some() {
+        return Admission::Unsupported;
+    }
+    let mut trigger = TriggerDefinition::new(mode).trigger_zones(vec![Zone::Battlefield]);
+    trigger.valid_source = Some(head.source);
+    trigger.valid_target = Some(TargetFilter::Player);
+    trigger.damage_kind = head.damage_kind;
+    trigger.batched = true;
+    Admission::Admitted(Box::new(trigger))
+}
+
+// CR 608.2c: consume every instruction before lowering or installing the watcher.
+fn parse_delayed_player_damage_body(
+    body: &str,
+    ctx: &mut ParseContext,
+) -> Option<crate::parser::oracle_ir::history_provenance::Lowered<AbilityDefinition>> {
+    type Instruction<'a> = (
+        &'a str,
+        (ImperativeFamilyAst, Option<TargetFilter>),
+        Option<ClauseBoundary>,
+    );
+
+    fn parse_instruction<'a>(
+        input: &'a str,
+        ctx: &mut ParseContext,
+    ) -> OracleResult<'a, Instruction<'a>> {
+        let (remainder, instruction) = recognize(many_till(
+            anychar,
+            peek(alt((
+                value((), sequence::parse_delayed_body_separator),
+                value((), tag(".")),
+                value((), eof),
+            ))),
+        ))
+        .parse(input)?;
+        let instruction = instruction.trim();
+        let (_, ast) =
+            all_consuming(|input| imperative::parse_delayed_player_instruction(input, ctx))
+                .parse(instruction)?;
+        let (_, boundary) = opt(peek(sequence::parse_delayed_body_separator)).parse(remainder)?;
+        Ok((remainder, (instruction, ast, boundary)))
+    }
+
+    let lower = body.trim().to_lowercase();
+    let (_, instructions) = all_consuming(terminated(
+        separated_list1(sequence::parse_delayed_body_separator, |input| {
+            parse_instruction(input, ctx)
+        }),
+        opt(tag(".")),
+    ))
+    .parse(lower.as_str())
+    .ok()?;
+
+    let mut builder = ClauseIrBuilder::new(&lower);
+    for (text, instruction, boundary) in instructions {
+        builder
+            .clause(
+                text,
+                parsed_clause(imperative::lower_delayed_player_instruction(instruction)),
+                boundary,
+                ClauseDisposition::Emit {
+                    followup: None,
+                    intrinsic: None,
+                },
+            )
+            .push();
+    }
+    Some(lower::lower_effect_chain_ir_with_provenance(
+        &EffectChainIr {
+            clauses: builder.finish(),
+            kind: AbilityKind::Spell,
+            continuation_kind: None,
+            player_scope_rewrite: PlayerScopeRewrite::Apply,
+            chain_rounding: None,
+            actor: ctx.actor.clone(),
+            in_trigger: ctx.in_trigger,
+            repeat_until: None,
+            injected_color_choice: InjectedColorChoice::Permitted,
+        },
+    ))
+}
+
+fn try_parse_whenever_this_turn_from<'a>(
+    tp: TextPair<'a>,
     unwindowed: UnwindowedWhenever,
-) -> Option<ParsedEffectClause> {
+) -> Option<(ParsedEffectClause, Option<&'a str>)> {
+    let source_text = tp.original;
     // CR 603.7b: capture a leading stated duration as the delayed trigger's
     // EXPIRY (its own lifetime), not the enclosing clause's duration. This runs
     // at the head so it precedes the outer `strip_leading_duration` dispatch site,
@@ -3526,14 +3647,36 @@ fn try_parse_whenever_this_turn_from(
         spell_anaphor_binding: SpellAnaphorBinding::EventSource,
         ..ParseContext::default()
     };
-    let mut trigger_def = parse_dealt_damage_this_way_dies_trigger(condition_text, &mut inner_ctx)
-        .unwrap_or_else(|| {
-            let (_, trigger_def) = crate::parser::oracle_trigger::parse_trigger_condition(
-                condition_text,
-                &mut inner_ctx,
-            );
-            trigger_def
-        });
+    let admission = if leading.is_none() {
+        parse_delayed_this_turn_head(tp)
+            .map(|(head, body)| (delayed_player_damage_admission(head), body))
+    } else {
+        None
+    };
+    let (strict_body, mut trigger_def, effect_text) = match admission {
+        Some((DelayedPlayerDamageAdmission::Admitted(trigger), body)) => (true, *trigger, body),
+        Some((DelayedPlayerDamageAdmission::Unsupported, _)) => {
+            return Some((
+                parsed_clause(Effect::unimplemented(
+                    "delayed_player_damage_head",
+                    before.original,
+                )),
+                None,
+            ));
+        }
+        None | Some((DelayedPlayerDamageAdmission::OutsideFamily, _)) => (
+            false,
+            parse_dealt_damage_this_way_dies_trigger(condition_text, &mut inner_ctx)
+                .unwrap_or_else(|| {
+                    let (_, trigger_def) = super::oracle_trigger::parse_trigger_condition(
+                        condition_text,
+                        &mut inner_ctx,
+                    );
+                    trigger_def
+                }),
+            effect_text,
+        ),
+    };
     trigger_def.execute = None; // Effect lives in DelayedTrigger.ability, not here
 
     // CR 109.4 + CR 115.1 + CR 506.2: The trigger condition may
@@ -3546,6 +3689,10 @@ fn try_parse_whenever_this_turn_from(
     // is already lowercase (`before.lower`).
     inner_ctx.relative_player_scope =
         crate::parser::oracle_trigger::relative_player_scope_for_condition(condition_text);
+    if strict_body {
+        inner_ctx.relative_player_scope = (trigger_def.mode == TriggerMode::DamageDone)
+            .then_some(ControllerRef::TriggeringPlayer);
+    }
     // CR 608.2k: an untargeted object anaphor in the delayed effect body names
     // the object the trigger condition referred to — the per-firing attacker or
     // blocker ("it gets +0/+1" — Battle Cry), the damage recipient ("is dealt
@@ -3560,12 +3707,25 @@ fn try_parse_whenever_this_turn_from(
     inner_ctx.object_pronoun_ref = anaphors.object_pronoun_ref;
     inner_ctx.condition_object_antecedent = anaphors.condition_object_antecedent;
     inner_ctx.demonstrative_object_ref = anaphors.demonstrative_object_ref;
-    let inner_lowered = parse_nested_effect_chain_with_damage_context_and_provenance(
-        effect_text,
-        AbilityKind::Spell,
-        &mut inner_ctx,
-        DamageTargetContext::InheritedTargets,
-    );
+    let inner_lowered = if strict_body {
+        let Some(body) = parse_delayed_player_damage_body(effect_text, &mut inner_ctx) else {
+            return Some((
+                parsed_clause(Effect::unimplemented(
+                    "delayed_player_damage_body",
+                    effect_text,
+                )),
+                None,
+            ));
+        };
+        body
+    } else {
+        parse_nested_effect_chain_with_damage_context_and_provenance(
+            effect_text,
+            AbilityKind::Spell,
+            &mut inner_ctx,
+            DamageTargetContext::InheritedTargets,
+        )
+    };
     let inner = inner_lowered.value;
     // CR 603.4: a delayed body that opens with an intervening "if" clause must
     // carry that condition on its root ability. When the shared conditional
@@ -3601,7 +3761,7 @@ fn try_parse_whenever_this_turn_from(
         inner
     };
 
-    Some(ParsedEffectClause {
+    let clause = ParsedEffectClause {
         history: inner_lowered
             .history
             .into_iter()
@@ -3632,7 +3792,8 @@ fn try_parse_whenever_this_turn_from(
         optional: false,
         unless_pay: None,
         entry_onset: ContinuousEffectOnset::WhenFollowed,
-    })
+    };
+    Some((clause, strict_body.then_some(source_text)))
 }
 
 /// Decompose the spell qualifier from `"when you next cast a <payload> this turn, ..."`
@@ -4496,16 +4657,23 @@ pub(crate) fn try_parse_temporal_delayed_trigger_ability(
 ) -> Option<AbilityIr> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
-    let clause = try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::PrintedLine)
-        .or_else(|| try_parse_when_next_event(tp))
-        .or_else(|| try_parse_copy_next_spell_when_cast(tp))
-        .or_else(|| try_parse_at_next_phase_delayed_trigger(text, kind, antecedents))?;
+    let (clause, description) =
+        try_parse_whenever_this_turn_from(tp, UnwindowedWhenever::PrintedLine).or_else(|| {
+            try_parse_when_next_event(tp)
+                .or_else(|| try_parse_copy_next_spell_when_cast(tp))
+                .or_else(|| try_parse_at_next_phase_delayed_trigger(text, kind, antecedents))
+                .map(|clause| (clause, None))
+        })?;
+    let root_transforms = description
+        .map(|sentence| AbilityRootTransform::SetDescription(sentence.to_string()))
+        .into_iter()
+        .collect();
     Some(AbilityIr {
         source_text: text.to_string(),
         body: EffectChainIr::single_clause(text, kind, clause, None, None, false),
         shell: AbilityShellIr::default(),
         die_results: vec![],
-        root_transforms: vec![],
+        root_transforms,
         modal: None,
     })
 }
@@ -6421,6 +6589,58 @@ fn rebind_triggering_source_to_parent_target(ability: &mut AbilityDefinition) {
     }
 }
 
+/// CR 603.7b: Split a delayed "When/Whenever <event> this turn, <body>" head at its
+/// effect boundary, returning the event text before the stated duration and the body.
+pub(super) fn parse_delayed_this_turn_head(tp: TextPair<'_>) -> Option<(&str, &str)> {
+    let (head, _) = terminated(
+        alt((tag::<_, _, OracleError<'_>>("whenever"), tag("when"))),
+        space1,
+    )
+    .parse(tp.lower)
+    .ok()?;
+    let boundary = super::oracle_trigger::find_effect_boundary(head)?;
+    let comma = tp.lower.len() - head.len() + boundary;
+    let head = &head[..boundary];
+    let window = nom_primitives::scan_at_word_boundaries(head, |input| {
+        recognize(all_consuming(pair(
+            tag("this"),
+            preceded(space1, tag("turn")),
+        )))
+        .parse(input)
+    })?;
+    let event = head[..head.len() - window.len()].trim_end();
+    if event.is_empty() {
+        return None;
+    }
+    let body = TextPair::new(&tp.original[comma..], &tp.lower[comma..]);
+    let ((), body) = nom_on_lower(body.original, body.lower, |input| {
+        value((), pair(tag(","), space1)).parse(input)
+    })?;
+    Some((event, body))
+}
+
+/// CR 603.7b + CR 603.7c: "When that creature dies this turn, ..." naming the single
+/// declared slot "that creature" resolves to; the stated duration keeps the watcher
+/// until cleanup.
+fn parse_declared_creature_death_this_turn<'a>(
+    tp: TextPair<'a>,
+    ctx: &ParseContext,
+) -> Option<(DelayedTriggerCondition, &'a str)> {
+    let (head, body) = parse_delayed_this_turn_head(tp)?;
+    let (verb, _) = tag::<_, _, OracleError<'_>>("that creature")
+        .parse(head)
+        .ok()?;
+    let (slot, _) = resolve_declared_slot_anaphor(head, ctx)?;
+    let trigger = super::oracle_trigger::parse_declared_creature_death(verb, slot)?;
+    Some((
+        DelayedTriggerCondition::WheneverEvent {
+            trigger: Box::new(trigger),
+            expiry: WheneverEventExpiry::EndOfTurn,
+        },
+        body,
+    ))
+}
+
 /// CR 603.7c: Parse inline delayed triggers like "when that creature dies, draw a card".
 /// Returns a `CreateDelayedTrigger` wrapping the parsed inner effect.
 fn try_parse_inline_delayed_trigger(
@@ -6461,6 +6681,8 @@ fn try_parse_inline_delayed_trigger(
     // single-event `scan_delayed_condition_kind` path, which would otherwise
     // drop the second disjunct.
     let mut self_disjunction = false;
+    let mut declared_death = false;
+    let mut effect_text = effect_text;
     let condition = if let Some(trigger) =
         parse_dealt_damage_this_way_dies_trigger(condition_text, ctx)
     {
@@ -6485,6 +6707,10 @@ fn try_parse_inline_delayed_trigger(
             or_trigger: Some(Box::new(or_trigger)),
             lifetime: DelayedTriggerLifetime::Persistent,
         }
+    } else if let Some((condition, body)) = parse_declared_creature_death_this_turn(tp, ctx) {
+        declared_death = true;
+        effect_text = body;
+        condition
     } else {
         match scan_delayed_condition_kind(condition_text) {
             Some(DelayedConditionKind::Dies | DelayedConditionKind::PutIntoGraveyard) => {
@@ -6515,7 +6741,7 @@ fn try_parse_inline_delayed_trigger(
     // "that creature/permanent/token" references the parent spell's target.
     // "the exiled creature/card" and "the targeted creature" also reference
     // the parent's tracked set.
-    let uses_tracked_set = scan_tracked_set_reference(condition_text);
+    let uses_tracked_set = !declared_death && scan_tracked_set_reference(condition_text);
 
     // Throwaway (`ChosenColorQualifierScope` rule 1) — the parsed `inner` is
     // kept, `inner_ctx` is dropped.
@@ -6523,6 +6749,10 @@ fn try_parse_inline_delayed_trigger(
     // CR 603.7 + CR 608.2k: delayed body, no announced parent target.
     inner_ctx.spell_anaphor_binding = SpellAnaphorBinding::EventSource;
     inner_ctx.subject = match &condition {
+        DelayedTriggerCondition::WheneverEvent { trigger, .. } if declared_death => trigger
+            .valid_card
+            .as_ref()
+            .map(|_| TargetFilter::ParentTarget),
         DelayedTriggerCondition::WhenDies { filter }
         | DelayedTriggerCondition::WhenLeavesPlayFiltered { filter }
         | DelayedTriggerCondition::WhenEntersBattlefield { filter }
@@ -39068,6 +39298,7 @@ fn from_among_batch_bounds(rest: &str) -> Option<ResolutionCastWindow> {
         CastCapReading::Unrepresentable => return None,
     };
     Some(ResolutionCastWindow {
+        pool: crate::types::ability::ResolutionCastPool::CurrentResolution,
         max_casts,
         max_total_mv: parse_from_among_total_mv_budget(head),
     })
@@ -40273,6 +40504,12 @@ enum CastAnaphor {
     /// honestly; any other form keeps its pre-change lowering (see the
     /// stopgap note at the promotion site).
     OneOfBatch,
+    /// "one of them" — one card chosen from a source-linked plural
+    /// antecedent established by the enclosing trigger condition. This is
+    /// intentionally distinct from `OneOfBatch`: the latter names a set
+    /// published by the current resolution, while this form reads a durable
+    /// linked-exile pool.
+    OneOfLinked,
     /// Every other anaphor; keeps `TargetFilter::ParentTarget`.
     Other,
 }
@@ -40417,6 +40654,16 @@ fn match_one_of_batch_anaphor(input: &str) -> Option<(&str, CastAnaphor)> {
     ))
     .parse(input)
     .ok()
+}
+
+/// CR 607.2a: match the linked plural one-of anaphor without accepting an
+/// untyped fallback. The caller must prove the antecedent through the parse
+/// context before it can lower this as a cast target.
+fn match_one_of_linked_anaphor(input: &str) -> Option<(&str, CastAnaphor)> {
+    type E<'a> = OracleError<'a>;
+    value(CastAnaphor::OneOfLinked, tag::<_, _, E>("one of them"))
+        .parse(input)
+        .ok()
 }
 
 /// CR 611.2a (stated-duration half) + CR 608.2g (no-window half): pre-`YouMay`
@@ -40567,8 +40814,9 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
     // anaphor. The `OneOfBatch` arms live in the shared
     // `match_one_of_batch_anaphor` (tried first, same longer-first order);
     // every other arm is unchanged.
-    let anaphor_match: Option<(&str, CastAnaphor)> =
-        match_one_of_batch_anaphor(rest).or_else(|| {
+    let anaphor_match: Option<(&str, CastAnaphor)> = match_one_of_linked_anaphor(rest)
+        .or_else(|| match_one_of_batch_anaphor(rest))
+        .or_else(|| {
             alt((
                 value(
                     CastAnaphor::SingularExiledCard,
@@ -40586,6 +40834,16 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
             .ok()
         });
     if let Some((after_anaphor, matched_anaphor)) = anaphor_match {
+        let linked_one_of_target = if matches!(matched_anaphor, CastAnaphor::OneOfLinked) {
+            match ctx.plural_object_pronoun_ref.as_ref() {
+                Some(TargetFilter::ExiledBySource) => Some(TargetFilter::ExiledBySource),
+                _ => {
+                    return Some(Effect::unimplemented("unbound_linked_one_of_anaphor", rest));
+                }
+            }
+        } else {
+            None
+        };
         let (_, dur) = strip_trailing_duration(lower);
         let duration = dur.or_else(|| {
             scan_contains_phrase(lower, "this turn").then_some(Duration::UntilEndOfTurn)
@@ -40657,7 +40915,9 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
         let mode_resolves_now = match mode {
             CardPlayMode::Cast => true,
             CardPlayMode::Play => match matched_anaphor {
-                CastAnaphor::SingularExiledCard | CastAnaphor::Other => without_paying,
+                CastAnaphor::SingularExiledCard | CastAnaphor::Other | CastAnaphor::OneOfLinked => {
+                    without_paying
+                }
                 CastAnaphor::PluralCardsExiled | CastAnaphor::OneOfBatch => false,
             },
         };
@@ -40715,9 +40975,18 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
                 return Some(Effect::unimplemented("bounded_batch_cast", lower));
             }
         }
-        let driver = if one_cast_window && matches!(matched_anaphor, CastAnaphor::OneOfBatch) {
+        let driver = if one_cast_window
+            && matches!(
+                matched_anaphor,
+                CastAnaphor::OneOfBatch | CastAnaphor::OneOfLinked
+            ) {
             crate::types::ability::CastFromZoneDriver::ResolutionWindow {
                 bounds: crate::types::ability::ResolutionCastWindow {
+                    pool: if matches!(matched_anaphor, CastAnaphor::OneOfLinked) {
+                        crate::types::ability::ResolutionCastPool::SourceLinked
+                    } else {
+                        crate::types::ability::ResolutionCastPool::CurrentResolution
+                    },
                     max_casts: Some(1),
                     max_total_mv: None,
                 },
@@ -40755,12 +41024,15 @@ fn try_parse_cast_effect(lower: &str, ctx: &ParseContext) -> Option<Effect> {
                 parse_host_anchored_exiled_cards_tail(after_anaphor).is_ok()
             }
             CastAnaphor::OneOfBatch | CastAnaphor::Other => false,
+            CastAnaphor::OneOfLinked => true,
         };
         let target = if anchors_to_source_exile_ledger {
-            resolve_singular_exiled_card_target(
-                ctx.chain_prior_publishers,
-                TargetFilter::ParentTarget,
-            )
+            linked_one_of_target.unwrap_or_else(|| {
+                resolve_singular_exiled_card_target(
+                    ctx.chain_prior_publishers,
+                    TargetFilter::ParentTarget,
+                )
+            })
         } else {
             TargetFilter::ParentTarget
         };
@@ -50198,6 +50470,7 @@ fn parse_for_each_attacker_copy_blocker_ir(
     let source_filter =
         TargetFilter::Typed(
             TypedFilter::creature().properties(vec![FilterProp::Attacking {
+                scope: Default::default(),
                 defender: Some(ControllerRef::You),
             }]),
         );
@@ -54735,6 +55008,7 @@ fn parse_effect_chain_ir_body(
             // that many tokens" chunk needs it to back-reference the cast spell's
             // colored-pip count instead of the generic EventContextAmount.
             pending_mana_symbol_count_color: ctx.pending_mana_symbol_count_color,
+            blocking_rider_antecedent: ctx.blocking_rider_antecedent.clone(),
             // CR 701.22a + CR 603.2: The completed-scry condition stages its
             // bottom-count provenance on the trigger body. Every chunk must
             // retain it so a following "exile that many cards from the bottom"
